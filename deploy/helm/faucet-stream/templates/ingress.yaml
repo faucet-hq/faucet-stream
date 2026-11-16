@@ -35,3 +35,43 @@ spec:
           {{- end }}
     {{- end }}
 {{- end }}
+{{- if and (include "faucet-stream.feedsListen" .) .Values.serve.feeds.listen.ingress.enabled }}
+{{- $feedsName := printf "%s-feeds" (include "faucet-stream.fullname" .) }}
+{{- $feedsPort := .Values.serve.feeds.listen.service.port }}
+---
+# Feed ingest only (#1034): routes to the ingest listener's Service.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $feedsName }}
+  labels:
+    {{- include "faucet-stream.labels" . | nindent 4 }}
+    app.kubernetes.io/component: feeds-ingest
+  {{- with .Values.serve.feeds.listen.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.serve.feeds.listen.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.serve.feeds.listen.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.serve.feeds.listen.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ $feedsName }}
+                port:
+                  number: {{ $feedsPort }}
+          {{- end }}
+    {{- end }}
+{{- end }}

@@ -1,0 +1,12 @@
+# expect-error: is a SQLite file, which only one server may use
+serve:
+  replicaCount: 2
+  cluster:
+    enabled: true
+  history:
+    backend: postgres
+    existingSecret: faucet-history
+  feeds:
+    stores:
+      - name: scratch
+        url: sqlite:///var/lib/faucet/scratch-feeds.db

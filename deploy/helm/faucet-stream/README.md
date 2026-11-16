@@ -245,10 +245,10 @@ none of them needs `serve.extraArgs`. Each needs an image built with that
 feature; the default image (the chart's `appVersion` tag, the published full
 image) has all of them.
 
-### File-backed: triggers, template sync, policy, connect providers, OTLP
+### File-backed: triggers, schedules, feeds, template sync, policy, connect providers, OTLP
 
-`serve.triggers`, `serve.templatesSync`, `serve.policy`,
-`serve.connectProviders` and `serve.otel` share one shape. Give the file in
+`serve.triggers`, `serve.schedules`, `serve.feeds`, `serve.templatesSync`,
+`serve.policy`, `serve.connectProviders` and `serve.otel` share one shape. Give the file in
 exactly one way:
 
 | Key | Result |
@@ -263,6 +263,8 @@ flag points at it:
 | Block | Flag | Mount | Default `fileName` |
 |---|---|---|---|
 | `serve.triggers` | `--triggers` | `/etc/faucet-triggers/` | `triggers.yaml` |
+| `serve.schedules` | `--schedules` | `/etc/faucet-schedules/` | `schedules.yaml` |
+| `serve.feeds` | `--feeds` | `/etc/faucet-feeds/` | `feeds.yaml` |
 | `serve.templatesSync` | `--templates-sync` | `/etc/faucet-templates-sync/` | `sync.yaml` |
 | `serve.policy` | `--policy` | `/etc/faucet-policy/` | `policy.yaml` |
 | `serve.connectProviders` | `--connect-providers` | `/etc/faucet-connect-providers/` | `providers.yaml` |
@@ -303,6 +305,77 @@ inline config, or a registered `template:`.
 `otel.logs.enabled`, list `logs` in its `export`; the chart refuses inline
 content that would silently stop log shipping. The `otel.logs` buffer bounds
 and link template still apply.
+
+### Feeds
+
+A [feed](https://faucet-hq.github.io/faucet-stream/cookbook/feeds/) is a
+durable event log senders push into over HTTP; each of its deliveries runs a
+pipeline over it. Feeds made in the console or through the API need no chart
+value: they live in the run history. `serve.feeds` adds the rest.
+
+```yaml
+serve:
+  feeds:
+    enabled: true                 # a --feeds file (read-only at runtime)
+    content:
+      version: 1
+      feeds:
+        - name: orders
+          ingest:
+            auth: { tokens: managed }
+          deliveries:
+            - name: archive
+              template: { id: orders-archive, version: 3 }
+    vaultKey:
+      existingSecret: faucet-vault   # sealed payloads, API-made signature secrets
+    listen:
+      enabled: true               # ingest on its own port, Service and Ingress
+      allowedHosts: [ingest.example.com]
+      ingress:
+        enabled: true
+        className: nginx
+        hosts:
+          - host: ingest.example.com
+            paths: [{ path: /, pathType: Prefix }]
+```
+
+- **The feeds file** follows the file-backed shape above. A delivery's
+  relative `pipeline:` path resolves against `/etc/faucet-feeds/`: use a
+  registered `template:`, an absolute path (the `pipelineConfig` mount), or an
+  `existingConfigMap` that also holds the pipeline files. Keep a signature
+  secret out of the file with `secret: "${env:ORDERS_HMAC_SECRET}"` and an
+  `envFrom` Secret.
+- **Where events live.** The `default` feed store follows the run history:
+  `feeds.db` beside the SQLite history file on the data volume
+  (`serve.persistence`), or the history's PostgreSQL database. Nothing is
+  written outside the data volume, so the read-only root file system stays.
+  `serve.feeds.stores` defines more stores a feed can name
+  (`--feed-store NAME=URL`): `url: sqlite:<path>` for a file on the data
+  volume, or `existingSecret` + `existingSecretKey` (default `url`) for a
+  PostgreSQL URL, which reaches the server through an environment variable
+  and never sits in the pod spec.
+- **Several replicas.** A SQLite feed store takes one server. With
+  `serve.cluster.enabled` the history must be PostgreSQL (so the default feed
+  store is too) and every named store must be PostgreSQL; the chart refuses a
+  `sqlite:` store there, and the server refuses the same at startup.
+- **The ingest listener.** `serve.feeds.listen.enabled` passes
+  `--feeds-listen 0.0.0.0:<port>`: the ingest routes and `/healthz` are served
+  on their own port and the control API's port serves no ingest route. The
+  chart adds the container port, a Service named `<fullname>-feeds` and, with
+  `listen.ingress.enabled`, an Ingress that routes only to it. Senders
+  authenticate with a feed token or a signature, never a serve token. TLS
+  stays with the Ingress.
+- **Limits.** `maxRequestBytes`, `requestTimeoutSecs` and
+  `maxConcurrentRequests` set the server-wide ingest limits
+  (`--feeds-max-request-bytes`, `--feeds-request-timeout-secs`,
+  `--feeds-max-concurrent-requests`); `null` keeps the server defaults (64 MiB,
+  30 s, 256). `serve.tenantDeliveryMinIntervalSecs` is the shortest gap
+  between two runs of a tenant feed's delivery (default 10).
+- **The vault key** seals event payloads (`seal: true`, the default for a
+  tenant's feed), the signature secret of a feed made through the API and a
+  delivery's secret template params. `serve.feeds.vaultKey` supplies it when
+  neither `serve.tenants` nor `serve.cluster.vaultKey` does (a server has one
+  key).
 
 ### Tenants
 
@@ -364,6 +437,10 @@ volume an `extraInitContainers` fetcher fills.
   `redirect_base`.
 - `POST|PUT /v1/triggers/{name}` (webhook triggers) is bearer-authenticated
   like every `/v1` route, so the calling system sends a token.
+- `POST /v1/feeds/{name}/events` and `/v1/tenants/{tenant}/feeds/{name}/events`
+  (feed ingest) authenticate themselves with a feed token or a signature. To
+  expose only them, turn on `serve.feeds.listen` and its own Ingress instead
+  of routing this Ingress's host to senders.
 
 ### Chaos testing
 
@@ -379,7 +456,12 @@ The render fails on: a feature block enabled with zero or several file sources;
 `serve.persistence`; `tenants` without a vault key; `connectProviders`
 without `tenants`; an unknown approval kind, a zero expiry, or template
 approvals with template sync; `mcp.allowMutations` without `mcp.enabled`;
-`serve.otel` content that drops `logs` while `otel.logs` is on. Template sync
+`serve.otel` content that drops `logs` while `otel.logs` is on; a feeds file
+with `memory` history or with `sqlite` history but no `serve.persistence`; a
+feed store named `default`, defined twice, given both or neither of `url` and
+`existingSecret`, given a PostgreSQL URL inline, or a `sqlite:` store with
+cluster mode or several replicas; `feeds.listen.allowedHosts` or
+`feeds.listen.ingress` without `feeds.listen.enabled`. Template sync
 or triggers with `memory` history render, with a warning in the install notes.
 
 ---
@@ -388,7 +470,8 @@ or triggers with `memory` history render, with a warning in the install notes.
 
 [`examples/everything.yaml`](./examples/everything.yaml) turns every serve
 feature on: RBAC with approval rules, Postgres history + cluster mode with two
-replicas, triggers, template sync, a policy, tenants with hosted OAuth connect,
+replicas, triggers, schedules, feeds with their own ingest listener, template
+sync, a policy, tenants with hosted OAuth connect,
 OTLP traces/metrics/logs, approvals, MCP, extra volumes, Ingress with TLS and a
 ServiceMonitor. Its header lists the Secrets to create first.
 
@@ -478,11 +561,20 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `serve.preview.rows` | `500` | rows a preview loads when the request omits `row_count_to_load` (soft cap); `0` = the whole dataset |
 | `serve.preview.maxRows` | `5000` | ceiling on one preview's rows (hard cap); a larger request — including `row_count_to_load=all` — is clamped to it. `0` lifts the ceiling, letting one request read an entire output file (still bounded by a 64 MiB response budget and a 30s deadline) |
 | `serve.triggers` / `.templatesSync` / `.policy` / `.connectProviders` / `.otel` | disabled | file-backed serve features: `enabled` + one of `content` / `existingConfigMap` / `existingSecret`, and `fileName` (see [Serve features](#serve-features)) |
+| `serve.schedules` | disabled | `--schedules` file, same shape |
+| `serve.feeds` | disabled | `--feeds` file, same shape (see [Feeds](#feeds)); needs a history that survives a restart |
+| `serve.feeds.stores` | `[]` | named feed stores (`--feed-store NAME=URL`): `{name, url}` for `sqlite:<path>`, `{name, existingSecret, existingSecretKey}` for a PostgreSQL URL from a Secret |
+| `serve.feeds.vaultKey.existingSecret` | `""` | vault key (`FAUCET_VAULT_KEY`) for sealed feed payloads and secrets, when tenants or the cluster vault key do not set one |
+| `serve.feeds.maxRequestBytes` / `.requestTimeoutSecs` / `.maxConcurrentRequests` | `null` | server-wide ingest limits; `null` = server defaults (64 MiB, 30 s, 256) |
+| `serve.feeds.listen.enabled` | `false` | `--feeds-listen`: ingest routes on their own port (`listen.port`, default `8081`) with a `<fullname>-feeds` Service (`listen.service`) |
+| `serve.feeds.listen.allowedHosts` | `[]` | `--feeds-allowed-host`; empty = any host |
+| `serve.feeds.listen.ingress` | disabled | an Ingress for the ingest Service only: `enabled`, `className`, `annotations`, `hosts`, `tls` |
+| `serve.tenantDeliveryMinIntervalSecs` | `10` | `--tenant-delivery-min-interval-secs` |
 | `serve.policy.store` | `server` | `--policy-store`: `server` keeps approved versions in the history store (the file only seeds an empty store); `file` makes the file the policy, read-only in the console (needs `serve.policy.enabled`) |
 | `serve.cluster.vaultKey.existingSecret` | `""` | vault key (`FAUCET_VAULT_KEY`) that seals clustered template runs' `secret: true` params; `cluster.previousKeys` open values sealed under an earlier key |
 | `serve.tenants.enabled` | `false` | tenants; needs `vaultKey.existingSecret` (+ `existingSecretKey`, default `FAUCET_VAULT_KEY`) and persistent history |
 | `serve.tenants.previousKeys` | `[]` | `{existingSecret, existingSecretKey}` entries → `FAUCET_VAULT_PREVIOUS_KEYS` |
-| `serve.approvals.require` | `[]` | change kinds needing approval: `run`, `template_register`, `template_launch` |
+| `serve.approvals.require` | `[]` | change kinds needing approval: `run`, `template_register`, `template_launch`, `schedule`, `feed` |
 | `serve.approvals.expirySecs` | `null` | `--approval-expiry-secs` (server default 86400) |
 | `serve.mcp.enabled` / `.allowMutations` | `false` / `false` | `/mcp` endpoint / its mutating tools |
 | `serve.allowedHosts` | `[]` | `--allowed-host`: host names the server answers; a request naming another `Host` is refused |

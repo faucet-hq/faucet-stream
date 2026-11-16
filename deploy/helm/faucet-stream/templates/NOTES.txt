@@ -86,6 +86,12 @@ restart starts the registry from scratch (each template re-registers as
 version 1 and `stable` follows only the sidecars again). Use sqlite (with
 serve.persistence) or postgres to keep them.
 {{- end }}
+{{- if .Values.serve.feeds.listen.enabled }}
+
+Feed ingest has its own listener: Service {{ include "faucet-stream.fullname" . }}-feeds, port {{ .Values.serve.feeds.listen.service.port }}.
+Senders POST to /v1/feeds/<name>/events there with a feed token or a
+signature; the control API's port serves no ingest route.
+{{- end }}
 {{- if and .Values.serve.triggers.enabled (eq (include "faucet-stream.historyBackend" $) "memory") }}
 
 Note: serve.triggers runs with serve.history.backend=memory, so trigger

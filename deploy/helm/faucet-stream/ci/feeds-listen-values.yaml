@@ -1,0 +1,29 @@
+# The ingest listener: its own container port, Service and Ingress, with the
+# server-wide ingest limits and a vault key for sealed payloads.
+# expect: - --feeds-listen=0.0.0.0:8081
+# expect: - --feeds-allowed-host=ingest.example.com
+# expect: - --feeds-max-request-bytes=16777216
+# expect: - --feeds-request-timeout-secs=15
+# expect: - --feeds-max-concurrent-requests=512
+# expect: - --tenant-delivery-min-interval-secs=30
+# expect: containerPort: 8081
+# expect: name: t-faucet-stream-feeds
+# expect: app.kubernetes.io/component: feeds-ingest
+# expect: targetPort: feeds
+# expect: host: "ingest.example.com"
+# expect: name: faucet-vault
+# expect-not: --feeds=
+serve:
+  tenantDeliveryMinIntervalSecs: 30
+  feeds:
+    maxRequestBytes: 16777216
+    requestTimeoutSecs: 15
+    maxConcurrentRequests: 512
+    vaultKey:
+      existingSecret: faucet-vault
+    listen:
+      enabled: true
+      allowedHosts: [ingest.example.com]
+      ingress:
+        enabled: true
+        className: nginx

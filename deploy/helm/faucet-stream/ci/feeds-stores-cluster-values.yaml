@@ -1,0 +1,21 @@
+# A cluster with feeds: PostgreSQL history (the default feed store follows it)
+# and a named PostgreSQL store whose URL comes from a Secret.
+# expect: - --cluster
+# expect: - --feeds=/etc/faucet-feeds/feeds.yaml
+# expect: - --feed-store=events=$(FAUCET_FEED_STORE_EVENTS)
+# expect: name: FAUCET_FEED_STORE_EVENTS
+# expect: name: faucet-feed-store
+# expect: key: url
+serve:
+  replicaCount: 2
+  cluster:
+    enabled: true
+  history:
+    backend: postgres
+    existingSecret: faucet-history
+  feeds:
+    enabled: true
+    existingConfigMap: my-feeds
+    stores:
+      - name: events
+        existingSecret: faucet-feed-store

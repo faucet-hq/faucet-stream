@@ -347,6 +347,85 @@ serve:
   # The shortest gap between the ticks of a schedule a tenant owns (seconds).
   tenantScheduleMinIntervalSecs: 300
 
+  # Feeds (#1034): --feeds. Image feature `feeds` (the published `full` image
+  # has it). A feed is a durable event log senders push into over HTTP
+  # (POST /v1/feeds/{name}/events); each delivery runs a pipeline over it.
+  # The file's feeds are read-only at runtime; feeds made in the console or
+  # API live in the run history and need no file. A delivery's relative
+  # `pipeline:` path resolves against /etc/faucet-feeds/: use an absolute path
+  # (e.g. the pipelineConfig mount), an existingConfigMap that also holds the
+  # pipeline files, or a registered `template:`. Events live in the feed
+  # store: by default `feeds.db` beside the SQLite history on the data volume
+  # (see persistence), or the history's PostgreSQL database. Feeds need a
+  # history that survives a restart (the chart refuses memory, or SQLite
+  # without a volume, together with a feeds file).
+  feeds:
+    enabled: false
+    content: null
+    existingConfigMap: ""
+    existingSecret: ""
+    fileName: feeds.yaml
+    # Named feed stores a feed may pick with `store: <name>`:
+    # `--feed-store NAME=URL` per entry. `url` is for a SQLite file on the
+    # data volume; read a PostgreSQL URL from your Secret so its password
+    # stays out of Helm values and the pod spec. `default` cannot be
+    # redefined: it follows the run history. With serve.cluster.enabled every
+    # store must be PostgreSQL (a SQLite file takes one server).
+    stores: []
+    #  - name: events
+    #    existingSecret: faucet-feed-store
+    #    existingSecretKey: url
+    #  - name: scratch
+    #    url: sqlite:///var/lib/faucet/scratch-feeds.db
+    # The vault key that seals a feed's event payloads (`seal: true`, the
+    # default for a tenant's feed), the HMAC secret of a feed made through
+    # the API and a delivery's secret template params. Read from your Secret
+    # as FAUCET_VAULT_KEY. Ignored when serve.tenants or serve.cluster
+    # already sets a vault key (there is one key per server).
+    vaultKey:
+      existingSecret: ""
+      existingSecretKey: FAUCET_VAULT_KEY
+    # Server-wide ingest limits; null keeps the server default.
+    # --feeds-max-request-bytes: the largest request body the server reads,
+    # whatever a feed's `ingest.max_request_bytes` says (default 64 MiB).
+    maxRequestBytes: null
+    # --feeds-request-timeout-secs: how long a request may take to send its
+    # body (default 30).
+    requestTimeoutSecs: null
+    # --feeds-max-concurrent-requests: ingest requests handled at once; past
+    # it senders get 503 and retry (default 256).
+    maxConcurrentRequests: null
+    # --feeds-listen: serve the ingest routes (and /healthz) on their own
+    # port, so senders on the internet reach only them and never the control
+    # API. The main port then serves no ingest route. The chart adds the
+    # container port and a second Service (`<fullname>-feeds`), and an
+    # Ingress when listen.ingress.enabled.
+    listen:
+      enabled: false
+      port: 8081
+      # --feeds-allowed-host: host names the ingest listener answers for
+      # (`*` = any). Empty = any host.
+      allowedHosts: []
+      service:
+        type: ClusterIP
+        port: 8081
+        annotations: {}
+      ingress:
+        enabled: false
+        className: ""
+        annotations: {}
+        hosts:
+          - host: ingest.example.com
+            paths:
+              - path: /
+                pathType: Prefix
+        tls: []
+        #  - secretName: faucet-ingest-tls
+        #    hosts: [ingest.example.com]
+  # The shortest gap between two runs of a delivery of a tenant's feed
+  # (seconds): --tenant-delivery-min-interval-secs.
+  tenantDeliveryMinIntervalSecs: 10
+
   # Template hosting + sync (#589): --templates-sync. Image feature
   # `templates-sync` (+ `templates-sync-object-store` for S3/GCS/Azure). Pair
   # it with a persistent history backend: with `memory` the registry, versions
@@ -419,7 +498,8 @@ serve:
     #    existingSecretKey: FAUCET_VAULT_KEY
 
   # Change requests (#703): actions that need an approved change request first.
-  # Kinds: run, template_register, template_launch → --require-approval.
+  # Kinds: run, template_register, template_launch, schedule, feed →
+  # --require-approval.
   # Who may approve is the `approvals:` block of the RBAC auth config
   # (auth.rbacConfig). template_* cannot be combined with templatesSync.
   approvals:
@@ -531,6 +611,10 @@ service:
 #   providers' `redirect_base`.
 # - POST|PUT /v1/triggers/{name} (webhook triggers) is bearer-authenticated
 #   like every /v1 route: the calling system must send a token.
+# - POST /v1/feeds/{name}/events and /v1/tenants/{t}/feeds/{name}/events (feed
+#   ingest) authenticate themselves with a feed token or a signature, never a
+#   serve token. To expose only them, use serve.feeds.listen with its own
+#   Service and Ingress instead of routing this Ingress to the control API.
 ingress:
   enabled: false
   className: ""

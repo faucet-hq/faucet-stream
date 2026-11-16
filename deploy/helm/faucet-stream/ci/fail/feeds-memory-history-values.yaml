@@ -1,0 +1,7 @@
+# expect-error: serve.feeds.enabled=true requires a run history that survives a restart
+serve:
+  history:
+    backend: memory
+  feeds:
+    enabled: true
+    existingConfigMap: my-feeds

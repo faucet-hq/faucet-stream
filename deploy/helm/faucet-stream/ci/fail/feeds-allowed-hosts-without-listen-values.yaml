@@ -1,0 +1,5 @@
+# expect-error: serve.feeds.listen.allowedHosts only applies with serve.feeds.listen.enabled=true
+serve:
+  feeds:
+    listen:
+      allowedHosts: [ingest.example.com]

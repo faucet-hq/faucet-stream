@@ -1,0 +1,6 @@
+# expect-error: a PostgreSQL URL carries a password and would sit in the pod spec
+serve:
+  feeds:
+    stores:
+      - name: events
+        url: postgres://faucet:pw@postgres:5432/feeds

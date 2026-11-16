@@ -1,0 +1,6 @@
+# expect-error: `default` follows the run history and cannot be redefined
+serve:
+  feeds:
+    stores:
+      - name: default
+        existingSecret: faucet-feed-store
