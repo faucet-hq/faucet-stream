@@ -1352,11 +1352,15 @@ async fn a_stale_definitions_snapshot_answers_503_while_the_history_is_unreachab
         #[cfg(feature = "triggers")]
         faucet_cli::serve::triggers::health::TriggersHandle::empty(),
     );
-    state.set_feeds(FeedsRuntime::new(
-        cfg.feeds.clone(),
-        spec::LoadedFile::default(),
-        stores::Stores::from_config(&cfg),
-    ));
+    // No background scheduler: its reload would replace a backdated snapshot.
+    state.set_feeds(
+        FeedsRuntime::new(
+            cfg.feeds.clone(),
+            spec::LoadedFile::default(),
+            stores::Stores::from_config(&cfg),
+        )
+        .offline(),
+    );
     let router = faucet_cli::serve::server::build_router(state.clone(), &cfg, &Default::default());
     let srv = Srv {
         addr: listen(router).await,

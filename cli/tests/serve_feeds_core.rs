@@ -2277,6 +2277,10 @@ async fn a_stall_and_a_nearly_full_feed_each_notify_once() {
     let mut spec = feed_spec("orders", json!([d, twin]));
     spec.retention.undelivered.max_bytes = spec::Size(100);
     spec.retention.warn_at = vec![0.5];
+    // Only the test's own scheduler runs: a background one would record the
+    // crossing count at times of its own.
+    srv.state
+        .set_feeds(FeedsRuntime::from_config(&srv.config).offline());
     service::create(&srv.state, &admin(), None, spec)
         .await
         .unwrap();
