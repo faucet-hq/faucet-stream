@@ -1120,11 +1120,27 @@ async fn a_sealed_feed_stores_ciphertext_and_delivers_what_was_sent() {
         );
     }
     assert_ne!(stored.events[0].payload, stored.events[1].payload);
+    // Sealing adds a few bytes, never a multiple, and limits count what was sent.
+    let sent = r#"{"card": "4111-secret-pan"}"#.len();
+    assert!(stored.events[0].payload.len() < sent + 96);
+    assert_eq!(stored.events[0].size as usize, sent);
+    let large = format!(r#"{{"card": "9999-large-pan", "pad": "{}"}}"#, "x".repeat(100_000));
+    let b = srv.push("private", &token, &large).await;
+    assert_eq!(b.status, 202, "{}", b.body);
+    let big = srv
+        .store("private")
+        .await
+        .read(&store_calls(), &uid, Seq(3), Seq(4))
+        .await
+        .unwrap();
+    assert!(big.events[0].sealed && big.events[0].payload.len() < large.len() + 96);
+    assert_eq!(big.events[0].size as usize, large.len());
     let file = std::fs::read(root.join("feeds.db")).unwrap();
     assert!(!String::from_utf8_lossy(&file).contains("4111-secret-pan"));
-    let got = delivered(&mut srv, &out, 2).await;
+    let got = delivered(&mut srv, &out, 3).await;
     assert_eq!(got[0]["card"], "4111-secret-pan");
     assert_eq!(got[1]["card"], "5500-other-pan");
+    assert_eq!(got[2]["card"], "9999-large-pan");
 }
 
 /// With `--feeds-listen` the ingest routes are on their own listener, with

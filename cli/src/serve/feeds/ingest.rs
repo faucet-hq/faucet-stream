@@ -49,6 +49,8 @@ pub const MAX_GROUP_BYTES: u64 = 32 * 1024 * 1024;
 /// authenticated, at once.
 pub const UNAUTHENTICATED_CONCURRENCY: usize = 32;
 /// How long a feed's append task waits for work before it ends.
+/// A sealed request at least this large is sealed off the async workers.
+pub const SEAL_OFF_THREAD_BYTES: usize = 64 * 1024;
 const BATCHER_IDLE: Duration = Duration::from_secs(30);
 /// The shortest gap between two writes of one token's `last_used_at`.
 pub const TOKEN_TOUCH_INTERVAL: Duration = Duration::from_secs(60);
@@ -886,6 +888,9 @@ fn build_events(
         let mut event = NewEvent::new(piece.content_type, payload)
             .received_at(received_at)
             .sealed(sealed);
+        if sealed {
+            event = event.plain_size(sizes[i]);
+        }
         for name in KEPT_HEADERS.iter().copied().chain(dedupe_header) {
             if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
                 event = event.header(name.to_ascii_lowercase(), value);
@@ -1216,8 +1221,24 @@ async fn handle(
             .retry(wait),
         ));
     }
-    let (events, sizes) =
-        build_events(&state, &feed, &headers, pieces, replay.as_deref()).map_err(refuse)?;
+    let built = if feed.spec.sealed() && body.len() >= SEAL_OFF_THREAD_BYTES {
+        let (state, feed, headers, replay) =
+            (state.clone(), feed.clone(), headers.clone(), replay.clone());
+        tokio::task::spawn_blocking(move || {
+            build_events(&state, &feed, &headers, pieces, replay.as_deref())
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(Refusal::unavailable(
+                "seal",
+                "the request could not be sealed; retry shortly",
+                RETRY_STORE_SECS,
+            ))
+        })
+    } else {
+        build_events(&state, &feed, &headers, pieces, replay.as_deref())
+    };
+    let (events, sizes) = built.map_err(refuse)?;
     let store = rt.store_for(&feed).await.map_err(|e| {
         refuse(store_refusal(
             &feed,

@@ -114,6 +114,23 @@ impl Vault {
         serde_json::from_slice(&plain).map_err(|e| format!("sealed value is not JSON: {e}"))
     }
 
+    /// Seal raw bytes bound to `context`; the result is binary.
+    pub fn seal_bytes_for(&self, plain: &[u8], context: &str) -> Vec<u8> {
+        self.enc.encrypt_bound(plain, context.as_bytes())
+    }
+
+    /// Open bytes sealed by [`Vault::seal_bytes_for`] under `context`.
+    pub fn open_bytes_for(&self, sealed: &[u8], context: &str) -> Result<Vec<u8>, String> {
+        self.enc
+            .decrypt_bound(sealed, context.as_bytes())
+            .map_err(|e| {
+                format!(
+                    "cannot open sealed bytes (wrong vault key, or they belong to another owner \
+                     than `{context}`): {e}"
+                )
+            })
+    }
+
     /// [`Vault::seal_for`] for a string.
     pub fn seal_str_for(&self, s: &str, context: &str) -> String {
         self.seal_for(&Value::String(s.to_string()), context)

@@ -214,6 +214,8 @@ pub struct NewEvent {
     /// Sender-supplied key; a retry with the same key inside the feed's
     /// dedupe window is not stored again.
     pub dedupe_key: Option<String>,
+    /// The payload's size before sealing; `None` when `payload` is as sent.
+    pub plain_size: Option<u64>,
 }
 
 impl NewEvent {
@@ -226,6 +228,7 @@ impl NewEvent {
             payload: payload.into(),
             sealed: false,
             dedupe_key: None,
+            plain_size: None,
         }
     }
 
@@ -253,9 +256,16 @@ impl NewEvent {
         self
     }
 
-    /// The payload size in bytes, as counted against quotas.
+    /// Set the size the payload had before it was sealed.
+    pub fn plain_size(mut self, bytes: u64) -> Self {
+        self.plain_size = Some(bytes);
+        self
+    }
+
+    /// The payload size in bytes as counted against quotas: the size as
+    /// sent, whatever sealing added.
     pub fn size(&self) -> u64 {
-        self.payload.len() as u64
+        self.plain_size.unwrap_or(self.payload.len() as u64)
     }
 }
 

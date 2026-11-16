@@ -69,33 +69,19 @@ fn open_text(state: &ServerState, sealed: &str, context: &str) -> Result<String,
 }
 
 /// Seal `payload` for an event of the feed (`context` is
-/// `faucet_common_feed::sealing_context`).
+/// `faucet_common_feed::sealing_context`). The result is binary and a few
+/// dozen bytes longer than the payload.
 pub fn seal_payload(state: &ServerState, payload: &[u8], context: &str) -> Result<Vec<u8>, String> {
-    seal_text(state, &hex(payload), context).map(String::into_bytes)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-            let _ = write!(s, "{b:02x}");
-            s
-        })
-}
-
-#[cfg(feature = "encryption")]
-fn unhex(text: &str) -> Result<Vec<u8>, String> {
-    if !text.len().is_multiple_of(2) || !text.is_ascii() {
-        return Err("the opened payload is not hex".into());
+    #[cfg(feature = "encryption")]
+    {
+        let vault = state.vault().ok_or(NO_VAULT)?;
+        Ok(vault.seal_bytes_for(payload, context))
     }
-    (0..text.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&text[i..i + 2], 16)
-                .map_err(|_| "the opened payload is not hex".to_string())
-        })
-        .collect()
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = (state, payload, context);
+        Err("this build has no `encryption` feature, so nothing can be sealed".into())
+    }
 }
 
 /// The opener a delivery run's source uses for sealed payloads; `None` when
@@ -105,13 +91,9 @@ pub fn payload_opener(state: &ServerState) -> Option<faucet_common_feed::Payload
     {
         let vault = state.vault()?;
         Some(std::sync::Arc::new(move |sealed: &[u8], context: &str| {
-            let text = std::str::from_utf8(sealed).map_err(|_| {
-                faucet_common_feed::OpenError("the sealed payload is not text".into())
-            })?;
-            let opened = vault
-                .open_str_for(text, context)
-                .map_err(faucet_common_feed::OpenError)?;
-            unhex(&opened).map_err(faucet_common_feed::OpenError)
+            vault
+                .open_bytes_for(sealed, context)
+                .map_err(faucet_common_feed::OpenError)
         }))
     }
     #[cfg(not(feature = "encryption"))]
@@ -557,19 +539,22 @@ mod tests {
         let open = payload_opener(&state).unwrap();
         assert_eq!(open(&sealed, &context).unwrap(), b"{\"a\":1}\xff");
         assert!(open(&sealed, "feed:other:tenant:-:event").is_err());
-        assert!(
-            open(b"\xff\xfe", &context)
-                .unwrap_err()
-                .to_string()
-                .contains("not text")
-        );
+        assert!(open(b"\xff\xfe", &context).is_err());
         assert!(payload_opener(&test_state()).is_none());
         assert!(
             seal_payload(&test_state(), b"x", &context)
                 .unwrap_err()
                 .contains("vault key")
         );
-        assert_eq!(unhex("zz").unwrap_err(), "the opened payload is not hex");
-        assert_eq!(unhex("abc").unwrap_err(), "the opened payload is not hex");
+    }
+
+    #[test]
+    fn sealing_adds_a_fixed_few_bytes_whatever_the_payload_size() {
+        let state = vaulted();
+        let feed = faucet_common_feed::FeedUid::new("f1").unwrap();
+        let context = faucet_common_feed::sealing_context(&feed, None);
+        let plain = vec![7u8; 100_000];
+        let sealed = seal_payload(&state, &plain, &context).unwrap();
+        assert!(sealed.len() < plain.len() + 128, "{}", sealed.len());
     }
 }
