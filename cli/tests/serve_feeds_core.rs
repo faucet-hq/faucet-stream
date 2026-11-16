@@ -24,7 +24,7 @@ use faucet_cli::serve::rbac::{AuthContext, Role};
 use faucet_cli::serve::state::ServerState;
 use faucet_common_feed::{FeedBinding, FeedStore, FeedUid, NewEvent, Seq};
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 

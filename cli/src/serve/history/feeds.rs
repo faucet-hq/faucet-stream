@@ -59,7 +59,7 @@ impl std::fmt::Display for Span {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let n = self.0;
         for (unit, factor) in [("d", 86_400), ("h", 3_600), ("m", 60)] {
-            if n != 0 && n % factor == 0 {
+            if n != 0 && n.is_multiple_of(factor) {
                 return write!(f, "{}{unit}", n / factor);
             }
         }
@@ -110,7 +110,7 @@ impl std::fmt::Display for Size {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let n = self.0;
         for (unit, shift) in [("TiB", 40), ("GiB", 30), ("MiB", 20), ("KiB", 10)] {
-            if n != 0 && n % (1u64 << shift) == 0 {
+            if n != 0 && n.is_multiple_of(1u64 << shift) {
                 return write!(f, "{}{unit}", n >> shift);
             }
         }

@@ -86,7 +86,7 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(feature = "encryption")]
 fn unhex(text: &str) -> Result<Vec<u8>, String> {
-    if text.len() % 2 != 0 || !text.is_ascii() {
+    if !text.len().is_multiple_of(2) || !text.is_ascii() {
         return Err("the opened payload is not hex".into());
     }
     (0..text.len())
