@@ -2,7 +2,7 @@
 //! `<tenant>/<name>` for a tenant feed, else the feed's name; `delivery` is
 //! the delivery's name; `outcome` is a closed set.
 
-use metrics::{counter, describe_counter, describe_gauge, gauge};
+use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 
 /// The closed set of delivery-run outcomes.
 pub const OUTCOMES: &[&str] = &[
@@ -52,6 +52,34 @@ pub fn describe() {
     describe_gauge!(
         "faucet_feed_held",
         "Deliveries of the feed that are held until an admin recovers them"
+    );
+    describe_counter!(
+        "faucet_feed_ingest_requests_total",
+        "Ingest requests by HTTP status (`feed` is empty for a request no feed admitted)"
+    );
+    describe_counter!(
+        "faucet_feed_ingest_refused_total",
+        "Refused ingest requests by reason: unauthorized, malformed, too_large, content_type, \
+         content_encoding, rate_limited, tenant_rate_limited, full, store, seal, busy, timeout, \
+         draining, definitions_stale"
+    );
+    describe_counter!("faucet_feed_events_total", "Events stored");
+    describe_counter!("faucet_feed_bytes_total", "Payload bytes stored");
+    describe_histogram!(
+        "faucet_feed_append_duration_seconds",
+        "How long one store transaction of ingested events took"
+    );
+    describe_histogram!(
+        "faucet_feed_append_group_requests",
+        "Ingest requests committed in one store transaction"
+    );
+    describe_counter!(
+        "faucet_feed_store_errors_total",
+        "Ingest requests that failed because the feed's store was unavailable"
+    );
+    describe_counter!(
+        "faucet_feed_dedupe_hits_total",
+        "Events not stored again because their dedupe key was already seen"
     );
     describe_counter!(
         "faucet_feed_scheduler_restarts_total",
@@ -112,6 +140,47 @@ pub fn held(feed: &str, deliveries: usize) {
     gauge!("faucet_feed_held", "feed" => feed.to_string()).set(deliveries as f64);
 }
 
+pub fn ingest_request(feed: &str, status: u16) {
+    counter!(
+        "faucet_feed_ingest_requests_total",
+        "feed" => feed.to_string(),
+        "status" => status.to_string()
+    )
+    .increment(1);
+}
+
+pub fn ingest_refused(feed: &str, reason: &'static str) {
+    counter!(
+        "faucet_feed_ingest_refused_total",
+        "feed" => feed.to_string(),
+        "reason" => reason
+    )
+    .increment(1);
+}
+
+pub fn ingested(feed: &str, events: u64, bytes: u64) {
+    counter!("faucet_feed_events_total", "feed" => feed.to_string()).increment(events);
+    counter!("faucet_feed_bytes_total", "feed" => feed.to_string()).increment(bytes);
+}
+
+pub fn append_duration(feed: &str, took: std::time::Duration) {
+    histogram!("faucet_feed_append_duration_seconds", "feed" => feed.to_string())
+        .record(took.as_secs_f64());
+}
+
+pub fn append_group(feed: &str, requests: usize) {
+    histogram!("faucet_feed_append_group_requests", "feed" => feed.to_string())
+        .record(requests as f64);
+}
+
+pub fn store_error(feed: &str) {
+    counter!("faucet_feed_store_errors_total", "feed" => feed.to_string()).increment(1);
+}
+
+pub fn dedupe_hits(feed: &str, events: u64) {
+    counter!("faucet_feed_dedupe_hits_total", "feed" => feed.to_string()).increment(events);
+}
+
 pub fn scheduler_restarted() {
     counter!("faucet_feed_scheduler_restarts_total").increment(1);
 }
@@ -152,6 +221,14 @@ mod tests {
         gap("acme/orders");
         held("acme/orders", 1);
         scheduler_restarted();
+        ingest_request("acme/orders", 202);
+        ingest_request("", 401);
+        ingest_refused("", "unauthorized");
+        ingested("acme/orders", 3, 120);
+        append_duration("acme/orders", std::time::Duration::from_millis(4));
+        append_group("acme/orders", 2);
+        store_error("acme/orders");
+        dedupe_hits("acme/orders", 1);
         forget_feed("acme/orders", &["lake".to_string()]);
         assert_eq!(OUTCOMES.len(), 7);
     }

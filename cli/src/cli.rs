@@ -2119,6 +2119,26 @@ pub struct ServeFeedArgs {
     /// feed (seconds), so one tenant cannot flood the server.
     #[arg(long, default_value_t = 10)]
     pub tenant_delivery_min_interval_secs: u64,
+    /// Serve the feed ingest routes (`POST /v1/feeds/{name}/events` and the
+    /// tenant form) on their own listener, with `/healthz`, so senders reach
+    /// only them; the main listener then serves no ingest route. Unset: the
+    /// main listener serves them.
+    #[arg(long, value_name = "ADDR", env = "FAUCET_SERVE_FEEDS_LISTEN")]
+    pub feeds_listen: Option<String>,
+    /// A host name the feeds listener answers for (repeatable; `*` = any).
+    /// Without one it answers for any host.
+    #[arg(long = "feeds-allowed-host", value_name = "HOST")]
+    pub feeds_allowed_host: Vec<String>,
+    /// The largest ingest request body the server reads, whatever a feed's
+    /// `ingest.max_request_bytes` says. Default 64 MiB.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    pub feeds_max_request_bytes: u64,
+    /// How long an ingest request may take to send its body (seconds).
+    #[arg(long, default_value_t = 30)]
+    pub feeds_request_timeout_secs: u64,
+    /// Ingest requests handled at once; past it senders get 503 and retry.
+    #[arg(long, default_value_t = 256)]
+    pub feeds_max_concurrent_requests: usize,
 }
 
 #[cfg(feature = "serve")]
@@ -2128,6 +2148,11 @@ impl Default for ServeFeedArgs {
             feeds: None,
             feed_store: Vec::new(),
             tenant_delivery_min_interval_secs: 10,
+            feeds_listen: None,
+            feeds_allowed_host: Vec::new(),
+            feeds_max_request_bytes: 64 * 1024 * 1024,
+            feeds_request_timeout_secs: 30,
+            feeds_max_concurrent_requests: 256,
         }
     }
 }

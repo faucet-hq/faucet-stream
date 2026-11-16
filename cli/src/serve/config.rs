@@ -308,6 +308,16 @@ pub struct FeedSettings {
     pub stores: std::collections::BTreeMap<String, String>,
     /// The shortest gap between two runs of a tenant feed's delivery.
     pub tenant_delivery_min_interval: Duration,
+    /// `--feeds-listen`: the ingest routes' own listener.
+    pub listen: Option<SocketAddr>,
+    /// The host names the feeds listener answers for; empty = any.
+    pub allowed_hosts: Vec<String>,
+    /// The largest ingest request body the server reads.
+    pub max_request_bytes: u64,
+    /// How long an ingest request may take to send its body.
+    pub request_timeout: Duration,
+    /// Ingest requests handled at once.
+    pub max_concurrent_requests: usize,
 }
 
 impl Default for FeedSettings {
@@ -316,6 +326,11 @@ impl Default for FeedSettings {
             path: None,
             stores: Default::default(),
             tenant_delivery_min_interval: DEFAULT_TENANT_DELIVERY_MIN_INTERVAL,
+            listen: None,
+            allowed_hosts: Vec::new(),
+            max_request_bytes: 64 * 1024 * 1024,
+            request_timeout: Duration::from_secs(30),
+            max_concurrent_requests: 256,
         }
     }
 }
@@ -350,10 +365,42 @@ impl FeedSettings {
             }
             crate::secrets::registry::register_server(url);
         }
+        let listen = a
+            .feeds_listen
+            .as_deref()
+            .map(|l| {
+                l.parse::<SocketAddr>()
+                    .map_err(|e| CliError::Serve(format!("invalid --feeds-listen '{l}': {e}")))
+            })
+            .transpose()?;
+        if listen.is_none() && !a.feeds_allowed_host.is_empty() {
+            return Err(CliError::Serve(
+                "--feeds-allowed-host only applies with --feeds-listen; the main listener \
+                 uses --allowed-host"
+                    .into(),
+            ));
+        }
+        let guard = crate::serve::guard::GuardSettings::from_args(&a.feeds_allowed_host, &[])
+            .map_err(|e| CliError::Serve(e.replace("--allowed-host", "--feeds-allowed-host")))?;
+        if a.feeds_max_request_bytes == 0
+            || a.feeds_request_timeout_secs == 0
+            || a.feeds_max_concurrent_requests == 0
+        {
+            return Err(CliError::Serve(
+                "--feeds-max-request-bytes, --feeds-request-timeout-secs and \
+                 --feeds-max-concurrent-requests must be greater than 0"
+                    .into(),
+            ));
+        }
         Ok(Self {
             path: a.feeds.clone(),
             stores,
             tenant_delivery_min_interval: Duration::from_secs(a.tenant_delivery_min_interval_secs),
+            listen,
+            allowed_hosts: guard.allowed_hosts,
+            max_request_bytes: a.feeds_max_request_bytes,
+            request_timeout: Duration::from_secs(a.feeds_request_timeout_secs),
+            max_concurrent_requests: a.feeds_max_concurrent_requests,
         })
     }
 }
@@ -727,9 +774,11 @@ impl ServeConfig {
         crate::serve::feeds::stores::check_config(&feeds, &history, cluster.enabled)
             .map_err(CliError::Serve)?;
         #[cfg(not(feature = "feeds"))]
-        if feeds.path.is_some() || !feeds.stores.is_empty() {
+        if feeds.path.is_some() || !feeds.stores.is_empty() || feeds.listen.is_some() {
             return Err(CliError::Serve(
-                "--feeds and --feed-store require a build with the `feeds` feature".into(),
+                "--feeds, --feed-store and --feeds-listen require a build with the `feeds` \
+                 feature"
+                    .into(),
             ));
         }
 

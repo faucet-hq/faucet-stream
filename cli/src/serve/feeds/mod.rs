@@ -263,6 +263,7 @@ pub struct FeedsRuntime {
     settings: FeedSettings,
     file: spec::LoadedFile,
     stores: stores::Stores,
+    ingest: ingest::Ingest,
     owner: ClaimOwner,
     snapshot: RwLock<Arc<Snapshot>>,
     file_ids: Mutex<HashMap<String, FileIds>>,
@@ -288,6 +289,7 @@ impl FeedsRuntime {
         let owner = ClaimOwner::new(format!("serve:{}", uuid::Uuid::new_v4().simple()))
             .expect("`serve:` and 32 hex characters form a valid claim owner");
         Self {
+            ingest: ingest::Ingest::new(&settings),
             settings,
             file,
             stores,
@@ -325,6 +327,16 @@ impl FeedsRuntime {
 
     pub fn stores(&self) -> &stores::Stores {
         &self.stores
+    }
+
+    /// What this server keeps for ingest.
+    pub fn ingest(&self) -> &ingest::Ingest {
+        &self.ingest
+    }
+
+    /// The feed settings the server was started with.
+    pub fn settings(&self) -> &FeedSettings {
+        &self.settings
     }
 
     /// Who this server's claims belong to: `serve:<instance>`.

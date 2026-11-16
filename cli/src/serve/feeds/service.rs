@@ -1235,7 +1235,7 @@ async fn delete_inner(
         .await
         .unwrap_or_default()
     {
-        super::ingest::forget_token(&token.id);
+        state.feeds().ingest().forget_token(&token.id);
     }
     store
         .purge_feed(&store_calls(), &feed.uid)
@@ -1244,7 +1244,7 @@ async fn delete_inner(
     let names: Vec<String> = feed.deliveries.keys().cloned().collect();
     metrics::forget_feed(&feed.label(), &names);
     super::notify::forget(&*state.history(), feed.uid.as_str()).await;
-    super::ingest::forget_feed(&feed);
+    state.feeds().ingest().forget_feed(feed.uid.as_str());
     after_change(state).await;
     Ok(())
 }
