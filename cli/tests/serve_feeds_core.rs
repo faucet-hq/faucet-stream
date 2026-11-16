@@ -23,6 +23,9 @@ use faucet_cli::serve::history::feeds::FeedSpec;
 use faucet_cli::serve::rbac::{AuthContext, Role};
 use faucet_cli::serve::state::ServerState;
 use faucet_common_feed::{FeedBinding, FeedStore, FeedUid, NewEvent, Seq};
+
+#[path = "support/ports.rs"]
+mod ports;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::Arc;
@@ -40,12 +43,21 @@ fn admin() -> AuthContext {
 }
 
 fn config(dir: &Path, history: &str, extra: &[&str]) -> ServeConfig {
+    try_config(dir, history, "127.0.0.1:0", extra).unwrap()
+}
+
+fn try_config(
+    dir: &Path,
+    history: &str,
+    listen: &str,
+    extra: &[&str],
+) -> faucet_cli::error::CliResult<ServeConfig> {
     let root = dir.display().to_string();
     let mut argv = vec![
         "faucet",
         "serve",
         "--listen",
-        "127.0.0.1:0",
+        listen,
         "--no-auth",
         "--no-env-file",
         "--no-ui",
@@ -61,7 +73,7 @@ fn config(dir: &Path, history: &str, extra: &[&str]) -> ServeConfig {
     let faucet_cli::cli::Command::Serve(args) = cli.command else {
         panic!("not a serve command");
     };
-    ServeConfig::from_args(*args).unwrap()
+    ServeConfig::from_args(*args)
 }
 
 struct Srv {
@@ -1585,4 +1597,145 @@ async fn two_servers_on_one_postgres_deliver_each_range_once() {
         .unwrap()
         .remove(0);
     assert_eq!(head.deliveries[0].cursor, Seq(8));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_started_server_delivers_a_feeds_file_and_reports_feeds_in_readyz() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let out = root.join("lake.jsonl");
+    std::fs::write(
+        root.join("lake.yaml"),
+        format!(
+            "version: 1\nname: file_lake\npipeline:\n  source: {{ type: feed }}\n  sink: {{ type: file, config: {{ path: \"{}\", if_exists: append }} }}\n",
+            out.display()
+        ),
+    )
+    .unwrap();
+    let feeds = root.join("feeds.yaml");
+    std::fs::write(
+        &feeds,
+        "version: 1\nfeeds:\n  - name: orders\n    ingest: { auth: { tokens: managed } }\n    deliveries:\n      - name: lake\n        pipeline: lake.yaml\n        flush: { max_events: 1, min_interval: 0s }\n",
+    )
+    .unwrap();
+    let feeds_arg = feeds.display().to_string();
+    let history = format!("sqlite:{}", root.join("history.db").display());
+
+    // What could lose or split feeds is refused before anything starts.
+    let memory = try_config(root, "memory", "127.0.0.1:0", &["--feeds", &feeds_arg]).unwrap_err();
+    assert!(memory.to_string().contains("--history memory"), "{memory}");
+    let cluster = try_config(
+        root,
+        &history,
+        "127.0.0.1:0",
+        &["--feeds", &feeds_arg, "--cluster"],
+    )
+    .unwrap_err();
+    assert!(cluster.to_string().contains("SQLite"), "{cluster}");
+    for bad in [
+        vec!["--feed-store", "nope"],
+        vec!["--feed-store", "=sqlite:/x.db"],
+        vec!["--feed-store", "default=sqlite:/x.db"],
+        vec![
+            "--feed-store",
+            "a=sqlite:/x.db",
+            "--feed-store",
+            "a=sqlite:/y.db",
+        ],
+        vec!["--feed-store", "a=mysql://h/db"],
+    ] {
+        assert!(
+            try_config(root, &history, "127.0.0.1:0", &bad).is_err(),
+            "{bad:?}"
+        );
+    }
+    let named = try_config(
+        root,
+        &history,
+        "127.0.0.1:0",
+        &["--feed-store", "big=sqlite:/data/big.db"],
+    )
+    .unwrap();
+    assert_eq!(named.feeds.stores["big"], "sqlite:/data/big.db");
+
+    let port = ports::free_port();
+    let listen = format!("127.0.0.1:{port}");
+    let mut cfg = try_config(root, &history, &listen, &["--feeds", &feeds_arg]).unwrap();
+    cfg.log_level = "warn".into();
+    tokio::spawn(async move {
+        let _ = faucet_cli::serve::run_server(
+            cfg,
+            faucet_cli::serve::McpServeSettings {
+                enabled: false,
+                allow_mutations: false,
+            },
+        )
+        .await;
+    });
+    let client = reqwest::Client::new();
+    let ready = format!("http://{listen}/readyz");
+    let mut body = Value::Null;
+    for _ in 0..400 {
+        if let Ok(r) = client.get(&ready).send().await
+            && let Ok(v) = r.json::<Value>().await
+            && v["feeds"]["feeds"] == 1
+        {
+            body = v;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(body["feeds"]["started"], true, "{body}");
+    assert_eq!(body["feeds"]["store_ok"], true, "{body}");
+    assert_eq!(body["feeds"]["stalled"], json!([]));
+    assert_eq!(body["feeds"]["held"], json!([]));
+    assert_eq!(body["status"], "ready");
+
+    // Events appended to the store are delivered by the server's own loop.
+    let h = faucet_cli::serve::history::connect(
+        &faucet_cli::serve::config::HistoryBackendSpec::Sqlite(history.clone()),
+        Duration::from_secs(60),
+        Duration::from_secs(30),
+        "reader",
+    )
+    .await
+    .unwrap();
+    let ids_doc: Value =
+        serde_json::from_str(&h.meta_get("feed_uid:-/orders").await.unwrap().unwrap()).unwrap();
+    let uid = FeedUid::new(ids_doc["uid"].as_str().unwrap()).unwrap();
+    let store = faucet_common_feed::SqliteFeedStore::open(
+        root.join("feeds.db"),
+        &faucet_common_feed::SqliteOptions::new(),
+    )
+    .await
+    .unwrap();
+    let events = (1..=2)
+        .map(|i| NewEvent::new("application/json", format!("{{\"id\":{i}}}").into_bytes()))
+        .collect();
+    store.append(&store_calls(), &uid, events).await.unwrap();
+    for _ in 0..600 {
+        if ids(&out).len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(ids(&out), vec![1, 2]);
+    // The claim is released once the run is over.
+    let mut released = false;
+    for _ in 0..400 {
+        let head = store
+            .heads(&store_calls(), std::slice::from_ref(&uid))
+            .await
+            .unwrap()
+            .remove(0);
+        if head.deliveries[0].cursor == Seq(3) && head.deliveries[0].claim.is_none() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        released,
+        "the scheduler releases the claim of a finished run"
+    );
 }
