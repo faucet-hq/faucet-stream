@@ -445,6 +445,16 @@ impl RbacConfig {
         &self,
         kinds: &[crate::serve::changes::ChangeKind],
     ) -> Result<(), String> {
+        self.check_approvers_for("schedule", kinds)
+    }
+
+    /// [`check_approvers`](Self::check_approvers) for a `what` change
+    /// (`schedule`, `feed`).
+    pub fn check_approvers_for(
+        &self,
+        what: &str,
+        kinds: &[crate::serve::changes::ChangeKind],
+    ) -> Result<(), String> {
         for kind in kinds {
             let min = self.approvals.effective(*kind).min_approvers as usize;
             let able = self
@@ -462,7 +472,7 @@ impl RbacConfig {
                 .count();
             if able < min {
                 return Err(format!(
-                    "a schedule change needs approvals under the {rules} rule(s) of \
+                    "a {what} change needs approvals under the {rules} rule(s) of \
                      --require-approval, and only {able} principal(s) in --auth-config may \
                      approve a {kind} change (its rule needs {min}); add approvers or change \
                      the `approvals:` rules",

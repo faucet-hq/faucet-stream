@@ -123,16 +123,27 @@ pub fn payload_opener(state: &ServerState) -> Option<faucet_common_feed::Payload
 
 /// Seal the HMAC secret of a feed made through the API, in place. The
 /// [`SEALED_TEXT`] marker keeps the stored one (`current`); a `${…}`
-/// reference is refused (references belong in the `--feeds` file).
+/// reference is refused (references belong in the `--feeds` file). With
+/// `presealed`, a value this server already sealed to `scope` is kept.
 pub fn seal_signature(
     state: &ServerState,
     spec: &mut FeedSpec,
     current: Option<&FeedSpec>,
     scope: Scope<'_>,
+    presealed: bool,
 ) -> Result<(), String> {
     let Some(sig) = spec.ingest.auth.signature.as_mut() else {
         return Ok(());
     };
+    if presealed
+        && let Some(sealed) = sig
+            .secret
+            .strip_prefix(SEALED_TEXT)
+            .and_then(|s| s.strip_prefix(':'))
+        && open_text(state, sealed, &scope.hmac()).is_ok()
+    {
+        return Ok(());
+    }
     if sig.secret == SEALED_TEXT {
         let stored = current
             .and_then(|c| c.ingest.auth.signature.as_ref())
@@ -326,7 +337,7 @@ mod tests {
             tenant: None,
         };
         let mut s = spec("hmac-secret");
-        seal_signature(&state, &mut s, None, scope).unwrap();
+        seal_signature(&state, &mut s, None, scope, false).unwrap();
         let stored = s.ingest.auth.signature.as_ref().unwrap().secret.clone();
         assert!(stored.starts_with("$sealed:") && !stored.contains("hmac-secret"));
         assert_eq!(
@@ -349,11 +360,11 @@ mod tests {
 
         // The marker keeps the stored secret; anything else that looks sealed is refused.
         let mut keep = spec(SEALED_TEXT);
-        seal_signature(&state, &mut keep, Some(&s), scope).unwrap();
+        seal_signature(&state, &mut keep, Some(&s), scope, false).unwrap();
         assert_eq!(keep.ingest.auth.signature.as_ref().unwrap().secret, stored);
         let mut nothing = spec(SEALED_TEXT);
         assert!(
-            seal_signature(&state, &mut nothing, None, scope)
+            seal_signature(&state, &mut nothing, None, scope, false)
                 .unwrap_err()
                 .contains("no stored secret")
         );
@@ -363,19 +374,19 @@ mod tests {
             tenant: None,
         };
         assert!(
-            seal_signature(&state, &mut wrong, Some(&s), elsewhere)
+            seal_signature(&state, &mut wrong, Some(&s), elsewhere, false)
                 .unwrap_err()
                 .contains("can no longer be opened")
         );
         let mut forged = spec("$sealed:abc");
         assert!(
-            seal_signature(&state, &mut forged, None, scope)
+            seal_signature(&state, &mut forged, None, scope, false)
                 .unwrap_err()
                 .contains("send the secret itself")
         );
         let mut reference = spec("${secret:HMAC}");
         assert!(
-            seal_signature(&state, &mut reference, None, scope)
+            seal_signature(&state, &mut reference, None, scope, false)
                 .unwrap_err()
                 .contains("--feeds")
         );
@@ -384,7 +395,7 @@ mod tests {
         let bare = test_state();
         let mut s2 = spec("hmac-secret");
         assert!(
-            seal_signature(&bare, &mut s2, None, scope)
+            seal_signature(&bare, &mut s2, None, scope, false)
                 .unwrap_err()
                 .contains("vault key")
         );
@@ -393,7 +404,7 @@ mod tests {
         let mut none: FeedSpec =
             serde_json::from_value(json!({"name": "a", "ingest": {"auth": {"tokens": "managed"}}}))
                 .unwrap();
-        seal_signature(&bare, &mut none, None, scope).unwrap();
+        seal_signature(&bare, &mut none, None, scope, false).unwrap();
         open_signature(&bare, &mut none, "f1").unwrap();
     }
 

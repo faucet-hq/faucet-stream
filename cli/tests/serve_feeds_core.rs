@@ -1739,3 +1739,460 @@ async fn a_started_server_delivers_a_feeds_file_and_reports_feeds_in_readyz() {
         "the scheduler releases the claim of a finished run"
     );
 }
+
+fn bob() -> AuthContext {
+    AuthContext {
+        principal: "bob".into(),
+        role: Role::Admin,
+        source_ip: None,
+        tenant: None,
+    }
+}
+
+async fn register_with_secret(state: &ServerState, id: &str, state_dir: &Path) {
+    let body = format!(
+        "version: 1\nkind: pipeline\nname: {id}\nparams:\n  out: {{ type: string, required: true }}\n  api_key: {{ type: string, secret: true, default: none }}\npipeline:\n  source: {{ type: feed }}\n  sink: {{ type: file, config: {{ path: \"${{param.out}}\", format: json_lines, if_exists: append }} }}\n  state: {{ type: file, config: {{ path: \"{}\" }} }}\ntests:\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
+        state_dir.display()
+    );
+    faucet_cli::templates::register(
+        &state.history(),
+        faucet_cli::templates::store::RegisterRequest {
+            id: Some(id.into()),
+            body,
+            format: faucet_cli::serve::load::ConfigFormat::Yaml,
+            description: None,
+            tags: Vec::new(),
+            launch: true,
+            created_by: None,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+fn pending(changed: service::Changed) -> faucet_cli::serve::changes::ChangeRequest {
+    match changed {
+        service::Changed::Pending(c) => *c,
+        service::Changed::Applied(v) => panic!("applied without approval: {v:?}"),
+    }
+}
+
+fn applied(changed: service::Changed) -> Option<service::FeedView> {
+    match changed {
+        service::Changed::Applied(v) => v.map(|v| *v),
+        service::Changed::Pending(c) => panic!("unexpectedly gated: {}", c.id),
+    }
+}
+
+/// Under `--require-approval run` a feed change that adds or edits a delivery
+/// is a change request; only an approved one makes a feed whose deliveries
+/// run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn under_run_approval_a_delivery_change_is_a_change_request() {
+    use faucet_cli::serve::changes::{self, ChangeKind, ChangeStatus};
+    use service::{ChangeAction, ChangePayload};
+    let dir = tempfile::tempdir().unwrap();
+    let (root, state_dir) = (dir.path(), dir.path().join("state"));
+    let mut srv = Srv::start(root, &["--require-approval", "run"]).await;
+    register_with_secret(&srv.state, "orders_lake", &state_dir).await;
+    let lake = root.join("lake.jsonl");
+    let mut spec = feed_spec(
+        "orders",
+        json!([{
+            "name": "lake",
+            "template": {"id": "orders_lake", "version": 1,
+                         "params": {"out": lake.display().to_string(), "api_key": "hunter2-key"}},
+            "flush": {"max_events": 1, "min_interval": "0s"}
+        }]),
+    );
+    spec.ingest.auth.signature = Some(
+        serde_json::from_value(json!({"header": "X-Signature", "secret": "hmac-plain-secret"}))
+            .unwrap(),
+    );
+
+    // A feed with no delivery starts no runs: it is made at once.
+    let bare = applied(
+        service::change(
+            &srv.state,
+            &admin(),
+            ChangePayload::new(
+                ChangeAction::Create,
+                None,
+                "bare",
+                Some(feed_spec("bare", json!([]))),
+            ),
+            None,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(!bare.approved);
+
+    let change = pending(
+        service::change(
+            &srv.state,
+            &admin(),
+            ChangePayload::new(ChangeAction::Create, None, "orders", Some(spec.clone())),
+            Some("new lake delivery".into()),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(change.kind, ChangeKind::Feed);
+    assert_eq!(change.status, ChangeStatus::Pending);
+    assert_eq!(change.reason.as_deref(), Some("new lake delivery"));
+    assert!(
+        service::find(&srv.state, None, "orders").await.is_err(),
+        "nothing is stored before the approval"
+    );
+    // The stored request names the feed and its delivery and holds every
+    // secret sealed; a reader sees markers only.
+    let stored = serde_json::to_string(&change.payload).unwrap();
+    assert!(!stored.contains("hunter2-key") && !stored.contains("hmac-plain-secret"));
+    let feed_uid = change.payload["feed_uid"].as_str().unwrap().to_string();
+    let lake_uid = change.payload["delivery_uids"]["lake"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(change.payload["starts_runs"], true);
+    assert!(
+        change.payload["spec"]["ingest"]["auth"]["signature"]["secret"]
+            .as_str()
+            .unwrap()
+            .starts_with("$sealed:")
+    );
+    let shown = change.clone().redacted_for(&bob());
+    assert_eq!(
+        shown.payload["spec"]["ingest"]["auth"]["signature"]["secret"],
+        "$sealed"
+    );
+    assert_eq!(
+        shown.payload["spec"]["deliveries"][0]["template"]["params"]["api_key"],
+        json!({"$sealed": true})
+    );
+    let rows = &change.plan.as_ref().unwrap().rows;
+    assert_eq!(rows[0]["action"], "create");
+    assert!(!serde_json::to_string(rows).unwrap().contains("$sealed:"));
+
+    // A payload that carries a plain secret is never planned as stored.
+    let plain = ChangePayload {
+        feed_uid: Some(feed_uid.clone()),
+        ..ChangePayload::new(ChangeAction::Create, None, "orders", Some(spec.clone()))
+    };
+    let refused = service::plan(&srv.state, &admin(), &plain)
+        .await
+        .unwrap_err();
+    assert!(message(refused).contains("sealed, never as sent"));
+
+    let done = changes::approve(&srv.state, &bob(), &change.id, None)
+        .await
+        .unwrap();
+    assert_eq!(done.status, ChangeStatus::Executed, "{:?}", done.error);
+    let found = service::find(&srv.state, None, "orders").await.unwrap();
+    let record = found.record.clone().unwrap();
+    assert!(record.approved);
+    assert_eq!(record.uid, feed_uid);
+    assert_eq!(record.deliveries["lake"].uid, lake_uid);
+    assert_eq!(
+        found
+            .feed
+            .spec
+            .ingest
+            .auth
+            .signature
+            .as_ref()
+            .unwrap()
+            .secret,
+        "hmac-plain-secret",
+        "the sealed secret opens for the feed it was sealed to"
+    );
+    let audit = srv
+        .state
+        .history()
+        .list_audit(&faucet_cli::serve::history::AuditFilter {
+            action: Some("feed.create".into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "feed.create" && a.principal == "alice"),
+        "{audit:?}"
+    );
+
+    // The approved delivery runs, with its sealed param opened for the run.
+    srv.append("orders", 1..=2).await;
+    let after = srv.delivered("orders", "lake", 3).await;
+    assert!(after.status.needs_approval.is_none());
+    assert_eq!(ids(&lake), vec![1, 2]);
+
+    // A change that touches no delivery is applied at once and keeps the
+    // approval; one that edits a delivery is gated again.
+    let mut described = secrets_masked(&record.spec);
+    described.description = Some("orders".into());
+    let view = applied(
+        service::change(
+            &srv.state,
+            &admin(),
+            ChangePayload::new(
+                ChangeAction::Update,
+                None,
+                "orders",
+                Some(described.clone()),
+            ),
+            None,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(view.approved);
+    let mut slower = described.clone();
+    slower.deliveries[0].flush.max_events = 2;
+    let edit = pending(
+        service::change(
+            &srv.state,
+            &admin(),
+            ChangePayload::new(ChangeAction::Update, None, "orders", Some(slower.clone())),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(edit.payload["feed_uid"], feed_uid.as_str());
+    assert!(
+        edit.payload.get("delivery_uids").is_none(),
+        "no new delivery"
+    );
+
+    // An edit that lands first invalidates the approval.
+    let mut other = described.clone();
+    other.description = Some("changed meanwhile".into());
+    service::update(&srv.state, &admin(), None, "orders", other)
+        .await
+        .unwrap();
+    let stale = changes::approve(&srv.state, &bob(), &edit.id, None)
+        .await
+        .unwrap();
+    assert_eq!(stale.status, ChangeStatus::Invalidated, "{:?}", stale.error);
+    assert_eq!(
+        service::find(&srv.state, None, "orders")
+            .await
+            .unwrap()
+            .feed
+            .spec
+            .deliveries[0]
+            .flush
+            .max_events,
+        1
+    );
+
+    // A delivery edited around the gate loses the approval: its runs wait,
+    // and it cannot be resumed.
+    let mut current = secrets_masked(
+        &service::find(&srv.state, None, "orders")
+            .await
+            .unwrap()
+            .record
+            .unwrap()
+            .spec,
+    );
+    current.deliveries[0].flush.max_events = 3;
+    let unapproved = service::update(&srv.state, &admin(), None, "orders", current.clone())
+        .await
+        .unwrap();
+    assert!(!unapproved.approved);
+    srv.append("orders", 3..=6).await;
+    let waiting = srv
+        .until("orders", "lake", false, "needs approval", |p| {
+            p.status.needs_approval.is_some()
+        })
+        .await;
+    assert_eq!(waiting.cursor, 3);
+    let resumed = service::resume(&srv.state, &admin(), None, "orders", "lake").await;
+    let why = message(resumed.unwrap_err());
+    assert!(
+        why.contains("cannot be resumed") && why.contains("--require-approval run"),
+        "{why}"
+    );
+
+    // Approving the same definition makes it run again.
+    let again = pending(
+        service::change(
+            &srv.state,
+            &admin(),
+            ChangePayload::new(
+                ChangeAction::Update,
+                None,
+                "orders",
+                Some({
+                    let mut s = current.clone();
+                    s.deliveries[0].flush.max_events = 1;
+                    s
+                }),
+            ),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let done = changes::approve(&srv.state, &bob(), &again.id, None)
+        .await
+        .unwrap();
+    assert_eq!(done.status, ChangeStatus::Executed, "{:?}", done.error);
+    service::resume(&srv.state, &admin(), None, "orders", "lake")
+        .await
+        .unwrap();
+    srv.delivered("orders", "lake", 7).await;
+
+    // Deleting a feed starts no run: under `run` alone it is not gated.
+    assert!(
+        applied(
+            service::change(
+                &srv.state,
+                &admin(),
+                ChangePayload::new(ChangeAction::Delete, None, "bare", None),
+                None,
+            )
+            .await
+            .unwrap()
+        )
+        .is_none()
+    );
+}
+
+fn secrets_masked(spec: &FeedSpec) -> FeedSpec {
+    faucet_cli::serve::feeds::secrets::masked(spec)
+}
+
+/// Under `--require-approval feed` every feed change is a change request,
+/// and one proposed for a feed that was replaced since is invalidated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn under_feed_approval_every_change_waits_and_names_its_feed() {
+    use faucet_cli::serve::changes::{self, ChangeStatus, NewChange};
+    use service::{ChangeAction, ChangePayload};
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &["--require-approval", "feed"]).await;
+    let create = pending(
+        service::change(
+            &srv.state,
+            &admin(),
+            ChangePayload::new(
+                ChangeAction::Create,
+                None,
+                "orders",
+                Some(feed_spec("orders", json!([]))),
+            ),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(create.payload.get("starts_runs").is_none());
+    // The same proposal through `POST /v1/changes` is prepared the same way,
+    // whatever ids the client sent.
+    let direct = changes::create(
+        &srv.state,
+        &admin(),
+        NewChange {
+            kind: changes::ChangeKind::Feed,
+            payload: json!({
+                "action": "create", "name": "orders", "feed_uid": "chosen-by-the-client",
+                "spec": {"name": "orders", "ingest": {"auth": {"tokens": "managed"}}}
+            }),
+            reason: None,
+            budget: None,
+            trusted_config: false,
+            caller_params: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_ne!(direct.payload["feed_uid"], "chosen-by-the-client");
+    let bad = changes::create(
+        &srv.state,
+        &admin(),
+        NewChange {
+            kind: changes::ChangeKind::Feed,
+            payload: json!({"action": "create", "name": "orders"}),
+            reason: None,
+            budget: None,
+            trusted_config: false,
+            caller_params: Default::default(),
+        },
+    )
+    .await;
+    assert!(message(bad.unwrap_err()).contains("create needs `spec`"));
+
+    let done = changes::approve(&srv.state, &bob(), &create.id, None)
+        .await
+        .unwrap();
+    assert_eq!(done.status, ChangeStatus::Executed, "{:?}", done.error);
+    // The second proposal for the same name is now stale.
+    let dup = changes::approve(&srv.state, &bob(), &direct.id, None)
+        .await
+        .unwrap();
+    assert_eq!(dup.status, ChangeStatus::Invalidated, "{:?}", dup.error);
+
+    let first_uid = service::find(&srv.state, None, "orders")
+        .await
+        .unwrap()
+        .feed
+        .uid
+        .as_str()
+        .to_string();
+    let delete = pending(
+        service::change(
+            &srv.state,
+            &admin(),
+            ChangePayload::new(ChangeAction::Delete, None, "orders", None),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(delete.payload["feed_uid"], first_uid.as_str());
+    // The feed is deleted and made again before the approval: the change
+    // was for the first one.
+    service::delete(&srv.state, &admin(), None, "orders")
+        .await
+        .unwrap();
+    service::create(&srv.state, &admin(), None, feed_spec("orders", json!([])))
+        .await
+        .unwrap();
+    let stale = changes::approve(&srv.state, &bob(), &delete.id, None)
+        .await
+        .unwrap();
+    assert_eq!(stale.status, ChangeStatus::Invalidated, "{:?}", stale.error);
+    assert!(stale.error.unwrap().contains("replaced since"));
+    assert!(service::find(&srv.state, None, "orders").await.is_ok());
+
+    // An approved delete removes it.
+    let delete = pending(
+        service::change(
+            &srv.state,
+            &admin(),
+            ChangePayload::new(ChangeAction::Delete, None, "orders", None),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let done = changes::approve(&srv.state, &bob(), &delete.id, None)
+        .await
+        .unwrap();
+    assert_eq!(done.status, ChangeStatus::Executed, "{:?}", done.error);
+    assert!(service::find(&srv.state, None, "orders").await.is_err());
+    let unknown = service::change(
+        &srv.state,
+        &admin(),
+        ChangePayload::new(ChangeAction::Delete, None, "orders", None),
+        None,
+    )
+    .await;
+    assert!(matches!(unknown, Err(ServeError::NotFound)));
+}

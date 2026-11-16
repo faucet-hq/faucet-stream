@@ -16,6 +16,7 @@
 //! [`status`] the shared per-delivery record, [`service`] every rule the API
 //! adapters call, [`secrets`] the sealed values and [`metrics`] the series.
 
+pub mod ingest;
 pub mod metrics;
 pub mod runner;
 pub mod secrets;

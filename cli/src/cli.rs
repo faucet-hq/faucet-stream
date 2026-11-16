@@ -2554,8 +2554,10 @@ pub struct ServeArgs {
     /// with a pending change request instead of a run; backfills are
     /// refused), `template_register`, `template_launch`, `template_delete`,
     /// `template_deprecate` (the last two are also gated by
-    /// `template_launch`). Repeatable or comma-separated. Who may approve is
-    /// the `approvals:` block of `--auth-config`.
+    /// `template_launch`), `schedule`, `feed` (creating, editing or deleting
+    /// a feed or one of its deliveries; under `run`, a feed change that adds
+    /// or edits a delivery is gated too). Repeatable or comma-separated. Who
+    /// may approve is the `approvals:` block of `--auth-config`.
     #[arg(long = "require-approval", value_name = "KIND")]
     pub require_approval: Vec<String>,
     /// How long a pending change request stays approvable (seconds) when the

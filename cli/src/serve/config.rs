@@ -424,6 +424,22 @@ fn schedule_change_rules(
     }
 }
 
+/// The approval rules a feed change must meet under `require_approval`
+/// (#1034): `None` when feed changes are not gated. Under `run`, a feed
+/// change that adds or edits a delivery needs the run rule as well.
+fn feed_change_rules(
+    require_approval: &[crate::serve::changes::ChangeKind],
+) -> Option<Vec<crate::serve::changes::ChangeKind>> {
+    use crate::serve::changes::ChangeKind;
+    if require_approval.contains(&ChangeKind::Run) {
+        Some(vec![ChangeKind::Feed, ChangeKind::Run])
+    } else if require_approval.contains(&ChangeKind::Feed) {
+        Some(vec![ChangeKind::Feed])
+    } else {
+        None
+    }
+}
+
 impl ServeConfig {
     /// Build + validate a `ServeConfig` from parsed CLI args. Enforces the
     /// no-auth gate: a server with neither a token nor `--no-auth` refuses to start.
@@ -522,6 +538,13 @@ impl ServeConfig {
             && let AuthMode::Rbac(rbac) = &auth
         {
             rbac.check_approvers(&kinds).map_err(CliError::Serve)?;
+        }
+        if cfg!(feature = "feeds")
+            && let Some(kinds) = feed_change_rules(&require_approval)
+            && let AuthMode::Rbac(rbac) = &auth
+        {
+            rbac.check_approvers_for("feed", &kinds)
+                .map_err(CliError::Serve)?;
         }
 
         let request_guard = crate::serve::guard::GuardSettings::from_args(
@@ -1050,6 +1073,25 @@ mod tests {
         // Every principal token must be registered for log redaction.
         let scrubbed = crate::secrets::registry::redact("t=rbacsecret12345 end").into_owned();
         assert!(!scrubbed.contains("rbacsecret12345"), "{scrubbed}");
+    }
+
+    #[test]
+    fn feed_changes_need_the_run_rule_while_runs_need_approval() {
+        use crate::serve::changes::ChangeKind;
+        assert_eq!(feed_change_rules(&[ChangeKind::Schedule]), None);
+        assert_eq!(
+            feed_change_rules(&[ChangeKind::Feed]),
+            Some(vec![ChangeKind::Feed])
+        );
+        for gated in [
+            vec![ChangeKind::Run],
+            vec![ChangeKind::Feed, ChangeKind::Run],
+        ] {
+            assert_eq!(
+                feed_change_rules(&gated),
+                Some(vec![ChangeKind::Feed, ChangeKind::Run])
+            );
+        }
     }
 
     #[test]

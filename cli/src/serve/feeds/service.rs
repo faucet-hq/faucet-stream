@@ -18,6 +18,7 @@ use crate::serve::state::ServerState;
 use chrono::{DateTime, Utc};
 use faucet_common_feed::{ClaimOwner, DeliveryUid, FeedStore, Head, Move, Seq};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const REPLACE_ATTEMPTS: usize = 5;
@@ -565,6 +566,7 @@ async fn prepare_delivery(
     record: &FeedRecord,
     d: &mut DeliverySpec,
     current: Option<&DeliverySpec>,
+    presealed: bool,
 ) -> Result<(), ServeError> {
     let Some(t) = d.template.as_mut() else {
         return Ok(());
@@ -622,6 +624,21 @@ async fn prepare_delivery(
         feed: &record.uid,
         tenant: record.tenant(),
     };
+    if presealed
+        && let Some(k) = secret.iter().find(|k| {
+            t.params.get(*k).is_some_and(|v| {
+                !v.is_null()
+                    && !crate::serve::schedules::secrets::is_keep_marker(v)
+                    && !crate::serve::schedules::secrets::is_sealed(v)
+            })
+        })
+    {
+        return Err(unprocessable(format!(
+            "delivery '{}': template.params.{k}: a change request carries secret values \
+             sealed, never as sent",
+            d.name
+        )));
+    }
     secrets::seal_params(
         state,
         t,
@@ -629,7 +646,7 @@ async fn prepare_delivery(
         &secret,
         current.and_then(|c| c.template.as_ref()),
         scope,
-        false,
+        presealed,
     )
     .map_err(|e| unprocessable(format!("delivery '{}': {e}", d.name)))
 }
@@ -672,13 +689,40 @@ async fn after_change(state: &ServerState) {
     rt.notify();
 }
 
-/// Create a feed. A tenant principal's feed belongs to its tenant.
-pub async fn create(
+/// The ids a change request fixed when it was proposed: the feed's, and one
+/// per delivery it adds. Secret values are sealed to them.
+#[derive(Debug, Clone, Copy)]
+struct Ids<'a> {
+    feed: Option<&'a str>,
+    deliveries: Option<&'a BTreeMap<String, String>>,
+}
+
+impl Ids<'_> {
+    const FRESH: Ids<'static> = Ids {
+        feed: None,
+        deliveries: None,
+    };
+
+    fn delivery(&self, name: &str) -> Option<&str> {
+        self.deliveries?.get(name).map(String::as_str)
+    }
+}
+
+/// A feed ready to be created: validated, its secrets sealed.
+struct BuiltCreate {
+    record: FeedRecord,
+    feed: Feed,
+    limits: Option<crate::serve::history::tenants::TenantLimits>,
+}
+
+async fn build_create(
     state: &ServerState,
     actor: &AuthContext,
     tenant: Option<&str>,
     mut new: FeedSpec,
-) -> Result<FeedView, ServeError> {
+    ids: Ids<'_>,
+    presealed: bool,
+) -> Result<BuiltCreate, ServeError> {
     crate::runtime::server::refuse_while_unavailable(state)?;
     if !state.persistent_history() {
         return Err(unprocessable(super::stores::NO_DEFAULT_STORE));
@@ -735,21 +779,49 @@ pub async fn create(
     .await?;
     let now = Utc::now();
     let mut record = FeedRecord::new(new, &actor.principal, now);
+    if let Some(uid) = ids.feed {
+        record.uid = uid.to_string();
+    }
+    for (name, meta) in record.deliveries.iter_mut() {
+        if let Some(uid) = ids.delivery(name) {
+            meta.uid = uid.to_string();
+        }
+    }
     let feed_scope = secrets::Scope {
         feed: &record.uid.clone(),
         tenant: tenant.as_deref(),
     };
-    secrets::seal_signature(state, &mut record.spec, None, feed_scope).map_err(unprocessable)?;
+    secrets::seal_signature(state, &mut record.spec, None, feed_scope, presealed)
+        .map_err(unprocessable)?;
     let mut deliveries = record.spec.deliveries.clone();
     for d in &mut deliveries {
-        prepare_delivery(state, actor, &record, d, None).await?;
+        prepare_delivery(state, actor, &record, d, None, presealed).await?;
     }
     record.spec.deliveries = deliveries;
     let feed = feed_of_record(state, &record).map_err(unprocessable)?;
     for d in &feed.spec.deliveries {
         check_delivery(state, &feed, d).await?;
     }
-    let store = rt.store_for(&feed).await.map_err(store_error)?;
+    Ok(BuiltCreate {
+        record,
+        feed,
+        limits,
+    })
+}
+
+async fn commit_create(
+    state: &ServerState,
+    built: BuiltCreate,
+    approved: bool,
+) -> Result<FeedView, ServeError> {
+    let BuiltCreate {
+        mut record,
+        feed,
+        limits,
+    } = built;
+    record.approved = approved;
+    let feed = Feed { approved, ..feed };
+    let store = state.feeds().store_for(&feed).await.map_err(store_error)?;
     if !state
         .history()
         .feed_insert(&record)
@@ -771,19 +843,55 @@ pub async fn create(
     view_of(state, &feed).await
 }
 
-/// Replace a stored feed's definition. The name, the tenant and the store
-/// stay; a delivery keeps its position by its name.
-pub async fn update(
+/// Create a feed. A tenant principal's feed belongs to its tenant.
+pub async fn create(
+    state: &ServerState,
+    actor: &AuthContext,
+    tenant: Option<&str>,
+    new: FeedSpec,
+) -> Result<FeedView, ServeError> {
+    let built = build_create(state, actor, tenant, new, Ids::FRESH, false).await?;
+    commit_create(state, built, false).await
+}
+
+/// Whether `detail` (a [`spec_diff`]) adds or changes a delivery: what makes
+/// a feed start runs it did not start before.
+fn touches_deliveries(detail: &[String]) -> bool {
+    detail
+        .iter()
+        .any(|l| l.starts_with("delivery ") && (l.ends_with(" added") || l.ends_with(" changed")))
+}
+
+/// A stored feed's next revision: validated, its secrets sealed.
+struct BuiltUpdate {
+    current: FeedRecord,
+    next: FeedRecord,
+    dropped: Vec<(String, String)>,
+    feed: Feed,
+    old: Arc<Feed>,
+    limits: Option<crate::serve::history::tenants::TenantLimits>,
+    touched: bool,
+    detail: Vec<String>,
+}
+
+async fn build_update(
     state: &ServerState,
     actor: &AuthContext,
     tenant: Option<&str>,
     name: &str,
     mut new: FeedSpec,
-) -> Result<FeedView, ServeError> {
+    ids: Ids<'_>,
+    presealed: bool,
+) -> Result<BuiltUpdate, ServeError> {
     crate::runtime::server::refuse_while_unavailable(state)?;
     let tenant = scope(actor, tenant)?;
     let found = find(state, tenant.as_deref(), name).await?;
     let current = read_only(&found)?.clone();
+    if ids.feed.is_some_and(|uid| uid != current.uid) {
+        return Err(ServeError::Conflict(format!(
+            "feed '{name}' was replaced since this change was proposed"
+        )));
+    }
     new.tenant.clone_from(&current.spec.tenant);
     if new.name != current.spec.name {
         return Err(unprocessable(
@@ -797,67 +905,121 @@ pub async fn update(
     }
     spec::validate(&new, Source::Console).map_err(unprocessable)?;
     let limits = tenant_limits(state, tenant.as_deref()).await?;
-    let rt = state.feeds();
-    let store = rt.store_for(&found.feed).await.map_err(store_error)?;
     let now = Utc::now();
-    let detail = spec_diff(&secrets::masked(&current.spec), &secrets::masked(&new));
-    let deliveries_changed = detail.iter().any(|l| l.starts_with("delivery "));
-    let mut current = current;
-    for _ in 0..REPLACE_ATTEMPTS {
-        let (mut next, dropped) = current.revised(
-            new.clone(),
-            &actor.principal,
-            now,
-            "updated",
-            detail.clone(),
-        );
-        let feed_scope = secrets::Scope {
-            feed: &current.uid,
-            tenant: tenant.as_deref(),
-        };
-        secrets::seal_signature(state, &mut next.spec, Some(&current.spec), feed_scope)
-            .map_err(unprocessable)?;
-        let mut deliveries = next.spec.deliveries.clone();
-        for d in &mut deliveries {
-            let before = current.spec.delivery(&d.name);
-            prepare_delivery(state, actor, &next, d, before).await?;
-        }
-        next.spec.deliveries = deliveries;
-        if deliveries_changed {
-            next.approved = false;
-        }
-        let feed = feed_of_record(state, &next).map_err(unprocessable)?;
-        for d in &feed.spec.deliveries {
-            if current.spec.delivery(&d.name) != Some(d) {
-                check_delivery(state, &feed, d).await?;
-            }
-        }
-        for (dropped_name, uid) in &dropped {
-            refuse_live_claim(&*store, &found.feed, dropped_name, uid).await?;
-        }
-        if state
-            .history()
-            .feed_replace(&current, &next)
-            .await
-            .map_err(ServeError::from)?
+    let (mut next, dropped) = current.revised(new, &actor.principal, now, "updated", Vec::new());
+    for (dname, meta) in next.deliveries.iter_mut() {
+        if !current.deliveries.contains_key(dname)
+            && let Some(uid) = ids.delivery(dname)
         {
-            ensure_in_store(&*store, &feed, limits.as_ref())
-                .await
-                .map_err(store_error)?;
-            for (dropped_name, uid) in &dropped {
-                if let Some(old) = current.spec.delivery(dropped_name) {
-                    forget_delivery(state, &*store, &found.feed, old, uid).await;
-                }
-            }
-            after_change(state).await;
-            return view_of(state, &feed).await;
+            meta.uid = uid.to_string();
         }
-        current = state
-            .history()
-            .feed_get(&current.key())
-            .await
-            .map_err(ServeError::from)?
-            .ok_or(ServeError::NotFound)?;
+    }
+    let feed_scope = secrets::Scope {
+        feed: &current.uid,
+        tenant: tenant.as_deref(),
+    };
+    secrets::seal_signature(
+        state,
+        &mut next.spec,
+        Some(&current.spec),
+        feed_scope,
+        presealed,
+    )
+    .map_err(unprocessable)?;
+    let mut deliveries = next.spec.deliveries.clone();
+    for d in &mut deliveries {
+        let before = current.spec.delivery(&d.name);
+        prepare_delivery(state, actor, &next, d, before, presealed).await?;
+    }
+    next.spec.deliveries = deliveries;
+    let detail = spec_diff(
+        &secrets::masked(&current.spec),
+        &secrets::masked(&next.spec),
+    );
+    let touched = touches_deliveries(&detail);
+    if let Some(last) = next.changes.last_mut() {
+        last.detail.clone_from(&detail);
+    }
+    let feed = feed_of_record(state, &next).map_err(unprocessable)?;
+    for d in &feed.spec.deliveries {
+        if current.spec.delivery(&d.name) != Some(d) {
+            check_delivery(state, &feed, d).await?;
+        }
+    }
+    Ok(BuiltUpdate {
+        current,
+        next,
+        dropped,
+        feed,
+        old: found.feed,
+        limits,
+        touched,
+        detail,
+    })
+}
+
+/// Store a built update. `Ok(None)`: the feed changed meanwhile.
+async fn commit_update(
+    state: &ServerState,
+    built: BuiltUpdate,
+    approved: bool,
+) -> Result<Option<FeedView>, ServeError> {
+    let BuiltUpdate {
+        current,
+        mut next,
+        dropped,
+        feed,
+        old,
+        limits,
+        touched,
+        ..
+    } = built;
+    if touched {
+        next.approved = approved;
+    }
+    let feed = Feed {
+        approved: next.approved,
+        ..feed
+    };
+    let store = state.feeds().store_for(&old).await.map_err(store_error)?;
+    for (dropped_name, uid) in &dropped {
+        refuse_live_claim(&*store, &old, dropped_name, uid).await?;
+    }
+    if !state
+        .history()
+        .feed_replace(&current, &next)
+        .await
+        .map_err(ServeError::from)?
+    {
+        return Ok(None);
+    }
+    ensure_in_store(&*store, &feed, limits.as_ref())
+        .await
+        .map_err(store_error)?;
+    for (dropped_name, uid) in &dropped {
+        if let Some(gone) = current.spec.delivery(dropped_name) {
+            forget_delivery(state, &*store, &old, gone, uid).await;
+        }
+    }
+    after_change(state).await;
+    view_of(state, &feed).await.map(Some)
+}
+
+/// Replace a stored feed's definition. The name, the tenant and the store
+/// stay; a delivery keeps its position by its name.
+pub async fn update(
+    state: &ServerState,
+    actor: &AuthContext,
+    tenant: Option<&str>,
+    name: &str,
+    new: FeedSpec,
+) -> Result<FeedView, ServeError> {
+    for _ in 0..REPLACE_ATTEMPTS {
+        let built =
+            build_update(state, actor, tenant, name, new.clone(), Ids::FRESH, false).await?;
+        if let Some(view) = commit_update(state, built, false).await? {
+            return Ok(view);
+        }
     }
     Err(ServeError::Conflict(
         "the feed kept changing; retry the update".into(),
@@ -884,6 +1046,32 @@ async fn refuse_live_claim(
         ))),
         None => Ok(()),
     }
+}
+
+/// The deliveries of `feed` with a run in flight: `(delivery, run id)`. The
+/// run id is `None` between a claim and its submit, and for a `faucet run`
+/// drain.
+pub async fn runs_in_flight(
+    state: &ServerState,
+    feed: &Feed,
+) -> Result<Vec<(String, Option<String>)>, ServeError> {
+    let store = state.feeds().store_for(feed).await.map_err(store_error)?;
+    let head = head_of(&*store, feed).await?;
+    let mut out = Vec::new();
+    for (name, dref) in &feed.deliveries {
+        let claimed = head
+            .iter()
+            .flat_map(|h| h.deliveries.iter())
+            .any(|d| d.delivery == dref.uid && d.claim.is_some());
+        if claimed {
+            let run = status::read(&*state.history(), feed.uid.as_str(), dref.uid.id())
+                .await
+                .ok()
+                .and_then(|s| s.claim.and_then(|c| c.run_id));
+            out.push((name.clone(), run));
+        }
+    }
+    Ok(out)
 }
 
 /// Remove a delivery from the store with its status, metric series and
@@ -964,19 +1152,22 @@ async fn remove_state(
     Ok(())
 }
 
-/// Delete a stored feed: its definition and tokens, its events, cursors and
-/// gaps, and each delivery's status, metric series and state keys. Refused
-/// while a delivery has a run in flight.
-pub async fn delete(
+async fn delete_inner(
     state: &ServerState,
     actor: &AuthContext,
     tenant: Option<&str>,
     name: &str,
+    expect_uid: Option<&str>,
 ) -> Result<(), ServeError> {
     crate::runtime::server::refuse_while_unavailable(state)?;
     let tenant = scope(actor, tenant)?;
     let found = find(state, tenant.as_deref(), name).await?;
     let record = read_only(&found)?.clone();
+    if expect_uid.is_some_and(|uid| uid != record.uid) {
+        return Err(ServeError::Conflict(format!(
+            "feed '{name}' was replaced since this change was proposed"
+        )));
+    }
     let feed = found.feed.clone();
     let store = state.feeds().store_for(&feed).await.map_err(store_error)?;
     for (dname, meta) in &record.deliveries {
@@ -995,14 +1186,435 @@ pub async fn delete(
     {
         return Err(ServeError::NotFound);
     }
+    for token in state
+        .history()
+        .feed_token_list(Some(&record.uid))
+        .await
+        .unwrap_or_default()
+    {
+        super::ingest::forget_token(&token.id);
+    }
     store
         .purge_feed(&store_calls(), &feed.uid)
         .await
         .map_err(store_error)?;
     let names: Vec<String> = feed.deliveries.keys().cloned().collect();
     metrics::forget_feed(&feed.label(), &names);
+    super::ingest::forget_feed(&feed);
     after_change(state).await;
     Ok(())
+}
+
+/// Delete a stored feed: its definition and tokens, its events, cursors and
+/// gaps, and each delivery's status, metric series and state keys. Refused
+/// while a delivery has a run in flight.
+pub async fn delete(
+    state: &ServerState,
+    actor: &AuthContext,
+    tenant: Option<&str>,
+    name: &str,
+) -> Result<(), ServeError> {
+    delete_inner(state, actor, tenant, name, None).await
+}
+
+// ── Changes ─────────────────────────────────────────────────────────────────
+
+pub use crate::serve::schedules::service::ChangeAction;
+
+/// What a feed change request (`kind: feed`) proposes.
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangePayload {
+    pub action: ChangeAction,
+    pub name: String,
+    /// The tenant the feed belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    /// The definition, for `create` and `update`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<FeedSpec>,
+    /// The feed's uid: set by the server when the change is proposed, never
+    /// taken from a client. Secret values in `spec` are sealed to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed_uid: Option<String>,
+    /// The id of each delivery the change adds; set by the server.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub delivery_uids: BTreeMap<String, String>,
+    /// The change adds or edits a delivery, so the feed starts runs it did
+    /// not start before; set by the server.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub starts_runs: bool,
+}
+
+impl ChangePayload {
+    pub fn new(
+        action: ChangeAction,
+        tenant: Option<&str>,
+        name: &str,
+        spec: Option<FeedSpec>,
+    ) -> Self {
+        Self {
+            action,
+            name: name.to_string(),
+            tenant: tenant.map(str::to_string),
+            spec,
+            feed_uid: None,
+            delivery_uids: BTreeMap::new(),
+            starts_runs: false,
+        }
+    }
+
+    fn ids(&self) -> Ids<'_> {
+        Ids {
+            feed: self.feed_uid.as_deref(),
+            deliveries: Some(&self.delivery_uids),
+        }
+    }
+}
+
+/// A planned change: what will be stored, and the row a reviewer sees.
+enum Planned {
+    Create(Box<BuiltCreate>),
+    Update(Box<BuiltUpdate>),
+    Delete,
+}
+
+fn spec_of<'a>(p: &'a ChangePayload) -> Result<&'a FeedSpec, ServeError> {
+    let spec = p
+        .spec
+        .as_ref()
+        .ok_or_else(|| unprocessable(format!("{} needs `spec`", p.action.as_str())))?;
+    if spec.name != p.name {
+        return Err(unprocessable("spec.name must equal name"));
+    }
+    Ok(spec)
+}
+
+async fn plan_inner(
+    state: &ServerState,
+    actor: &AuthContext,
+    p: &ChangePayload,
+    presealed: bool,
+) -> Result<(Planned, serde_json::Value), ServeError> {
+    let tenant = scope(actor, p.tenant.as_deref())?;
+    let mut row = serde_json::json!({
+        "feed": p.name,
+        "tenant": tenant,
+        "action": p.action.as_str(),
+    });
+    let planned = match p.action {
+        ChangeAction::Create => {
+            let spec = spec_of(p)?;
+            if state
+                .history()
+                .feed_get(&feed_key(tenant.as_deref(), &p.name))
+                .await
+                .map_err(ServeError::from)?
+                .is_some()
+            {
+                return Err(ServeError::Conflict(format!(
+                    "a feed named '{}' already exists",
+                    p.name
+                )));
+            }
+            let built = build_create(
+                state,
+                actor,
+                tenant.as_deref(),
+                spec.clone(),
+                p.ids(),
+                presealed,
+            )
+            .await?;
+            row["spec"] = serde_json::to_value(secrets::masked(&built.record.spec))
+                .map_err(|e| ServeError::Internal(e.to_string()))?;
+            row["starts_runs"] = (!built.record.spec.deliveries.is_empty()).into();
+            Planned::Create(Box::new(built))
+        }
+        ChangeAction::Update => {
+            let spec = spec_of(p)?;
+            let built = build_update(
+                state,
+                actor,
+                tenant.as_deref(),
+                &p.name,
+                spec.clone(),
+                p.ids(),
+                presealed,
+            )
+            .await?;
+            row["revision"] = built.current.revision.into();
+            row["diff"] = built.detail.clone().into();
+            row["spec"] = serde_json::to_value(secrets::masked(&built.next.spec))
+                .map_err(|e| ServeError::Internal(e.to_string()))?;
+            row["starts_runs"] = built.touched.into();
+            Planned::Update(Box::new(built))
+        }
+        ChangeAction::Delete => {
+            let found = find(state, tenant.as_deref(), &p.name).await?;
+            let record = read_only(&found)?;
+            if p.feed_uid.as_deref().is_some_and(|uid| uid != record.uid) {
+                return Err(ServeError::Conflict(format!(
+                    "feed '{}' was replaced since this change was proposed",
+                    p.name
+                )));
+            }
+            row["revision"] = record.revision.into();
+            Planned::Delete
+        }
+    };
+    Ok((planned, row))
+}
+
+/// Plan a change: validate it as `actor`, return the rows a reviewer sees.
+/// The payload is the one [`prepare_change`] stored: its secret values are
+/// sealed to the feed; a plain secret value is refused.
+pub async fn plan(
+    state: &ServerState,
+    actor: &AuthContext,
+    p: &ChangePayload,
+) -> Result<Vec<serde_json::Value>, ServeError> {
+    if let Some(sig) = p
+        .spec
+        .as_ref()
+        .and_then(|s| s.ingest.auth.signature.as_ref())
+        && !sig.secret.starts_with(secrets::SEALED_TEXT)
+    {
+        return Err(unprocessable(
+            "ingest.auth.signature.secret: a change request carries secret values sealed, \
+             never as sent",
+        ));
+    }
+    let (_, row) = plan_inner(state, actor, p, true).await?;
+    Ok(vec![row])
+}
+
+/// Whether a change makes the feed start runs it did not start before.
+async fn starts_runs(
+    state: &ServerState,
+    actor: &AuthContext,
+    p: &ChangePayload,
+) -> Result<bool, ServeError> {
+    let Some(spec) = &p.spec else {
+        return Ok(false);
+    };
+    match p.action {
+        ChangeAction::Create => Ok(!spec.deliveries.is_empty()),
+        ChangeAction::Delete => Ok(false),
+        ChangeAction::Update => {
+            let tenant = scope(actor, p.tenant.as_deref())?;
+            let found = find(state, tenant.as_deref(), &p.name).await?;
+            let before = secrets::masked(&found.feed.spec);
+            Ok(touches_deliveries(&spec_diff(
+                &before,
+                &secrets::masked(spec),
+            )))
+        }
+    }
+}
+
+/// Prepare a feed change request's payload before it is stored: the server
+/// names the feed and the deliveries it adds (whatever the client sent) and
+/// seals its secret values to them, so the stored request never holds a
+/// secret in the clear.
+pub async fn prepare_change(
+    state: &ServerState,
+    actor: &AuthContext,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, ServeError> {
+    let mut p: ChangePayload = serde_json::from_value(payload)
+        .map_err(|e| ServeError::BadConfig(format!("feed change payload: {e}")))?;
+    let tenant = scope(actor, p.tenant.as_deref())?;
+    p.tenant.clone_from(&tenant);
+    let stored = match p.action {
+        ChangeAction::Create => None,
+        ChangeAction::Update | ChangeAction::Delete => {
+            let found = find(state, tenant.as_deref(), &p.name).await?;
+            Some(read_only(&found)?.clone())
+        }
+    };
+    p.feed_uid = Some(match &stored {
+        Some(r) => r.uid.clone(),
+        None => uuid::Uuid::new_v4().simple().to_string(),
+    });
+    p.delivery_uids = p
+        .spec
+        .iter()
+        .flat_map(|s| s.deliveries.iter())
+        .filter(|d| {
+            stored
+                .as_ref()
+                .is_none_or(|r| !r.deliveries.contains_key(&d.name))
+        })
+        .map(|d| (d.name.clone(), uuid::Uuid::new_v4().simple().to_string()))
+        .collect();
+    p.starts_runs = starts_runs(state, actor, &p).await?;
+    if p.spec.is_some() {
+        p.spec = match plan_inner(state, actor, &p, false).await?.0 {
+            Planned::Create(b) => Some(b.record.spec),
+            Planned::Update(b) => Some(b.next.spec),
+            Planned::Delete => None,
+        };
+    }
+    serde_json::to_value(&p).map_err(|e| ServeError::Internal(e.to_string()))
+}
+
+/// Apply a change as `actor`. Returns the feed's view after it (`None` for
+/// a delete).
+///
+/// `approved` is true when an approved change request applies it: such a
+/// feed's delivery runs need no further approval under
+/// `--require-approval run`.
+pub async fn apply(
+    state: &ServerState,
+    actor: &AuthContext,
+    p: ChangePayload,
+    approved: bool,
+) -> Result<Option<FeedView>, ServeError> {
+    if approved && p.feed_uid.is_none() {
+        return Err(ServeError::Conflict(
+            "the change names no feed; propose it again".into(),
+        ));
+    }
+    let out = match plan_inner(state, actor, &p, approved).await?.0 {
+        Planned::Create(b) => Some(commit_create(state, *b, approved).await?),
+        Planned::Update(b) => {
+            Some(commit_update(state, *b, approved).await?.ok_or_else(|| {
+                ServeError::Conflict(format!("feed '{}' changed meanwhile", p.name))
+            })?)
+        }
+        Planned::Delete => {
+            delete_inner(
+                state,
+                actor,
+                p.tenant.as_deref(),
+                &p.name,
+                p.feed_uid.as_deref(),
+            )
+            .await?;
+            None
+        }
+    };
+    if approved {
+        crate::serve::audit::write_target_detail(
+            state,
+            actor,
+            &format!("feed.{}", p.action.as_str()),
+            format!("feed:{}", label_of(p.tenant.as_deref(), &p.name)),
+            "an approved change request".into(),
+            "ok",
+        )
+        .await;
+    }
+    Ok(out)
+}
+
+/// `<tenant>/<name>` for a tenant feed, else the name.
+pub fn label_of(tenant: Option<&str>, name: &str) -> String {
+    match tenant {
+        Some(t) => format!("{t}/{name}"),
+        None => name.to_string(),
+    }
+}
+
+/// What a create / update / delete did.
+#[derive(Debug)]
+pub enum Changed {
+    /// Applied now (`None` for a delete).
+    Applied(Option<Box<FeedView>>),
+    /// The server gates it: proposed as a change request instead.
+    Pending(Box<crate::serve::changes::ChangeRequest>),
+}
+
+/// Whether `p` needs an approved change request on this server: always
+/// under `--require-approval feed`, and under `--require-approval run` when
+/// it adds or edits a delivery.
+pub async fn gated(
+    state: &ServerState,
+    actor: &AuthContext,
+    p: &ChangePayload,
+) -> Result<bool, ServeError> {
+    use crate::serve::changes::ChangeKind;
+    if state.requires_approval(ChangeKind::Feed) {
+        return Ok(true);
+    }
+    Ok(state.requires_approval(ChangeKind::Run) && starts_runs(state, actor, p).await?)
+}
+
+/// Create, update or delete a feed: applied now, or proposed as a change
+/// request that applies it once approved.
+pub async fn change(
+    state: &ServerState,
+    actor: &AuthContext,
+    mut p: ChangePayload,
+    reason: Option<String>,
+) -> Result<Changed, ServeError> {
+    p.tenant = scope(actor, p.tenant.as_deref())?;
+    if gated(state, actor, &p).await? {
+        let payload = serde_json::to_value(&p).map_err(|e| ServeError::Internal(e.to_string()))?;
+        let change = crate::serve::changes::create(
+            state,
+            actor,
+            crate::serve::changes::NewChange {
+                kind: crate::serve::changes::ChangeKind::Feed,
+                payload,
+                reason,
+                budget: None,
+                trusted_config: false,
+                caller_params: Default::default(),
+            },
+        )
+        .await?;
+        return Ok(Changed::Pending(Box::new(change)));
+    }
+    if p.action == ChangeAction::Update
+        && let Some(spec) = p.spec.clone()
+    {
+        return update(state, actor, p.tenant.as_deref(), &p.name, spec)
+            .await
+            .map(|v| Changed::Applied(Some(Box::new(v))));
+    }
+    apply(state, actor, p, false)
+        .await
+        .map(|v| Changed::Applied(v.map(Box::new)))
+}
+
+/// A stored feed's definition with one delivery added or replaced, as an
+/// update would send it.
+pub async fn with_delivery(
+    state: &ServerState,
+    actor: &AuthContext,
+    tenant: Option<&str>,
+    name: &str,
+    delivery: DeliverySpec,
+) -> Result<FeedSpec, ServeError> {
+    let scoped = scope(actor, tenant)?;
+    let found = find(state, scoped.as_deref(), name).await?;
+    let mut next = secrets::masked(&read_only(&found)?.spec);
+    match next.deliveries.iter_mut().find(|d| d.name == delivery.name) {
+        Some(slot) => *slot = delivery,
+        None => next.deliveries.push(delivery),
+    }
+    Ok(next)
+}
+
+/// A stored feed's definition without one delivery.
+pub async fn without_delivery(
+    state: &ServerState,
+    actor: &AuthContext,
+    tenant: Option<&str>,
+    name: &str,
+    delivery: &str,
+) -> Result<FeedSpec, ServeError> {
+    let scoped = scope(actor, tenant)?;
+    let found = find(state, scoped.as_deref(), name).await?;
+    let mut next = secrets::masked(&read_only(&found)?.spec);
+    let before = next.deliveries.len();
+    next.deliveries.retain(|d| d.name != delivery);
+    if next.deliveries.len() == before {
+        return Err(ServeError::NotFound);
+    }
+    Ok(next)
 }
 
 /// Add a delivery to a stored feed, or replace the one with its name.
@@ -1013,13 +1625,7 @@ pub async fn set_delivery(
     name: &str,
     delivery: DeliverySpec,
 ) -> Result<FeedView, ServeError> {
-    let scoped = scope(actor, tenant)?;
-    let found = find(state, scoped.as_deref(), name).await?;
-    let mut next = secrets::masked(&read_only(&found)?.spec);
-    match next.deliveries.iter_mut().find(|d| d.name == delivery.name) {
-        Some(slot) => *slot = delivery,
-        None => next.deliveries.push(delivery),
-    }
+    let next = with_delivery(state, actor, tenant, name, delivery).await?;
     update(state, actor, tenant, name, next).await
 }
 
@@ -1031,14 +1637,7 @@ pub async fn delete_delivery(
     name: &str,
     delivery: &str,
 ) -> Result<FeedView, ServeError> {
-    let scoped = scope(actor, tenant)?;
-    let found = find(state, scoped.as_deref(), name).await?;
-    let mut next = secrets::masked(&read_only(&found)?.spec);
-    let before = next.deliveries.len();
-    next.deliveries.retain(|d| d.name != delivery);
-    if next.deliveries.len() == before {
-        return Err(ServeError::NotFound);
-    }
+    let next = without_delivery(state, actor, tenant, name, delivery).await?;
     update(state, actor, tenant, name, next).await
 }
 
@@ -1151,6 +1750,11 @@ pub async fn resume(
         return Err(ServeError::Conflict(format!(
             "delivery '{delivery}' is paused in its definition (`paused: true`); change the \
              definition to resume it"
+        )));
+    }
+    if let Some(why) = super::runner::approval_missing(state, &t.feed, &t.delivery) {
+        return Err(ServeError::Conflict(format!(
+            "delivery '{delivery}' cannot be resumed: {why}"
         )));
     }
     t.update_status(state, |s| {
