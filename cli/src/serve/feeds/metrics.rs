@@ -49,6 +49,10 @@ pub fn describe() {
         "faucet_feed_gaps_total",
         "Ranges of events a delivery skipped (an admin skip or a recover)"
     );
+    describe_counter!(
+        "faucet_feed_orphan_deliveries_total",
+        "Delivery positions deleted from the feed store because no definition listed them"
+    );
     describe_gauge!(
         "faucet_feed_held",
         "Deliveries of the feed that are held until an admin recovers them"
@@ -179,6 +183,10 @@ pub fn store_error(feed: &str) {
 
 pub fn dedupe_hits(feed: &str, events: u64) {
     counter!("faucet_feed_dedupe_hits_total", "feed" => feed.to_string()).increment(events);
+}
+
+pub fn orphan_delivery(feed: &str) {
+    counter!("faucet_feed_orphan_deliveries_total", "feed" => feed.to_string()).increment(1);
 }
 
 pub fn scheduler_restarted() {

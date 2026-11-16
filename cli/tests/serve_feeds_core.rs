@@ -2925,3 +2925,88 @@ async fn the_feed_verbs_delete_feeds_and_need_a_store() {
         assert!(err.to_string().contains("pass --store"), "{err}");
     }
 }
+
+async fn delivery_ids(store: &Arc<dyn FeedStore>, uid: &FeedUid) -> Vec<String> {
+    store
+        .heads(&store_calls(), std::slice::from_ref(uid))
+        .await
+        .unwrap()
+        .remove(0)
+        .deliveries
+        .iter()
+        .map(|d| d.delivery.id().to_string())
+        .collect()
+}
+
+/// A change that dropped a delivery's id and stopped before deleting its
+/// store row leaves a position nothing reads; the scheduler removes it, for
+/// a stored feed and for a `--feeds` file feed, and never a row the stored
+/// ids still list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delivery_position_no_definition_lists_is_removed_from_the_store() {
+    use faucet_common_feed::{DeliveryUid, Start};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("lake.yaml"),
+        format!(
+            "version: 1\nname: file_lake\npipeline:\n  source: {{ type: feed }}\n  sink: {{ type: file, config: {{ path: \"{}\", if_exists: append }} }}\n  state: {{ type: file, config: {{ path: \"{}\" }} }}\n",
+            root.join("lake.jsonl").display(),
+            root.join("state").display()
+        ),
+    )
+    .unwrap();
+    let feeds = root.join("feeds.yaml");
+    std::fs::write(
+        &feeds,
+        "version: 1\nfeeds:\n  - name: filed\n    ingest: { auth: { signature: { header: X-Signature, secret: file-hmac-secret } } }\n    deliveries:\n      - name: lake\n        pipeline: lake.yaml\n        flush: { max_events: 1000, min_interval: 0s }\n",
+    )
+    .unwrap();
+    let feeds_arg = feeds.display().to_string();
+    let history = format!("sqlite:{}", root.join("history.db").display());
+    let mut srv = Srv::over(&config(root, &history, &["--feeds", &feeds_arg])).await;
+    register(&srv.state, "orders_lake", &root.join("state")).await;
+    let mut wide = delivery("lake", "orders_lake", &root.join("api.jsonl"));
+    wide["flush"]["max_events"] = json!(1000);
+    service::create(&srv.state, &admin(), None, feed_spec("stored", json!([wide])))
+        .await
+        .unwrap();
+    srv.tick().await;
+
+    for feed in ["stored", "filed"] {
+        let (store, uid) = srv.store(feed).await;
+        let defined = delivery_ids(&store, &uid).await;
+        assert_eq!(defined.len(), 1, "{feed}");
+        let orphan = DeliveryUid::new(uid.clone(), "0123456789abcdef0123456789abcdef").unwrap();
+        store
+            .ensure_delivery(&store_calls(), &orphan, Start::Earliest)
+            .await
+            .unwrap();
+        assert_eq!(delivery_ids(&store, &uid).await.len(), 2);
+        srv.tick().await;
+        assert_eq!(delivery_ids(&store, &uid).await, defined, "{feed}");
+    }
+
+    // An id the stored record lists is another server's newer definition.
+    let (store, uid) = srv.store("filed").await;
+    let key = faucet_cli::serve::feeds::file_ids_key(&faucet_cli::serve::history::feeds::feed_key(None, "filed"));
+    let history = srv.state.history();
+    let raw = history.meta_get(&key).await.unwrap().unwrap();
+    let mut ids: faucet_cli::serve::feeds::FileIds = serde_json::from_str(&raw).unwrap();
+    let newer = "fedcba9876543210fedcba9876543210";
+    ids.deliveries.insert("later".into(), newer.into());
+    history
+        .meta_put(&key, &serde_json::to_string(&ids).unwrap())
+        .await
+        .unwrap();
+    store
+        .ensure_delivery(
+            &store_calls(),
+            &DeliveryUid::new(uid.clone(), newer).unwrap(),
+            Start::Earliest,
+        )
+        .await
+        .unwrap();
+    srv.tick().await;
+    assert!(delivery_ids(&store, &uid).await.iter().any(|d| d == newer));
+}

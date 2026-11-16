@@ -403,6 +403,74 @@ async fn run_of_claim(
     Ok(page.runs.into_iter().next())
 }
 
+/// The delivery ids `feed`'s stored definition lists right now; `None`
+/// when it cannot be read or names another feed.
+async fn defined_ids(state: &ServerState, feed: &Feed) -> Option<HashSet<String>> {
+    let history = state.history();
+    let ids: HashSet<String> = match feed.source {
+        Source::File => {
+            let raw = history
+                .meta_get(&super::file_ids_key(&feed.key()))
+                .await
+                .ok()??;
+            let ids: super::FileIds = serde_json::from_str(&raw).ok()?;
+            if ids.uid != feed.uid.as_str() {
+                return None;
+            }
+            ids.deliveries.into_values().collect()
+        }
+        Source::Console => {
+            let record = history.feed_get(&feed.key()).await.ok()??;
+            if record.uid != feed.uid.as_str() {
+                return None;
+            }
+            record.deliveries.values().map(|m| m.uid.clone()).collect()
+        }
+    };
+    (!history.degraded()).then_some(ids)
+}
+
+/// Delete the store's delivery rows that no definition lists and no claim
+/// holds: what a change leaves when it stops between dropping a delivery's
+/// id and deleting its row. Returns how many were deleted.
+pub async fn drop_orphans(
+    state: &ServerState,
+    store: &dyn FeedStore,
+    feed: &Feed,
+    head: &Head,
+) -> usize {
+    let known: HashSet<&str> = feed.deliveries.values().map(|d| d.uid.id()).collect();
+    let orphans: Vec<&DeliveryHead> = head
+        .deliveries
+        .iter()
+        .filter(|d| d.claim.is_none() && !known.contains(d.delivery.id()))
+        .collect();
+    if orphans.is_empty() {
+        return 0;
+    }
+    let Some(defined) = defined_ids(state, feed).await else {
+        return 0;
+    };
+    let mut deleted = 0;
+    for orphan in orphans {
+        if defined.contains(orphan.delivery.id()) {
+            continue;
+        }
+        match store.delete_delivery(&store_calls(), &orphan.delivery).await {
+            Ok(()) => {
+                status::forget(&*state.history(), feed.uid.as_str(), orphan.delivery.id()).await;
+                metrics::orphan_delivery(&feed.label());
+                tracing::warn!(feed = %feed.label(), delivery_uid = orphan.delivery.id(), cursor = orphan.cursor.get(), "deleted a delivery position no definition lists");
+                deleted += 1;
+            }
+            Err(e) => {
+                tracing::warn!(feed = %feed.label(), delivery_uid = orphan.delivery.id(), error = %e, "could not delete a delivery position no definition lists; retrying")
+            }
+        }
+    }
+    deleted
+}
+
 /// One delivery as a step sees it.
 struct Work {
     feed: Arc<Feed>,
@@ -822,6 +890,7 @@ impl Scheduler {
                     continue;
                 };
                 maintain.push((store.clone(), (*feed).clone()));
+                drop_orphans(state, &*store, feed, head).await;
                 if let Some((crossed, ratio)) = self.observe(feed, head) {
                     crossings.push(((*feed).clone(), crossed, ratio));
                 }
