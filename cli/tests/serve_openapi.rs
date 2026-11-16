@@ -64,6 +64,10 @@ fn openapi_routes() -> BTreeSet<(String, String)> {
         if path.starts_with("/v1/schedules") {
             continue;
         }
+        #[cfg(not(feature = "feeds"))]
+        if path.starts_with("/v1/feeds") || path.contains("/feeds/") {
+            continue;
+        }
         // …and the `mcp` feature's transport (#420).
         #[cfg(not(feature = "mcp"))]
         if path == "/mcp" {
@@ -156,6 +160,7 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         cluster_max_attempts: 3,
         triggers: None,
         schedules: Default::default(),
+        feeds: Default::default(),
         templates_sync: None,
         policy: None,
         policy_store: Default::default(),

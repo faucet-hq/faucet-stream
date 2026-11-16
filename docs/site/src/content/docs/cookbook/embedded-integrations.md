@@ -68,6 +68,9 @@ curl -X POST localhost:8080/v1/tenants -H "Authorization: Bearer $ADMIN" \
 | `name`, `labels` | What `${tenant.name}` and `${tenant.labels.<key>}` read. |
 | `limits.max_concurrent_runs` | Runs queued or running at once — a tenant's DLQ replay counts while it runs; the next submission (or replay) is a `429`. In a cluster the count is re-checked against the shared history once the run is recorded, so two instances admitting the last slot at once both back out (`429`, retry) rather than exceed it. |
 | `limits.max_schedules` | [Schedules](/faucet-stream/cookbook/schedules/) the tenant's own principal may own, paused ones included; the next create is a `422`. Unset = no limit. |
+| `limits.max_feeds` | [Feeds](/faucet-stream/cookbook/feeds/#tenants) the tenant may have; the next create is a `422`. Unset = no limit. |
+| `limits.max_feed_events_per_sec` | Events a second the tenant's feeds accept together, per server; past it senders get `429` with `Retry-After`. |
+| `limits.max_feed_bytes` | Bytes the tenant's feeds may hold together; past it they refuse new events (`503`) until deliveries catch up. |
 | `limits.max_records_per_run`, `max_bytes_per_run`, `max_duration_secs` | Joined into every run's [budget](/faucet-stream/cookbook/usage/#run-budgets): a noisy tenant stops at the page boundary. |
 | `notifications` | The config `notifications:` shape, for tenant-level events (`connection_needs_reauth`). Webhook URLs, routing keys and HMAC secrets are credentials: the list is sealed under the vault key (a non-empty list needs `--vault-key`), and responses show every value under a rule's `channel.config` as `***`. A list stored in clear by an earlier release is sealed when the server starts with a vault key; on a server that cannot open a sealed list the response carries `notifications_error` and the list reads as empty. |
 
@@ -324,7 +327,8 @@ config snapshot under the `<tenant>::<pipeline>` name, like its state keys;
 a dataset another pipeline also reads or writes is kept), every
 state key its runs used (recorded as each run starts, with its store spec
 sealed under the vault key) and their markers, its connections and pending
-connect sessions. It is refused while a run is queued or running. Destination
+connect sessions, and its [feeds](/faucet-stream/cookbook/feeds/) with their
+tokens, events and positions (`feeds` in the report). It is refused while a run is queued or running. Destination
 data is never touched — faucet does not own it. A key the server could not
 record safely (no vault key, a state store with credentials in its spec) is
 listed under `state_keys_not_deleted` instead.

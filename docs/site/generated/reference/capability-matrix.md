@@ -29,6 +29,7 @@
 | `bigquery` |  | ✓ |
 | `dynamodb` |  | ✓ |
 | `elasticsearch` |  | ✓ |
+| `feed` | ✓ |  |
 | `file` |  | ✓ |
 | `gcs` |  | ✓ |
 | `iceberg` |  | ✓ |
@@ -55,6 +56,7 @@ A `delivery: exactly_once` pipeline needs a replayable source **and** an atomic-
 
 | source ↓ / sink → | `bigquery` | `databricks` | `iceberg` | `kafka` | `mongodb` | `mssql` | `mysql` | `oracle` | `postgres` | `redis` | `snowflake` | `spanner` | `sqlite` |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `feed` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `kafka` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `mongodb-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `mssql-cdc` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |

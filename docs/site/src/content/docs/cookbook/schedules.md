@@ -158,6 +158,10 @@ change names (the server picks its id when the change is proposed); every
 view of the change request shows them as `{"$sealed": true}`. A change whose
 schedule was deleted and made again since it was proposed is invalidated.
 
+A change to a tenant's schedule belongs to that tenant even when a server
+admin proposes it: the tenant's principals see the request and its approvers
+may approve it. A fan-out schedule's change is server-level.
+
 `--require-approval run` gates runs, and a schedule starts runs on its own,
 so under it:
 

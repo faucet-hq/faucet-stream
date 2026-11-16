@@ -224,6 +224,9 @@ pub struct ServeConfig {
     pub triggers_path: Option<PathBuf>,
     /// Schedules (#1044): the `--schedules` file and the tenant guardrail.
     pub schedules: ScheduleSettings,
+    /// Feeds (#1034): the `--feeds` file, the named stores and the tenant
+    /// guardrail.
+    pub feeds: FeedSettings,
     /// Path to a `--templates-sync` file. `None` = no remote template origins.
     /// Loaded + validated at startup (gated on the `templates-sync` feature).
     pub templates_sync_path: Option<PathBuf>,
@@ -291,6 +294,117 @@ impl From<&crate::cli::ServeScheduleArgs> for ScheduleSettings {
     }
 }
 
+/// The default shortest gap between two runs of a tenant feed's delivery.
+pub const DEFAULT_TENANT_DELIVERY_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Feed settings (#1034): `--feeds`, `--feed-store` and
+/// `--tenant-delivery-min-interval-secs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedSettings {
+    /// The `--feeds` file. `None` = only feeds made through the API.
+    pub path: Option<PathBuf>,
+    /// The named stores beyond `default`: name → `sqlite:<path>` or
+    /// `postgres://…`.
+    pub stores: std::collections::BTreeMap<String, String>,
+    /// The shortest gap between two runs of a tenant feed's delivery.
+    pub tenant_delivery_min_interval: Duration,
+    /// `--feeds-listen`: the ingest routes' own listener.
+    pub listen: Option<SocketAddr>,
+    /// The host names the feeds listener answers for; empty = any.
+    pub allowed_hosts: Vec<String>,
+    /// The largest ingest request body the server reads.
+    pub max_request_bytes: u64,
+    /// How long an ingest request may take to send its body.
+    pub request_timeout: Duration,
+    /// Ingest requests handled at once.
+    pub max_concurrent_requests: usize,
+}
+
+impl Default for FeedSettings {
+    fn default() -> Self {
+        Self {
+            path: None,
+            stores: Default::default(),
+            tenant_delivery_min_interval: DEFAULT_TENANT_DELIVERY_MIN_INTERVAL,
+            listen: None,
+            allowed_hosts: Vec::new(),
+            max_request_bytes: 64 * 1024 * 1024,
+            request_timeout: Duration::from_secs(30),
+            max_concurrent_requests: 256,
+        }
+    }
+}
+
+impl FeedSettings {
+    /// The settings `--feeds`, `--feed-store` and the guardrail flag give.
+    pub fn from_args(a: &crate::cli::ServeFeedArgs) -> CliResult<Self> {
+        let mut stores = std::collections::BTreeMap::new();
+        for entry in &a.feed_store {
+            let Some((name, url)) = entry.split_once('=') else {
+                return Err(CliError::Serve(format!(
+                    "--feed-store '{entry}': use NAME=sqlite:<path> or NAME=postgres://…"
+                )));
+            };
+            let (name, url) = (name.trim(), url.trim());
+            if name.is_empty() || url.is_empty() {
+                return Err(CliError::Serve(format!(
+                    "--feed-store '{entry}': the name and the URL must not be empty"
+                )));
+            }
+            if name == crate::serve::history::feeds::DEFAULT_STORE {
+                return Err(CliError::Serve(
+                    "--feed-store: `default` follows the run history and cannot be redefined; \
+                     pick another name"
+                        .into(),
+                ));
+            }
+            if stores.insert(name.to_string(), url.to_string()).is_some() {
+                return Err(CliError::Serve(format!(
+                    "--feed-store: store '{name}' is defined twice"
+                )));
+            }
+            crate::secrets::registry::register_server(url);
+        }
+        let listen = a
+            .feeds_listen
+            .as_deref()
+            .map(|l| {
+                l.parse::<SocketAddr>()
+                    .map_err(|e| CliError::Serve(format!("invalid --feeds-listen '{l}': {e}")))
+            })
+            .transpose()?;
+        if listen.is_none() && !a.feeds_allowed_host.is_empty() {
+            return Err(CliError::Serve(
+                "--feeds-allowed-host only applies with --feeds-listen; the main listener \
+                 uses --allowed-host"
+                    .into(),
+            ));
+        }
+        let guard = crate::serve::guard::GuardSettings::from_args(&a.feeds_allowed_host, &[])
+            .map_err(|e| CliError::Serve(e.replace("--allowed-host", "--feeds-allowed-host")))?;
+        if a.feeds_max_request_bytes == 0
+            || a.feeds_request_timeout_secs == 0
+            || a.feeds_max_concurrent_requests == 0
+        {
+            return Err(CliError::Serve(
+                "--feeds-max-request-bytes, --feeds-request-timeout-secs and \
+                 --feeds-max-concurrent-requests must be greater than 0"
+                    .into(),
+            ));
+        }
+        Ok(Self {
+            path: a.feeds.clone(),
+            stores,
+            tenant_delivery_min_interval: Duration::from_secs(a.tenant_delivery_min_interval_secs),
+            listen,
+            allowed_hosts: guard.allowed_hosts,
+            max_request_bytes: a.feeds_max_request_bytes,
+            request_timeout: Duration::from_secs(a.feeds_request_timeout_secs),
+            max_concurrent_requests: a.feeds_max_concurrent_requests,
+        })
+    }
+}
+
 /// Log-shipping buffer bounds and the console's log link (#806).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogBufferSettings {
@@ -352,6 +466,22 @@ fn schedule_change_rules(
         Some(vec![ChangeKind::Schedule, ChangeKind::Run])
     } else if require_approval.contains(&ChangeKind::Schedule) {
         Some(vec![ChangeKind::Schedule])
+    } else {
+        None
+    }
+}
+
+/// The approval rules a feed change must meet under `require_approval`
+/// (#1034): `None` when feed changes are not gated. Under `run`, a feed
+/// change that adds or edits a delivery needs the run rule as well.
+fn feed_change_rules(
+    require_approval: &[crate::serve::changes::ChangeKind],
+) -> Option<Vec<crate::serve::changes::ChangeKind>> {
+    use crate::serve::changes::ChangeKind;
+    if require_approval.contains(&ChangeKind::Run) {
+        Some(vec![ChangeKind::Feed, ChangeKind::Run])
+    } else if require_approval.contains(&ChangeKind::Feed) {
+        Some(vec![ChangeKind::Feed])
     } else {
         None
     }
@@ -455,6 +585,13 @@ impl ServeConfig {
             && let AuthMode::Rbac(rbac) = &auth
         {
             rbac.check_approvers(&kinds).map_err(CliError::Serve)?;
+        }
+        if cfg!(feature = "feeds")
+            && let Some(kinds) = feed_change_rules(&require_approval)
+            && let AuthMode::Rbac(rbac) = &auth
+        {
+            rbac.check_approvers_for("feed", &kinds)
+                .map_err(CliError::Serve)?;
         }
 
         let request_guard = crate::serve::guard::GuardSettings::from_args(
@@ -632,6 +769,18 @@ impl ServeConfig {
             .map(load_otel_config)
             .transpose()?;
         let log_retention = resolve_log_retention(args.log_retention_secs, otel.as_ref());
+        let feeds = FeedSettings::from_args(&args.feeds)?;
+        #[cfg(feature = "feeds")]
+        crate::serve::feeds::stores::check_config(&feeds, &history, cluster.enabled)
+            .map_err(CliError::Serve)?;
+        #[cfg(not(feature = "feeds"))]
+        if feeds.path.is_some() || !feeds.stores.is_empty() || feeds.listen.is_some() {
+            return Err(CliError::Serve(
+                "--feeds, --feed-store and --feeds-listen require a build with the `feeds` \
+                 feature"
+                    .into(),
+            ));
+        }
 
         Ok(Self {
             listen,
@@ -667,6 +816,7 @@ impl ServeConfig {
             cluster,
             triggers_path: args.triggers,
             schedules: ScheduleSettings::from(&args.schedules),
+            feeds,
             templates_sync_path: args.templates_sync,
             policy_path: args.policy,
             policy_store: args.policy_store,
@@ -879,6 +1029,7 @@ mod tests {
             cluster_max_attempts: 3,
             triggers: None,
             schedules: Default::default(),
+            feeds: Default::default(),
             templates_sync: None,
             policy: None,
             policy_store: Default::default(),
@@ -971,6 +1122,25 @@ mod tests {
         // Every principal token must be registered for log redaction.
         let scrubbed = crate::secrets::registry::redact("t=rbacsecret12345 end").into_owned();
         assert!(!scrubbed.contains("rbacsecret12345"), "{scrubbed}");
+    }
+
+    #[test]
+    fn feed_changes_need_the_run_rule_while_runs_need_approval() {
+        use crate::serve::changes::ChangeKind;
+        assert_eq!(feed_change_rules(&[ChangeKind::Schedule]), None);
+        assert_eq!(
+            feed_change_rules(&[ChangeKind::Feed]),
+            Some(vec![ChangeKind::Feed])
+        );
+        for gated in [
+            vec![ChangeKind::Run],
+            vec![ChangeKind::Feed, ChangeKind::Run],
+        ] {
+            assert_eq!(
+                feed_change_rules(&gated),
+                Some(vec![ChangeKind::Feed, ChangeKind::Run])
+            );
+        }
     }
 
     #[test]

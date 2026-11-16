@@ -136,3 +136,22 @@ fn synth_change_requested_names_the_synthetic_request() {
     assert_eq!(e.kind, crate::notify::EventKind::ChangeRequested);
     assert!(e.message.contains("synthetic change request"));
 }
+
+#[test]
+fn synth_feed_events_name_the_feed_and_the_delivery() {
+    let full = synth_event("feed_near_full", "orders").unwrap();
+    assert_eq!(full.kind.as_str(), "feed_near_full");
+    assert_eq!(full.details["feed"], "orders");
+    assert_eq!(full.details["threshold"], 0.8);
+    assert!(full.title.contains("82%"));
+    let stalled = synth_event("feed_stalled", "orders").unwrap();
+    assert_eq!(stalled.kind.as_str(), "feed_stalled");
+    assert_eq!(stalled.details["seq"], 4211);
+    assert!(stalled.message.contains("skips the event"));
+    assert!(
+        synth_event("feed_gone", "p")
+            .unwrap_err()
+            .to_string()
+            .contains("feed_near_full, feed_stalled")
+    );
+}

@@ -28,6 +28,15 @@ pub struct Submission<'a> {
     /// The stored data-flow policy versions to load under (#1043): a stored
     /// run keeps the versions it was admitted with. `None` = the newest.
     pub policy_pin: Option<&'a crate::serve::history::policies::PolicyPin>,
+    /// Appended to the config's pipeline name once it is parsed (#1034): a
+    /// delivery run's `<name>.<delivery short id>`.
+    pub name_suffix: Option<&'a str>,
+    /// The run is (or was) a feed delivery bound to a claimed range, so a
+    /// `feed` source in its config is expected whoever passes the config.
+    pub feed_bound: bool,
+    /// The operation never reads the config's source (a plan, a DLQ replay,
+    /// which swaps it), so an unbound `feed` source in it is harmless.
+    pub source_unread: bool,
 }
 
 impl<'a> Submission<'a> {
@@ -39,7 +48,24 @@ impl<'a> Submission<'a> {
             selection: None,
             caller_fields: None,
             policy_pin: None,
+            name_suffix: None,
+            feed_bound: false,
+            source_unread: false,
         }
+    }
+
+    /// For an operation that never reads the config's source.
+    pub fn without_reading_source(mut self) -> Self {
+        self.source_unread = true;
+        self
+    }
+
+    /// As the feed delivery a run record or request describes (#1034): its
+    /// pipeline name suffix, and whether it is bound to a feed range.
+    pub fn delivering(mut self, name_suffix: Option<&'a str>, feed_bound: bool) -> Self {
+        self.name_suffix = name_suffix;
+        self.feed_bound = feed_bound;
+        self
     }
 
     /// Under the policy versions a stored run was admitted with (#1043).
@@ -188,6 +214,30 @@ pub async fn load(
         other => other?,
     };
     loaded.policy_pin = policy_pin;
+    if let Some(suffix) = sub.name_suffix {
+        loaded.cfg.name = Some(delivery_pipeline_name(loaded.cfg.name.as_deref(), suffix));
+    }
+    if principal.caller_body() && !sub.feed_bound {
+        let feeds = || loaded.nodes.iter().filter(|n| n.source.kind == FEED_KIND);
+        let names_a_store = |n: &crate::expand::ExpandedNode| {
+            FEED_PLACE_FIELDS
+                .iter()
+                .any(|f| n.source.config.get(f).is_some_and(|v| !v.is_null()))
+        };
+        let message = if !sub.source_unread && feeds().next().is_some() {
+            Some(FEED_SOURCE_REFUSAL)
+        } else if feeds().any(names_a_store) {
+            Some(FEED_PLACE_REFUSAL)
+        } else {
+            None
+        };
+        if let Some(message) = message {
+            return Err(ServeError::Unprocessable {
+                message: message.to_string(),
+                details: None,
+            });
+        }
+    }
     if principal.caller_body() {
         let policy =
             crate::serve::host_identity::caller_policy(&state.references(), principal.tenant());
@@ -225,6 +275,25 @@ pub async fn load(
         .map_err(bad)?;
     }
     Ok(loaded)
+}
+
+/// The connector kind of the `feed` source.
+pub use crate::executor::FEED_KIND;
+
+/// The `feed` source's fields that say where to read; only `faucet run` sets them.
+const FEED_PLACE_FIELDS: &[&str] = &["store", "feed", "delivery"];
+
+/// The refusal of a submitted config whose `feed` source names its own store.
+pub const FEED_PLACE_REFUSAL: &str = "a `feed` source in a config sent to the server may not set \
+     `store`, `feed` or `delivery`: the server binds a delivery to its feed";
+
+/// The refusal of a submitted config that reads a feed (#1034).
+pub const FEED_SOURCE_REFUSAL: &str = "a `feed` source runs only as a delivery of a feed: the      server binds it to a claimed range of events. Add this pipeline as a delivery of the feed      (a registered template), or run it with `faucet run` against the feed's store";
+
+/// A delivery run's pipeline name: `<config name>.<suffix>`, `serve.<suffix>`
+/// for a config with no name.
+pub fn delivery_pipeline_name(name: Option<&str>, suffix: &str) -> String {
+    format!("{}.{suffix}", name.unwrap_or("serve"))
 }
 
 /// Every stage up to execution: [`load`] (load + trust), then the policy
@@ -428,7 +497,8 @@ pub async fn reload(
         Submission::new(&body, rec.config_format.unwrap_or_default())
             .selected(rec.selection.as_ref())
             .with_caller_fields(&rec.caller_params)
-            .pinned(rec.policy_pin.as_ref()),
+            .pinned(rec.policy_pin.as_ref())
+            .delivering(rec.pipeline_name_suffix.as_deref(), rec.feed.is_some()),
     )
     .await
 }
@@ -448,6 +518,9 @@ pub struct GovernedRun {
     pub notifier: Option<std::sync::Arc<crate::notify::Notifier>>,
     /// Record the run in the Data Movement Catalog (whole runs only).
     pub catalog: bool,
+    /// How a `feed` source of this run reads (#1034): refused, or bound to
+    /// the delivery's claimed range.
+    pub feed: crate::executor::FeedRun,
 }
 
 /// The governed execution options of a server run: its budget (the
@@ -507,6 +580,7 @@ pub fn governed_options(
         }),
         usage,
         budget: run_budget(cfg, tenant),
+        feed: run.feed,
     })
 }
 
@@ -629,7 +703,8 @@ pub async fn submit(
         principal,
         Submission::new(&req.config, req.config_format.into())
             .selected(req.selection.as_ref())
-            .with_caller_fields(&req.caller_fields),
+            .with_caller_fields(&req.caller_fields)
+            .delivering(req.pipeline_name_suffix.as_deref(), req.feed.is_some()),
         Gates {
             policy: true,
             budget: req.budget.take(),
@@ -921,7 +996,7 @@ pub async fn plan(
     let loaded = load(
         state,
         principal,
-        Submission::new(&req.config, req.config_format.into()),
+        Submission::new(&req.config, req.config_format.into()).without_reading_source(),
     )
     .await?;
     loaded.require_matrix()?;
@@ -1230,11 +1305,13 @@ pub async fn rollback(
     let admitted = admit(
         state,
         &run_as,
-        Submission::new(&config, format).with_caller_fields(if stored_params {
-            &rec.caller_params
-        } else {
-            &no_params
-        }),
+        Submission::new(&config, format)
+            .with_caller_fields(if stored_params {
+                &rec.caller_params
+            } else {
+                &no_params
+            })
+            .delivering(rec.pipeline_name_suffix.as_deref(), rec.feed.is_some()),
         if req.dry_run {
             Gates::default()
         } else {
@@ -1312,6 +1389,29 @@ pub async fn rollback(
         outcome
     })
     .await??;
+    // A rollback leaves the feed's position alone and pauses the delivery (#1034).
+    #[cfg(feature = "feeds")]
+    let report = {
+        let mut report = report;
+        if let Some(binding) = rec
+            .feed
+            .as_ref()
+            .filter(|_| !dry_run && report.outcome.applied)
+            && let Some(note) = crate::serve::feeds::service::pause_for_rollback(
+                state,
+                &principal.actor(),
+                id,
+                binding,
+            )
+            .await
+        {
+            report.outcome.note = Some(match report.outcome.note.take() {
+                Some(own) => format!("{own}. {note}"),
+                None => note,
+            });
+        }
+        report
+    };
     Ok(report)
 }
 
@@ -1344,7 +1444,7 @@ pub async fn replay_dlq(
     let admitted = admit(
         state,
         &principal,
-        Submission::new(&req.config, req.config_format.into()),
+        Submission::new(&req.config, req.config_format.into()).without_reading_source(),
         Gates {
             policy: !req.dry_run,
             budget: None,
@@ -1974,9 +2074,13 @@ mod templates {
             principal.body_origin(),
             crate::serve::load::BodyOrigin::Trusted
         );
+        let by_feed = body.feed.is_some();
         labels.retain(|k, _| {
             !RESERVED_LABELS.contains(&k.as_str())
                 || (trusted && crate::serve::history::labels::SCHEDULE_LABELS.contains(&k.as_str()))
+                || (trusted
+                    && by_feed
+                    && crate::serve::history::labels::FEED_LABELS.contains(&k.as_str()))
         });
         labels.insert(LABEL_TEMPLATE.into(), materialized.template_id.clone());
         if let Some(status) = materialized.untested {
@@ -2051,6 +2155,8 @@ mod templates {
                 materialized.caller_fields.clone()
             },
             server_key: body.server_key,
+            feed: body.feed.clone(),
+            pipeline_name_suffix: body.pipeline_name_suffix.clone(),
         };
         // The template is the operator's: the run loads it trusted.
         let run_as = Principal::new(actor.clone(), Origin::Trusted).on_behalf_of(tenant);

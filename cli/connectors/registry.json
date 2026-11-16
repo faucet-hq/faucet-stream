@@ -192,6 +192,15 @@
       "description": "Webhook HTTP receiver source"
     },
     {
+      "name": "feed",
+      "kind": "source",
+      "title": "Feed",
+      "category": "streaming",
+      "verified": true,
+      "tier": "stable",
+      "description": "Feed source — delivers the events a durable feed store holds for one delivery, in order"
+    },
+    {
       "name": "websocket",
       "kind": "source",
       "title": "WebSocket",

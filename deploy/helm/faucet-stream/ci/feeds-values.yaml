@@ -1,0 +1,25 @@
+# A feeds file as a mapping → chart-managed ConfigMap + --feeds. The default
+# history (SQLite on the data volume) holds the definitions; feeds.db sits
+# beside it. No second listener unless asked for.
+# expect: - --feeds=/etc/faucet-feeds/feeds.yaml
+# expect: name: t-faucet-stream-serve-feeds
+# expect: mountPath: /etc/faucet-feeds
+# expect: feeds.yaml: |
+# expect: name: orders
+# expect: checksum/serve-files:
+# expect-not: --feeds-listen
+# expect-not: --feed-store
+# expect-not: --tenant-delivery-min-interval-secs
+# expect-not: name: t-faucet-stream-feeds
+serve:
+  feeds:
+    enabled: true
+    content:
+      version: 1
+      feeds:
+        - name: orders
+          ingest:
+            auth: { tokens: managed }
+          deliveries:
+            - name: archive
+              template: { id: orders-archive, version: 3 }

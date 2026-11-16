@@ -565,6 +565,12 @@ pub fn protect_sqlite_url(url: &str) {
     }
 }
 
+/// The file a `sqlite:<path>` URL names; `None` for another scheme or an
+/// in-memory database.
+pub fn sqlite_file(url: &str) -> Option<std::path::PathBuf> {
+    sqlite_path(url).map(|p| std::path::PathBuf::from(p.as_ref()))
+}
+
 fn sqlite_path(url: &str) -> Option<std::borrow::Cow<'_, str>> {
     if !url.starts_with("sqlite:") {
         return None;

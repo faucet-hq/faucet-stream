@@ -50,3 +50,21 @@
 .ov-att td:last-child { width: 1%; white-space: nowrap; }
 .ov-rows { padding: 6px 6px 8px; display: flex; flex-direction: column; gap: 2px; }
 .ov-checklist { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* ---- feeds ---- */
+.fd-url { height: auto; min-height: var(--ctl-h); padding-top: 5px; padding-bottom: 5px; white-space: normal; }
+.fd-url .fd-url-t { min-width: 0; overflow-wrap: anywhere; flex: 1; }
+.fd-wrap { overflow-wrap: anywhere; }
+.fd-line { display: flex; justify-content: space-between; gap: 12px; }
+.fd-line > b { text-align: right; }
+.fd-checks { display: flex; gap: 14px; min-height: var(--ctl-h); align-items: center; flex-wrap: wrap; }
+.fd-pairrow { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 8px; }
+.fd-goto .input { width: 230px; max-width: 46vw; }
+.fd-log { font-family: var(--sans); font-size: 12.5px; line-height: 2; }
+.fd-log > div { display: flex; align-items: baseline; }
+.fd-log .fd-when { flex: none; width: 190px; }
+.fd-log .dot { align-self: center; }
+button.fd-lnk { background: none; border: 0; padding: 0; font: inherit; }
+.card .form textarea.area.fd-area, textarea.area.fd-area { min-height: 0; height: 58px; white-space: pre-wrap; }
+.seg a { padding: 3px 10px; border-radius: 5px; color: var(--muted); text-decoration: none; }
+.seg a.on { background: var(--teal-fill); color: var(--teal-ink); box-shadow: inset 0 0 0 1px var(--teal-line); }

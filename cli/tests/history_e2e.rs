@@ -48,6 +48,7 @@ fn record(id: &str, row_id: &str) -> RunRecord {
             rows: None,
             skipped: false,
             status: None,
+            feed_error: None,
         }],
         error: None,
         idempotency_key: None,
@@ -70,6 +71,8 @@ fn record(id: &str, row_id: &str) -> RunRecord {
         dlq_location: None,
         policy_pin: Default::default(),
         policy_projection: None,
+        feed: None,
+        pipeline_name_suffix: None,
     }
 }
 

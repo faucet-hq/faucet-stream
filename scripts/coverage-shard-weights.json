@@ -62,6 +62,7 @@
     "faucet-source-duckdb": 1,
     "faucet-source-dynamodb": 92,
     "faucet-source-elasticsearch": 45,
+    "faucet-source-feed": 6,
     "faucet-source-file": 11,
     "faucet-source-gcs": 7,
     "faucet-source-graphql": 17,

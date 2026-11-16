@@ -376,6 +376,7 @@ fn make_opts(
         catalog: catalog.clone(),
         usage: usage.clone(),
         budget: budget.clone(),
+        feed: Default::default(),
     }
 }
 

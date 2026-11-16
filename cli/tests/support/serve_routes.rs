@@ -124,6 +124,34 @@ const ROUTES_TENANTS: &[(&str, &str)] = &[
     ("GET", "/v1/connect/callback"),
 ];
 
+/// Feeds (#1034). The two `events` POSTs are the ingest routes, which
+/// authenticate themselves.
+#[cfg(feature = "feeds")]
+const ROUTES_FEEDS: &[(&str, &str)] = &[
+    ("GET", "/v1/feeds"),
+    ("POST", "/v1/feeds"),
+    ("GET", "/v1/feeds/{name}"),
+    ("PUT", "/v1/feeds/{name}"),
+    ("DELETE", "/v1/feeds/{name}"),
+    ("POST", "/v1/feeds/{name}/deliveries"),
+    ("PUT", "/v1/feeds/{name}/deliveries/{delivery}"),
+    ("DELETE", "/v1/feeds/{name}/deliveries/{delivery}"),
+    ("POST", "/v1/feeds/{name}/deliveries/{delivery}/pause"),
+    ("POST", "/v1/feeds/{name}/deliveries/{delivery}/resume"),
+    ("POST", "/v1/feeds/{name}/deliveries/{delivery}/deliver-now"),
+    ("POST", "/v1/feeds/{name}/deliveries/{delivery}/replay"),
+    ("POST", "/v1/feeds/{name}/deliveries/{delivery}/skip"),
+    ("POST", "/v1/feeds/{name}/deliveries/{delivery}/recover"),
+    ("GET", "/v1/feeds/{name}/tokens"),
+    ("POST", "/v1/feeds/{name}/tokens"),
+    ("DELETE", "/v1/feeds/{name}/tokens/{id}"),
+    ("GET", "/v1/feeds/{name}/events"),
+    ("POST", "/v1/feeds/{name}/events"),
+    ("GET", "/v1/feeds/{name}/events/{seq}"),
+    ("GET", "/v1/feeds/{name}/refusals"),
+    ("POST", "/v1/tenants/{tenant}/feeds/{name}/events"),
+];
+
 /// Schedules (#1044). Without the features only `GET /v1/schedules` is
 /// wired, answering `available: false`.
 #[cfg(all(feature = "schedule", feature = "templates"))]
@@ -194,6 +222,10 @@ pub fn canonical_routes() -> BTreeSet<(String, String)> {
     for (m, p) in ROUTES_SCHEDULES {
         set.insert((m.to_string(), p.to_string()));
     }
+    #[cfg(feature = "feeds")]
+    for (m, p) in ROUTES_FEEDS {
+        set.insert((m.to_string(), p.to_string()));
+    }
     #[cfg(feature = "policy")]
     for (m, p) in ROUTES_POLICY {
         set.insert((m.to_string(), p.to_string()));
@@ -225,6 +257,8 @@ pub fn authenticated_routes() -> Vec<(&'static str, &'static str)> {
     all.extend_from_slice(ROUTES_TENANTS);
     #[cfg(all(feature = "schedule", feature = "templates"))]
     all.extend_from_slice(ROUTES_SCHEDULES);
+    #[cfg(feature = "feeds")]
+    all.extend_from_slice(ROUTES_FEEDS);
     #[cfg(feature = "policy")]
     all.extend_from_slice(ROUTES_POLICY);
     #[cfg(all(feature = "policy", feature = "tenants"))]
@@ -232,6 +266,9 @@ pub fn authenticated_routes() -> Vec<(&'static str, &'static str)> {
     #[cfg(feature = "mcp")]
     all.extend_from_slice(ROUTES_MCP);
     all.into_iter()
-        .filter(|(_, p)| (p.starts_with("/v1/") || *p == "/mcp") && *p != "/v1/connect/callback")
+        .filter(|(m, p)| {
+            let ingest = *m == "POST" && p.ends_with("/feeds/{name}/events");
+            (p.starts_with("/v1/") || *p == "/mcp") && *p != "/v1/connect/callback" && !ingest
+        })
         .collect()
 }

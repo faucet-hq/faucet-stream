@@ -47,6 +47,7 @@ fn opts(name: &str, max_concurrent: Option<usize>) -> ExecuteOptions {
         catalog: None,
         usage: Default::default(),
         budget: None,
+        feed: Default::default(),
     }
 }
 

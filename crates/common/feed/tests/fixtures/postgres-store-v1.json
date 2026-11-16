@@ -1,0 +1,299 @@
+{
+  "schema_version": 1,
+  "tables": {
+    "faucet_feed_dedupe": [
+      {
+        "column": "feed",
+        "key": 1,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "key",
+        "key": 2,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "seq",
+        "key": 0,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "id",
+        "key": 0,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "expires_at",
+        "key": 0,
+        "not_null": true,
+        "type": "bigint"
+      }
+    ],
+    "faucet_feed_deliveries": [
+      {
+        "column": "feed",
+        "key": 1,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "delivery",
+        "key": 2,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "epoch",
+        "key": 0,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "cursor",
+        "key": 0,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "claim_id",
+        "key": 0,
+        "not_null": false,
+        "type": "text"
+      },
+      {
+        "column": "claim_to",
+        "key": 0,
+        "not_null": false,
+        "type": "bigint"
+      },
+      {
+        "column": "claim_owner",
+        "key": 0,
+        "not_null": false,
+        "type": "text"
+      },
+      {
+        "column": "holder",
+        "key": 0,
+        "not_null": false,
+        "type": "text"
+      },
+      {
+        "column": "claim_expires_at",
+        "key": 0,
+        "not_null": false,
+        "type": "bigint"
+      }
+    ],
+    "faucet_feed_events": [
+      {
+        "column": "feed",
+        "key": 1,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "lane",
+        "key": 2,
+        "not_null": true,
+        "type": "integer"
+      },
+      {
+        "column": "seq",
+        "key": 3,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "id",
+        "key": 0,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "received_at",
+        "key": 0,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "stored_at",
+        "key": 0,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "content_type",
+        "key": 0,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "headers",
+        "key": 0,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "payload",
+        "key": 0,
+        "not_null": true,
+        "type": "bytea"
+      },
+      {
+        "column": "size",
+        "key": 0,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "sealed",
+        "key": 0,
+        "not_null": true,
+        "type": "boolean"
+      },
+      {
+        "column": "dedupe_key",
+        "key": 0,
+        "not_null": false,
+        "type": "text"
+      }
+    ],
+    "faucet_feed_gaps": [
+      {
+        "column": "feed",
+        "key": 0,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "delivery",
+        "key": 0,
+        "not_null": false,
+        "type": "text"
+      },
+      {
+        "column": "from_seq",
+        "key": 0,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "to_seq",
+        "key": 0,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "reason",
+        "key": 0,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "at",
+        "key": 0,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "by",
+        "key": 0,
+        "not_null": true,
+        "type": "text"
+      }
+    ],
+    "faucet_feed_heads": [
+      {
+        "column": "feed",
+        "key": 1,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "tenant",
+        "key": 0,
+        "not_null": false,
+        "type": "text"
+      },
+      {
+        "column": "head",
+        "key": 0,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "bytes",
+        "key": 0,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "max_age_ms",
+        "key": 0,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "dedupe_window_ms",
+        "key": 0,
+        "not_null": true,
+        "type": "bigint"
+      },
+      {
+        "column": "tenant_max_bytes",
+        "key": 0,
+        "not_null": false,
+        "type": "bigint"
+      },
+      {
+        "column": "undelivered_max_events",
+        "key": 0,
+        "not_null": false,
+        "type": "bigint"
+      },
+      {
+        "column": "undelivered_max_bytes",
+        "key": 0,
+        "not_null": false,
+        "type": "bigint"
+      },
+      {
+        "column": "undelivered_max_age_ms",
+        "key": 0,
+        "not_null": false,
+        "type": "bigint"
+      },
+      {
+        "column": "maintenance_owner",
+        "key": 0,
+        "not_null": false,
+        "type": "text"
+      },
+      {
+        "column": "maintenance_expires_at",
+        "key": 0,
+        "not_null": false,
+        "type": "bigint"
+      }
+    ],
+    "faucet_feed_meta": [
+      {
+        "column": "k",
+        "key": 1,
+        "not_null": true,
+        "type": "text"
+      },
+      {
+        "column": "v",
+        "key": 0,
+        "not_null": true,
+        "type": "bigint"
+      }
+    ]
+  }
+}

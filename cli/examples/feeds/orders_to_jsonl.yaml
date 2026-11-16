@@ -1,0 +1,21 @@
+# The pipeline of the `archive` delivery in feeds.yaml. The server binds its
+# `feed` source to the range of events one run delivers, so the source takes
+# no feed, delivery or store here.
+version: 1
+name: orders_archive
+pipeline:
+  source:
+    type: feed
+  sink:
+    type: file
+    config:
+      path: ./out/orders.jsonl
+      # Append: a run moves the delivery past what it wrote, so the next run
+      # must not replace this one's output.
+      if_exists: append
+  # With a bookmark, a run that crashed between the write and the position
+  # move recognises the page the destination already holds.
+  state:
+    type: file
+    config:
+      path: ./state

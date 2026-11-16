@@ -65,6 +65,32 @@ serve:
           timezone: Etc/UTC
           template: { id: platform-nightly }
 
+  # A feed senders push into, delivered by a pinned template version, with
+  # ingest on its own port, Service and Ingress. The feed store follows the
+  # PostgreSQL history; the vault key comes from serve.tenants below.
+  feeds:
+    enabled: true
+    content:
+      version: 1
+      feeds:
+        - name: orders
+          ingest:
+            auth: { tokens: managed }
+          deliveries:
+            - name: archive
+              template: { id: orders-archive, version: 1 }
+    listen:
+      enabled: true
+      allowedHosts: [ingest.example.com]
+      ingress:
+        enabled: true
+        className: nginx
+        hosts:
+          - host: ingest.example.com
+            paths:
+              - path: /
+                pathType: Prefix
+
   templatesSync:
     enabled: true
     content:

@@ -86,8 +86,7 @@ The sidebar groups the pages: **Operate** (Overview, Runs, Changes, Triggers,
 Schedules, Feeds), **Data** (Datasets, Lineage), **Build** (Templates, Schemas,
 Submit), **Govern** (Policy, Usage, Tenants) and **Admin** (Audit log,
 Settings). Badges count running runs, pending change requests, datasets,
-templates, tenants and schedules. Feeds is marked *soon*: its page says what will
-live there and how to do it today.
+templates, tenants, schedules and feeds.
 
 - **Go to… / ⌘K** (Ctrl+K) opens a palette over pages, recent runs, datasets,
   templates, change requests, tenants and actions (submit a run, switch theme,
@@ -227,6 +226,58 @@ approval** under `--require-approval schedule`. Schedules from the
 `--schedules` file are read-only. With a tenant picked in the switcher the
 page shows the schedules that run for it, and its runs only. See
 [Schedules](/faucet-stream/cookbook/schedules/).
+
+### Feeds
+
+**Feeds** lists every feed, grouped into *Needs attention* (a stalled, failing
+or held delivery, a feed that refuses events, a store that does not answer),
+*Receiving* and *Delivery paused*, with the events of the last 24 hours, what
+is pending and the share of requests refused (`GET /v1/feeds`). With nothing
+selected the page names what needs attention and lists every delivery, most
+behind first. With **All tenants** picked an operator sees each tenant's feeds
+too; with one tenant picked, or as a tenant's own principal, the page shows
+that tenant's feeds and its quotas. The quotas card's rate line is the sum of
+the rate limits set on the tenant's feeds against its quota, not live traffic.
+
+A feed's page has six tabs:
+
+- **Overview**: the URL senders post to, how they sign in, what the feed
+  accepts, the last 24 hours (received, delivered, pending, refused), storage
+  (what is not delivered yet against the feed's limits, and the delivered
+  events kept for replay) and its deliveries.
+- **Deliveries**: one delivery's position (delivered to, newest event, behind,
+  replay from), its delivery guarantee (derived from its template), the
+  template, version and params it runs (secret ones as
+  *sealed*), when it flushes, and its recent runs with the events each read.
+  A failing delivery shows its failed runs and the size of the next run; a
+  stalled one names the event it cannot deliver, with **Try again now** and
+  **Skip this event…**.
+- **Events**: the stored events, newest first, with which deliveries have each.
+  Opening one shows its envelope and, for admins, its payload (recorded in the
+  audit log). A sealed feed's payloads are never shown.
+- **Refused**: the requests this server refused lately by reason, with status
+  and sender. Payloads of refused requests are never kept.
+- **Tokens**: the feed's tokens (never their text) with **New token** and
+  **Revoke**, and the signature check's settings.
+- **History**: the feed's changes, its tokens, every skipped range, and what
+  was done to its deliveries (pause, resume, deliver now, replay, skip,
+  recover), read from the audit log's most recent entries.
+
+Operators get **New**, **Edit**, **Add delivery**, **Pause** / **Resume**,
+**Deliver now** and **Send test event**; admins also get **Replay…**,
+**Skip events…**, **Recover…** and **Delete feed**. Replay and skip say how
+many events they move before you confirm, and deleting a feed with a run in
+flight is refused with a link to the run. A new token is shown once. Under
+`--require-approval feed` (or `run`, for a change that adds or edits a
+delivery) the form's button becomes **Request approval** and the page links
+to the change request. Feeds from the `--feeds` file are read-only.
+
+**Send test event** posts to the feed's own ingest URL from your browser with
+a feed token you paste; the console never keeps it. For a feed that checks a
+signature, or on a server whose ingest routes are on `--feeds-listen`, the
+dialog shows the `faucet feed send` and `curl` commands instead: the console
+never holds a feed's signing secret. See
+[Feeds](/faucet-stream/cookbook/feeds/).
 
 ### Submit
 

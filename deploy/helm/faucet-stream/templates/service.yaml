@@ -21,3 +21,28 @@ spec:
     {{- include "faucet-stream.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: serve
 {{- end }}
+{{- if include "faucet-stream.feedsListen" . }}
+---
+# The feed ingest listener (#1034): senders reach only the ingest routes.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "faucet-stream.fullname" . }}-feeds
+  labels:
+    {{- include "faucet-stream.labels" . | nindent 4 }}
+    app.kubernetes.io/component: feeds-ingest
+  {{- with .Values.serve.feeds.listen.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.serve.feeds.listen.service.type }}
+  ports:
+    - name: feeds
+      port: {{ .Values.serve.feeds.listen.service.port }}
+      targetPort: feeds
+      protocol: TCP
+  selector:
+    {{- include "faucet-stream.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: serve
+{{- end }}

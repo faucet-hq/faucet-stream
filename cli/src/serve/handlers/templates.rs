@@ -1452,6 +1452,14 @@ pub struct TriggerBody {
     /// those are held to the caller reference policy.
     #[serde(skip)]
     pub sender_params: std::collections::BTreeSet<String>,
+    /// Set (never from the wire) by the feed scheduler (#1034): the claimed
+    /// range the run's `feed` source reads.
+    #[serde(skip)]
+    pub feed: Option<crate::serve::history::feeds::RunFeedBinding>,
+    /// Set (never from the wire) by the feed scheduler: appended to the
+    /// config's pipeline name when it is loaded.
+    #[serde(skip)]
+    pub pipeline_name_suffix: Option<String>,
 }
 
 /// A trigger's `overlay`: a registered deployment id, or an inline document.
@@ -1586,10 +1594,13 @@ mod tests {
             "schedule",
             "schedule_tick",
             "schedule_manual",
+            "feed",
+            "feed_delivery",
+            "feed_claim",
         ] {
             assert!(super::RESERVED_LABELS.contains(&k), "{k}");
         }
-        assert_eq!(super::RESERVED_LABELS.len(), 12);
+        assert_eq!(super::RESERVED_LABELS.len(), 15);
     }
 
     /// The pre-#703 handler shape the tests were written against: a run, as

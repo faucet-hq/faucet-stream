@@ -310,6 +310,8 @@ async fn dispatch(cli: Cli) -> CliResult<()> {
         Command::Usage(args) => commands::usage::run(args).await,
         #[cfg(feature = "templates")]
         Command::Template(args) => commands::template::run(args).await,
+        #[cfg(feature = "feeds")]
+        Command::Feed(args) => commands::feed::run(args).await,
         Command::Completions(args) => commands::completions::run(args.shell),
         Command::Migrate(args) => commands::migrate::run(args).await,
         Command::Fmt(args) => commands::fmt::run(args).await,
@@ -494,6 +496,7 @@ pub async fn run_from_yaml_str_selected(
             usage: usage::UsageOptions::from_spec(cfg.usage.as_ref(), None)
                 .map_err(CliError::Config)?,
             budget: cfg.budget.clone(),
+            feed: Default::default(),
         },
     )
     .await

@@ -100,6 +100,31 @@ pub fn tool_defs(ctx: &McpContext) -> Vec<ToolDef> {
             }),
         });
     }
+    #[cfg(feature = "feeds")]
+    if feeds_reader(ctx).is_some() {
+        defs.push(ToolDef {
+            name: "list_feeds",
+            description: "List the server's feeds (durable event logs senders push into): status, stored events, what the last 24 hours brought, and each delivery with its position and pending events. Read-only.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "tenant": { "type": "string", "description": "Only this tenant's feeds (a tenant principal's own is implied)." }
+                }
+            }),
+        });
+        defs.push(ToolDef {
+            name: "get_feed",
+            description: "Show one feed: its definition (secrets as markers), deliveries with their positions and last runs, gaps, tokens (never their text) and change log. Read-only; event payloads are never returned.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Feed name." },
+                    "tenant": { "type": "string", "description": "The tenant the feed belongs to." }
+                },
+                "required": ["name"]
+            }),
+        });
+    }
     #[cfg(feature = "templates")]
     if ctx.templates.is_some() {
         defs.push(ToolDef {
@@ -321,6 +346,8 @@ pub async fn call_tool(ctx: &McpContext, name: &str, args: &Value) -> Value {
                     .to_string(),
             ),
         },
+        #[cfg(feature = "feeds")]
+        "list_feeds" | "get_feed" => feed_tool(ctx, name, args).await,
         #[cfg(feature = "templates")]
         "list_templates" => list_templates(ctx).await,
         #[cfg(feature = "templates")]
@@ -959,6 +986,45 @@ fn template_store(ctx: &McpContext) -> Result<&crate::templates::TemplateStore, 
     })
 }
 
+/// The server and caller the feed tools read as: only on a server
+/// transport, and only for a caller that may read feeds.
+#[cfg(feature = "feeds")]
+fn feeds_reader(ctx: &McpContext) -> Option<&crate::mcp::ChangeProposer> {
+    ctx.server.as_ref().filter(|s| {
+        s.actor
+            .role
+            .grants(crate::serve::rbac::Permission::FeedRead)
+    })
+}
+
+/// `list_feeds` / `get_feed`: what `GET /v1/feeds[/{name}]` answers, for
+/// the caller's tenant scope.
+#[cfg(feature = "feeds")]
+async fn feed_tool(ctx: &McpContext, tool: &str, args: &Value) -> Result<String, String> {
+    use crate::serve::feeds::service;
+    let server = feeds_reader(ctx).ok_or_else(|| {
+        format!("{tool} is only available on a server transport (faucet serve --mcp) to a caller that may read feeds")
+    })?;
+    let tenant = args.get("tenant").and_then(Value::as_str);
+    let message = |e: crate::serve::error::ServeError| e.api_error().error.message;
+    let out = if tool == "list_feeds" {
+        let list = service::overview(&server.state, &server.actor, tenant, Default::default())
+            .await
+            .map_err(message)?;
+        serde_json::to_string_pretty(&list)
+    } else {
+        let name = args
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or("get_feed needs `name`")?;
+        let feed = service::get(&server.state, &server.actor, tenant, name)
+            .await
+            .map_err(message)?;
+        serde_json::to_string_pretty(&feed)
+    };
+    out.map_err(|e| e.to_string())
+}
+
 #[cfg(feature = "templates")]
 async fn list_templates(ctx: &McpContext) -> Result<String, String> {
     let store = template_store(ctx)?;
@@ -1474,6 +1540,58 @@ async fn run_template_on_server(
 mod tests {
     use super::*;
     use crate::mcp::McpContext;
+
+    /// The feed tools exist only on a server transport, for a caller that
+    /// may read feeds, and answer in that caller's tenant scope.
+    #[cfg(feature = "feeds")]
+    #[tokio::test]
+    async fn the_feed_tools_read_feeds_as_the_caller() {
+        use crate::serve::rbac::{AuthContext, Role};
+        let names = |c: &McpContext| -> Vec<&'static str> {
+            tool_defs(c).into_iter().map(|t| t.name).collect()
+        };
+        let local = ctx(false);
+        assert!(!names(&local).contains(&"list_feeds"));
+        let refused = call_tool(&local, "list_feeds", &json!({})).await;
+        assert!(
+            refused["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("only available on a server transport")
+        );
+        let state = crate::serve::test_support::test_state();
+        let as_role = |role, tenant: Option<&str>| {
+            ctx(false).with_server(crate::mcp::ChangeProposer {
+                state: state.clone(),
+                actor: AuthContext {
+                    principal: "carol".into(),
+                    role,
+                    source_ip: None,
+                    tenant: tenant.map(str::to_string),
+                },
+            })
+        };
+        let viewer = as_role(Role::Viewer, None);
+        assert!(names(&viewer).contains(&"list_feeds") && names(&viewer).contains(&"get_feed"));
+        let listed = call_tool(&viewer, "list_feeds", &json!({})).await;
+        let text = listed["content"][0]["text"].as_str().unwrap();
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["feeds"], json!([]));
+        assert_eq!(body["stores"], json!(["default"]));
+        let missing = call_tool(&viewer, "get_feed", &json!({"name": "nope"})).await;
+        assert_eq!(missing["isError"], true, "{missing}");
+        let unnamed = call_tool(&viewer, "get_feed", &json!({})).await;
+        assert!(
+            unnamed["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("needs `name`")
+        );
+        // A tenant principal cannot look into another tenant.
+        let scoped = as_role(Role::Viewer, Some("acme"));
+        let other = call_tool(&scoped, "list_feeds", &json!({"tenant": "globex"})).await;
+        assert_eq!(other["isError"], true, "{other}");
+    }
 
     fn ctx(allow: bool) -> McpContext {
         McpContext::new(

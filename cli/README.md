@@ -349,9 +349,91 @@ Auth is mandatory: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** with
 | `--triggers <path>` | Path to a triggers file (YAML) defining event-driven watchers. Requires the `triggers` Cargo feature. See [Event-driven triggers](#event-driven-triggers-triggers). |
 | `--schedules <path>` | Path to a schedules file: registered templates to run on a cron, read-only in the console. Requires the `schedule` and `templates` features. See [Schedules](#schedules---schedules). |
 | `--tenant-schedule-min-interval-secs <n>` | Shortest gap between the ticks of a tenant-owned schedule (default and minimum 300: every schedule ticks at most every 5 minutes, and this flag can only raise the floor). |
+| `--feeds <path>` | Feeds file (YAML/JSON): event feeds senders push into and the deliveries that run pipelines over them. Read-only at runtime and wins over a stored feed of the same name. Needs a build with the `feeds` feature and a run history that survives a restart (refused with `--history memory`). Nothing feed-related runs until a feed exists. |
+| `--feed-store <name>=<url>` | Define a named feed store (`sqlite:<path>` or `postgres://…`; repeatable). The `default` store follows the run history: a `feeds.db` beside a SQLite history file, or the history's PostgreSQL database through its own connection pool. A SQLite store takes one server: a cluster is refused with one. |
+| `--tenant-delivery-min-interval-secs <n>` | Shortest gap allowed between two runs of a delivery of a tenant's feed (default `10`). |
+| `--feeds-listen <addr>` | Serve the feed ingest routes (`POST /v1/feeds/{name}/events`, `POST /v1/tenants/{tenant}/feeds/{name}/events`) and `/healthz` on their own listener, so senders reach nothing else; the main listener then serves no ingest route. Unset: the main listener serves them. |
+| `--feeds-allowed-host <host>` | A host name the feeds listener answers for (repeatable; `*` = any). Only with `--feeds-listen`. |
+| `--feeds-max-request-bytes <n>` | The largest ingest request body the server reads, whatever a feed's `ingest.max_request_bytes` says (default 64 MiB). |
+| `--feeds-request-timeout-secs <n>` | How long an ingest request may take to send its body (default `30`). |
+| `--feeds-max-concurrent-requests <n>` | Ingest requests handled at once (default `256`); past it senders get `503` with `Retry-After`. |
+
 | `--local-output-retention-days <n>` / `--local-output-in-flight-grace-secs <n>` | Retention GC for the local files a run's sinks wrote (jsonl/csv/parquet): the window (default `7`; `0` disables the sweep) and the mid-write guard (default `60`). Only files faucet recorded as its own sink outputs are ever deleted. Requires the `catalog` feature. |
 | `--preview-local-outputs` | Serve **dataset previews** of those local files — the console reads a tracked output's first N rows back (`FAUCET_SERVE_PREVIEW_LOCAL_OUTPUTS`). **Off by default**: it returns file contents over HTTP, so it is a local-testing convenience. Caps: `--preview-default-rows` (soft, default `500`) and `--preview-max-rows` (hard, default `5000`; a larger `row_count_to_load` — including `all` — is clamped to it). `--preview-max-rows 0` lifts the ceiling so `row_count_to_load=all` reads a whole dataset; the read is still bounded by a response-size budget and a deadline, and a partial answer names the bound that stopped it. |
 | `--body-limit-bytes`, `--shutdown-grace-secs`, `--retain-terminal-runs-secs`, `--idempotency-retention-secs`, `--probe-timeout-secs` | Tuning knobs. |
+
+#### Feeds (`--feeds`)
+
+Senders push events with the feed's own credential, never a serve token: a
+feed token (`Authorization: Bearer fdt_…`, or `?token=` when the feed sets
+`ingest.url_token`), an HMAC signature over the body, or both. One JSON
+value, a JSON array (one event per element) or NDJSON (one per line) per
+request; a request is all or nothing and is answered `202 {ids, first_seq,
+last_seq}` only after its events are stored. An unknown feed, a bad
+credential and a disallowed sender address get the same `401`. Feeds are
+managed under `/v1/feeds` (`FeedRead` viewer+, `FeedWrite` operator+,
+`FeedAdmin` admin: delete, replay, skip, recover, reading an event's
+payload), and `--require-approval feed` (or `run`, for a change that adds or
+edits a delivery) turns a feed change into a change request.
+
+`faucet feed` manages feeds straight in their stores, the way `faucet
+template` manages templates; point `--store` at the run history the server
+uses (a SQLite feed store takes one process at a time, so use it while the
+server is stopped, or use PostgreSQL):
+
+```bash
+faucet feed create -f feed.yaml --store sqlite:./history.db   # or: apply -f (create or replace)
+faucet feed list | show <feed> | delete <feed>
+faucet feed token create <feed> <name> [--expires-at <RFC 3339>] | token list <feed> | token revoke <feed> <id>
+faucet feed push <feed> [events.ndjson] [--content-type application/x-ndjson] [--dedupe-key K]
+faucet feed events <feed> [--before N | --from N] [--limit N]
+faucet feed tail <feed> [-n N] [--payload] [-f|--follow [--interval-secs N]]
+faucet feed stats <feed>
+faucet feed cursor <feed> [<delivery>]
+faucet feed pause|resume|deliver-now|recover <feed> <delivery>
+faucet feed replay <feed> <delivery> --to-seq N | --to-time <RFC 3339>
+faucet feed skip <feed> <delivery> [--to N] --reason "why"
+```
+
+`tail` prints the newest retained events oldest first (`--json`: one object
+per line; `--payload` adds each payload, never a sealed one's) and with
+`--follow` keeps printing events as they are stored, which needs a
+PostgreSQL feed store, since nothing else can write to a SQLite store while
+`tail` holds it. `stats` shows the feed's retained events and bytes, what the
+last 24 hours brought and each delivery's pending events. `cursor` shows where
+each delivery reads next (position, epoch, pending events, live claim, gaps);
+it is read-only, and `replay`, `skip` and `recover` are what move a position.
+
+`faucet feed send` is the one verb that talks to a running server: it posts
+a file or stdin to the feed's ingest URL the way a sender does, so the
+feed's credential, limits, rate limit and tenant quota all apply (`push`
+writes to the store directly and skips them). It takes no `--store`:
+
+```bash
+FEED_TOKEN=fdt_… faucet feed send --url https://faucet.example.com/v1/feeds/orders/events \
+  --token-env FEED_TOKEN -f events.ndjson --content-type application/x-ndjson [--gzip]
+FEED_SECRET=… faucet feed send --url … --signature-secret-env FEED_SECRET \
+  --signature-header X-Signature [--signature-prefix sha256=] \
+  [--signature-timestamp-header X-Timestamp] [--signature-algorithm sha256|sha512] \
+  [--signature-encoding hex|base64] < event.json
+```
+
+The token (`--token-env`, or `--token`) and the signing secret are never
+printed or logged; `--header NAME=VALUE` adds a header such as the feed's
+dedupe header, and a refusal exits non-zero with the server's status and
+message. The ingest route also accepts `Content-Encoding: gzip` from any
+sender: the signature covers the bytes as sent and the feed's size limits
+apply to the expanded body.
+
+Every store verb takes `--json`, `--tenant <id>`, `--vault-key` (for a feed with
+a signature secret, secret delivery params or sealed events),
+`--feed-store NAME=URL` and `--feeds <file>`. A feed of the server's `--feeds`
+file is found only when the same file is passed here: then it can be shown,
+pushed to, given tokens, and its deliveries paused, resumed, replayed,
+skipped or recovered. `create`, `apply` and `delete` refuse a file feed: it
+changes in the file. `faucet schema feed` prints the schema of one feed
+definition, `faucet schema feeds` that of the `--feeds` file
+(`cli/examples/feeds/feeds.yaml`).
 
 #### Schedules (`--schedules`)
 

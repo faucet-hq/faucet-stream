@@ -26,6 +26,7 @@ const ALL = [
   "run_write", "config_submit", "doctor", "dlq_manage", "rollback", "catalog_annotate", "template_admin", "local_output_manage", "audit_read", "reload",
   "change_request", "change_approve", "status_read", "state_admin",
   "tenant_admin", "connection_manage", "schedule_write", "plan", "policy_admin",
+  "feed_write", "feed_admin",
 ];
 
 function applyStyle() {

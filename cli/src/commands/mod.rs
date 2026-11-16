@@ -16,6 +16,8 @@ pub mod discover;
 pub mod dlq;
 pub mod doctor;
 pub mod explain;
+#[cfg(feature = "feeds")]
+pub mod feed;
 pub mod fmt;
 #[cfg(feature = "catalog")]
 pub mod history;

@@ -17,7 +17,7 @@ const DECIDED = ["executed", "rejected", "failed", "invalidated", "expired"];
 const RING = { pending: ["warn", "hollow"], approved: ["info", "half"], executed: ["ok", ""], rejected: ["bad", ""], failed: ["bad", ""], invalidated: ["bad", ""], expired: ["", "hollow"] };
 const TONE = { pending: "warn", approved: "info", executed: "ok", rejected: "bad", failed: "bad", invalidated: "bad", expired: "" };
 const PILL_ICON = { executed: "check", rejected: "x", failed: "x", invalidated: "x", approved: "play" };
-const KIND = { run: "run", template_register: "template register", template_launch: "template launch", template_delete: "template delete", template_deprecate: "template deprecate", policy_update: "policy update", tenant_policy_update: "tenant policy" };
+const KIND = { run: "run", template_register: "template register", template_launch: "template launch", template_delete: "template delete", template_deprecate: "template deprecate", policy_update: "policy update", tenant_policy_update: "tenant policy", schedule: "schedule", feed: "feed" };
 const isPolicy = (c) => c.kind === "policy_update" || c.kind === "tenant_policy_update";
 
 /** A policy diff, unchanged stretches folded to one marker line. */
@@ -72,6 +72,12 @@ export function summaryText(c) {
     const v = s.version ?? s.next_version ?? "?";
     return s.restores != null ? `Roll back ${who} to v${s.restores} (as v${v})` : `Update ${who} to v${v}`;
   }
+  if (c.kind === "feed" || c.kind === "schedule") {
+    const p = c.payload || {};
+    const verb = { create: "Create", update: "Change", delete: "Delete" }[p.action] || "Change";
+    const n = c.kind === "feed" && p.action !== "delete" ? ((p.spec || {}).deliveries || []).length : 0;
+    return `${verb} ${c.kind} ${p.tenant ? `${p.tenant}/` : ""}${p.name || s.name || "?"}${n ? ` · ${n} ${n === 1 ? "delivery" : "deliveries"}` : ""}`;
+  }
   return c.kind;
 }
 
@@ -120,6 +126,14 @@ function planDiff(c) {
   } else if (isPolicy(c)) {
     lines.push(...foldDiff(s.diff || []));
     return { lines, note: policyImpactNote(c) };
+  } else if (c.kind === "feed") {
+    const p = c.payload || {};
+    const spec = p.spec || {};
+    const op = p.action === "delete" ? "-" : "+";
+    lines.push([op, `feed: ${p.tenant ? `${p.tenant}/` : ""}${p.name || "?"}`]);
+    for (const d of spec.deliveries || []) lines.push(["+", `delivery ${d.name}: ${d.template ? `${d.template.id} @ ${/^\d+$/.test(String(d.template.version)) ? `pin v${d.template.version}` : d.template.version || "stable"}` : d.pipeline || "?"}`]);
+    if (p.action === "delete") lines.push([" ", "  its stored events are removed with it"]);
+    return { lines, note: p.action === "delete" ? "" : "Each delivery’s runs go through the same admission, budgets and audit as any other run." };
   }
   for (const r of plan.rows || []) {
     lines.push([" ", `row ${r.row || "?"} · ${r.source || "?"} → ${r.sink || "?"}`]);

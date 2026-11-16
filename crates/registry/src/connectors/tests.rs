@@ -56,6 +56,35 @@ fn a_webhook_that_answers_after_commit_consumes_destructively() {
     ));
 }
 
+#[cfg(feature = "source-feed")]
+#[test]
+fn the_feed_source_is_a_resuming_delta_that_cannot_be_read_twice() {
+    let standalone = json!({
+        "feed": "orders",
+        "delivery": "warehouse",
+        "store": {"type": "sqlite", "config": {"path": "./feeds.db"}}
+    });
+    for config in [json!({}), standalone.clone()] {
+        assert!(source_kind_consumes_destructively("feed", &config));
+        assert!(source_resumes_from_bookmark("feed", &config));
+        assert!(source_reads_a_delta("feed", &config));
+        let caps = source_capabilities("feed", &config);
+        assert!(caps.exactly_once() && caps.read_side_effects());
+        assert!(!caps.discover() && !caps.shardable());
+    }
+    assert!(FIRST_PARTY_SOURCES.contains(&"feed"));
+    validate_source_config("feed", "in", standalone).unwrap();
+    validate_source_config("feed", "in", json!({})).unwrap();
+    let err = validate_source_config("feed", "in", json!({"page_events": 0}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("page_events"), "{err}");
+    let err = validate_source_config("feed", "in", json!({"feeds": "orders"}))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("feeds"), "{err}");
+}
+
 #[test]
 fn bookmark_schema_and_migration_per_source_kind() {
     assert_eq!(source_state_schema("csv"), 0);
@@ -916,6 +945,7 @@ fn builtin_kind_capabilities_are_pinned() {
         ("mongodb-cdc", true, false),
         ("oracle-cdc", true, false),
         ("kafka", true, false),
+        ("feed", true, false),
         ("postgres", false, true),
         ("oracle", false, true),
         ("iceberg", false, true),

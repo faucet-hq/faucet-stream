@@ -102,14 +102,68 @@
 {{- if and .Values.serve.cluster.previousKeys (not .Values.serve.cluster.vaultKey.existingSecret) -}}
 {{- fail "serve.cluster.previousKeys needs serve.cluster.vaultKey.existingSecret: previous keys only open values sealed under an earlier key." -}}
 {{- end -}}
+{{- /* Feeds (#1034). `faucet serve` refuses the same combinations at startup
+       (serve/feeds/stores.rs `check_config`, serve/config.rs `FeedSettings`). */ -}}
+{{- $feeds := .Values.serve.feeds -}}
+{{- if and $feeds.enabled (not (include "faucet-stream.durableHistory" .)) -}}
+{{- fail "serve.feeds.enabled=true requires a run history that survives a restart: feed definitions live in the run history and the default feed store (feeds.db) sits beside it, so with memory the server refuses to start with a feeds file, and with sqlite on an emptyDir every restart loses the events senders were told are stored. Set serve.history.backend to postgres, or keep sqlite with serve.persistence.enabled (or serve.persistence.existingClaim)." -}}
+{{- end -}}
+{{- $storeNames := dict -}}
+{{- range $i, $s := $feeds.stores -}}
+{{- if not (and (kindIs "map" $s) $s.name) -}}
+{{- fail (printf "serve.feeds.stores[%d] needs a name." $i) -}}
+{{- end -}}
+{{- if not (regexMatch "^[a-z0-9][a-z0-9_-]{0,63}$" (toString $s.name)) -}}
+{{- fail (printf "serve.feeds.stores[%d]: invalid store name %q — use 1-64 lowercase letters, digits, `-` or `_`, starting with a letter or digit." $i (toString $s.name)) -}}
+{{- end -}}
+{{- if eq (toString $s.name) "default" -}}
+{{- fail "serve.feeds.stores: `default` follows the run history and cannot be redefined; give the store another name." -}}
+{{- end -}}
+{{- if hasKey $storeNames (toString $s.name) -}}
+{{- fail (printf "serve.feeds.stores: store %q is defined twice." (toString $s.name)) -}}
+{{- end -}}
+{{- $_ := set $storeNames (toString $s.name) true -}}
+{{- if and $s.url $s.existingSecret -}}
+{{- fail (printf "serve.feeds.stores[%d] (%s): set url or existingSecret, not both." $i $s.name) -}}
+{{- end -}}
+{{- if not (or $s.url $s.existingSecret) -}}
+{{- fail (printf "serve.feeds.stores[%d] (%s) needs url (sqlite:<path>) or existingSecret (a Secret holding the URL)." $i $s.name) -}}
+{{- end -}}
+{{- if and $s.url (or (hasPrefix "postgres://" (toString $s.url)) (hasPrefix "postgresql://" (toString $s.url))) -}}
+{{- fail (printf "serve.feeds.stores[%d] (%s): a PostgreSQL URL carries a password and would sit in the pod spec; put it in a Secret and set existingSecret (and existingSecretKey)." $i $s.name) -}}
+{{- end -}}
+{{- if and $s.url (not (hasPrefix "sqlite:" (toString $s.url))) -}}
+{{- fail (printf "serve.feeds.stores[%d] (%s): url must be sqlite:<path> (got %q); a PostgreSQL URL goes in existingSecret." $i $s.name (toString $s.url)) -}}
+{{- end -}}
+{{- if and $s.url (or $.Values.serve.cluster.enabled $multi) -}}
+{{- fail (printf "serve.feeds.stores[%d] (%s) is a SQLite file, which only one server may use; with serve.cluster.enabled or several replicas a feed store must be PostgreSQL (existingSecret holding a postgres:// URL)." $i $s.name) -}}
+{{- end -}}
+{{- end -}}
+{{- range list (list "maxRequestBytes" $feeds.maxRequestBytes) (list "requestTimeoutSecs" $feeds.requestTimeoutSecs) (list "maxConcurrentRequests" $feeds.maxConcurrentRequests) -}}
+{{- if and (not (kindIs "invalid" (index . 1))) (le (int64 (index . 1)) 0) -}}
+{{- fail (printf "serve.feeds.%s must be greater than 0 (got %v); leave it null for the server default." (index . 0) (index . 1)) -}}
+{{- end -}}
+{{- end -}}
+{{- if lt (int64 .Values.serve.tenantDeliveryMinIntervalSecs) 0 -}}
+{{- fail (printf "serve.tenantDeliveryMinIntervalSecs must not be negative (got %v)." .Values.serve.tenantDeliveryMinIntervalSecs) -}}
+{{- end -}}
+{{- if and $feeds.listen.allowedHosts (not $feeds.listen.enabled) -}}
+{{- fail "serve.feeds.listen.allowedHosts only applies with serve.feeds.listen.enabled=true; the main listener's hosts are serve.allowedHosts." -}}
+{{- end -}}
+{{- if and $feeds.listen.ingress.enabled (not $feeds.listen.enabled) -}}
+{{- fail "serve.feeds.listen.ingress.enabled=true requires serve.feeds.listen.enabled=true: the ingest Ingress routes to the ingest listener's Service." -}}
+{{- end -}}
+{{- if and $feeds.listen.enabled (eq (int $feeds.listen.port) 8080) -}}
+{{- fail "serve.feeds.listen.port must differ from the control API's port (8080)." -}}
+{{- end -}}
 {{- if and .Values.serve.connectProviders.enabled (not .Values.serve.tenants.enabled) -}}
 {{- fail "serve.connectProviders.enabled=true requires serve.tenants.enabled=true: a hosted OAuth connect stores the grant as a tenant connection sealed with the vault key." -}}
 {{- end -}}
 {{- range .Values.serve.approvals.require -}}
-{{- if not (has . (list "run" "template_register" "template-register" "template_launch" "template-launch")) -}}
-{{- fail (printf "serve.approvals.require: unknown change kind %q (expected run, template_register or template_launch)." .) -}}
+{{- if not (has . (list "run" "template_register" "template-register" "template_launch" "template-launch" "schedule" "feed")) -}}
+{{- fail (printf "serve.approvals.require: unknown change kind %q (expected run, template_register, template_launch, schedule or feed)." .) -}}
 {{- end -}}
-{{- if and $.Values.serve.templatesSync.enabled (ne . "run") -}}
+{{- if and $.Values.serve.templatesSync.enabled (hasPrefix "template" .) -}}
 {{- fail (printf "serve.approvals.require=%s cannot be combined with serve.templatesSync.enabled: template sync registers and launches templates on its own schedule, which would bypass the approval (faucet serve refuses to start). Drop one of the two." .) -}}
 {{- end -}}
 {{- end -}}

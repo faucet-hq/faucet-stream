@@ -92,6 +92,87 @@ impl StateScope {
     }
 }
 
+/// How a `feed` source of a run reads (#1034).
+#[derive(Clone, Default)]
+pub enum FeedRun {
+    /// Not a server run (`faucet run`): the source opens the store its own
+    /// config names and takes its own claim.
+    #[default]
+    Standalone,
+    /// A server run that is not a feed delivery: a `feed` source is refused.
+    Refused,
+    /// A feed delivery: the source reads the claimed range through this
+    /// handle, scoped over the run's task.
+    #[cfg(feature = "source-feed")]
+    Delivery(Box<faucet_common_feed::FeedExecution>),
+}
+
+impl std::fmt::Debug for FeedRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            FeedRun::Standalone => "standalone",
+            FeedRun::Refused => "refused",
+            #[cfg(feature = "source-feed")]
+            FeedRun::Delivery(_) => "delivery",
+        })
+    }
+}
+
+/// The connector kind of the `feed` source.
+pub const FEED_KIND: &str = "feed";
+
+/// Hold a run to its [`FeedRun`]: an ordinary server run has no `feed`
+/// source, and a delivery run is exactly one root row reading the feed.
+fn check_feed_rows(nodes: &[ExpandedNode], opts: &ExecuteOptions) -> CliResult<()> {
+    let reads_feed = |n: &ExpandedNode| n.source.kind == FEED_KIND && n.source_override.is_none();
+    match &opts.feed {
+        FeedRun::Standalone => Ok(()),
+        FeedRun::Refused => match nodes.iter().find(|n| reads_feed(n)) {
+            Some(n) => Err(CliError::Config(format!(
+                "row '{}': a `feed` source runs only as a delivery of a feed, which binds it to \
+                 a claimed range of events; this run is not one",
+                n.id
+            ))),
+            None => Ok(()),
+        },
+        #[cfg(feature = "source-feed")]
+        FeedRun::Delivery(_) => {
+            let refuse = |why: &str| {
+                Err(CliError::Config(format!(
+                    "a feed delivery runs one pipeline row that reads the feed: {why}"
+                )))
+            };
+            let [node] = nodes else {
+                return refuse(&format!("this config has {} rows", nodes.len()));
+            };
+            if !reads_feed(node) {
+                return refuse(&format!("row '{}' reads `{}`", node.id, node.source.kind));
+            }
+            if !matches!(node.role, NodeRole::Root) {
+                return refuse(&format!(
+                    "row '{}' has a `parent`, a `fan_out` or is a discovery row",
+                    node.id
+                ));
+            }
+            if node.cleanup_scope.is_some() {
+                return refuse(&format!("row '{}' declares `complete_for`", node.id));
+            }
+            if opts.shard.is_some() {
+                return refuse("the run is sharded");
+            }
+            for field in ["feed", "delivery", "store"] {
+                if node.source.config.get(field).is_some_and(|v| !v.is_null()) {
+                    return refuse(&format!(
+                        "row '{}' sets the source's `{field}`, which the server supplies",
+                        node.id
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Knobs passed to [`run_expanded`].
 pub struct ExecuteOptions {
     /// Store bookmarks bare instead of in the versioned envelope (#736): a
@@ -191,6 +272,10 @@ pub struct ExecuteOptions {
     /// request — the stricter winning). `allowed_sinks` is checked before
     /// anything runs; the others by a sink decorator per invocation.
     pub budget: Option<faucet_core::BudgetSpec>,
+    /// How a `feed` source of this run reads (#1034). Only the server's
+    /// governed options set it; every other caller leaves the default, under
+    /// which the source runs standalone.
+    pub feed: FeedRun,
     /// Shared OpenLineage emitter, built once from the `lineage:` block. `None`
     /// disables lineage (and adds zero overhead). Gated on the `lineage` feature.
     #[cfg(feature = "lineage")]
@@ -280,6 +365,10 @@ pub enum InvocationErrorKind {
     /// [`CliError::LeaseHeld`] — another run holds the row's live run lease.
     /// Orchestrators fail the whole run on it rather than retrying the unit.
     LeaseHeld,
+    /// The `feed` source held its delivery: an admin has to recover it.
+    FeedHeld,
+    /// The `feed` source lost its range claim and stopped before committing.
+    FeedClaimLost,
     /// The invocation never ran because its parent or a `depends_on` row
     /// failed or was skipped.
     Skipped,
@@ -427,6 +516,14 @@ pub fn classify_error(err: &CliError) -> InvocationErrorKind {
         CliError::Faucet(FaucetError::BudgetExceeded { .. })
         | CliError::BudgetSinkNotAllowed { .. } => InvocationErrorKind::BudgetExceeded,
         CliError::LeaseHeld(_) => InvocationErrorKind::LeaseHeld,
+        #[cfg(feature = "source-feed")]
+        CliError::Faucet(e) => match faucet_source_feed::FeedSourceError::of(e) {
+            Some(faucet_source_feed::FeedSourceError::Held { .. }) => InvocationErrorKind::FeedHeld,
+            Some(faucet_source_feed::FeedSourceError::ClaimLost { .. }) => {
+                InvocationErrorKind::FeedClaimLost
+            }
+            _ => InvocationErrorKind::Other,
+        },
         _ => InvocationErrorKind::Other,
     }
 }
@@ -576,9 +673,32 @@ pub fn run_expanded_boxed(
 }
 
 pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> CliResult<RunSummary> {
+    check_feed_rows(&nodes, &opts)?;
+    #[cfg(feature = "source-feed")]
+    if let FeedRun::Delivery(execution) = &opts.feed {
+        let execution = (**execution).clone();
+        return faucet_common_feed::scope(
+            execution,
+            Box::pin(run_expanded_unredacted(nodes, opts)),
+        )
+        .await
+        .map(redact_summary);
+    }
     run_expanded_unredacted(nodes, opts)
         .await
         .map(redact_summary)
+}
+
+/// `fut` under the feed handle of the current task (#1034), for a unit
+/// spawned onto its own task.
+#[cfg(feature = "source-feed")]
+fn inherit_feed<F: std::future::Future>(fut: F) -> impl std::future::Future<Output = F::Output> {
+    faucet_common_feed::inherit(fut)
+}
+
+#[cfg(not(feature = "source-feed"))]
+fn inherit_feed<F: std::future::Future>(fut: F) -> F {
+    fut
 }
 
 /// Redact every invocation error where it is created (#874), before any
@@ -1191,21 +1311,25 @@ async fn run_expanded_unredacted(
                         untrusted,
                         faucet_core::http::inherit_reference_policy(STATE_STORES.scope(
                             state_stores,
-                            DLQ_SINKS.scope(dlq_sinks, async move {
-                                let _permit = sem.acquire().await.expect("semaphore not closed");
-                                run_unit(
-                                    &unit,
-                                    capture,
-                                    &captured,
-                                    &discovered,
-                                    &collected,
-                                    &opts2,
-                                    unit_cancel,
-                                    suppress_overwrite,
-                                    overwrite_grouped,
-                                )
-                                .await
-                            }),
+                            DLQ_SINKS.scope(
+                                dlq_sinks,
+                                inherit_feed(Box::pin(async move {
+                                    let _permit =
+                                        sem.acquire().await.expect("semaphore not closed");
+                                    run_unit(
+                                        &unit,
+                                        capture,
+                                        &captured,
+                                        &discovered,
+                                        &collected,
+                                        &opts2,
+                                        unit_cancel,
+                                        suppress_overwrite,
+                                        overwrite_grouped,
+                                    )
+                                    .await
+                                })),
+                            ),
                         )),
                     )
                     .in_current_span(),
@@ -4885,6 +5009,7 @@ impl ExecuteOptions {
             catalog: None,
             usage: Default::default(),
             budget: None,
+            feed: Default::default(),
         }
     }
 }
@@ -5534,6 +5659,7 @@ mod tests {
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                feed: Default::default(),
             },
         )
         .await
@@ -5582,6 +5708,7 @@ mod tests {
             catalog: None,
             usage: Default::default(),
             budget: None,
+            feed: Default::default(),
         }
     }
 
@@ -6306,6 +6433,7 @@ matrix:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                feed: Default::default(),
             },
         )
         .await
@@ -6572,6 +6700,7 @@ matrix:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                feed: Default::default(),
             },
         )
         .await
@@ -6823,6 +6952,7 @@ execution:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                feed: Default::default(),
             },
         )
         .await
@@ -6968,6 +7098,7 @@ pipeline:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                feed: Default::default(),
             },
         )
         .await
@@ -7039,6 +7170,7 @@ matrix:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                feed: Default::default(),
             },
         )
         .await
@@ -7124,6 +7256,7 @@ execution:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                feed: Default::default(),
             },
         )
         .await
@@ -7205,6 +7338,7 @@ matrix:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                feed: Default::default(),
             },
         )
         .await
@@ -7499,6 +7633,7 @@ matrix:
             catalog: None,
             usage: Default::default(),
             budget: None,
+            feed: Default::default(),
         }
     }
 
@@ -8681,6 +8816,7 @@ matrix:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                feed: Default::default(),
             },
         )
         .await

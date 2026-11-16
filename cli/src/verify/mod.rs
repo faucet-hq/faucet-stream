@@ -950,6 +950,7 @@ async fn run_repair(
             catalog: None,
             usage: Default::default(),
             budget: guards.budget.clone(),
+            feed: Default::default(),
         },
     )
     .await?;

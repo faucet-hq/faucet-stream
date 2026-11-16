@@ -47,6 +47,7 @@ fn opts(name: &str, cfg: &PipelineConfig) -> ExecuteOptions {
         catalog: None,
         usage: Default::default(),
         budget: None,
+        feed: Default::default(),
     }
 }
 

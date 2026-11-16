@@ -3,7 +3,7 @@ title: "Connector catalog"
 description: "faucet-stream ships 43 sources and 35 sinks. Each is a Cargo feature (source- / sink-) and an independently published crate. Full API docs are on docs.rs."
 ---
 
-faucet-stream ships **<!--COUNT:sources-->43<!--/COUNT--> sources** and **<!--COUNT:sinks-->35<!--/COUNT--> sinks**. Each is a Cargo feature
+faucet-stream ships **<!--COUNT:sources-->44<!--/COUNT--> sources** and **<!--COUNT:sinks-->35<!--/COUNT--> sinks**. Each is a Cargo feature
 (`source-<name>` / `sink-<name>`) and an independently published crate. Full API
 docs are on [docs.rs](https://docs.rs/faucet-stream).
 
@@ -60,6 +60,7 @@ connector's config schema and advertised capabilities; that tier shows in
 | MongoDB CDC | T1 ✅ | `source-mongodb-cdc` | ✓ | ✓ | **✓** | ✗ | ✗ | Change Streams, resumeToken bookmarks; `max_staged_records` buffer cap |
 | Redis | T1 ✅ | `source-redis` | ✓ | ✗ | ✗ | ✗ | ✗ | streams, lists, key patterns |
 | Webhook | T2 | `source-webhook` | ✗⁶ | ✗ | ✗ | ✗ | ✗ | temporary HTTP server collecting POSTs; answers each sender once its event is written (`ack: on_commit`) |
+| Feed | T1 ✅ | `source-feed` | ✓ | ✓ | **✓** | ✗ | ✗ | delivers the events a durable feed store (SQLite or PostgreSQL) holds for one delivery, in order; one page per run by default; the delivery's cursor moves only after the page is written, flushed and bookmarked. Under `faucet serve` it is the source of a [feed](/faucet-stream/cookbook/feeds/) delivery |
 | WebSocket | T1 ✅ | `source-websocket` | ✓ | ✗ | ✗ | ✗ | ✗ | live push feed; subscribe frames, reconnect, ping keepalive |
 | CSV *(deprecated: use `file`)* | T1 ✅ | `source-csv` | ✓ | ✗ | ✗ | ✓ | ✗ | CSV files as JSON; strict field count by default (`flexible: true` to tolerate ragged rows). For new configs prefer the file source |
 | Local files | T1 ✅ | `source-file` | ✓ | ✓ | ✗ | ✓ | ✓ | [file source](/faucet-stream/cookbook/file-formats/#the-local-file-source): a path, directory, glob or `http(s)://` URL; JSONL / JSON / CSV / Excel / XML / Parquet / Avro / ORC, format + compression resolved per file; incremental by mtime or name; hash-of-path sharding; Avro / ORC / Parquet join the columnar path |

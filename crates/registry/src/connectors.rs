@@ -691,6 +691,12 @@ async fn build_source_inner(
             cfg.validate()?;
             Ok(Box::new(faucet_source_webhook::WebhookSource::new(cfg)))
         }
+        #[cfg(feature = "source-feed")]
+        "feed" => {
+            let cfg = decode::<faucet_source_feed::FeedSourceConfig>("source", "feed", config)?;
+            cfg.validate()?;
+            Ok(Box::new(faucet_source_feed::FeedSource::new(cfg)))
+        }
         #[cfg(feature = "source-websocket")]
         "websocket" => {
             let cfg = decode::<faucet_source_websocket::WebsocketSourceConfig>(
@@ -1432,7 +1438,7 @@ pub fn source_kind_consumes_destructively(kind: &str, config: &Value) -> bool {
 /// incremental `replication_method`, a SQL source's `replication: { type:
 /// incremental }`, the file source's `incremental:` block,
 /// an incremental Iceberg / DynamoDB-streams read, a change-stream / log
-/// source, or a Singer tap (handed its stored STATE). A full refresh (`write_mode: overwrite`) from such a source would
+/// source, a feed delivery (it reads from its cursor), or a Singer tap (handed its stored STATE). A full refresh (`write_mode: overwrite`) from such a source would
 /// replace the destination with only the delta (#789 CLI-20).
 pub fn source_resumes_from_bookmark(kind: &str, config: &Value) -> bool {
     let incremental_method = match config.get("replication_method") {
@@ -1450,7 +1456,7 @@ pub fn source_resumes_from_bookmark(kind: &str, config: &Value) -> bool {
         || (kind == "iceberg" && mode == Some("incremental"))
         || (kind == "dynamodb" && mode == Some("streams"))
         || kind.ends_with("-cdc")
-        || matches!(kind, "kafka" | "kinesis" | "singer")
+        || matches!(kind, "feed" | "kafka" | "kinesis" | "singer")
 }
 
 /// Whether a source reads only what arrived since its last run whatever the
@@ -1541,6 +1547,7 @@ pub const FIRST_PARTY_SOURCES: &[&str] = &[
     "duckdb",
     "dynamodb",
     "elasticsearch",
+    "feed",
     "file",
     "gcs",
     "graphql",
@@ -1837,6 +1844,8 @@ fn builtin_source_descriptor(kind: &str) -> Option<ConnectorDescriptor> {
         "redis" => Some(faucet_source_redis::DESCRIPTOR),
         #[cfg(feature = "source-webhook")]
         "webhook" => Some(faucet_source_webhook::DESCRIPTOR),
+        #[cfg(feature = "source-feed")]
+        "feed" => Some(faucet_source_feed::DESCRIPTOR),
         #[cfg(feature = "source-websocket")]
         "websocket" => Some(faucet_source_websocket::DESCRIPTOR),
         #[cfg(feature = "source-csv")]
@@ -2384,6 +2393,12 @@ pub fn validate_source_config(kind: &str, name: &str, config: Value) -> Registry
             config,
             |c| c.validate(),
         ),
+        #[cfg(feature = "source-feed")]
+        "feed" => {
+            check_with::<faucet_source_feed::FeedSourceConfig, _, _>("feed", name, config, |c| {
+                c.validate()
+            })
+        }
         #[cfg(feature = "source-websocket")]
         "websocket" => check_with::<faucet_source_websocket::WebsocketSourceConfig, _, _>(
             "websocket",
@@ -2919,6 +2934,8 @@ pub fn source_schema(kind: &str) -> RegistryResult<Value> {
         "redis" => Ok(schema::<faucet_source_redis::RedisSourceConfig>()),
         #[cfg(feature = "source-webhook")]
         "webhook" => Ok(schema::<faucet_source_webhook::WebhookSourceConfig>()),
+        #[cfg(feature = "source-feed")]
+        "feed" => Ok(schema::<faucet_source_feed::FeedSourceConfig>()),
         #[cfg(feature = "source-websocket")]
         "websocket" => Ok(schema::<faucet_source_websocket::WebsocketSourceConfig>()),
         #[cfg(feature = "source-csv")]
@@ -3166,6 +3183,11 @@ pub fn builtin_source_descriptions() -> Vec<(&'static str, &'static str)> {
     v.push(("redis", "Redis (streams, lists, keys) source"));
     #[cfg(feature = "source-webhook")]
     v.push(("webhook", "Webhook HTTP receiver source"));
+    #[cfg(feature = "source-feed")]
+    v.push((
+        "feed",
+        "Feed source — delivers the events a durable feed store holds for one delivery, in order",
+    ));
     #[cfg(feature = "source-websocket")]
     v.push((
         "websocket",

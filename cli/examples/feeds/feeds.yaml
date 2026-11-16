@@ -1,0 +1,50 @@
+# Feeds for `faucet serve --feeds cli/examples/feeds/feeds.yaml`.
+#
+# A feed is a durable log senders push events into over HTTP:
+#   POST /v1/feeds/orders/events        (a feed token, a signature, or both)
+# Each delivery runs a pipeline over the feed with its own position, once
+# its flush policy is met. Feeds in this file are read-only at runtime;
+# feeds made through the API or `faucet feed` live in the run history.
+#
+# `faucet feed` finds this file's feeds when it is given the file too
+# (`--feeds`), beside the run history the server uses (`--store`). The file
+# is loaded as the server loads it, so ORDERS_HMAC_SECRET must be set.
+# Issue a token for a feed (the text is shown once):
+#   faucet feed token create orders shop --feeds cli/examples/feeds/feeds.yaml --store sqlite:./history.db
+# Push a test event without a sender, straight into the store:
+#   echo '{"id": 1}' | faucet feed push orders --feeds cli/examples/feeds/feeds.yaml --store sqlite:./history.db
+# Or post it to the running server as a sender does:
+#   echo '{"id": 1}' | faucet feed send --url http://127.0.0.1:8080/v1/feeds/orders/events \
+#     --token-env ORDERS_TOKEN --signature-secret-env ORDERS_HMAC_SECRET \
+#     --signature-header X-Signature --signature-prefix sha256=
+version: 1
+feeds:
+  - name: orders
+    description: Order events from the shop
+    ingest:
+      auth:
+        tokens: managed                   # write-only tokens, stored hashed
+        signature:                        # and an HMAC over the body
+          header: X-Signature
+          secret: "${env:ORDERS_HMAC_SECRET}"
+          prefix: "sha256="
+      accept: [application/json, application/x-ndjson]
+      max_event_bytes: 256KiB
+      dedupe: { header: X-Event-Id, window: 24h }   # a retried event is stored once
+      rate_limit: { events_per_sec: 200, burst: 1000 }
+    retention:
+      max_age: 7d                         # how long delivered events stay replayable
+      undelivered: { max_age: 30d, max_bytes: 5GiB }   # past these the feed refuses new events
+      warn_at: [0.5, 0.8]
+    deliveries:
+      - name: archive
+        pipeline: orders_to_jsonl.yaml    # relative to this file; its source is `type: feed`
+        flush: { max_events: 5000, max_bytes: 64MiB, max_age: 60s, min_interval: 10s }
+        max_batch: { events: 10000, bytes: 64MiB }
+        start: earliest
+        retries: 5
+
+  - name: clicks
+    ingest:
+      auth: { tokens: managed }
+      url_token: true                     # for senders that can only be given a URL

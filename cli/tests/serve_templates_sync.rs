@@ -59,6 +59,7 @@ fn args(port: u16, sync: Option<std::path::PathBuf>) -> ServeArgs {
         cluster_max_attempts: 3,
         triggers: None,
         schedules: Default::default(),
+        feeds: Default::default(),
         templates_sync: sync,
         policy: None,
         policy_store: Default::default(),

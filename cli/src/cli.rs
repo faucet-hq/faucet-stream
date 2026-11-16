@@ -227,6 +227,11 @@ pub enum Command {
     /// store URL and templates registered here are triggerable over HTTP.
     #[cfg(feature = "templates")]
     Template(TemplateArgs),
+    /// Manage feeds (durable event logs senders push into) straight in their
+    /// stores: definitions, deliveries, positions, tokens and events. Point
+    /// `--store` at the run history `faucet serve` uses.
+    #[cfg(feature = "feeds")]
+    Feed(FeedArgs),
     /// Generate a shell tab-completion script (bash / zsh / fish / powershell /
     /// elvish). For registry- and config-aware *dynamic* completion, enable the
     /// `COMPLETE` hook instead, e.g. `source <(COMPLETE=zsh faucet)`.
@@ -594,6 +599,235 @@ pub struct CatalogLineageArgs {
     /// BFS hop bound around --root.
     #[arg(long, default_value_t = 5)]
     pub depth: u32,
+}
+
+/// `faucet feed` arguments (#1034).
+#[cfg(feature = "feeds")]
+#[derive(Debug, Parser)]
+pub struct FeedArgs {
+    #[command(subcommand)]
+    pub command: FeedCommand,
+    /// The run history the server keeps its feeds in: `sqlite:<path>` or
+    /// `postgres://…`. The feed store follows it (a `feeds.db` beside a
+    /// SQLite history, or the same PostgreSQL database).
+    #[arg(
+        long,
+        global = true,
+        value_name = "URL",
+        env = "FAUCET_FEED_STORE",
+        hide_env_values = true
+    )]
+    pub store: Option<String>,
+    /// A named feed store a feed may use: `NAME=sqlite:<path>` or
+    /// `NAME=postgres://…` (repeatable), as given to `faucet serve`.
+    #[arg(long = "feed-store", global = true, value_name = "NAME=URL")]
+    pub feed_store: Vec<String>,
+    /// The feeds file the server runs with (`faucet serve --feeds`), so its
+    /// feeds can be read, pushed to, given tokens and have their deliveries
+    /// paused, replayed, skipped or recovered. A file feed is changed by
+    /// editing the file: `create`, `apply` and `delete` refuse one.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub feeds: Option<PathBuf>,
+    /// The server's vault key: needed for a feed with a signature secret,
+    /// secret delivery params or sealed events.
+    #[arg(long, global = true, env = "FAUCET_VAULT_KEY", hide_env_values = true)]
+    pub vault_key: Option<String>,
+    /// The tenant whose feeds are meant.
+    #[arg(long, global = true)]
+    pub tenant: Option<String>,
+    /// Print JSON.
+    #[arg(long, global = true)]
+    pub json: bool,
+}
+
+/// `faucet feed` subcommands.
+#[cfg(feature = "feeds")]
+#[derive(Debug, Subcommand)]
+pub enum FeedCommand {
+    /// List feeds with their status, size and pending events.
+    List,
+    /// Show one feed: deliveries and their positions, gaps, tokens.
+    Show { name: String },
+    /// Create a feed from a definition file (YAML or JSON; `-` = stdin).
+    Create {
+        #[arg(short = 'f', long, value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Create the feed a definition file names, or replace it when it exists.
+    Apply {
+        #[arg(short = 'f', long, value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Delete a feed with its events, positions and tokens.
+    Delete { name: String },
+    /// Pause a delivery: it keeps its position and starts no runs.
+    Pause {
+        name: String,
+        delivery: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Resume a delivery and clear a stall.
+    Resume { name: String, delivery: String },
+    /// Have a server start the delivery's next run without waiting for its
+    /// flush policy.
+    DeliverNow { name: String, delivery: String },
+    /// Move a delivery back to deliver retained events again.
+    Replay {
+        name: String,
+        delivery: String,
+        /// The event to deliver next.
+        #[arg(long, value_name = "SEQ")]
+        to_seq: Option<u64>,
+        /// The first event stored at or after this time (RFC 3339).
+        #[arg(long, value_name = "TIME")]
+        to_time: Option<String>,
+    },
+    /// Move a delivery forward past events that will not be delivered,
+    /// leaving a gap that names them.
+    Skip {
+        name: String,
+        delivery: String,
+        /// The next event to read (default: one event past the position).
+        #[arg(long, value_name = "SEQ")]
+        to: Option<u64>,
+        /// Why; kept with the gap.
+        #[arg(long)]
+        reason: String,
+    },
+    /// Put a held delivery back on a valid position after its store was
+    /// restored from a backup.
+    Recover { name: String, delivery: String },
+    /// List a feed's retained events (never their payloads), newest first.
+    Events {
+        name: String,
+        #[arg(long)]
+        before: Option<u64>,
+        #[arg(long)]
+        from: Option<u64>,
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+    /// Append events from a file or stdin straight to the feed's store, with
+    /// the checks, dedupe and sealing the ingest route applies. An operator
+    /// tool: no sender credential, rate limit or tenant quota applies.
+    Push {
+        name: String,
+        /// The body: one JSON value, a JSON array or NDJSON (`-` or omitted
+        /// = stdin).
+        file: Option<PathBuf>,
+        #[arg(long, default_value = "application/json")]
+        content_type: String,
+        /// The value the feed's dedupe header would carry.
+        #[arg(long)]
+        dedupe_key: Option<String>,
+    },
+    /// Print a feed's newest retained events, oldest first; with `--follow`
+    /// keep printing events as they are stored (on a PostgreSQL feed store:
+    /// nothing else can write to a SQLite store while this runs).
+    Tail {
+        name: String,
+        /// How many of the newest events to start with (at most 200).
+        #[arg(short = 'n', long, default_value_t = 10, value_name = "N")]
+        lines: u64,
+        /// Keep running and print each new event.
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// How often `--follow` looks for new events.
+        #[arg(long, default_value_t = 2, value_name = "SECS")]
+        interval_secs: u64,
+        /// Print each event's payload too (never a sealed event's).
+        #[arg(long)]
+        payload: bool,
+    },
+    /// A feed's size and what the last 24 hours brought, with each delivery's
+    /// backlog.
+    Stats { name: String },
+    /// Where each delivery of a feed reads next: its position, epoch,
+    /// pending events, live claim and gaps. Read-only; `replay`, `skip` and
+    /// `recover` move a position.
+    Cursor {
+        name: String,
+        /// Only this delivery.
+        delivery: Option<String>,
+    },
+    /// Post events to a running server's ingest route over HTTP, as a sender
+    /// does: with the feed's token, its signature, or both. Needs no
+    /// `--store`.
+    Send(Box<FeedSendArgs>),
+    /// Issue, list and revoke the feed's ingest tokens.
+    #[command(subcommand)]
+    Token(FeedTokenCommand),
+}
+
+/// `faucet feed send` arguments.
+#[cfg(feature = "feeds")]
+#[derive(Debug, clap::Args)]
+pub struct FeedSendArgs {
+    /// The feed's ingest URL, e.g.
+    /// `https://faucet.example.com/v1/feeds/orders/events`.
+    #[arg(long, value_name = "URL")]
+    pub url: String,
+    /// The body: one JSON value, a JSON array or NDJSON (`-` or omitted =
+    /// stdin).
+    #[arg(short = 'f', long, value_name = "FILE")]
+    pub file: Option<PathBuf>,
+    #[arg(long, default_value = "application/json")]
+    pub content_type: String,
+    /// The feed token. Prefer `--token-env`: an argument is visible to other
+    /// processes on the host.
+    #[arg(long, value_name = "TOKEN", conflicts_with = "token_env")]
+    pub token: Option<String>,
+    /// The environment variable that holds the feed token.
+    #[arg(long, value_name = "VAR")]
+    pub token_env: Option<String>,
+    /// The environment variable that holds the feed's signing secret; the
+    /// body is signed as the feed's `ingest.auth.signature` describes.
+    #[arg(long, value_name = "VAR", requires = "signature_header")]
+    pub signature_secret_env: Option<String>,
+    /// The header the feed reads the signature from.
+    #[arg(long, value_name = "NAME", requires = "signature_secret_env")]
+    pub signature_header: Option<String>,
+    /// `sha256` or `sha512`.
+    #[arg(long, default_value = "sha256", value_name = "ALGORITHM")]
+    pub signature_algorithm: String,
+    /// `hex` or `base64`.
+    #[arg(long, default_value = "hex", value_name = "ENCODING")]
+    pub signature_encoding: String,
+    /// Text the feed expects before the digest (e.g. `sha256=`).
+    #[arg(long, value_name = "TEXT")]
+    pub signature_prefix: Option<String>,
+    /// The header that carries the signed Unix-seconds timestamp, when the
+    /// feed sets one.
+    #[arg(long, value_name = "NAME")]
+    pub signature_timestamp_header: Option<String>,
+    /// Another request header, e.g. the feed's dedupe header (repeatable).
+    #[arg(long = "header", value_name = "NAME=VALUE")]
+    pub headers: Vec<String>,
+    /// Send the body gzip-compressed.
+    #[arg(long)]
+    pub gzip: bool,
+    /// How long the request may take.
+    #[arg(long, default_value_t = 30, value_name = "SECS")]
+    pub timeout_secs: u64,
+}
+
+/// `faucet feed token` subcommands.
+#[cfg(feature = "feeds")]
+#[derive(Debug, Subcommand)]
+pub enum FeedTokenCommand {
+    /// Issue a token; its text is printed once.
+    Create {
+        name: String,
+        token_name: String,
+        /// When it stops working (RFC 3339).
+        #[arg(long, value_name = "TIME")]
+        expires_at: Option<String>,
+    },
+    /// List the feed's tokens (never their text).
+    List { name: String },
+    /// Revoke a token by its id.
+    Revoke { name: String, id: String },
 }
 
 /// `faucet template` arguments (#444).
@@ -1088,7 +1322,7 @@ pub struct NotifyTestArgs {
     /// `run_failure`, `run_success`, `sla_breach`, `circuit_open`,
     /// `contract_abort`, `dlq_threshold`, `scheduler_stuck`, `profile_drift`,
     /// `change_requested`, `budget_exceeded`, `connection_needs_reauth`,
-    /// `log_export_failed`.
+    /// `log_export_failed`, `feed_near_full`, `feed_stalled`.
     #[arg(long, default_value = "run_failure")]
     pub event: String,
     /// Leave the PagerDuty incident a failure-class test event opens. By
@@ -2098,6 +2332,65 @@ impl Default for ServeScheduleArgs {
     }
 }
 
+/// `faucet serve` feeds (#1034).
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone, clap::Args)]
+pub struct ServeFeedArgs {
+    /// Path to a feeds file (YAML/JSON): event feeds senders push into and
+    /// the deliveries that run pipelines over them, read-only at runtime
+    /// (feeds made through the API are stored in the run history). Requires a
+    /// build with the `feeds` feature and a run history that survives a
+    /// restart.
+    #[arg(long, value_name = "PATH")]
+    pub feeds: Option<std::path::PathBuf>,
+    /// Define a named feed store: `NAME=sqlite:<path>` or
+    /// `NAME=postgres://…` (repeatable). The `default` store follows the run
+    /// history: a `feeds.db` beside a SQLite history file, or the history's
+    /// PostgreSQL database.
+    #[arg(long = "feed-store", value_name = "NAME=URL")]
+    pub feed_store: Vec<String>,
+    /// The shortest gap allowed between two runs of a delivery of a tenant's
+    /// feed (seconds), so one tenant cannot flood the server.
+    #[arg(long, default_value_t = 10)]
+    pub tenant_delivery_min_interval_secs: u64,
+    /// Serve the feed ingest routes (`POST /v1/feeds/{name}/events` and the
+    /// tenant form) on their own listener, with `/healthz`, so senders reach
+    /// only them; the main listener then serves no ingest route. Unset: the
+    /// main listener serves them.
+    #[arg(long, value_name = "ADDR", env = "FAUCET_SERVE_FEEDS_LISTEN")]
+    pub feeds_listen: Option<String>,
+    /// A host name the feeds listener answers for (repeatable; `*` = any).
+    /// Without one it answers for any host.
+    #[arg(long = "feeds-allowed-host", value_name = "HOST")]
+    pub feeds_allowed_host: Vec<String>,
+    /// The largest ingest request body the server reads, whatever a feed's
+    /// `ingest.max_request_bytes` says. Default 64 MiB.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    pub feeds_max_request_bytes: u64,
+    /// How long an ingest request may take to send its body (seconds).
+    #[arg(long, default_value_t = 30)]
+    pub feeds_request_timeout_secs: u64,
+    /// Ingest requests handled at once; past it senders get 503 and retry.
+    #[arg(long, default_value_t = 256)]
+    pub feeds_max_concurrent_requests: usize,
+}
+
+#[cfg(feature = "serve")]
+impl Default for ServeFeedArgs {
+    fn default() -> Self {
+        Self {
+            feeds: None,
+            feed_store: Vec::new(),
+            tenant_delivery_min_interval_secs: 10,
+            feeds_listen: None,
+            feeds_allowed_host: Vec::new(),
+            feeds_max_request_bytes: 64 * 1024 * 1024,
+            feeds_request_timeout_secs: 30,
+            feeds_max_concurrent_requests: 256,
+        }
+    }
+}
+
 /// `faucet serve` log-shipping buffer bounds (#806).
 #[cfg(feature = "serve")]
 #[derive(Debug, Clone, clap::Args)]
@@ -2488,6 +2781,8 @@ pub struct ServeArgs {
     pub triggers: Option<std::path::PathBuf>,
     #[command(flatten)]
     pub schedules: ServeScheduleArgs,
+    #[command(flatten)]
+    pub feeds: ServeFeedArgs,
     /// Path to a template-sync file (YAML/JSON) listing remote origins to pull
     /// pipeline templates from (GitHub / S3 / GCS / Azure Blob). Pulled on
     /// start, on `POST /v1/templates/sync`, and on each origin's
@@ -2518,8 +2813,10 @@ pub struct ServeArgs {
     /// with a pending change request instead of a run; backfills are
     /// refused), `template_register`, `template_launch`, `template_delete`,
     /// `template_deprecate` (the last two are also gated by
-    /// `template_launch`). Repeatable or comma-separated. Who may approve is
-    /// the `approvals:` block of `--auth-config`.
+    /// `template_launch`), `schedule`, `feed` (creating, editing or deleting
+    /// a feed or one of its deliveries; under `run`, a feed change that adds
+    /// or edits a delivery is gated too). Repeatable or comma-separated. Who
+    /// may approve is the `approvals:` block of `--auth-config`.
     #[arg(long = "require-approval", value_name = "KIND")]
     pub require_approval: Vec<String>,
     /// How long a pending change request stays approvable (seconds) when the
@@ -3169,6 +3466,13 @@ pub enum SchemaTarget {
     /// templates run on a cron schedule).
     #[cfg(all(feature = "schedule", feature = "templates"))]
     Schedules,
+    /// JSON Schema for one feed definition (`faucet feed create -f`, the
+    /// body of `POST /v1/feeds`).
+    #[cfg(feature = "feeds")]
+    Feed,
+    /// JSON Schema for the `faucet serve --feeds` file.
+    #[cfg(feature = "feeds")]
+    Feeds,
     /// JSON Schema for the `notifications:` (incident-routing) block.
     #[cfg(feature = "notify")]
     Notifications,

@@ -27,6 +27,7 @@ fn invocation(ms: u64, rows: Option<faucet_core::RowAccountsSnapshot>) -> Invoca
         rows,
         skipped: false,
         status: None,
+        feed_error: None,
     }
 }
 

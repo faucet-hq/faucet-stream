@@ -128,6 +128,7 @@ mod tests {
             rows: None,
             skipped: false,
             status: None,
+            feed_error: None,
         }
     }
 

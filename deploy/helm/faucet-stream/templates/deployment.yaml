@@ -109,6 +109,31 @@ spec:
             {{- with .Values.serve.cluster.poolWaitTimeoutSecs }}
             - --pool-wait-timeout-secs={{ . }}
             {{- end }}
+            {{- if ne (toString .Values.serve.tenantDeliveryMinIntervalSecs) "10" }}
+            - --tenant-delivery-min-interval-secs={{ .Values.serve.tenantDeliveryMinIntervalSecs }}
+            {{- end }}
+            {{- range .Values.serve.feeds.stores }}
+            {{- if .existingSecret }}
+            - --feed-store={{ .name }}=$({{ include "faucet-stream.feedStoreEnv" .name }})
+            {{- else }}
+            - --feed-store={{ .name }}={{ .url }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.serve.feeds.maxRequestBytes }}
+            - --feeds-max-request-bytes={{ int64 . }}
+            {{- end }}
+            {{- with .Values.serve.feeds.requestTimeoutSecs }}
+            - --feeds-request-timeout-secs={{ int64 . }}
+            {{- end }}
+            {{- with .Values.serve.feeds.maxConcurrentRequests }}
+            - --feeds-max-concurrent-requests={{ int64 . }}
+            {{- end }}
+            {{- if .Values.serve.feeds.listen.enabled }}
+            - --feeds-listen=0.0.0.0:{{ .Values.serve.feeds.listen.port }}
+            {{- range .Values.serve.feeds.listen.allowedHosts }}
+            - --feeds-allowed-host={{ . }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.pipelineConfig.create }}
             - --default-config={{ include "faucet-stream.configFilePath" . }}
             {{- end }}
@@ -146,6 +171,11 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            {{- if .Values.serve.feeds.listen.enabled }}
+            - name: feeds
+              containerPort: {{ .Values.serve.feeds.listen.port }}
+              protocol: TCP
+            {{- end }}
           env:
             # Retention window for local sink outputs (#587). Passed as env rather
             # than a flag so it can be overridden per environment without
@@ -217,11 +247,23 @@ spec:
               value: {{ . | quote }}
             {{- end }}
             {{- end }}
+            {{- range .Values.serve.feeds.stores }}
+            {{- if .existingSecret }}
+            # A named feed store's URL, read from a Secret (#1034).
+            - name: {{ include "faucet-stream.feedStoreEnv" .name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .existingSecret }}
+                  key: {{ .existingSecretKey | default "url" }}
+            {{- end }}
+            {{- end }}
             {{- $vault := dict }}
             {{- if .Values.serve.tenants.enabled }}
             {{- $vault = dict "key" .Values.serve.tenants.vaultKey "previous" .Values.serve.tenants.previousKeys }}
             {{- else if and .Values.serve.cluster.enabled .Values.serve.cluster.vaultKey.existingSecret }}
             {{- $vault = dict "key" .Values.serve.cluster.vaultKey "previous" .Values.serve.cluster.previousKeys }}
+            {{- else if .Values.serve.feeds.vaultKey.existingSecret }}
+            {{- $vault = dict "key" .Values.serve.feeds.vaultKey "previous" (list) }}
             {{- end }}
             {{- with $vault }}
             - name: FAUCET_VAULT_KEY

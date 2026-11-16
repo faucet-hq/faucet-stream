@@ -1025,6 +1025,629 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
         "403": { description: Principal's role lacks the required permission }
         "422": { $ref: "#/components/responses/Error" }
+  /v1/feeds:
+    get:
+      summary: List feeds
+      description: >
+        Every feed this principal may see (#1034): feeds made through the API
+        (kept in the run history) and those of the `--feeds` file (read-only),
+        each with its store position, its deliveries and their status, and what
+        the last 24 hours brought (`events_24h`, `bytes_24h`, `last_event_at`).
+        With a tenant, the tenant's quotas too. `ingest_on_api` is `false` when
+        `--feeds-listen` serves the ingest routes on another listener.
+        Each feed carries `retained_bytes` (every retained event, the
+        delivered ones kept for replay included) and `undelivered_bytes`
+        (what its slowest delivery has not delivered yet, which is what the
+        undelivered limit and `undelivered_ratio` count), and `warnings`
+        when its definition has a weakness worth knowing (a signature with
+        no `timestamp_header` and no dedupe key). A delivery's `status` is
+        `ok`, `failing`, `stalled`, `held`, `paused`, `needs_approval` or
+        `setting_up` (defined, but the store has no position for it yet).
+        The list is read from the server's definitions snapshot (at most a
+        few seconds old) and is ordered by tenant and name. `tenant=*` lists
+        the server's feeds and every tenant's in one call for a principal
+        that is not confined to a tenant (a tenant principal still gets its
+        own). Pages hold `limit` feeds (default 200, at most 1000); pass
+        `next` back as `after` for the following page.
+        Requires `FeedRead` (viewer+).
+      operationId: listFeeds
+      parameters:
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feeds are meant (operators; a tenant principal's own is implied). `*`: the server's feeds and every tenant's." }
+        - { name: after, in: query, required: false, schema: { type: string }, description: "The `next` of the page before." }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 200 } }
+      responses:
+        "200":
+          description: "`{feeds, quotas?, stores, ingest_on_api, approval, next?}`."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+    post:
+      summary: Create a feed
+      description: >
+        Creates a feed. A signature secret and secret delivery params are stored
+        sealed with the server's vault key. A delivery names a registered template
+        whose source is `type: feed`. Under `--require-approval feed`, or
+        `--require-approval run` when the feed has a delivery, the answer is 202
+        with a pending change request (kind `feed`). Refused with `--history
+        memory`. Requires `FeedWrite` (operator+); audited as `feed.create`.
+      operationId: createFeed
+      parameters:
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+        - { name: reason, in: query, required: false, schema: { type: string }, description: "Kept on the change request when the change needs approval." }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, description: "A feed definition: `name`, `ingest`, `retention`, `seal`, `deliveries` (`faucet schema feed`)." }
+      responses:
+        "201":
+          description: "The feed."
+          content:
+            application/json:
+              schema: { type: object }
+        "202":
+          description: "The change needs approval: `{status: pending_approval, change_id, change}`."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/feeds/{name}:
+    get:
+      summary: Read a feed
+      description: >
+        One feed with its deliveries, gaps, tokens (never their text) and change
+        log, who made it (`created_by`, `created_at`; absent for a `--feeds`
+        file feed) and `hourly_24h`, the retained events stored in each of the
+        last 24 hours, oldest first. Each delivery carries `guarantee`, the
+        delivery guarantee derived from its template as `faucet validate`
+        derives it (`at-least-once`, `effectively-once (…)`, or `unknown`),
+        `undelivered_bytes` (payload bytes from its own position on; absent
+        when the store cannot count them), `last_delivered_at` (when a run
+        last moved its position) and, while it waits out a back-off,
+        `next_run_at` (no run starts before it).
+        `changes` merges the definition's change log with what the audit log
+        records for its deliveries (pause, resume, deliver now, replay, skip,
+        recover; from the most recent audit entries), newest first. Secrets
+        show as markers. Requires `FeedRead` (viewer+).
+      operationId: getFeed
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+      responses:
+        "200":
+          description: "The feed."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+    put:
+      summary: Replace a feed
+      description: >
+        Replaces a stored feed's definition; the name, the tenant and the store
+        stay, and a delivery keeps its position by its name. Send `"$sealed"` /
+        `{"$sealed": true}` to keep a stored secret. A `--feeds` file feed is
+        read-only (409). Gated like a create when it adds or edits a delivery.
+        Requires `FeedWrite` (operator+); audited as `feed.update`.
+      operationId: updateFeed
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+        - { name: reason, in: query, required: false, schema: { type: string }, description: "Kept on the change request when the change needs approval." }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: "The feed."
+          content:
+            application/json:
+              schema: { type: object }
+        "202":
+          description: "The change needs approval: `{status: pending_approval, change_id, change}`."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Delete a feed
+      description: >
+        Deletes a stored feed with its tokens, events, positions and each
+        delivery's state. While a delivery has a run in flight the answer is 409
+        and `error.details.runs` names each delivery and run id. The feed is
+        gone for its users when this answers; a removal that a crash or a
+        store failure interrupts is finished by any server's scheduler, and
+        the name answers 409 to a create until then. Requires
+        `FeedAdmin` (admin); audited as `feed.delete`.
+      operationId: deleteFeed
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+        - { name: reason, in: query, required: false, schema: { type: string }, description: "Kept on the change request when the change needs approval." }
+      responses:
+        "204": { description: Deleted. }
+        "202":
+          description: "The change needs approval: `{status: pending_approval, change_id, change}`."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/feeds/{name}/deliveries:
+    post:
+      summary: Add a delivery
+      description: >
+        Adds a delivery to a stored feed (409 when the name is taken). Gated as a
+        feed change under `--require-approval feed` or `run`. Requires
+        `FeedWrite` (operator+); audited as `feed.delivery_set`.
+      operationId: createFeedDelivery
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+        - { name: reason, in: query, required: false, schema: { type: string }, description: "Kept on the change request when the change needs approval." }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, description: "A delivery: `name`, `template`, `flush`, `max_batch`, `start`, …" }
+      responses:
+        "201":
+          description: "The feed."
+          content:
+            application/json:
+              schema: { type: object }
+        "202":
+          description: "The change needs approval: `{status: pending_approval, change_id, change}`."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/feeds/{name}/deliveries/{delivery}:
+    put:
+      summary: Replace a delivery
+      description: >
+        Replaces one delivery; it keeps its position. Requires `FeedWrite`
+        (operator+); audited as `feed.delivery_set`.
+      operationId: updateFeedDelivery
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: delivery, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+        - { name: reason, in: query, required: false, schema: { type: string }, description: "Kept on the change request when the change needs approval." }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: "The feed."
+          content:
+            application/json:
+              schema: { type: object }
+        "202":
+          description: "The change needs approval: `{status: pending_approval, change_id, change}`."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Remove a delivery
+      description: >
+        Removes a delivery with its position and state. 409 with
+        `error.details.runs` while its run is in flight. Requires `FeedWrite`
+        (operator+); audited as `feed.delivery_delete`.
+      operationId: deleteFeedDelivery
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: delivery, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+        - { name: reason, in: query, required: false, schema: { type: string }, description: "Kept on the change request when the change needs approval." }
+      responses:
+        "200":
+          description: "The feed."
+          content:
+            application/json:
+              schema: { type: object }
+        "202":
+          description: "The change needs approval: `{status: pending_approval, change_id, change}`."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /v1/feeds/{name}/deliveries/{delivery}/pause:
+    post:
+      summary: Pause a delivery
+      description: >
+        It keeps its position and starts no runs; an optional `{reason}` is shown with it.
+        Requires `FeedWrite` (operator+); audited as `feed.pause`.
+      operationId: pauseFeedDelivery
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: delivery, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+      responses:
+        "200":
+          description: "The feed, or `{from, to, epoch}` for a move."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/feeds/{name}/deliveries/{delivery}/resume:
+    post:
+      summary: Resume a delivery
+      description: >
+        Clears a pause, a stall and its failure counts. 409 for a delivery paused in its definition, or one whose runs wait for an approved change.
+        Requires `FeedWrite` (operator+); audited as `feed.resume`.
+      operationId: resumeFeedDelivery
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: delivery, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+      responses:
+        "200":
+          description: "The feed, or `{from, to, epoch}` for a move."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/feeds/{name}/deliveries/{delivery}/deliver-now:
+    post:
+      summary: Deliver now
+      description: >
+        Starts a run for whatever is undelivered without waiting for the flush policy.
+        Requires `FeedWrite` (operator+); audited as `feed.deliver_now`.
+      operationId: deliverFeedNow
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: delivery, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+      responses:
+        "200":
+          description: "The feed, or `{from, to, epoch}` for a move."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/feeds/{name}/deliveries/{delivery}/replay:
+    post:
+      summary: Replay a delivery
+      description: >
+        Moves the delivery back to `{seq}` or `{time}` (exactly one) to deliver retained events again. 409 while its run is in flight.
+        Requires `FeedAdmin` (admin); audited as `feed.replay`.
+      operationId: replayFeedDelivery
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: delivery, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: "The feed, or `{from, to, epoch}` for a move."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/feeds/{name}/deliveries/{delivery}/skip:
+    post:
+      summary: Skip events
+      description: >
+        Moves the delivery forward to `{to}` (default: one event) and records a gap with the required `{reason}`. 409 while its run is in flight.
+        Requires `FeedAdmin` (admin); audited as `feed.skip`.
+      operationId: skipFeedDelivery
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: delivery, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: "The feed, or `{from, to, epoch}` for a move."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/feeds/{name}/deliveries/{delivery}/recover:
+    post:
+      summary: Recover a held delivery
+      description: >
+        After a store restore: puts the position back inside the feed, starts a new epoch and records a gap.
+        Requires `FeedAdmin` (admin); audited as `feed.recover`.
+      operationId: recoverFeedDelivery
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: delivery, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+      responses:
+        "200":
+          description: "The feed, or `{from, to, epoch}` for a move."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/feeds/{name}/tokens:
+    get:
+      summary: List a feed's tokens
+      description: >
+        The feed's ingest tokens: name, prefix, creation, expiry, revocation and
+        last use. Never the token or its hash. Requires `FeedRead` (viewer+).
+      operationId: listFeedTokens
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+      responses:
+        "200":
+          description: "The tokens."
+          content:
+            application/json:
+              schema: { type: array, items: { type: object } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+    post:
+      summary: Issue a feed token
+      description: >
+        Issues a write-only ingest token (`{name, expires_at?}`). Its text is in
+        the answer's `token` once and is never stored. Requires `FeedWrite`
+        (operator+); audited as `feed.token_create`.
+      operationId: createFeedToken
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [name], properties: { name: { type: string }, expires_at: { type: string, format: date-time } } }
+      responses:
+        "201":
+          description: "The token, with its text in `token`."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /v1/feeds/{name}/tokens/{id}:
+    delete:
+      summary: Revoke a feed token
+      description: >
+        Revokes a token: every server refuses it within one refresh (5 seconds).
+        Requires `FeedWrite` (operator+); audited as `feed.token_revoke`.
+      operationId: revokeFeedToken
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+      responses:
+        "200":
+          description: "The token."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/feeds/{name}/events:
+    get:
+      summary: Browse a feed's events
+      description: >
+        A page of retained events without their payloads, newest first: number,
+        id, times, content type, size, kept headers and which deliveries have
+        delivered each. `before` pages back; `from` lists forward instead, and
+        `at` lists forward from the first event stored at or after that time.
+        Requires `FeedRead` (viewer+).
+      operationId: listFeedEvents
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+        - { name: before, in: query, required: false, schema: { type: integer } }
+        - { name: from, in: query, required: false, schema: { type: integer } }
+        - { name: at, in: query, required: false, schema: { type: string, format: date-time }, description: "List from the first event stored at or after this time on; `from` wins when both are given." }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 50, maximum: 200 } }
+      responses:
+        "200":
+          description: "`{events, oldest, watermark, next_before?}`."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+    post:
+      summary: Push events into a feed
+      description: >
+        The ingest route. It is outside the API's auth: the credential is the
+        feed's own token (`Authorization: Bearer`, or `?token=` when the feed
+        allows it), its HMAC signature over the body, or both; a serve token is
+        not accepted. One JSON value, a JSON array (one event per element) or
+        NDJSON (one per line); text, a form or bytes are one event. A request is
+        all or nothing, and `202 {ids, first_seq, last_seq}` is sent only after
+        the events are stored. `duplicate` / `duplicates` report events already
+        stored under their dedupe key (409 when the feed asks for it). An unknown
+        feed, a bad credential and a disallowed sender address get the same 401.
+        With `--feeds-listen` only that listener serves this route. A body may be
+        sent with `Content-Encoding: gzip`: the signature is checked over the
+        bytes as sent, the body is then expanded, and the request and event size
+        limits apply to the expanded bytes (413 once the expansion passes the
+        request limit; 400 when it is not valid gzip). Any other encoding is 415.
+      operationId: pushFeedEvents
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: {} }
+          application/x-ndjson: { schema: { type: string } }
+          text/plain: { schema: { type: string } }
+      responses:
+        "202":
+          description: "Stored."
+          content:
+            application/json:
+              schema: { type: object }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "408": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "415": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/feeds/{name}/events/{seq}:
+    get:
+      summary: Read one event
+      description: >
+        One retained event with its payload (`payload`, `payload_encoding`:
+        `utf8` or `base64`). A sealed event's payload is never returned
+        (`payload_withheld: sealed`). Requires `FeedAdmin` (admin); audited as
+        `feed.events_read`.
+      operationId: getFeedEvent
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: seq, in: path, required: true, schema: { type: integer } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+      responses:
+        "200":
+          description: "The event."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/feeds/{name}/refusals:
+    get:
+      summary: List refused requests
+      description: >
+        The ingest requests of this feed that this server refused lately, newest
+        first: time, reason, status, sender address and message. Kept in memory
+        per server (at most 200 per feed) and lost when it restarts: `scope` is
+        always `this_server`, and behind several replicas each answers with the
+        requests it refused itself (the `faucet_feed_ingest_refused_total`
+        metric counts them across replicas). A feed's `refused_recent` is the
+        same per-server count. Payloads and credentials are never kept.
+        Requires `FeedRead` (viewer+).
+      operationId: listFeedRefusals
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+        - { name: limit, in: query, required: false, schema: { type: integer } }
+      responses:
+        "200":
+          description: "`{scope, refusals}`."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [scope, refusals]
+                properties:
+                  scope: { type: string, enum: [this_server] }
+                  refusals:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        at: { type: string, format: date-time }
+                        reason: { type: string }
+                        status: { type: integer }
+                        sender: { type: string }
+                        detail: { type: string }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/tenants/{tenant}/feeds/{name}/events:
+    post:
+      summary: Push events into a tenant's feed
+      description: >
+        The ingest route of a tenant's feed; see `POST /v1/feeds/{name}/events`.
+        The tenant's `max_feed_events_per_sec` and `max_feed_bytes` apply.
+      operationId: pushTenantFeedEvents
+      parameters:
+        - { name: tenant, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: {} }
+      responses:
+        "202":
+          description: "Stored."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
   /v1/policy:
     get:
       summary: The data-flow policy in force
@@ -1648,7 +2271,7 @@ paths:
       security: [{ bearerAuth: [] }]
       parameters:
         - { name: status, in: query, required: false, schema: { type: string, enum: [pending, approved, rejected, executed, expired, invalidated, failed] } }
-        - { name: kind, in: query, required: false, schema: { type: string, enum: [run, template_register, template_launch, template_delete, template_deprecate, policy_update, tenant_policy_update] } }
+        - { name: kind, in: query, required: false, schema: { type: string, enum: [run, template_register, template_launch, template_delete, template_deprecate, schedule, feed, policy_update, tenant_policy_update] } }
         - { name: requester, in: query, required: false, schema: { type: string } }
         - { name: tenant, in: query, required: false, schema: { type: string }, description: "Only requests for this tenant (#709); forced for a tenant-scoped principal." }
         - { name: limit, in: query, required: false, schema: { type: integer, default: 200, maximum: 2000 } }
@@ -1672,7 +2295,7 @@ paths:
       operationId: countChanges
       security: [{ bearerAuth: [] }]
       parameters:
-        - { name: kind, in: query, required: false, schema: { type: string, enum: [run, template_register, template_launch, template_delete, template_deprecate, policy_update, tenant_policy_update] } }
+        - { name: kind, in: query, required: false, schema: { type: string, enum: [run, template_register, template_launch, template_delete, template_deprecate, schedule, feed, policy_update, tenant_policy_update] } }
         - { name: requester, in: query, required: false, schema: { type: string } }
         - { name: tenant, in: query, required: false, schema: { type: string }, description: "Only requests for this tenant (#709); forced for a tenant-scoped principal." }
       responses:
@@ -3397,6 +4020,16 @@ paths:
                       properties:
                         name: { type: string }
                         healthy: { type: boolean, description: "false when the watcher is in error backoff." }
+                  feeds:
+                    type: object
+                    nullable: true
+                    description: "Feeds (#1034); null in a build without the `feeds` feature. It never makes the server unready: a store problem holds deliveries while runs and the API keep working."
+                    properties:
+                      started: { type: boolean, description: "Whether this server runs the feed scheduler (it starts when the first feed exists)." }
+                      store_ok: { type: boolean, description: "false when a feed store could not be opened or read on the last pass." }
+                      feeds: { type: integer }
+                      stalled: { type: array, items: { type: string }, description: "`<feed>/<delivery>` of every stalled delivery." }
+                      held: { type: array, items: { type: string }, description: "`<feed>/<delivery>` of every held delivery." }
         "503":
           description: Not ready (history degraded or queue full).
           content:
@@ -3594,6 +4227,9 @@ components:
         max_records_per_run: { type: integer, minimum: 1 }
         max_bytes_per_run: { type: integer, minimum: 1 }
         max_duration_secs: { type: integer, minimum: 1 }
+        max_feeds: { type: integer, minimum: 1, description: "Most feeds the tenant may have (#1034)." }
+        max_feed_events_per_sec: { type: integer, minimum: 1, description: "Most events a second the tenant's feeds accept together, per server." }
+        max_feed_bytes: { type: integer, minimum: 1, description: "Most bytes the tenant's feeds may hold together; past it a feed refuses new events." }
     Connection:
       type: object
       description: A tenant connection — never its credentials.
@@ -3940,6 +4576,7 @@ components:
         parent_record_key: { type: string, nullable: true }
         run_id: { type: string, nullable: true, description: "The invocation's own run id — what `POST /v1/runs/{id}/rollback` undoes (#706)." }
         records_written: { type: integer }
+        feed_error: { type: string, enum: [held, claim_lost], description: "Set when a feed delivery's `feed` source ended the read itself: `held` (an admin has to recover the delivery) or `claim_lost` (the run's range claim was lost before it committed). The feed scheduler acts on this field, never on the error text." }
         duration_ms: { type: integer, description: "Wall-clock duration of this invocation in milliseconds (#645)." }
         error: { type: string, nullable: true }
         batches: { $ref: "#/components/schemas/BatchOutcomes" }
@@ -4378,7 +5015,7 @@ components:
         id: { type: string }
         kind:
           type: string
-          enum: [run, template_register, template_launch, template_delete, template_deprecate, policy_update, tenant_policy_update]
+          enum: [run, template_register, template_launch, template_delete, template_deprecate, schedule, feed, policy_update, tenant_policy_update]
           description: >
             `policy_update` / `tenant_policy_update` (#1043) are created by
             `POST /v1/policy` and `POST /v1/tenants/{tenant}/policy` (and
@@ -4388,7 +5025,7 @@ components:
             executed — the `version` stored.
         status: { type: string, enum: [pending, approved, rejected, executed, expired, invalidated, failed] }
         requester: { type: string }
-        tenant: { type: string, description: "The tenant the proposed run is for (#709)." }
+        tenant: { type: string, description: "The tenant the change is for (#709). A run: the requester's tenant or the tenant route it was proposed through. A `schedule`, `feed` or `tenant_policy_update` change: the tenant that owns the object, whoever proposed it, so that tenant's principals see it and its approvers may approve it; absent for a server-level object (a fan-out schedule included)." }
         requester_role: { type: string, enum: [viewer, operator, admin] }
         reason: { type: string }
         payload: { type: object, description: "The proposed action, verbatim; secrets are never resolved into it." }

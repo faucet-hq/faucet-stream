@@ -123,6 +123,11 @@ it). Admin-only (`Rollback` permission), audited as `run.rollback`. The web
 console's run detail page shows each invocation's run id and a **Roll back…**
 panel with the same dry-run / force controls.
 
+Rolling back a run that a [feed](/faucet-stream/cookbook/feeds/#rolling-back-a-delivery-run)
+delivery started undoes the destination only. The feed keeps its position,
+the delivery is paused, and the report's `note` says whether resuming
+redelivers the events or which event to replay from.
+
 ## Limits
 
 - Rollback covers the SQL sinks in column mode. A JSON/JSONB-column sink,

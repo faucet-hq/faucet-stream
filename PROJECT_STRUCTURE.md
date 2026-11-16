@@ -4,9 +4,9 @@ Where everything lives in the faucet-stream repository. For how the pieces fit
 together at run time, see the [architecture guide](docs/architecture/README.md);
 to start contributing, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-The workspace has <!--COUNT:crates-->115<!--/COUNT--> crates: <!--COUNT:sources-->43<!--/COUNT-->
+The workspace has <!--COUNT:crates-->117<!--/COUNT--> crates: <!--COUNT:sources-->44<!--/COUNT-->
 source connectors, <!--COUNT:sinks-->35<!--/COUNT--> sink connectors and
-<!--COUNT:common-->26<!--/COUNT--> shared connector libraries, plus the core, auth, state,
+<!--COUNT:common-->27<!--/COUNT--> shared connector libraries, plus the core, auth, state,
 lineage, transform and test crates below.
 
 ```
@@ -15,9 +15,9 @@ crates/
   core/                       — faucet-core: shared types, traits, pipeline, transforms, config
   auth/                       — faucet-auth: shared OAuth2 / token-endpoint providers
   registry/                   — faucet-registry: build any connector from its `type:` name + JSON config, and the shared auth catalog (for embedders; the CLI re-exports it)
-  source/                     — source connectors (rest, graphql, xml, grpc, *-cdc, kafka, s3, azure-blob, redshift, clickhouse, pubsub, delta, databricks, iceberg, dynamodb, oracle, oracle-cdc, singer, duckdb, sqs, nats, rabbitmq, sftp, file, …)
+  source/                     — source connectors (rest, graphql, xml, grpc, *-cdc, kafka, s3, azure-blob, redshift, clickhouse, pubsub, delta, databricks, iceberg, dynamodb, oracle, oracle-cdc, singer, duckdb, sqs, nats, rabbitmq, sftp, file, feed, …)
   sink/                       — sink connectors (bigquery, iceberg, delta, databricks, dynamodb, oracle, postgres, parquet, kafka, redshift, clickhouse, pubsub, azure-blob, duckdb, sqs, nats, rabbitmq, sftp, singer, …)
-  common/                     — shared connector libraries (bigquery, elasticsearch, gcs, kafka, snowflake, mssql, kinesis, spanner, delta, redshift, pubsub, clickhouse, azure, s3, sqs, nats, rabbitmq, sftp, iceberg, dynamodb, databricks, oracle, singer, redis, file, sql — the shared SQL dialects and sink engine)
+  common/                     — shared connector libraries (bigquery, elasticsearch, gcs, kafka, snowflake, mssql, kinesis, spanner, delta, redshift, pubsub, clickhouse, azure, s3, sqs, nats, rabbitmq, sftp, iceberg, dynamodb, databricks, oracle, singer, redis, file, sql — the shared SQL dialects and sink engine, feed — the durable feed store: `FeedStore`, SQLite and PostgreSQL backends, conformance suite)
   state/                      — Redis- and Postgres-backed StateStore backends
   lineage/                    — faucet-lineage: OpenLineage event emission
   transform-sql/              — faucet-transform-sql: embedded DuckDB SQL transform
@@ -26,7 +26,9 @@ crates/
   interop-tests/              — unpublished: tests that need two connectors (round trips, fidelity)
 faucet-stream/                — umbrella crate with feature-gated re-exports
 cli/                          — faucet-cli: `faucet` binary, YAML/JSON pipeline runner
+  src/serve/feeds/            — feeds for `faucet serve`: ingest, the delivery scheduler, the stores and the management rules (`src/commands/feed.rs` is the `faucet feed` command)
   examples/                   — ready-to-run pipeline YAMLs
+  examples/feeds/             — a feeds file for `faucet serve --feeds` and its delivery pipeline
   tests/                      — assert_cmd + wiremock + testcontainers integration tests
 hub/                          — Template Hub: sink templates + example source templates
 skills/                       — agent skills (Claude Code / Codex plugin), versioned with faucet-cli

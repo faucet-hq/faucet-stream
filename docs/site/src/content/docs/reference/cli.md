@@ -43,6 +43,7 @@ JSON-RPC stream.
 | `faucet mirror [config]` | Bulk-snapshot a table (or every table matching `mirror.tables`), then hand off to CDC for a gap-free mirror. `faucet mirror status` shows per-table progress. |
 | `faucet schedule [config]` | Run a pipeline on a cron schedule (long-running foreground process). |
 | `faucet serve` | Run a long-running HTTP control plane: submit / poll / cancel pipeline runs over REST. |
+| `faucet feed <verb>` | Manage [feeds](/faucet-stream/cookbook/feeds/) (durable event logs senders push into) straight in their stores: create, list, pause, replay, skip, tokens, push. Needs the `feeds` feature. |
 | `faucet completions <shell>` | Print a shell tab-completion script (bash / zsh / fish / powershell / elvish). |
 | `faucet migrate [config]` | Upgrade a config written against an older grammar to the current shape (idempotent); `--state` upgrades the pipeline's stored bookmarks instead. |
 | `faucet doctor --offline [config]` | Static, credential-free config lints (no network; secret-manager directives stay unresolved, an unsupplied required param gets a placeholder) — dangling/unused auth, unused vars, no-op sink `batch_size`. `faucet doctor` takes `--param NAME=VALUE` / `--param-env NAME[=VALUE]` like `run`. |
@@ -449,6 +450,11 @@ that needs to understand the interpolation syntax without reading the docs.
 `faucet schema schedules` prints the JSON Schema for the `--schedules` file
 format (`SchedulesFile` / `ScheduleSpec`). Requires the `schedule` and
 `templates` Cargo features. See [Schedules](/faucet-stream/cookbook/schedules/).
+
+`faucet schema feed` prints the JSON Schema for one feed definition (the body
+of `POST /v1/feeds` and the file `faucet feed create -f` reads), and
+`faucet schema feeds` the schema for the `--feeds` file. Both require the
+`feeds` Cargo feature. See the [feeds reference](/faucet-stream/reference/feeds/).
 
 `faucet schema catalog` prints the JSON Schema for the top-level `catalog:`
 (Data Movement Catalog store) block — see
@@ -1368,6 +1374,34 @@ bookmark is never touched; delivery is forced to at-least-once (pair with
 See the [backfill cookbook](/faucet-stream/cookbook/backfill/) and the
 [`backfill:` config block](/faucet-stream/reference/config/#backfill).
 
+## `feed`
+
+`faucet feed <verb>` manages [feeds](/faucet-stream/cookbook/feeds/) straight
+in their stores, the way `faucet template` manages templates: `--store <url>`
+(or `FAUCET_FEED_STORE`) names the run history a server keeps its feed
+definitions in, and the events are in the feed store that history implies (or
+a `--feed-store NAME=URL`). It starts no delivery runs; a server does.
+
+```bash
+export FAUCET_FEED_STORE=postgres://faucet@db/faucet
+faucet feed create -f orders-feed.yaml
+faucet feed token create orders shop            # the token is printed once
+echo '{"order_id": 1}' | faucet feed push orders
+faucet feed list
+faucet feed show orders
+faucet feed pause orders archive --reason "warehouse maintenance"
+faucet feed replay orders archive --to-time 2026-11-15T00:00:00Z
+faucet feed skip orders archive --reason "malformed order"
+```
+
+The verbs are `list`, `show`, `create`, `apply`, `delete`, `pause`, `resume`,
+`deliver-now`, `replay`, `skip`, `recover`, `events`, `tail`, `stats`,
+`cursor`, `push`, `send` and `token create|list|revoke`. `send` posts events
+to a running server over HTTP as a sender would and needs no `--store`. Every
+verb and flag is in the
+[feeds reference](/faucet-stream/reference/feeds/#faucet-feed). Requires the
+`feeds` Cargo feature.
+
 ## `schedule`
 
 ```bash
@@ -1464,11 +1498,19 @@ Selected flags (`faucet serve --help` for the full list):
 | `--triggers <path>` | Path to a YAML triggers file that defines event-driven watchers (object-arrival / webhook / queue-depth). Requires the `triggers` Cargo feature. See [Triggers reference](/faucet-stream/reference/triggers/). |
 | `--schedules <path>` | Path to a YAML/JSON schedules file: registered templates to run on a cron, read-only in the console (schedules made through the API or console live in the run history). Requires the `schedule` and `templates` Cargo features. See [Schedules](/faucet-stream/cookbook/schedules/). |
 | `--tenant-schedule-min-interval-secs <n>` | Shortest gap allowed between the ticks of a schedule a tenant owns (default and minimum `300`). Every schedule ticks at most every 5 minutes; this flag can only raise the floor for tenants. |
+| `--feeds <path>` | Feeds file (YAML/JSON): event feeds senders push into and the deliveries that run pipelines over them. Read-only at runtime and wins over a stored feed of the same name. Needs a build with the `feeds` feature and a run history that survives a restart (refused with `--history memory`). Nothing feed-related runs until a feed exists. |
+| `--feed-store <name>=<url>` | Define a named feed store (`sqlite:<path>` or `postgres://…`; repeatable). The `default` store follows the run history: a `feeds.db` beside a SQLite history file, or the history's PostgreSQL database through its own connection pool. A SQLite store takes one server: a cluster is refused with one. |
+| `--tenant-delivery-min-interval-secs <n>` | Shortest gap allowed between two runs of a delivery of a tenant's feed (default `10`). |
+| `--feeds-listen <addr>` | Serve the feed ingest routes (`POST /v1/feeds/{name}/events` and the tenant form) and `/healthz` on their own listener, so senders reach only them; the main listener then serves no ingest route. Unset: the main listener serves them. Env `FAUCET_SERVE_FEEDS_LISTEN`. See [A second listener for senders](/faucet-stream/cookbook/feeds/#a-second-listener-for-senders). |
+| `--feeds-allowed-host <host>` | A host name the feeds listener answers for (repeatable; `*` = any). Without one it answers for any host. Refused without `--feeds-listen`. |
+| `--feeds-max-request-bytes <n>` | The largest ingest request body the server reads, whatever a feed's `ingest.max_request_bytes` says. Default 64 MiB. |
+| `--feeds-request-timeout-secs <n>` | How long an ingest request may take to send its body. Default `30`. |
+| `--feeds-max-concurrent-requests <n>` | Ingest requests handled at once; past it senders get `503` and retry. Default `256`. |
 | `--policy <path>` | A [data-flow policy](/faucet-stream/cookbook/policies/#where-the-policy-lives) file, read and validated at start. Under `--policy-store server` (the default) it only seeds an empty store as version 1; once a version is stored, that version stays in force and a differing file is reported (`file_drift`), not applied. Under `--policy-store file` it is the policy, read-only in the console and API. Every submission is checked against the policy in force (merged with the config's own block). Requires the `policy` feature. |
 | `--policy-store server\|file` | Where the server policy lives (default `server`). `server`: the newest approved version in the run-history store is in force, changed through approved `policy_update` change requests (`POST /v1/policy`, **Policy → Edit policy**); editing needs a persistent `--history` (on the in-memory history edits answer `409`). `file`: the `--policy` file is the policy, re-read on every start; edits answer `409`; refused without `--policy`. |
-| `--require-approval <kind>` | Require an approved [change request](/faucet-stream/cookbook/approvals/) before these actions happen: `run` (`POST /v1/runs` and template triggers answer with a pending request; backfills are refused; creating or editing a schedule becomes a change request, and only approved or `--schedules`-file schedules tick, see [Trust and approvals](/faucet-stream/cookbook/schedules/#trust-and-approvals)), `template_register`, `template_launch`, `template_delete`, `template_deprecate` (the last two are also gated by `template_launch`). Repeatable or comma-separated. Who may approve is the `approvals:` block of `--auth-config`. The template kinds gate the lifecycle routes and MCP tools (`409`); `template_register`, `template_launch` and `template_deprecate` cannot be combined with `--templates-sync`. |
+| `--require-approval <kind>` | Require an approved [change request](/faucet-stream/cookbook/approvals/) before these actions happen: `run` (`POST /v1/runs` and template triggers answer with a pending request; backfills are refused; creating or editing a schedule becomes a change request, and only approved or `--schedules`-file schedules tick, see [Trust and approvals](/faucet-stream/cookbook/schedules/#trust-and-approvals)), `template_register`, `template_launch`, `template_delete`, `template_deprecate` (the last two are also gated by `template_launch`), `schedule`, `feed` (creating, editing or deleting a [feed](/faucet-stream/cookbook/feeds/#approvals) or one of its deliveries; under `run`, a feed change that adds or edits a delivery is gated too). Repeatable or comma-separated. Who may approve is the `approvals:` block of `--auth-config`. The template kinds gate the lifecycle routes and MCP tools (`409`); `template_register`, `template_launch` and `template_deprecate` cannot be combined with `--templates-sync`. |
 | `--approval-expiry-secs <n>` | How long a pending change request stays approvable when `approvals.expire_secs` does not say. Default `86400`. |
-| `--vault-key <key>` | Key that seals secrets at rest (AES-256-GCM; env `FAUCET_VAULT_KEY`): [tenant connection](/faucet-stream/cookbook/embedded-integrations/) credentials, and on a `--cluster` server the `secret: true` params a [template trigger](/faucet-stream/cookbook/cluster/#3-per-run-secret-template-params-need-a-vault-key) supplies. At least 32 bytes of random key material (`openssl rand -hex 32`); a shorter key is refused at startup. Each sealed value is bound to its owner (tenant + connection, or the run id), so a row copied onto another record does not open. On a `--cluster` server it also seals each pending run's stored config whole before it is written to the shared history. Every cluster member needs the same key. Without it the server refuses to store or open tenant connections, a clustered server refuses template triggers that supply a `secret: true` param, and stored configs are kept as submitted. Requires the `encryption` feature (tenants also need `tenants`). |
+| `--vault-key <key>` | Key that seals secrets at rest (AES-256-GCM; env `FAUCET_VAULT_KEY`): [tenant connection](/faucet-stream/cookbook/embedded-integrations/) credentials, and on a `--cluster` server the `secret: true` params a [template trigger](/faucet-stream/cookbook/cluster/#3-per-run-secret-template-params-need-a-vault-key) supplies; and for [feeds](/faucet-stream/cookbook/feeds/#sealing), sealed event payloads, the signature secret of a feed made through the API and a delivery's secret template params. At least 32 bytes of random key material (`openssl rand -hex 32`); a shorter key is refused at startup. Each sealed value is bound to its owner (tenant + connection, or the run id), so a row copied onto another record does not open. On a `--cluster` server it also seals each pending run's stored config whole before it is written to the shared history. Every cluster member needs the same key. Without it the server refuses to store or open tenant connections, a clustered server refuses template triggers that supply a `secret: true` param, and stored configs are kept as submitted. Requires the `encryption` feature (tenants also need `tenants`). |
 | `--vault-previous-key <key>` | A previous vault key, tried when opening credentials or sealed params sealed before a rotation; never used to seal. Repeatable. Env: `FAUCET_VAULT_PREVIOUS_KEYS`, a comma-separated list, which keeps the keys out of the process arguments. |
 | `--connect-providers <path>` | Hosted OAuth connect providers (a YAML/JSON file), validated at startup; needs `--vault-key`. |
 | `--callback-allow-host <host>` | Restrict per-run completion callbacks to these hosts. Repeatable. Unset = any host except link-local / cloud-metadata addresses, which are always refused unless named here. See [Completion callbacks](/faucet-stream/reference/http-api/#completion-callbacks). |

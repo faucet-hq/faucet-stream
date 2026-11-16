@@ -65,6 +65,9 @@ pub enum ChangeKind {
     /// Create, edit or delete a schedule (#1044): payload
     /// `{action: create|update|delete, name, spec?}`.
     Schedule,
+    /// Create, edit or delete a feed or its deliveries (#1034): payload
+    /// `{action: create|update|delete, name, tenant?, spec?}`.
+    Feed,
     /// Put a new version of the server-managed data-flow policy in force
     /// (`POST /v1/policy`, `POST /v1/policy/rollback`, #1043).
     PolicyUpdate,
@@ -74,13 +77,14 @@ pub enum ChangeKind {
 }
 
 impl ChangeKind {
-    pub const ALL: [ChangeKind; 8] = [
+    pub const ALL: [ChangeKind; 9] = [
         ChangeKind::Run,
         ChangeKind::TemplateRegister,
         ChangeKind::TemplateLaunch,
         ChangeKind::TemplateDelete,
         ChangeKind::TemplateDeprecate,
         ChangeKind::Schedule,
+        ChangeKind::Feed,
         ChangeKind::PolicyUpdate,
         ChangeKind::TenantPolicyUpdate,
     ];
@@ -93,6 +97,7 @@ impl ChangeKind {
             ChangeKind::TemplateDelete => "template_delete",
             ChangeKind::TemplateDeprecate => "template_deprecate",
             ChangeKind::Schedule => "schedule",
+            ChangeKind::Feed => "feed",
             ChangeKind::PolicyUpdate => "policy_update",
             ChangeKind::TenantPolicyUpdate => "tenant_policy_update",
         }
@@ -129,12 +134,13 @@ impl FromStr for ChangeKind {
             "template_delete" | "template-delete" => Ok(ChangeKind::TemplateDelete),
             "template_deprecate" | "template-deprecate" => Ok(ChangeKind::TemplateDeprecate),
             "schedule" => Ok(ChangeKind::Schedule),
+            "feed" => Ok(ChangeKind::Feed),
             "policy_update" | "policy-update" => Ok(ChangeKind::PolicyUpdate),
             "tenant_policy_update" | "tenant-policy-update" => Ok(ChangeKind::TenantPolicyUpdate),
             other => Err(format!(
                 "unknown change kind `{other}` (expected run, template_register, \
-                 template_launch, template_delete, template_deprecate, schedule, policy_update \
-                 or tenant_policy_update)"
+                 template_launch, template_delete, template_deprecate, schedule, feed, \
+                 policy_update or tenant_policy_update)"
             )),
         }
     }
@@ -287,9 +293,10 @@ pub struct ChangeRequest {
     /// Why execution failed or the approval was invalidated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// The tenant the proposed run is for (#709): the requester's own tenant
-    /// or the tenant route it was proposed through. Execution runs it as that
-    /// tenant.
+    /// The tenant the change is for (#709): for a run, the requester's own
+    /// tenant or the tenant route it was proposed through; for a schedule,
+    /// feed or tenant policy change, the tenant that owns the object,
+    /// whoever proposed it. Execution runs as the requester for that tenant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
     /// The proposed run's config was written by the server's operator (a
@@ -338,6 +345,9 @@ impl ChangeRequest {
                     *v = serde_json::json!({ "$sealed": true });
                 }
             }
+        }
+        if self.kind == ChangeKind::Feed {
+            mask_feed_payload(&mut self.payload);
         }
         let template_body = self.kind == ChangeKind::TemplateRegister
             || (self.kind == ChangeKind::Run && self.trusted_config);
@@ -946,6 +956,7 @@ async fn plan_for(
             })
         }
         ChangeKind::Schedule => plan_schedule(state, actor, payload).await,
+        ChangeKind::Feed => plan_feed(state, actor, payload).await,
         #[cfg(feature = "policy")]
         ChangeKind::PolicyUpdate | ChangeKind::TenantPolicyUpdate => {
             policy_update::plan(state, kind, payload).await
@@ -993,6 +1004,69 @@ async fn plan_schedule(
             .into(),
         details: None,
     })
+}
+
+/// Plan a feed change (#1034): validate it as the requester; the rows carry
+/// the stored revision it edits, so an edit made meanwhile invalidates the
+/// approval.
+#[cfg(feature = "feeds")]
+async fn plan_feed(
+    state: &ServerState,
+    actor: &AuthContext,
+    payload: &Value,
+) -> Result<ChangePlan, ServeError> {
+    let p: crate::serve::feeds::service::ChangePayload = serde_json::from_value(payload.clone())
+        .map_err(|e| ServeError::BadConfig(format!("feed payload: {e}")))?;
+    let rows = crate::serve::feeds::service::plan(state, actor, &p).await?;
+    Ok(ChangePlan {
+        material: sha_hex(&serde_json::to_string(&rows).unwrap_or_default()),
+        summary: json!({"feed": p.name, "tenant": p.tenant, "action": p.action.as_str()}),
+        rows,
+    })
+}
+
+#[cfg(not(feature = "feeds"))]
+async fn plan_feed(
+    state: &ServerState,
+    actor: &AuthContext,
+    payload: &Value,
+) -> Result<ChangePlan, ServeError> {
+    let _ = (state, actor, payload);
+    Err(ServeError::Unprocessable {
+        message: "feed changes require a server built with the `feeds` feature".into(),
+        details: None,
+    })
+}
+
+/// Replace every sealed value of a feed change's payload with its marker:
+/// sealed values never leave the server, not even as ciphertext.
+fn mask_feed_payload(payload: &mut Value) {
+    if let Some(secret) = payload.pointer_mut("/spec/ingest/auth/signature/secret")
+        && secret.as_str().is_some_and(|s| s.starts_with("$sealed"))
+    {
+        *secret = json!("$sealed");
+    }
+    let Some(deliveries) = payload
+        .pointer_mut("/spec/deliveries")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for d in deliveries {
+        let Some(params) = d
+            .pointer_mut("/template/params")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        for v in params.values_mut() {
+            if v.as_object()
+                .is_some_and(|m| m.len() == 1 && m.get("$sealed").is_some_and(Value::is_string))
+            {
+                *v = json!({ "$sealed": true });
+            }
+        }
+    }
 }
 
 fn record_metric(kind: ChangeKind, outcome: &'static str) {
@@ -1083,6 +1157,12 @@ fn approval_kinds(state: &ServerState, kind: ChangeKind, payload: &Value) -> Vec
     {
         // A schedule starts runs: its change needs the run rule too (#1051).
         vec![kind, ChangeKind::Run]
+    } else if kind == ChangeKind::Feed
+        && state.requires_approval(ChangeKind::Run)
+        && payload.get("starts_runs").and_then(Value::as_bool) == Some(true)
+    {
+        // So does a feed change that makes or edits a delivery (#1034).
+        vec![kind, ChangeKind::Run]
     } else {
         vec![kind]
     }
@@ -1092,7 +1172,7 @@ fn approval_kinds(state: &ServerState, kind: ChangeKind, payload: &Value) -> Vec
 /// rather than every approver meeting every rule (#1051): a schedule change
 /// under run approval.
 fn rules_met_independently(kind: ChangeKind) -> bool {
-    kind == ChangeKind::Schedule
+    matches!(kind, ChangeKind::Schedule | ChangeKind::Feed)
 }
 
 /// Serializes every transition of one change request within this process.
@@ -1161,6 +1241,11 @@ pub async fn create(
     if new.kind == ChangeKind::Schedule {
         payload = crate::serve::schedules::service::prepare_change(state, actor, payload).await?;
     }
+    // So does a feed change: its uids, and its secrets sealed (#1034).
+    #[cfg(feature = "feeds")]
+    if new.kind == ChangeKind::Feed {
+        payload = crate::serve::feeds::service::prepare_change(state, actor, payload).await?;
+    }
     let plan = plan_for(
         state,
         actor,
@@ -1179,13 +1264,19 @@ pub async fn create(
     let now = Utc::now();
     // A tenant policy change belongs to the tenant whose policy it changes,
     // whoever proposed it (a server admin through the tenant's route).
-    let tenant = if new.kind == ChangeKind::TenantPolicyUpdate {
-        payload
+    let tenant = match new.kind {
+        ChangeKind::TenantPolicyUpdate => payload
             .get("tenant")
             .and_then(Value::as_str)
-            .map(str::to_string)
-    } else {
-        actor.tenant.clone()
+            .map(str::to_string),
+        // A schedule or feed change belongs to the tenant that owns the object.
+        #[cfg(all(feature = "schedule", feature = "templates"))]
+        ChangeKind::Schedule => {
+            crate::serve::schedules::service::change_tenant(state, actor, &payload).await?
+        }
+        #[cfg(feature = "feeds")]
+        ChangeKind::Feed => crate::serve::feeds::service::change_tenant(actor, &payload)?,
+        _ => actor.tenant.clone(),
     };
     let change = ChangeRequest {
         id: uuid::Uuid::now_v7().to_string(),
@@ -1215,7 +1306,7 @@ pub async fn create(
     record_metric(change.kind, "requested");
     crate::serve::audit::write(
         state,
-        actor,
+        &audit_as(actor, &change),
         "change.requested",
         None,
         Some(change.id.clone()),
@@ -1310,7 +1401,7 @@ async fn expire_if_due(
         record_metric(change.kind, "expired");
         crate::serve::audit::write(
             state,
-            &AuthContext::system("expiry"),
+            &audit_as(&AuthContext::system("expiry"), &change),
             "change.expired",
             None,
             Some(change.id.clone()),
@@ -1319,6 +1410,38 @@ async fn expire_if_due(
         .await;
     }
     Ok(change)
+}
+
+/// Whether a change of `kind` belongs to the tenant that owns its object.
+fn owned_by_object(kind: ChangeKind) -> bool {
+    matches!(kind, ChangeKind::Schedule | ChangeKind::Feed)
+}
+
+/// `actor` as the audit log records it for `change`: an unscoped principal
+/// acting on a tenant's schedule or feed is recorded under that tenant.
+fn audit_as(actor: &AuthContext, change: &ChangeRequest) -> AuthContext {
+    let mut as_recorded = actor.clone();
+    if owned_by_object(change.kind) && as_recorded.tenant.is_none() {
+        as_recorded.tenant = change.tenant.clone();
+    }
+    as_recorded
+}
+
+/// Whether `actor` may decide a change that belongs to `change_tenant`: a
+/// server principal any, a tenant principal its own tenant's only.
+pub(crate) fn approver_in_scope(
+    actor: &AuthContext,
+    change_tenant: Option<&str>,
+) -> Result<(), String> {
+    match (&actor.tenant, change_tenant) {
+        (None, _) => Ok(()),
+        (Some(own), Some(t)) if own == t => Ok(()),
+        (Some(own), _) => Err(format!(
+            "'{}' is confined to tenant {own}; only a server admin or an admin of the tenant \
+             the change is for may approve it",
+            actor.principal
+        )),
+    }
 }
 
 /// One request, expiry applied.
@@ -1373,6 +1496,12 @@ pub async fn approve(
             ServeError::Forbidden(reason)
         })?;
     }
+    if owned_by_object(change.kind) {
+        approver_in_scope(actor, change.tenant.as_deref()).map_err(|reason| {
+            record_metric(change.kind, "denied");
+            ServeError::Forbidden(reason)
+        })?;
+    }
     if change
         .approvals
         .iter()
@@ -1417,7 +1546,7 @@ pub async fn approve(
     record_metric(change.kind, "approved");
     crate::serve::audit::write(
         state,
-        actor,
+        &audit_as(actor, &change),
         "change.approved",
         None,
         Some(change.id.clone()),
@@ -1468,6 +1597,9 @@ pub async fn reject(
             policy_update::approver_in_scope(actor, change.tenant.as_deref())
                 .map_err(ServeError::Forbidden)?;
         }
+        if owned_by_object(change.kind) {
+            approver_in_scope(actor, change.tenant.as_deref()).map_err(ServeError::Forbidden)?;
+        }
     }
     change.status = ChangeStatus::Rejected;
     change.rejection = Some(Rejection {
@@ -1480,7 +1612,7 @@ pub async fn reject(
     record_metric(change.kind, "rejected");
     crate::serve::audit::write(
         state,
-        actor,
+        &audit_as(actor, &change),
         "change.rejected",
         None,
         Some(change.id.clone()),
@@ -1537,6 +1669,10 @@ async fn execute(
     .await
     {
         Ok(p) => p,
+        // The feed it was proposed for was replaced or made meanwhile.
+        Err(ServeError::Conflict(why)) if change.kind == ChangeKind::Feed => {
+            return finish_invalidated(state, actor, change, why, None).await;
+        }
         Err(e) => return finish_refused(state, actor, change, e).await,
     };
     if let Some(before) = &change.plan
@@ -1694,6 +1830,22 @@ async fn execute(
             message: "schedule changes require the `schedule` and `templates` features".into(),
             details: None,
         }),
+        #[cfg(feature = "feeds")]
+        ChangeKind::Feed => {
+            let p: crate::serve::feeds::service::ChangePayload =
+                match serde_json::from_value(change.payload.clone()) {
+                    Ok(p) => p,
+                    Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
+                };
+            crate::serve::feeds::service::apply(state, &requester, p, true)
+                .await
+                .map(|_| (None, None))
+        }
+        #[cfg(not(feature = "feeds"))]
+        ChangeKind::Feed => Err(ServeError::Unprocessable {
+            message: "feed changes require the `feeds` feature".into(),
+            details: None,
+        }),
         #[cfg(feature = "policy")]
         ChangeKind::PolicyUpdate | ChangeKind::TenantPolicyUpdate => {
             policy_update::execute(state, &change, &fresh, actor)
@@ -1727,7 +1879,7 @@ async fn execute(
             record_metric(change.kind, "executed");
             crate::serve::audit::write(
                 state,
-                actor,
+                &audit_as(actor, &change),
                 "change.executed",
                 run_id,
                 Some(change.id.clone()),
@@ -1739,7 +1891,8 @@ async fn execute(
         // A policy or schedule change that another landed change has made
         // stale.
         Err(ServeError::Conflict(why))
-            if change.kind.is_policy() || change.kind == ChangeKind::Schedule =>
+            if change.kind.is_policy()
+                || matches!(change.kind, ChangeKind::Schedule | ChangeKind::Feed) =>
         {
             finish_invalidated(state, actor, change, why, None).await
         }
@@ -1767,7 +1920,7 @@ async fn finish_invalidated(
     record_metric(change.kind, "invalidated");
     crate::serve::audit::write(
         state,
-        actor,
+        &audit_as(actor, &change),
         "change.invalidated",
         None,
         Some(change.id.clone()),
@@ -1823,7 +1976,7 @@ async fn finish_refused(
     record_metric(change.kind, "deferred");
     crate::serve::audit::write(
         state,
-        actor,
+        &audit_as(actor, &change),
         "change.deferred",
         None,
         Some(change.id.clone()),
@@ -1958,7 +2111,7 @@ async fn finish_failed(
     record_metric(change.kind, "failed");
     crate::serve::audit::write(
         state,
-        actor,
+        &audit_as(actor, &change),
         "change.failed",
         None,
         Some(change.id.clone()),
@@ -2534,6 +2687,31 @@ mod tests {
             vec![ChangeKind::Schedule]
         );
         assert!(rules_met_independently(ChangeKind::Schedule));
+        // A feed change needs the run rule only when it starts runs (#1034).
+        let starts = json!({"action": "update", "starts_runs": true});
+        assert_eq!(
+            approval_kinds(&state, ChangeKind::Feed, &starts),
+            vec![ChangeKind::Feed]
+        );
+        assert_eq!(
+            approval_kinds(&gated, ChangeKind::Feed, &starts),
+            vec![ChangeKind::Feed, ChangeKind::Run]
+        );
+        assert_eq!(
+            approval_kinds(&gated, ChangeKind::Feed, &json!({"action": "delete"})),
+            vec![ChangeKind::Feed]
+        );
+        assert!(rules_met_independently(ChangeKind::Feed));
+        assert_eq!("feed".parse::<ChangeKind>(), Ok(ChangeKind::Feed));
+        assert_eq!(ChangeKind::Feed.to_string(), "feed");
+        let mut plain = json!({"spec": {"ingest": {"auth": {"signature": {"secret": "s"}}},
+            "deliveries": [{"name": "a"}, {"name": "b", "template": {"params": {"k": 1}}}]}});
+        let before = plain.clone();
+        mask_feed_payload(&mut plain);
+        assert_eq!(plain, before, "nothing sealed, nothing masked");
+        let mut none = json!({"action": "delete"});
+        mask_feed_payload(&mut none);
+        assert_eq!(none, json!({"action": "delete"}));
         assert!(!rules_met_independently(ChangeKind::TemplateRegister));
     }
 

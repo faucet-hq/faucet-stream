@@ -461,3 +461,114 @@ groups:
           description: >
             Lineage emission is failing (transport error or queue overflow).
             Pipelines are unaffected; the lineage graph has gaps.
+
+  # Feeds (#1034): scheduler-side alerts. The ingest alerts (refusals, 5xx,
+  # store errors) come with the ingest route.
+  - name: faucet-feeds
+    rules:
+      - alert: FaucetFeedDeliveryStalled
+        expr: faucet_feed_delivery_stalled == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "delivery {{ $labels.delivery }} of feed {{ $labels.feed }} is stalled"
+          description: >-
+            One event kept failing, so the delivery starts no more runs and
+            the feed keeps what it has not delivered. Open the delivery to
+            see the event and the error, fix the destination and resume it,
+            or skip the event (an admin action that records a gap).
+
+      - alert: FaucetFeedDeliveryHeld
+        expr: faucet_feed_held > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "feed {{ $labels.feed }} has a held delivery"
+          description: >-
+            A delivery's bookmark and the feed store disagree (the store was
+            probably restored from a backup). Nothing is delivered or skipped
+            until an admin recovers the delivery.
+
+      - alert: FaucetFeedDeliveryLagging
+        expr: faucet_feed_oldest_undelivered_seconds > 600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "delivery {{ $labels.delivery }} of feed {{ $labels.feed }} is behind"
+          description: >-
+            The oldest undelivered event has waited more than ten minutes.
+            Check the delivery's recent runs: a failing destination, a paused
+            delivery, or runs waiting for a free slot.
+
+      - alert: FaucetFeedNearFull
+        expr: faucet_feed_undelivered_ratio >= 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "feed {{ $labels.feed }} is close to its undelivered limits"
+          description: >-
+            Undelivered data is at 80% or more of the feed's limits
+            (`retention.undelivered`). Past them the feed refuses new events
+            rather than dropping old ones. Unblock the slow delivery or raise
+            the limits.
+
+      - alert: FaucetFeedRunsFailing
+        expr: increase(faucet_feed_runs_total{outcome=~"failed|refused"}[30m]) >= 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "delivery {{ $labels.delivery }} of feed {{ $labels.feed }} keeps failing"
+          description: >-
+            Three or more runs failed or could not start in the last half
+            hour. The batch shrinks after each failure; if a single event
+            keeps failing the delivery stalls.
+
+      - alert: FaucetFeedStoreErrors
+        expr: sum by (feed) (increase(faucet_feed_store_errors_total[10m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "the store of feed {{ $labels.feed }} is failing"
+          description: >-
+            Appends to the feed's store have been failing for five minutes or
+            more, so senders get 503 and retry. Nothing acknowledged is lost.
+            Check the feed store (the database or the disk under `feeds.db`)
+            and `/readyz`, whose `feeds.store_ok` says the same.
+
+      - alert: FaucetFeedIngestErrors
+        expr: |
+          sum by (feed) (rate(faucet_feed_ingest_requests_total{status=~"5.."}[5m]))
+            / sum by (feed) (rate(faucet_feed_ingest_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "feed {{ $labels.feed }} answers more than 5% of its ingest requests with a 5xx"
+          description: >-
+            Senders are told to retry: the feed is full, its store is failing,
+            the server is at its ingest concurrency limit, or it cannot read
+            its feed definitions. `faucet_feed_ingest_refused_total` gives
+            the reason. An empty `feed` label is requests no feed admitted.
+
+      - alert: FaucetFeedIngestRefusals
+        expr: |
+          sum by (feed, reason) (rate(faucet_feed_ingest_refused_total{reason=~"unauthorized|malformed|too_large|content_type|content_encoding|rate_limited|tenant_rate_limited|timeout"}[15m]))
+            / on (feed) group_left sum by (feed) (rate(faucet_feed_ingest_requests_total[15m])) > 0.2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "feed {{ $labels.feed }} refuses more than 20% of its ingest requests ({{ $labels.reason }})"
+          description: >-
+            A sender keeps sending requests the feed will not take: a wrong or
+            revoked credential, a body that does not parse or is too large, a
+            content type or encoding the feed does not accept, or more than
+            its rate limit. The feed's refusals listing shows the sender
+            address and the message. An empty `feed` label is requests for an
+            unknown feed or with a credential no feed accepts.

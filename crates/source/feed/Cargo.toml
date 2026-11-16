@@ -1,0 +1,72 @@
+[package]
+name = "faucet-source-feed"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Feed source connector for the faucet-stream ecosystem: reads a delivery's events from a durable feed store"
+readme = "README.md"
+keywords = ["feed", "events", "etl", "pipeline", "connector"]
+categories.workspace = true
+
+[features]
+default = ["sqlite", "postgres"]
+# Open a SQLite feed store named in the source's `store:` config.
+sqlite = ["faucet-common-feed/sqlite"]
+# Open a PostgreSQL feed store named in the source's `store:` config.
+postgres = ["faucet-common-feed/postgres"]
+
+[dependencies]
+faucet-core.workspace = true
+faucet-common-feed.workspace = true
+schemars.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+url.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+faucet-conformance = { workspace = true, features = ["containers"] }
+faucet-common-feed = { workspace = true, features = ["sqlite", "postgres", "conformance"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+futures.workspace = true
+tempfile.workspace = true
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+
+[[test]]
+name = "behaviour"
+required-features = ["sqlite"]
+
+[[test]]
+name = "conformance"
+required-features = ["sqlite"]
+
+[[test]]
+name = "postgres"
+required-features = ["sqlite", "postgres"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# API-stability (cargo-semver-checks) lint overrides.
+#
+# Additive evolution is a MINOR bump by declared contract (CLAUDE.md
+# "API-Evolution & Versioning Policy"): struct-literal construction and
+# exhaustive matching of config/data types are NOT part of this crate's
+# stability surface — construct via serde deserialization, `new()`/`Default`,
+# or builders, and match with a `_` arm. So adding an optional config field
+# never forces a major. Every other API-stability lint stays at its default
+# (deny) level, so genuine removals and signature changes still fail the gate.
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "allow"
+constructible_struct_adds_private_field = "allow"
+enum_struct_variant_field_added = "allow"
+
+[lints]
+workspace = true

@@ -725,6 +725,19 @@ pub const DDL: &[&str] = &[
         tenant TEXT,\
         updated_at TEXT NOT NULL,\
         body TEXT NOT NULL)",
+    // Feeds and their hashed tokens (#1034); never purged by run retention.
+    "CREATE TABLE IF NOT EXISTS faucet_feeds (\
+        feed_key TEXT PRIMARY KEY,\
+        uid TEXT NOT NULL,\
+        tenant TEXT,\
+        updated_at TEXT NOT NULL,\
+        body TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS faucet_feed_tokens (\
+        id TEXT PRIMARY KEY,\
+        feed TEXT NOT NULL,\
+        updated_at TEXT NOT NULL,\
+        body TEXT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS faucet_feed_tokens_feed_idx ON faucet_feed_tokens (feed)",
     "CREATE TABLE IF NOT EXISTS faucet_tenant_connections (\
         tenant TEXT NOT NULL,\
         name TEXT NOT NULL,\
@@ -1038,6 +1051,31 @@ pub struct Stmts {
     pub schedule_select: String,
     pub schedule_list: String,
     pub schedule_delete: String,
+    /// Delete the tokens of a tenant's feeds, then the feeds (#1034). Param: tenant.
+    pub tenant_delete_feed_tokens: String,
+    pub tenant_delete_feeds: String,
+    /// Insert a feed unless its key is taken. Params: key, uid, tenant,
+    /// updated_at, body.
+    pub feed_insert: String,
+    /// Replace a feed's body only while it still equals the expected one.
+    /// Params: updated_at, body, key, expected body.
+    pub feed_replace: String,
+    pub feed_select: String,
+    pub feed_list: String,
+    pub feed_count: String,
+    /// Params: key.
+    pub feed_delete_tokens: String,
+    pub feed_delete: String,
+    /// Params: uid.
+    pub feed_remove_tokens: String,
+    /// Params: key, expected body.
+    pub feed_remove: String,
+    /// Params: id, feed, updated_at, body.
+    pub feed_token_insert: String,
+    /// Params: updated_at, body, id, expected body.
+    pub feed_token_replace: String,
+    pub feed_token_list: String,
+    pub feed_token_list_all: String,
     pub connection_upsert: String,
     /// Insert a connection only while its tenant row exists and no
     /// connection has its name; waits on a concurrent tenant delete. Params:
@@ -1962,6 +2000,36 @@ impl Stmts {
             schedule_select: "SELECT body FROM faucet_serve_schedules WHERE name=$1".into(),
             schedule_list: "SELECT body FROM faucet_serve_schedules ORDER BY name".into(),
             schedule_delete: "DELETE FROM faucet_serve_schedules WHERE name=$1".into(),
+            tenant_delete_feed_tokens: "DELETE FROM faucet_feed_tokens WHERE feed IN (SELECT uid FROM faucet_feeds WHERE tenant=$1)"
+                .into(),
+            tenant_delete_feeds: "DELETE FROM faucet_feeds WHERE tenant=$1"
+                .into(),
+            feed_insert: "INSERT INTO faucet_feeds (feed_key, uid, tenant, updated_at, body) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (feed_key) DO NOTHING"
+                .into(),
+            feed_replace: "UPDATE faucet_feeds SET updated_at=$1, body=$2 WHERE feed_key=$3 AND body=$4"
+                .into(),
+            feed_select: "SELECT body FROM faucet_feeds WHERE feed_key=$1"
+                .into(),
+            feed_list: "SELECT body FROM faucet_feeds ORDER BY feed_key"
+                .into(),
+            feed_count: "SELECT COUNT(*) FROM faucet_feeds"
+                .into(),
+            feed_delete_tokens: "DELETE FROM faucet_feed_tokens WHERE feed IN (SELECT uid FROM faucet_feeds WHERE feed_key=$1)"
+                .into(),
+            feed_delete: "DELETE FROM faucet_feeds WHERE feed_key=$1"
+                .into(),
+            feed_remove_tokens: "DELETE FROM faucet_feed_tokens WHERE feed=$1"
+                .into(),
+            feed_remove: "DELETE FROM faucet_feeds WHERE feed_key=$1 AND body=$2"
+                .into(),
+            feed_token_insert: "INSERT INTO faucet_feed_tokens (id, feed, updated_at, body) VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING"
+                .into(),
+            feed_token_replace: "UPDATE faucet_feed_tokens SET updated_at=$1, body=$2 WHERE id=$3 AND body=$4"
+                .into(),
+            feed_token_list: "SELECT body FROM faucet_feed_tokens WHERE feed=$1 ORDER BY id"
+                .into(),
+            feed_token_list_all: "SELECT body FROM faucet_feed_tokens ORDER BY id"
+                .into(),
             connection_replace: "UPDATE faucet_tenant_connections SET status=$1, updated_at=$2, \
                 body=$3 WHERE tenant=$4 AND name=$5 AND updated_at=$6"
                 .into(),
@@ -2617,6 +2685,36 @@ impl Stmts {
             schedule_select: "SELECT body FROM faucet_serve_schedules WHERE name=?".into(),
             schedule_list: "SELECT body FROM faucet_serve_schedules ORDER BY name".into(),
             schedule_delete: "DELETE FROM faucet_serve_schedules WHERE name=?".into(),
+            tenant_delete_feed_tokens: "DELETE FROM faucet_feed_tokens WHERE feed IN (SELECT uid FROM faucet_feeds WHERE tenant=?)"
+                .into(),
+            tenant_delete_feeds: "DELETE FROM faucet_feeds WHERE tenant=?"
+                .into(),
+            feed_insert: "INSERT INTO faucet_feeds (feed_key, uid, tenant, updated_at, body) VALUES (?,?,?,?,?) ON CONFLICT (feed_key) DO NOTHING"
+                .into(),
+            feed_replace: "UPDATE faucet_feeds SET updated_at=?, body=? WHERE feed_key=? AND body=?"
+                .into(),
+            feed_select: "SELECT body FROM faucet_feeds WHERE feed_key=?"
+                .into(),
+            feed_list: "SELECT body FROM faucet_feeds ORDER BY feed_key"
+                .into(),
+            feed_count: "SELECT COUNT(*) FROM faucet_feeds"
+                .into(),
+            feed_delete_tokens: "DELETE FROM faucet_feed_tokens WHERE feed IN (SELECT uid FROM faucet_feeds WHERE feed_key=?)"
+                .into(),
+            feed_delete: "DELETE FROM faucet_feeds WHERE feed_key=?"
+                .into(),
+            feed_remove_tokens: "DELETE FROM faucet_feed_tokens WHERE feed=?"
+                .into(),
+            feed_remove: "DELETE FROM faucet_feeds WHERE feed_key=? AND body=?"
+                .into(),
+            feed_token_insert: "INSERT INTO faucet_feed_tokens (id, feed, updated_at, body) VALUES (?,?,?,?) ON CONFLICT (id) DO NOTHING"
+                .into(),
+            feed_token_replace: "UPDATE faucet_feed_tokens SET updated_at=?, body=? WHERE id=? AND body=?"
+                .into(),
+            feed_token_list: "SELECT body FROM faucet_feed_tokens WHERE feed=? ORDER BY id"
+                .into(),
+            feed_token_list_all: "SELECT body FROM faucet_feed_tokens ORDER BY id"
+                .into(),
             connection_replace: "UPDATE faucet_tenant_connections SET status=?, updated_at=?, \
                 body=? WHERE tenant=? AND name=? AND updated_at=?"
                 .into(),
@@ -6136,6 +6234,166 @@ macro_rules! impl_sql_history {
                 Ok(n > 0)
             }
 
+            async fn feed_insert(
+                &self,
+                feed: &$crate::serve::history::feeds::FeedRecord,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let n = sqlx::query(&self.stmts.feed_insert)
+                    .bind(feed.key())
+                    .bind(&feed.uid)
+                    .bind(feed.tenant())
+                    .bind(sql::fmt_ts(feed.updated_at))
+                    .bind(sql::encode_json(feed, "feed")?)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .rows_affected();
+                Ok(n > 0)
+            }
+
+            async fn feed_replace(
+                &self,
+                expected: &$crate::serve::history::feeds::FeedRecord,
+                new: &$crate::serve::history::feeds::FeedRecord,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                if new.key() != expected.key() {
+                    return Ok(false);
+                }
+                let n = sqlx::query(&self.stmts.feed_replace)
+                    .bind(sql::fmt_ts(new.updated_at))
+                    .bind(sql::encode_json(new, "feed")?)
+                    .bind(expected.key())
+                    .bind(sql::encode_json(expected, "feed")?)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .rows_affected();
+                Ok(n > 0)
+            }
+
+            async fn feed_get(
+                &self,
+                key: &str,
+            ) -> Result<Option<$crate::serve::history::feeds::FeedRecord>, $crate::serve::history::HistoryError> {
+                self.select_one_body(&self.stmts.feed_select, &[key], "feed").await
+            }
+
+            async fn feed_list(&self) -> Result<Vec<$crate::serve::history::feeds::FeedRecord>, $crate::serve::history::HistoryError> {
+                self.select_bodies(&self.stmts.feed_list, &[], "feed").await
+            }
+
+            async fn feed_count(&self) -> Result<u64, $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let n: i64 = sqlx::query_scalar(&self.stmts.feed_count)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(u64::try_from(n).unwrap_or(0))
+            }
+
+            async fn feed_delete(&self, key: &str) -> Result<bool, $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
+                sqlx::query(&self.stmts.feed_delete_tokens)
+                    .bind(key)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?;
+                let n = sqlx::query(&self.stmts.feed_delete)
+                    .bind(key)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?
+                    .rows_affected();
+                tx.commit().await.map_err(backend)?;
+                Ok(n > 0)
+            }
+
+            async fn feed_remove(
+                &self,
+                expected: &$crate::serve::history::feeds::FeedRecord,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
+                let n = sqlx::query(&self.stmts.feed_remove)
+                    .bind(expected.key())
+                    .bind(sql::encode_json(expected, "feed")?)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?
+                    .rows_affected();
+                if n > 0 {
+                    sqlx::query(&self.stmts.feed_remove_tokens)
+                        .bind(&expected.uid)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(backend)?;
+                }
+                tx.commit().await.map_err(backend)?;
+                Ok(n > 0)
+            }
+
+            async fn feed_token_insert(
+                &self,
+                token: &$crate::serve::history::feeds::FeedTokenRecord,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let n = sqlx::query(&self.stmts.feed_token_insert)
+                    .bind(&token.id)
+                    .bind(&token.feed)
+                    .bind(sql::fmt_ts(token.created_at))
+                    .bind(sql::encode_json(token, "feed token")?)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .rows_affected();
+                Ok(n > 0)
+            }
+
+            async fn feed_token_replace(
+                &self,
+                expected: &$crate::serve::history::feeds::FeedTokenRecord,
+                new: &$crate::serve::history::feeds::FeedTokenRecord,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                if new.id != expected.id {
+                    return Ok(false);
+                }
+                let n = sqlx::query(&self.stmts.feed_token_replace)
+                    .bind(sql::fmt_ts(chrono::Utc::now()))
+                    .bind(sql::encode_json(new, "feed token")?)
+                    .bind(&expected.id)
+                    .bind(sql::encode_json(expected, "feed token")?)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?
+                    .rows_affected();
+                Ok(n > 0)
+            }
+
+            async fn feed_token_list(
+                &self,
+                feed: Option<&str>,
+            ) -> Result<Vec<$crate::serve::history::feeds::FeedTokenRecord>, $crate::serve::history::HistoryError> {
+                match feed {
+                    Some(f) => {
+                        self.select_bodies(&self.stmts.feed_token_list, &[f], "feed token")
+                            .await
+                    }
+                    None => {
+                        self.select_bodies(&self.stmts.feed_token_list_all, &[], "feed token")
+                            .await
+                    }
+                }
+            }
+
             async fn tenant_delete(&self, id: &str) -> Result<bool, $crate::serve::history::HistoryError> {
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
@@ -6153,6 +6411,8 @@ macro_rules! impl_sql_history {
                     &self.stmts.tenant_delete_runs,
                     &self.stmts.tenant_delete_state_refs,
                     &self.stmts.tenant_delete_schedules,
+                    &self.stmts.tenant_delete_feed_tokens,
+                    &self.stmts.tenant_delete_feeds,
                 ] {
                     sqlx::query(stmt)
                         .bind(id)

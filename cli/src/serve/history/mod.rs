@@ -7,6 +7,7 @@
 pub mod catalog;
 #[cfg(feature = "serve")]
 pub mod fallback;
+pub mod feeds;
 pub mod labels;
 pub mod memory;
 pub mod overview;
@@ -128,6 +129,20 @@ pub struct InvocationRecord {
     /// existed; derive it from `error` / `skipped` there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<InvocationStatus>,
+    /// Why a feed delivery's read ended without delivering, when the `feed`
+    /// source said so: the scheduler acts on this, never on the error text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed_error: Option<FeedFailure>,
+}
+
+/// A `feed` source failure the feed scheduler acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedFailure {
+    /// The delivery is held until an admin recovers it.
+    Held,
+    /// The run's range claim was lost; it stopped before committing.
+    ClaimLost,
 }
 
 /// One invocation's outcome in a run record.
@@ -171,6 +186,13 @@ impl From<&InvocationOutcome> for InvocationRecord {
                 o.error.as_deref(),
                 o.error_kind == Some(crate::executor::InvocationErrorKind::Skipped),
             )),
+            feed_error: match o.error_kind {
+                Some(crate::executor::InvocationErrorKind::FeedHeld) => Some(FeedFailure::Held),
+                Some(crate::executor::InvocationErrorKind::FeedClaimLost) => {
+                    Some(FeedFailure::ClaimLost)
+                }
+                _ => None,
+            },
         }
     }
 }
@@ -285,6 +307,15 @@ pub struct RunRecord {
     /// `policy` feature): the newest versions apply (#1051).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_pin: Option<policies::PolicyPin>,
+    /// The feed range a delivery run reads (#1034), set by the feed
+    /// scheduler: a claim, reload or rollback binds the same range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed: Option<feeds::RunFeedBinding>,
+    /// Appended to the config's pipeline name when it is loaded
+    /// (`<name>.<suffix>`), so two deliveries of one template never share a
+    /// state key (#1034). Set by the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_name_suffix: Option<String>,
     /// What a policy change's impact needs of the run's config, and nothing
     /// else (#1051): no connector settings, no masking keys, no values from
     /// secret references. Stored only while the server keeps its policy in
@@ -347,6 +378,8 @@ impl RunRecord {
             submitted_by: None,
             dlq_location: None,
             policy_pin: None,
+            feed: None,
+            pipeline_name_suffix: None,
             policy_projection: None,
         }
     }
@@ -433,12 +466,17 @@ pub const CAP_HOST_CREDENTIALS: &str = "host_credentials";
 /// A member holds a caller's config to the reference kinds added after
 /// `x-faucet-resource: path | url | command` (a listener's address).
 pub const CAP_REFERENCE_KINDS_V2: &str = "reference_kinds_v2";
+/// A member runs feeds (#1034): it knows the `feed` source and binds a
+/// delivery run to its claimed range.
+pub const CAP_FEEDS: &str = "feeds";
 /// What this build advertises in its heartbeat.
 pub const INSTANCE_CAPABILITIES: &[&str] = &[
     CAP_POLICY_PIN,
     CAP_CONNECTION_GENERATION,
     CAP_HOST_CREDENTIALS,
     CAP_REFERENCE_KINDS_V2,
+    #[cfg(feature = "feeds")]
+    CAP_FEEDS,
 ];
 
 /// One live cluster member (for `/readyz` + metrics).
@@ -2413,6 +2451,94 @@ pub trait RunHistory: Send + Sync {
         Ok(false)
     }
 
+    /// Store a new feed (#1034); `false` when one with its key (tenant and
+    /// name) already exists. Default: unsupported.
+    async fn feed_insert(&self, feed: &feeds::FeedRecord) -> Result<bool, HistoryError> {
+        let _ = feed;
+        Err(HistoryError::Backend(
+            "this run-history backend does not store feeds".into(),
+        ))
+    }
+
+    /// Replace feed `expected` with `new` only while the stored record is
+    /// still exactly `expected` (so its revision too); returns whether it was
+    /// replaced. Default: unsupported.
+    async fn feed_replace(
+        &self,
+        expected: &feeds::FeedRecord,
+        new: &feeds::FeedRecord,
+    ) -> Result<bool, HistoryError> {
+        let _ = (expected, new);
+        Err(HistoryError::Backend(
+            "this run-history backend does not store feeds".into(),
+        ))
+    }
+
+    /// One feed by its key ([`feeds::feed_key`]). Default: `None`.
+    async fn feed_get(&self, key: &str) -> Result<Option<feeds::FeedRecord>, HistoryError> {
+        let _ = key;
+        Ok(None)
+    }
+
+    /// Every stored feed, ordered by key. Default: empty.
+    async fn feed_list(&self) -> Result<Vec<feeds::FeedRecord>, HistoryError> {
+        Ok(Vec::new())
+    }
+
+    /// How many feeds are stored. Default: 0.
+    async fn feed_count(&self) -> Result<u64, HistoryError> {
+        Ok(0)
+    }
+
+    /// Delete a feed and its tokens; returns whether it existed. Default:
+    /// `false`.
+    async fn feed_delete(&self, key: &str) -> Result<bool, HistoryError> {
+        let _ = key;
+        Ok(false)
+    }
+
+    /// Delete feed `expected` and its tokens only while the stored record is
+    /// still exactly `expected`; returns whether it was deleted. Default:
+    /// `false`.
+    async fn feed_remove(&self, expected: &feeds::FeedRecord) -> Result<bool, HistoryError> {
+        let _ = expected;
+        Ok(false)
+    }
+
+    /// Store a new feed token; `false` when its id is taken. Default:
+    /// unsupported.
+    async fn feed_token_insert(
+        &self,
+        token: &feeds::FeedTokenRecord,
+    ) -> Result<bool, HistoryError> {
+        let _ = token;
+        Err(HistoryError::Backend(
+            "this run-history backend does not store feed tokens".into(),
+        ))
+    }
+
+    /// Replace token `expected` with `new` only while it is unchanged.
+    /// Default: unsupported.
+    async fn feed_token_replace(
+        &self,
+        expected: &feeds::FeedTokenRecord,
+        new: &feeds::FeedTokenRecord,
+    ) -> Result<bool, HistoryError> {
+        let _ = (expected, new);
+        Err(HistoryError::Backend(
+            "this run-history backend does not store feed tokens".into(),
+        ))
+    }
+
+    /// The tokens of the feed with uid `feed`, or every token. Default: empty.
+    async fn feed_token_list(
+        &self,
+        feed: Option<&str>,
+    ) -> Result<Vec<feeds::FeedTokenRecord>, HistoryError> {
+        let _ = feed;
+        Ok(Vec::new())
+    }
+
     /// Every stored version of a template, newest first — one read for the
     /// whole template. Default: one [`template_get`](Self::template_get) per
     /// version.
@@ -2768,6 +2894,7 @@ pub(crate) async fn assert_list_filters_agree(h: &dyn RunHistory) {
                 rows: None,
                 skipped: false,
                 status: None,
+                feed_error: None,
             });
             h.upsert(&rec).await.unwrap();
         };
@@ -3167,6 +3294,41 @@ mod tests {
             assert!(err.to_string().contains("queue_depth"), "{err}");
         }
         assert!(!h.recover_degraded().await);
+    }
+
+    #[tokio::test]
+    async fn feed_defaults_refuse_writes_and_read_empty() {
+        let h = Bare;
+        let spec: feeds::FeedSpec = serde_json::from_value(serde_json::json!({
+            "name": "orders", "ingest": {"auth": {"tokens": "managed"}}
+        }))
+        .unwrap();
+        let f = feeds::FeedRecord::new(spec, "x", Utc::now());
+        assert!(h.feed_insert(&f).await.is_err());
+        assert!(h.feed_replace(&f, &f).await.is_err());
+        assert!(h.feed_get(&f.key()).await.unwrap().is_none());
+        assert!(h.feed_list().await.unwrap().is_empty());
+        assert_eq!(h.feed_count().await.unwrap(), 0);
+        assert!(!h.feed_delete(&f.key()).await.unwrap());
+        assert!(!h.feed_remove(&f).await.unwrap());
+        let t = feeds::FeedTokenRecord {
+            id: "t".into(),
+            feed: f.uid.clone(),
+            name: "ci".into(),
+            hash: "00".into(),
+            prefix: "fdt_".into(),
+            created_at: Utc::now(),
+            created_by: "x".into(),
+            expires_at: None,
+            revoked_at: None,
+            revoked_by: None,
+            last_used_at: None,
+        };
+        assert!(h.feed_token_insert(&t).await.is_err());
+        assert!(h.feed_token_replace(&t, &t).await.is_err());
+        assert!(h.feed_token_list(None).await.unwrap().is_empty());
+        #[cfg(feature = "feeds")]
+        assert!(INSTANCE_CAPABILITIES.contains(&CAP_FEEDS));
     }
 
     #[tokio::test]

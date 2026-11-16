@@ -59,6 +59,15 @@ approved after another policy change landed is `invalidated` rather than
 overwriting it. (On a server with a single principal — `--auth-token`,
 `--no-auth` — that principal may approve its own request, as for every kind.)
 
+A `schedule` or `feed` change also belongs to the tenant that owns the
+schedule or feed, whoever proposed it. When a server admin proposes a change
+to a tenant's schedule or feed, the request carries that tenant: the tenant's
+principals see it in `GET /v1/changes`, and an approver of that tenant (or a
+server approver) may approve it under the usual approval rules. Another
+tenant's principals get a `404`. The change is still applied as the requester,
+and its audit entries carry the tenant. A fan-out schedule (`tenants:`) is
+owned by no tenant, so its changes stay server-level.
+
 The response is the stored request: `status: pending`, the plan (one
 [`faucet plan`](/faucet-stream/reference/cli/#plan) report per root row — source, sink,
 write mode, delivery guarantee, transforms, the [policy](/faucet-stream/cookbook/policies/)
@@ -168,6 +177,11 @@ Whenever schedule changes are gated (`run`, `schedule` or both), the server
 refuses to start when the principals in `--auth-config` could not meet one of
 the rules they need.
 
+A [feed](/faucet-stream/cookbook/feeds/#approvals) change follows the same
+two-rule model: under `--require-approval feed` it needs the `feed` rule, and
+under `--require-approval run` a change that adds or edits a delivery needs
+both `feed` and `run`, because a delivery starts runs.
+
 ## Making it mandatory
 
 ```bash
@@ -190,6 +204,14 @@ faucet serve --auth-config auth.yaml --require-approval run,template_launch
   fire per event would otherwise file one request per file or tick, and a
   rejected one would lose the event. Leave a pipeline out of `--triggers` if
   every run of it needs review.
+- `feed`: creating, editing or deleting a feed or one of its deliveries
+  (`POST`/`PUT`/`DELETE /v1/feeds…`) answers `202` with a pending change
+  request of kind `feed`. Under `run` alone, a feed change that adds or edits
+  a delivery is gated the same way, and an approved feed's deliveries then run
+  without a per-run request only while their template versions are pinned to
+  numbers; a delivery that follows a channel shows `needs_approval` and starts
+  no runs. Feeds in the server's `--feeds` file are a standing approval, like
+  the triggers file. Pausing, resuming and issuing tokens are not gated.
 - `template_register` / `template_launch`: those kinds must come through
   `POST /v1/changes`. `POST /v1/templates` (both kinds when it also launches or
   assigns channels), `/launch`, `/rollback`, `/tags` and a non-dry-run

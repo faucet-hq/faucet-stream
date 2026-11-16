@@ -42,6 +42,7 @@ fn opts(clock: &str) -> ExecuteOptions {
         catalog: None,
         usage: Default::default(),
         budget: None,
+        feed: Default::default(),
     }
 }
 

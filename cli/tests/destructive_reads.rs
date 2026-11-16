@@ -57,6 +57,7 @@ fn opts(dry_run: bool, limit: Option<usize>) -> ExecuteOptions {
         catalog: None,
         usage: Default::default(),
         budget: None,
+        feed: Default::default(),
     }
 }
 

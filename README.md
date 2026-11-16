@@ -281,7 +281,7 @@ warehouse is dbt's job, and the two work well together
 
 ## Connectors
 
-<!--COUNT:sources-->43<!--/COUNT--> sources and <!--COUNT:sinks-->35<!--/COUNT--> sinks. Every
+<!--COUNT:sources-->44<!--/COUNT--> sources and <!--COUNT:sinks-->35<!--/COUNT--> sinks. Every
 connector depends only on `faucet-core`, so any source works with any sink.
 
 | Category | Sources | Sinks |
@@ -290,7 +290,7 @@ connector depends only on `faucet-core`, so any source works with any sink.
 | **CDC** | PostgreSQL, MySQL, SQL Server, MongoDB, Oracle, DynamoDB Streams | Applied through `write_mode: upsert` / `delete` on keyed sinks |
 | **Warehouses and lakehouses** | BigQuery, Snowflake, Redshift, ClickHouse, Databricks, Delta, Iceberg | BigQuery, Snowflake, Redshift, ClickHouse, Databricks, Delta, Iceberg |
 | **Object stores and files** | S3, GCS, Azure Blob, SFTP, local files (path, glob or URL); CSV and Parquet *(deprecated: use local files)* | S3, GCS, Azure Blob, SFTP, local files; CSV, Parquet and JSONL *(deprecated: use local files)* |
-| **Streams and queues** | Kafka, Kinesis, Pub/Sub, NATS, RabbitMQ, SQS | Kafka, Kinesis, Pub/Sub, NATS, RabbitMQ, SQS |
+| **Streams and queues** | Kafka, Kinesis, Pub/Sub, NATS, RabbitMQ, SQS, feed (a durable event feed store) | Kafka, Kinesis, Pub/Sub, NATS, RabbitMQ, SQS |
 | **APIs** | REST, GraphQL, gRPC, XML, Webhook, WebSocket | HTTP |
 | **Search** | Elasticsearch | Elasticsearch |
 | **Bridges** | Singer taps (experimental) | Singer targets (experimental), stdout |
@@ -329,6 +329,7 @@ faucet serve                    # HTTP control plane with a web console
 - **`faucet serve`** is a long-running control plane. It covers:
   - a REST API for submitting, polling and cancelling runs ([serve](https://faucet-hq.github.io/faucet-stream/cookbook/serve/) · [HTTP API](https://faucet-hq.github.io/faucet-stream/reference/http-api/))
   - event triggers on object arrival, webhooks and queue depth ([triggers](https://faucet-hq.github.io/faucet-stream/reference/triggers/))
+  - feeds: durable HTTP push ingestion, where senders are answered once their events are stored and each delivery runs a pipeline over them with its own position and replay ([feeds](https://faucet-hq.github.io/faucet-stream/cookbook/feeds/))
   - clustered execution ([cluster](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/))
   - an MCP server for agents ([MCP](https://faucet-hq.github.io/faucet-stream/cookbook/mcp/))
   - multi-tenant embedding with per-tenant credentials, hosted OAuth and isolated state ([embedded integrations](https://faucet-hq.github.io/faucet-stream/cookbook/embedded-integrations/))

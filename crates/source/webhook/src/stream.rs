@@ -6,12 +6,12 @@ use crate::config::{
 use async_trait::async_trait;
 use axum::{Router, extract::State, http::StatusCode, routing::post};
 use faucet_core::driver::{DriverSource, PageStream, SourceDriver};
+use faucet_core::signature::{DigestEncoding, HmacAlgorithm, SignatureCheck, token_matches};
 use faucet_core::{CallSlot, CancellationToken, FaucetError, StreamPage};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, Notify, oneshot};
 
 /// Shared state for the webhook HTTP handler.
@@ -237,8 +237,24 @@ fn server_result(
     }
 }
 
-/// Verify an HMAC signature over the raw body (and the signed timestamp, when
-/// configured) in constant time.
+fn signature_check(sig: &WebhookSignature) -> SignatureCheck<'_> {
+    SignatureCheck {
+        header: &sig.header,
+        secret: sig.secret.as_bytes(),
+        algorithm: match sig.algorithm {
+            SignatureAlgorithm::Sha256 => HmacAlgorithm::Sha256,
+            SignatureAlgorithm::Sha512 => HmacAlgorithm::Sha512,
+        },
+        encoding: match sig.encoding {
+            SignatureEncoding::Hex => DigestEncoding::Hex,
+            SignatureEncoding::Base64 => DigestEncoding::Base64,
+        },
+        prefix: sig.prefix.as_deref(),
+        timestamp_header: sig.timestamp_header.as_deref(),
+        tolerance_secs: sig.tolerance_secs,
+    }
+}
+
 /// For a request signed with a timestamp: its signature header value, its
 /// timestamp, and the oldest timestamp still inside the tolerance window.
 fn signed_request_key(
@@ -247,104 +263,21 @@ fn signed_request_key(
     now_unix: u64,
 ) -> Option<(String, u64, u64)> {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    let ts = header(sig.timestamp_header.as_deref()?)?
-        .trim()
-        .parse::<u64>()
-        .ok()?;
-    let provided = header(&sig.header)?.trim();
-    let provided = match sig.encoding {
-        SignatureEncoding::Hex => provided.to_ascii_lowercase(),
-        _ => provided.to_string(),
-    };
-    Some((provided, ts, now_unix.saturating_sub(sig.tolerance_secs)))
+    signature_check(sig)
+        .signed_request(header, now_unix)
+        .map(|r| (r.signature, r.timestamp, r.oldest_accepted))
 }
 
+/// Verify an HMAC signature over the raw body (and the signed timestamp, when
+/// configured) in constant time.
 fn signature_ok(
     sig: &WebhookSignature,
     headers: &axum::http::HeaderMap,
     body: &[u8],
     now_unix: u64,
 ) -> bool {
-    use hmac::{Mac, digest::KeyInit};
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    let Some(provided) = header(&sig.header) else {
-        return false;
-    };
-    let provided = provided.trim();
-    let provided = match &sig.prefix {
-        Some(p) => match provided.strip_prefix(p.as_str()) {
-            Some(rest) => rest,
-            None => return false,
-        },
-        None => provided,
-    };
-    let mut signed: Vec<u8> = Vec::with_capacity(body.len() + 16);
-    if let Some(ts_name) = &sig.timestamp_header {
-        let Some(ts) = header(ts_name).and_then(|t| t.trim().parse::<u64>().ok()) else {
-            return false;
-        };
-        if ts.abs_diff(now_unix) > sig.tolerance_secs {
-            return false;
-        }
-        signed.extend_from_slice(ts.to_string().as_bytes());
-        signed.push(b'.');
-    }
-    signed.extend_from_slice(body);
-    let digest: Vec<u8> = match sig.algorithm {
-        SignatureAlgorithm::Sha256 => {
-            let Ok(mut mac) =
-                <hmac::Hmac<sha2::Sha256> as KeyInit>::new_from_slice(sig.secret.as_bytes())
-            else {
-                return false;
-            };
-            mac.update(&signed);
-            mac.finalize().into_bytes().to_vec()
-        }
-        SignatureAlgorithm::Sha512 => {
-            let Ok(mut mac) =
-                <hmac::Hmac<sha2::Sha512> as KeyInit>::new_from_slice(sig.secret.as_bytes())
-            else {
-                return false;
-            };
-            mac.update(&signed);
-            mac.finalize().into_bytes().to_vec()
-        }
-    };
-    let expected = match sig.encoding {
-        SignatureEncoding::Hex => digest
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>(),
-        SignatureEncoding::Base64 => {
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD.encode(&digest)
-        }
-    };
-    let provided = match sig.encoding {
-        SignatureEncoding::Hex => provided.to_ascii_lowercase(),
-        SignatureEncoding::Base64 => provided.to_string(),
-    };
-    bool::from(provided.as_bytes().ct_eq(expected.as_bytes()))
-}
-
-/// Constant-time check of an `Authorization` header value against the shared
-/// secret. Accepts either the raw token or a `Bearer <token>` form, matching the
-/// original behaviour. The comparison uses [`subtle::ConstantTimeEq`] and a
-/// non-short-circuiting `|` so neither *which* form matched nor *where* the first
-/// byte differs is observable via response timing — closing a side-channel that
-/// could otherwise leak the secret byte-by-byte. (Length difference short-circuits;
-/// the secret's length is not itself sensitive.)
-fn token_matches(provided: Option<&str>, expected: &str) -> bool {
-    let Some(p) = provided else {
-        return false;
-    };
-    let exp = expected.as_bytes();
-    let raw = bool::from(p.as_bytes().ct_eq(exp));
-    let stripped = p
-        .strip_prefix("Bearer ")
-        .map(|s| bool::from(s.as_bytes().ct_eq(exp)))
-        .unwrap_or(false);
-    raw | stripped
+    signature_check(sig).verify(header, body, now_unix)
 }
 
 /// Decision for an incoming payload, given the current record count and the

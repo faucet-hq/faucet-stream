@@ -1,0 +1,6 @@
+# expect-error: serve.feeds.listen.ingress.enabled=true requires serve.feeds.listen.enabled=true
+serve:
+  feeds:
+    listen:
+      ingress:
+        enabled: true

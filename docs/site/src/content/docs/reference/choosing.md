@@ -67,13 +67,19 @@ are not aliases of the file source.)
 - **`source-webhook`** — opens a temporary HTTP server and *receives* inbound HTTP
   POSTs from external systems over a time window. Use it when the remote system pushes
   to you over HTTP rather than WebSocket.
+- **A [feed](/faucet-stream/cookbook/feeds/)** (`faucet serve`, read by `source-feed`) — the
+  server itself receives the HTTP POSTs, stores each event before it answers, and delivers
+  them with one position per destination. Use it when the sender cannot send again, when the
+  destination may be down while events arrive, or when the same events go to several
+  destinations. The `webhook` source only listens while its run is open.
 - **`source-kafka`** / **`source-redis`** — broker-backed streaming with durable,
   replayable offsets and resumable bookmarks. Use these when you need guaranteed delivery
   and the ability to continue from where a previous run left off.
 
 **Rule of thumb:** connecting out to a live WebSocket feed → `source-websocket`; receiving
-inbound HTTP POST payloads → `source-webhook`; durable, replayable event stream →
-`source-kafka` or `source-redis`.
+inbound HTTP POST payloads during one run → `source-webhook`; inbound HTTP POSTs that must be
+kept and delivered later, with no broker to run → a feed; durable, replayable event stream on
+a broker you already have → `source-kafka` or `source-redis`.
 
 ## Streaming: Redis vs. Kafka vs. Kinesis vs. RabbitMQ
 

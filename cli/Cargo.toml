@@ -31,7 +31,7 @@ default = ["observability", "source", "sink", "state", "transforms", "compressio
 # transform, secrets resolver and catalog option. The container image's
 # complete build is exactly this set; `scripts/full-feature-coverage.py`
 # fails CI when a new feature is left out.
-full = ["default", "hub-remote", "otel", "schedule", "serve", "serve-ui", "serve-history-postgres", "serve-history-sqlite", "catalog", "lineage", "lineage-kafka", "notify", "transform-sql", "transform-wasm", "triggers", "triggers-object-store", "triggers-redis", "triggers-kafka", "templates", "templates-sync", "templates-sync-object-store", "tenants", "cli-dev", "cli-interactive", "encryption", "cli-tui", "mcp", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "sink-clickhouse-staging", "sink-mssql-staging", "sink-databricks-staging", "source-oracle", "source-oracle-cdc", "sink-oracle", "source-rest-excel", "source-xml-excel", "file-formats", "secrets", "kafka-schema-registry", "quality-jsonschema", "arrow", "source-iceberg-glue", "source-iceberg-hms", "source-iceberg-sql", "sink-iceberg-glue", "sink-iceberg-hms", "sink-iceberg-sql"]
+full = ["default", "hub-remote", "otel", "schedule", "serve", "serve-ui", "serve-history-postgres", "serve-history-sqlite", "catalog", "lineage", "lineage-kafka", "notify", "transform-sql", "transform-wasm", "triggers", "triggers-object-store", "triggers-redis", "triggers-kafka", "templates", "templates-sync", "templates-sync-object-store", "tenants", "feeds", "cli-dev", "cli-interactive", "encryption", "cli-tui", "mcp", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "sink-clickhouse-staging", "sink-mssql-staging", "sink-databricks-staging", "source-oracle", "source-oracle-cdc", "sink-oracle", "source-rest-excel", "source-xml-excel", "file-formats", "secrets", "kafka-schema-registry", "quality-jsonschema", "arrow", "source-iceberg-glue", "source-iceberg-hms", "source-iceberg-sql", "sink-iceberg-glue", "sink-iceberg-hms", "sink-iceberg-sql"]
 
 # Remote Template Hub catalogs (#677): `--hub github:owner/repo[@ref][/path]`
 # fetches a catalog through the GitHub contents API and caches it locally;
@@ -103,6 +103,7 @@ source = [
     "source-websocket",
     "source-csv",
     "source-file",
+    "source-feed",
     "source-elasticsearch",
     "source-kafka",
     "source-kinesis",
@@ -187,6 +188,7 @@ source-webhook = ["dep:faucet-source-webhook", "faucet-registry/source-webhook"]
 source-websocket = ["dep:faucet-source-websocket", "faucet-registry/source-websocket"]
 source-csv = ["dep:faucet-source-csv", "faucet-registry/source-csv"]
 source-file = ["dep:faucet-source-file", "faucet-registry/source-file"]
+source-feed = ["dep:faucet-source-feed", "dep:faucet-common-feed", "faucet-registry/source-feed"]
 source-elasticsearch = ["dep:faucet-source-elasticsearch", "faucet-registry/source-elasticsearch"]
 source-kafka = ["dep:faucet-source-kafka", "faucet-registry/source-kafka"]
 source-kinesis = ["dep:faucet-source-kinesis", "faucet-registry/source-kinesis"]
@@ -516,8 +518,8 @@ schedule = ["dep:croner"]
 # it in; the feature-isolation CI matrix builds `serve` alone.
 # `sqlx/sqlite`: the run history is a SQLite file by default (#1049), so every
 # server build can persist it.
-serve = ["observability", "tokio/net", "tokio/time", "tokio/io-util", "dep:axum", "dep:tower-http", "dep:subtle", "dep:dashmap", "dep:sha2", "dep:async-stream", "dep:reqwest", "dep:sqlx", "sqlx/sqlite"]
-serve-history-postgres = ["serve", "dep:sqlx", "sqlx/postgres"]
+serve = ["observability", "faucet-core/signature", "tokio/net", "tokio/time", "tokio/io-util", "dep:axum", "dep:tower-http", "dep:subtle", "dep:dashmap", "dep:sha2", "dep:async-stream", "dep:reqwest", "dep:sqlx", "sqlx/sqlite"]
+serve-history-postgres = ["serve", "dep:sqlx", "sqlx/postgres", "faucet-common-feed?/postgres"]
 # Kept for builds that name it: `serve` now includes the SQLite history.
 serve-history-sqlite = ["serve"]
 # Embedded web console (single-page UI) served by `faucet serve` at `/`.
@@ -553,6 +555,12 @@ templates = ["serve"]
 # state / schedules and tenant-scoped principals. CLI-only; not in
 # `default`; included in `full`.
 tenants = ["serve", "encryption", "templates", "notify"]
+# Feeds (#1034): durable event feeds senders push into, delivered by runs of
+# a registered template or a server-side pipeline file. The store follows the
+# run history (SQLite file, or PostgreSQL with `serve-history-postgres`);
+# sealing payloads and secret params needs `encryption`. CLI-only; not in
+# `default`; included in `full`.
+feeds = ["serve", "templates", "schedule", "source-feed", "faucet-common-feed/sqlite", "dep:flate2"]
 # Template hosting + sync (RFC 0006 / #589): pull templates into the registry
 # from a remote origin (GitHub, S3, GCS, Azure Blob) and publish one back.
 # GitHub goes over the HTTP client already linked; the object-store origins
@@ -600,6 +608,9 @@ faucet-source-webhook = { workspace = true, optional = true }
 faucet-source-websocket = { workspace = true, optional = true }
 faucet-source-csv = { workspace = true, optional = true }
 faucet-source-file = { workspace = true, optional = true }
+faucet-source-feed = { workspace = true, optional = true }
+faucet-common-feed = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
 faucet-source-elasticsearch = { workspace = true, optional = true }
 faucet-source-kafka = { workspace = true, optional = true }
 faucet-source-kinesis = { workspace = true, optional = true }
@@ -779,12 +790,16 @@ opentelemetry-proto = { workspace = true, features = ["metrics"] }
 prost-otlp = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
+# `faucet run` over the `feed` source: seeds a real SQLite feed store.
+faucet-common-feed = { workspace = true, features = ["sqlite"] }
+# Feed ingest tests send gzip bodies.
+flate2 = { workspace = true }
 
 [package.metadata.docs.rs]
 # Every feature but bundled DuckDB, librdkafka and Oracle (docs.rs OOM, #794); see scripts/full-feature-coverage.py.
 features = [
     "arrow", "catalog", "cli-dev", "cli-interactive", "cli-progress", "cli-tui", "compression",
-    "contract", "delta-azure", "delta-gcs", "delta-s3", "file-formats", "google-sa",
+    "contract", "delta-azure", "delta-gcs", "delta-s3", "feeds", "file-formats", "google-sa",
     "hub-remote", "mcp", "mtls", "oauth1", "otel", "policy", "quality-jsonschema",
     "rabbitmq-tls", "schedule", "secrets", "serve-history-postgres", "serve-history-sqlite",
     "serve-ui", "sink-azure-blob", "sink-bigquery", "sink-clickhouse-staging", "sink-csv",
@@ -796,7 +811,7 @@ features = [
     "sink-sftp", "sink-singer", "sink-snowflake", "sink-spanner", "sink-sqlite", "sink-sqs",
     "sink-stdout", "source-azure-blob", "source-bigquery", "source-clickhouse", "source-csv",
     "source-databricks", "source-delta", "source-dynamodb", "source-elasticsearch",
-    "source-file", "source-gcs", "source-graphql", "source-grpc", "source-iceberg",
+    "source-feed", "source-file", "source-gcs", "source-graphql", "source-grpc", "source-iceberg",
     "source-iceberg-glue", "source-iceberg-hms", "source-iceberg-sql", "source-kinesis",
     "source-mongodb", "source-mongodb-cdc", "source-mssql", "source-mssql-cdc", "source-mysql",
     "source-mysql-cdc", "source-nats", "source-parquet", "source-postgres",

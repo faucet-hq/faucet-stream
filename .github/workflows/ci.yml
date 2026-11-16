@@ -655,6 +655,7 @@ jobs:
           - source-websocket
           - source-csv
           - source-file
+          - source-feed
           - "source-file,file-formats"
           - source-elasticsearch
           - source-kafka
@@ -783,6 +784,8 @@ jobs:
           - templates-sync-object-store
           # Multi-tenant embedded integrations (CLI-only; implies serve, templates, encryption, notify)
           - tenants
+          # Event feeds (CLI-only; implies serve, templates, schedule, source-feed, #1034)
+          - feeds
           # Remote Template Hub catalogs (CLI-only, #677)
           - hub-remote
           # Notification / incident routing (CLI-only)
@@ -844,7 +847,7 @@ jobs:
           if [[ "${{ matrix.feature }}" == registry:* ]]; then
             features="${{ matrix.feature }}"
             cargo check -p faucet-registry --no-default-features --features "${features#registry:}"
-          elif [[ "${{ matrix.feature }}" == secrets-* || "${{ matrix.feature }}" == "schedule" || "${{ matrix.feature }}" == serve* || "${{ matrix.feature }}" == "mcp" || "${{ matrix.feature }}" == "catalog" || "${{ matrix.feature }}" == triggers* || "${{ matrix.feature }}" == templates* || "${{ matrix.feature }}" == "tenants" || "${{ matrix.feature }}" == "hub-remote" || "${{ matrix.feature }}" == "notify" || "${{ matrix.feature }}" == "cli-dev" || "${{ matrix.feature }}" == "cli-tui" || "${{ matrix.feature }}" == "cli-progress" ]]; then
+          elif [[ "${{ matrix.feature }}" == secrets-* || "${{ matrix.feature }}" == "schedule" || "${{ matrix.feature }}" == serve* || "${{ matrix.feature }}" == "mcp" || "${{ matrix.feature }}" == "catalog" || "${{ matrix.feature }}" == triggers* || "${{ matrix.feature }}" == templates* || "${{ matrix.feature }}" == "tenants" || "${{ matrix.feature }}" == "feeds" || "${{ matrix.feature }}" == "hub-remote" || "${{ matrix.feature }}" == "notify" || "${{ matrix.feature }}" == "cli-dev" || "${{ matrix.feature }}" == "cli-tui" || "${{ matrix.feature }}" == "cli-progress" ]]; then
             cargo check -p faucet-cli --no-default-features --features ${{ matrix.feature }}
           else
             cargo check -p faucet-stream --no-default-features --features ${{ matrix.feature }}

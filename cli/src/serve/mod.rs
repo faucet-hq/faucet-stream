@@ -11,6 +11,8 @@ pub mod changes;
 pub mod cluster;
 pub mod config;
 pub mod error;
+#[cfg(feature = "feeds")]
+pub mod feeds;
 pub mod guard;
 pub mod handlers;
 pub mod history;

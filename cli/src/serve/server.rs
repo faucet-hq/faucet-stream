@@ -116,6 +116,55 @@ pub fn build_router(
             get(crate::serve::handlers::schedules::list),
         );
     }
+    // Feeds (#1034). The ingest routes are a router of their own.
+    #[cfg(feature = "feeds")]
+    {
+        use crate::serve::handlers::feeds as f;
+        use axum::routing::put;
+        api = api
+            .route("/v1/feeds", get(f::list).post(f::create))
+            .route(
+                "/v1/feeds/{name}",
+                get(f::get).put(f::update).delete(f::delete),
+            )
+            .route("/v1/feeds/{name}/deliveries", post(f::delivery_create))
+            .route(
+                "/v1/feeds/{name}/deliveries/{delivery}",
+                put(f::delivery_update).delete(f::delivery_delete),
+            )
+            .route(
+                "/v1/feeds/{name}/deliveries/{delivery}/pause",
+                post(f::pause),
+            )
+            .route(
+                "/v1/feeds/{name}/deliveries/{delivery}/resume",
+                post(f::resume),
+            )
+            .route(
+                "/v1/feeds/{name}/deliveries/{delivery}/deliver-now",
+                post(f::deliver_now),
+            )
+            .route(
+                "/v1/feeds/{name}/deliveries/{delivery}/replay",
+                post(f::replay),
+            )
+            .route("/v1/feeds/{name}/deliveries/{delivery}/skip", post(f::skip))
+            .route(
+                "/v1/feeds/{name}/deliveries/{delivery}/recover",
+                post(f::recover),
+            )
+            .route(
+                "/v1/feeds/{name}/tokens",
+                get(f::tokens).post(f::token_create),
+            )
+            .route(
+                "/v1/feeds/{name}/tokens/{id}",
+                axum::routing::delete(f::token_revoke),
+            )
+            .route("/v1/feeds/{name}/events", get(f::events))
+            .route("/v1/feeds/{name}/events/{seq}", get(f::event))
+            .route("/v1/feeds/{name}/refusals", get(f::refusals));
+    }
     #[cfg(all(feature = "schedule", feature = "templates"))]
     {
         use crate::serve::handlers::schedules as s;
@@ -347,7 +396,13 @@ pub fn build_router(
             .fallback(ui_assets::spa_fallback);
     }
 
-    router
+    let guard = std::sync::Arc::new(crate::serve::guard::RequestGuard::new(
+        &config.request_guard,
+        config.listen,
+        matches!(config.auth, crate::serve::config::AuthMode::None),
+        &config.cors_origins,
+    ));
+    let router = router
         // axum's own 2 MiB extractor cap would otherwise win over a larger
         // `--body-limit-bytes`.
         .layer(axum::extract::DefaultBodyLimit::disable())
@@ -359,15 +414,20 @@ pub fn build_router(
             scope_test_policy,
         ))
         .layer(axum::middleware::from_fn_with_state(
-            std::sync::Arc::new(crate::serve::guard::RequestGuard::new(
-                &config.request_guard,
-                config.listen,
-                matches!(config.auth, crate::serve::config::AuthMode::None),
-                &config.cors_origins,
-            )),
+            guard.clone(),
             crate::serve::guard::guard,
         ))
-        .with_state(state)
+        .with_state(state.clone());
+    // Ingest routes authenticate themselves; `--feeds-listen` moves them (#1034).
+    #[cfg(feature = "feeds")]
+    let router = if config.feeds.listen.is_none() {
+        router.merge(crate::serve::feeds::ingest::router(state, guard))
+    } else {
+        router
+    };
+    #[cfg(not(feature = "feeds"))]
+    let _ = (state, guard);
+    router
 }
 
 /// Run each request as this server's work, so template tests it starts
@@ -662,6 +722,8 @@ pub async fn maintain_leases(
     if let Err(e) = retry_policy_seed(state).await {
         tracing::error!(error = %e, "seeding the policy store from the --policy file failed; new work waits for it");
     }
+    #[cfg(feature = "feeds")]
+    state.feeds().lease_tick(state).await;
     // Terminal records whose write failed go first: until they land the rows
     // read `running`, and their lease is renewed below so no peer re-runs them.
     crate::serve::runner::retry_pending_finalize(state).await;
@@ -1115,6 +1177,23 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
             "--schedules requires a build with the `schedule` and `templates` features".into(),
         ));
     }
+    // Feeds (#1034): validate the file first and protect every SQLite feed store.
+    #[cfg(feature = "feeds")]
+    let feeds_file = match &config.feeds.path {
+        Some(path) => crate::serve::feeds::spec::load_file(path).await?,
+        None => Default::default(),
+    };
+    #[cfg(feature = "feeds")]
+    for target in crate::serve::feeds::stores::targets(&config.feeds, &config.history)
+        .map_err(CliError::Serve)?
+        .values()
+    {
+        if let crate::serve::feeds::stores::StoreTarget::Sqlite(path) = target {
+            for file in crate::serve::feeds::stores::protected_files(path) {
+                crate::serve::load::protect_file(&file);
+            }
+        }
+    }
     // Template origins (RFC 0006 / #589): load + validate the sync file
     // fail-fast; the pull itself runs after the state exists.
     #[cfg(feature = "templates-sync")]
@@ -1319,6 +1398,21 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         .local_addr()
         .map_err(|e| CliError::Serve(e.to_string()))?;
     tracing::info!(listen = %local, "faucet serve listening");
+    // `--feeds-listen` (#1034): the ingest routes' own listener.
+    #[cfg(feature = "feeds")]
+    let feeds_listener = match config.feeds.listen {
+        Some(addr) => {
+            let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+                CliError::Serve(format!("failed to bind --feeds-listen {addr}: {e}"))
+            })?;
+            let local = listener
+                .local_addr()
+                .map_err(|e| CliError::Serve(e.to_string()))?;
+            tracing::info!(listen = %local, "feed ingest listening");
+            Some((listener, local))
+        }
+        None => None,
+    };
 
     // Background history maintenance: bounds run-record / idempotency-claim
     // growth and makes the retention knobs effective (audit #146 C4).
@@ -1432,6 +1526,21 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         crate::serve::schedules::spawn(state.clone(), shutdown.clone())
     };
 
+    // Feeds (#1034): a `--feeds` file with feeds starts the scheduler now.
+    #[cfg(feature = "feeds")]
+    {
+        let stores = crate::serve::feeds::stores::Stores::from_config(&config);
+        state.set_feeds(crate::serve::feeds::FeedsRuntime::new(
+            config.feeds.clone(),
+            feeds_file,
+            stores,
+        ));
+        crate::serve::feeds::service::check_file_deliveries(&state)
+            .await
+            .map_err(CliError::Serve)?;
+        state.feeds().lease_tick(&state).await;
+    }
+
     // The HTTP graceful-shutdown future resolves on signal, then drives the run
     // drain *inside itself* — this is load-bearing: `axum::serve(...).await` does
     // not return until every open connection closes, and an open SSE
@@ -1441,6 +1550,24 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     // on the SSE, the SSE waits on the run, the run waits on a cancel that never
     // fires. Draining + cancelling from within the signal handler breaks that
     // cycle — cancelled runs end, their SSE streams close, and axum can return.
+    #[cfg(feature = "feeds")]
+    let ingest_stop = CancellationToken::new();
+    #[cfg(feature = "feeds")]
+    let ingest_server = feeds_listener.map(|(listener, local)| {
+        let app = crate::serve::feeds::ingest::listener_router(state.clone(), &config.feeds, local);
+        let stop = ingest_stop.clone();
+        tokio::spawn(async move {
+            let served = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(stop.cancelled_owned())
+            .await;
+            if let Err(e) = served {
+                tracing::error!(error = %e, "the feed ingest listener stopped");
+            }
+        })
+    });
     // `into_make_service_with_connect_info` exposes the peer address so the auth
     // layer can record a `source_ip` on audit records (#205).
     let drain_state = state.clone();
@@ -1471,6 +1598,14 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     })
     .await
     .map_err(|e| CliError::Serve(format!("server error: {e}")))?;
+    // Let ingest requests admitted before the drain get their answer.
+    #[cfg(feature = "feeds")]
+    {
+        ingest_stop.cancel();
+        if let Some(server) = ingest_server {
+            let _ = tokio::time::timeout(Duration::from_secs(10), server).await;
+        }
+    }
 
     // Serve has returned (connections closed). Give any just-cancelled runs the
     // full cooperative-flush grace to write their terminal status / complete an

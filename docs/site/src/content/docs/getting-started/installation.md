@@ -81,7 +81,7 @@ The prebuilt binary includes every feature: it is the CLI's `full` build, the
 same set as the `:latest` / `-full` container image. That is every first-party
 connector, `serve` with the web console and its SQLite / Postgres history,
 `schedule`, `triggers` (webhook, object-arrival, Redis and Kafka watchers),
-`templates` and template sync, `mcp`, `notify`, `secrets` (`${vault:…}`,
+`templates` and template sync, `feeds`, `mcp`, `notify`, `secrets` (`${vault:…}`,
 `${aws-sm:…}`, `${gcp-sm:…}`, `${azure-kv:…}`), `catalog`, `lineage`, `otel`,
 `tenants`, `encryption`, and the `sql` / `wasm` transforms. The Oracle
 connectors are included too; using them needs Oracle Instant Client installed
@@ -100,7 +100,7 @@ either kind of node; releases up to 1.14.0 were `linux/amd64` only.
 
 | Tag | What is compiled in |
 |---|---|
-| `full` | The CLI's `full` feature: **every** connector and **every** feature — serve with the web console, tenants, templates and template sync, triggers (all watchers), the SQL and WASM transforms, OTLP export, secret-manager references, encryption, every file format, lineage, the catalog, MCP — plus the Oracle Instant Client the Oracle connectors load at run time. |
+| `full` | The CLI's `full` feature: **every** connector and **every** feature — serve with the web console, tenants, templates and template sync, feeds, triggers (all watchers), the SQL and WASM transforms, OTLP export, secret-manager references, encryption, every file format, lineage, the catalog, MCP — plus the Oracle Instant Client the Oracle connectors load at run time. |
 | `core` | `rest`, `postgres`, `s3`, `csv` → `postgres`, `s3`, `jsonl`, `stdout`. |
 | `analytics` | `rest`, `postgres`, `s3`, `bigquery`, `snowflake` → `bigquery`, `snowflake`, `s3`, `jsonl`. |
 | `cdc` | `postgres-cdc`, `mysql-cdc`, `mongodb-cdc` → `postgres`, `kafka`, `s3`. |

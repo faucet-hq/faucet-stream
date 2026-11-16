@@ -1,0 +1,34 @@
+# Feed → JSON Lines. Drains the events a feed store holds for one delivery:
+#   faucet run cli/examples/feed_to_jsonl.yaml
+#
+# The feed and its delivery must already exist in the store. Each run reads
+# what lies past the delivery's cursor, writes it, and only then moves the
+# cursor, so a failed run reads the same events again. Run it again to drain
+# more.
+version: 1
+name: feed_to_jsonl
+pipeline:
+  source:
+    type: feed
+    config:
+      feed: orders              # the feed's uid in the store
+      delivery: archive         # the delivery's id within the feed
+      store:
+        type: sqlite
+        config:
+          path: ./feeds.db
+      max_events: 5000          # most events one run reads
+      include_metadata: true    # adds _feed: {seq, id, received_at, headers}
+  sink:
+    type: file
+    config:
+      path: ./out/orders.jsonl
+      # Append: a run moves the delivery past what it wrote, so the next run
+      # must not replace this one's output.
+      if_exists: append
+  # The bookmark lets a run that crashed between the write and the cursor
+  # move recognise a page the destination already holds.
+  state:
+    type: file
+    config:
+      path: ./state
