@@ -3604,6 +3604,9 @@ components:
         max_records_per_run: { type: integer, minimum: 1 }
         max_bytes_per_run: { type: integer, minimum: 1 }
         max_duration_secs: { type: integer, minimum: 1 }
+        max_feeds: { type: integer, minimum: 1, description: "Most feeds the tenant may have (#1034)." }
+        max_feed_events_per_sec: { type: integer, minimum: 1, description: "Most events a second the tenant's feeds accept together, per server." }
+        max_feed_bytes: { type: integer, minimum: 1, description: "Most bytes the tenant's feeds may hold together; past it a feed refuses new events." }
     Connection:
       type: object
       description: A tenant connection — never its credentials.
