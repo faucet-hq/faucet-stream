@@ -82,6 +82,11 @@ pub struct DeliveryView {
     /// Events stored in the last 24 hours that this delivery has delivered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivered_24h: Option<u64>,
+    /// The delivery guarantee its pipeline gives, derived from the template
+    /// as `faucet validate` derives it; `unknown` when it cannot be derived.
+    /// Only on a feed's own page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guarantee: Option<String>,
 }
 
 /// One feed as a response shows it.
@@ -309,6 +314,7 @@ pub fn view(
                 last_error: s.last_error.clone().or(s.needs_approval.clone()),
                 consecutive_failures: s.consecutive_failures,
                 delivered_24h: None,
+                guarantee: None,
                 spec: d.clone(),
             })
         })
@@ -934,6 +940,85 @@ pub async fn list_page(
     Ok((views(state, &seen).await?, next))
 }
 
+/// The delivery guarantee of each of `feed`'s deliveries, by name: its
+/// pipeline loaded as a run would load it, with placeholders for sealed
+/// params. Remembered per delivery and feed revision for a minute.
+async fn guarantees(state: &ServerState, feed: &Feed) -> BTreeMap<String, String> {
+    let rt = state.feeds();
+    let mut out = BTreeMap::new();
+    for d in &feed.spec.deliveries {
+        let Some(dref) = feed.delivery(&d.name) else {
+            continue;
+        };
+        let key = format!("{}@{}", dref.uid, feed.revision);
+        let word = match rt.guarantee(&key) {
+            Some(word) => word,
+            None => {
+                let word = match delivery_config(state, feed, d, dref).await {
+                    Ok(loaded) => loaded
+                        .nodes
+                        .first()
+                        .map(|n| n.delivery_guarantee.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    Err(_) => "unknown".into(),
+                };
+                rt.remember_guarantee(key, word.clone());
+                word
+            }
+        };
+        out.insert(d.name.clone(), word);
+    }
+    out
+}
+
+/// The delivery actions the audit log records and the feed's history shows.
+const AUDITED_MOVES: &[&str] = &[
+    "feed.pause",
+    "feed.resume",
+    "feed.deliver_now",
+    "feed.replay",
+    "feed.skip",
+    "feed.recover",
+];
+/// Audit entries read for one feed's history.
+const ACTIVITY_SCAN: usize = 2000;
+
+/// What was done to `feed`'s deliveries (pause, resume, deliver now, replay,
+/// skip, recover), newest first, from the audit log's most recent entries.
+async fn activity(state: &ServerState, feed: &Feed) -> Vec<FeedChange> {
+    let filter = crate::serve::history::AuditFilter {
+        tenant: feed.tenant().map(str::to_string),
+        result: Some("ok".into()),
+        limit: ACTIVITY_SCAN,
+        ..Default::default()
+    };
+    let Ok(entries) = state.history().list_audit(&filter).await else {
+        return Vec::new();
+    };
+    let label = feed.label();
+    let own = |target: &str| -> Option<String> {
+        let target = target.strip_prefix("feed:").unwrap_or(target);
+        let delivery = target.strip_prefix(label.as_str())?.strip_prefix('/')?;
+        feed.delivery(delivery).map(|_| delivery.to_string())
+    };
+    entries
+        .into_iter()
+        .filter(|e| AUDITED_MOVES.contains(&e.action.as_str()))
+        .filter(|e| e.tenant.as_deref() == feed.tenant())
+        .filter_map(|e| {
+            let delivery = e.target.as_deref().and_then(own)?;
+            let mut detail = vec![format!("delivery {delivery}")];
+            detail.extend(e.detail.filter(|d| !d.is_empty()));
+            Some(FeedChange {
+                at: e.timestamp,
+                by: e.principal,
+                action: e.action.trim_start_matches("feed.").to_string(),
+                detail,
+            })
+        })
+        .collect()
+}
+
 /// One feed with its gaps, tokens and change log.
 pub async fn get(
     state: &ServerState,
@@ -971,14 +1056,24 @@ pub async fn get(
         .feed_token_list(Some(feed.uid.as_str()))
         .await
         .map_err(ServeError::from)?;
+    let mut view = view_of(state, feed).await?;
+    let derived = guarantees(state, feed).await;
+    for d in &mut view.deliveries {
+        d.guarantee = derived.get(&d.name).cloned();
+    }
     Ok(FeedDetail {
-        feed: view_of(state, feed).await?,
+        feed: view,
         gaps,
         tokens: tokens.iter().map(TokenView::from).collect(),
         hourly_24h: hourly_24h(state, feed).await,
         created_at: found.record.as_ref().map(|r| r.created_at),
         created_by: found.record.as_ref().map(|r| r.created_by.clone()),
-        changes: found.record.map(|r| r.changes).unwrap_or_default(),
+        changes: {
+            let mut all = found.record.map(|r| r.changes).unwrap_or_default();
+            all.extend(activity(state, feed).await);
+            all.sort_by(|a, b| b.at.cmp(&a.at));
+            all
+        },
     })
 }
 

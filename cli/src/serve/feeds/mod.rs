@@ -329,6 +329,7 @@ pub struct FeedsRuntime {
     last_refresh: tokio::sync::Mutex<Option<Instant>>,
     readiness: Mutex<Readiness>,
     bytes: Mutex<HashMap<String, (FeedBytes, Instant)>>,
+    guarantees: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 impl std::fmt::Debug for FeedsRuntime {
@@ -360,6 +361,7 @@ impl FeedsRuntime {
             last_refresh: tokio::sync::Mutex::new(None),
             readiness: Mutex::new(Readiness::default()),
             bytes: Mutex::new(HashMap::new()),
+            guarantees: Mutex::new(HashMap::new()),
         }
     }
 
@@ -501,6 +503,24 @@ impl FeedsRuntime {
             .get(feed_uid)
             .filter(|(_, at)| at.elapsed() < BYTES_MAX_AGE)
             .map(|(b, _)| *b)
+    }
+
+    pub(crate) fn remember_guarantee(&self, key: String, word: String) {
+        let mut held = self
+            .guarantees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.retain(|_, (_, at)| at.elapsed() < BYTES_MAX_AGE);
+        held.insert(key, (word, Instant::now()));
+    }
+
+    pub(crate) fn guarantee(&self, key: &str) -> Option<String> {
+        self.guarantees
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .filter(|(_, at)| at.elapsed() < BYTES_MAX_AGE)
+            .map(|(w, _)| w.clone())
     }
 
     /// The store that holds `feed`, opened on first use.

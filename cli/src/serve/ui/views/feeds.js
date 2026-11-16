@@ -168,12 +168,15 @@ export async function renderFeeds(host, params) {
   async function load() {
     try {
       const t = scope();
-      const first = await api(`/v1/feeds${q(t)}`);
+      // An operator looking at every tenant asks for all of them, a page at a time.
+      const everyone = !t && !tenantPrincipal();
+      const page = (after) => api(`/v1/feeds${everyone ? `?tenant=*${after ? `&after=${enc(after)}` : ""}` : `${q(t)}${after ? `${t ? "&" : "?"}after=${enc(after)}` : ""}`}`);
+      const first = await page();
       let feeds = first.feeds || [];
-      // An operator looking at every tenant also sees each tenant's feeds.
-      if (!t && !tenantPrincipal()) {
-        const more = await Promise.all((tenantList() || []).slice(0, 50).map((x) => api(`/v1/feeds${q(x.id)}`).then((r) => r.feeds || []).catch(() => [])));
-        feeds = feeds.concat(...more);
+      for (let next = first.next; next; ) {
+        const more = await page(next);
+        feeds = feeds.concat(more.feeds || []);
+        next = more.next;
       }
       data = { ...first, feeds };
       loadErr = null;
@@ -279,6 +282,7 @@ export async function renderFeeds(host, params) {
     return row(ring(tone, shape), f.name, f.last_event_at && f.status !== "full" ? fmtAge(f.last_event_at) : "—", metaHtml, { on: !!detail && fkey(f) === selKey() && !form, id: fkey(f), href: feedHref(f) });
   }
 
+  const guaranteeWords = (g) => (g === "at-least-once" ? "at least once" : /atomic watermark/.test(g) ? "exactly once" : /keyed upsert/.test(g) ? "effectively once, by key" : "guarantee unknown");
   const atLimit = () => !!(data && data.quotas && data.quotas.max_feeds != null && data.quotas.feeds >= data.quotas.max_feeds);
   function newButton() {
     if (!data || off || noStore()) return "";
@@ -290,7 +294,7 @@ export async function renderFeeds(host, params) {
     const today = all.reduce((n, f) => n + (f.events_24h || 0), 0);
     const pending = all.reduce((n, f) => n + lagOf(f), 0);
     const refused = all.reduce((n, f) => n + (f.refused_recent || 0), 0);
-    const stored = all.reduce((n, f) => n + (f.stored_bytes || 0), 0);
+    const stored = all.reduce((n, f) => n + (f.retained_bytes || 0), 0);
     const pct = today + refused ? `${((refused / (today + refused)) * 100).toFixed(1)}%` : "0%";
     return { today, pending, refused, stored, pct };
   }
@@ -335,7 +339,7 @@ export async function renderFeeds(host, params) {
     const of = (used, max, fmt = fmtInt) => (max != null ? `${fmt(used)} of ${fmt(max)}` : fmt(used));
     return card({ icon, title: `${qd.tenant}’s quotas`, body: grid(3, [
       kv("Feeds", of(qd.feeds, qd.max_feeds), atLimit() ? "at the limit" : ""),
-      kv(icon ? "Events / second" : "Events per second", of(rate, qd.max_feed_events_per_sec), "set on its feeds"),
+      kv(icon ? "Rate limits set" : "Rate limits set on its feeds", html`${of(rate, qd.max_feed_events_per_sec)} <span class="muted">events/s</span>`, "the sum of its feeds’ configured limits, not live traffic"),
       kv(icon ? "Stored" : "Stored events", of(qd.stored_bytes, qd.max_feed_bytes, bytes)),
     ]), note });
   }
@@ -454,17 +458,18 @@ feeds:
     const und = f.spec.retention.undelivered;
     const maxBytes = sizeBytes(und.max_bytes);
     const maxAge = spanSecs(und.max_age);
-    const pending = lagOf(f) > 0;
-    const held = pending ? f.stored_bytes || 0 : 0;
+    const retained = f.retained_bytes || 0;
+    const held = f.undelivered_bytes != null ? f.undelivered_bytes : lagOf(f) > 0 ? retained : 0;
+    const kept = Math.max(0, retained - held);
     const oldest = oldestWaiting(f);
     const tone = f.status === "full" ? "bad" : "";
     const agePct = oldest ? ((Date.now() - Date.parse(oldest)) / 1000 / maxAge) * 100 : 0;
     const keep = span(spanSecs(f.spec.retention.max_age));
     return card({ icon: "db", title: "Storage and retention", aside: html`store <span class="mono">${f.store}</span>`,
       body: html`<div class="pad stack" style="gap:12px">
-        <div><div class="fd-line"><span>Not delivered yet</span><b class="${tone}">${pending ? `up to ${bytes(held)}` : bytes(0)} of ${bytes(maxBytes)}</b></div>${meter(Math.max(pending ? 1 : 0, (held / maxBytes) * 100))}</div>
+        <div><div class="fd-line"><span>Not delivered yet</span><b class="${tone}">${bytes(held)} of ${bytes(maxBytes)}</b></div>${meter(Math.max(held ? 1 : 0, (held / maxBytes) * 100))}</div>
         <div><div class="fd-line"><span>Oldest waiting</span><b class="${tone}">${oldest ? since(oldest) : "nothing"} <span class="muted">of ${span(maxAge)}</span></b></div>${meter(Math.max(oldest ? 1 : 0, agePct))}</div>
-        <div class="fd-line"><span>Stored, kept for replay</span><b>${bytes(f.stored_bytes || 0)} <span class="muted">· ${keep}</span></b></div></div>`,
+        <div class="fd-line"><span>Delivered, kept for replay</span><b>${bytes(kept)} <span class="muted">· ${keep}</span></b></div></div>`,
       note: `Events are removed only after ${keep} and once every delivery has them. At the limit the feed refuses new events; it never drops stored ones.` });
   }
 
@@ -518,8 +523,9 @@ feeds:
     if (f.source === "file") banner = alert("Defined in the server’s feeds file.", html`Change it in the file passed to <code>--feeds</code> and restart the server. The console can send a test event but cannot edit, pause or delete it.`, "");
     if (f.status === "full") {
       const slow = f.deliveries.find((d) => d.status === "paused") || sick || f.deliveries[0];
-      banner = html`${banner}${alert("This feed holds as much as it is allowed to.", html`${slow ? html`Its delivery ${slow.name} ${slow.status === "paused" ? "is paused" : "is behind"}, so ` : ""}${bytes(f.stored_bytes || 0)} of events are waiting, against a limit of ${undelivered(f.spec)}. Senders get <b>503</b> with a retry time and nothing already stored is dropped. Resume or fix the delivery, or raise the limit.`, "bad", html`${slow ? btn(`Open ${slow.name}`, { icon: "right", href: deliveryHref(f, slow.name) }) : ""}${editable(f) ? btn("Raise the limit", { icon: "edit", perm: "feed_write", data: { act: "edit" } }) : ""}`)}`;
+      banner = html`${banner}${alert("This feed holds as much as it is allowed to.", html`${slow ? html`Its delivery ${slow.name} ${slow.status === "paused" ? "is paused" : "is behind"}, so ` : ""}${bytes(f.undelivered_bytes != null ? f.undelivered_bytes : f.retained_bytes || 0)} of events are waiting, against a limit of ${undelivered(f.spec)}. Senders get <b>503</b> with a retry time and nothing already stored is dropped. Resume or fix the delivery, or raise the limit.`, "bad", html`${slow ? btn(`Open ${slow.name}`, { icon: "right", href: deliveryHref(f, slow.name) }) : ""}${editable(f) ? btn("Raise the limit", { icon: "edit", perm: "feed_write", data: { act: "edit" } }) : ""}`)}`;
     } else if (sick) banner = html`${banner}${attentionAlert(f)}`;
+    for (const w of f.warnings || []) banner = html`${banner}${alert("Requests to this feed can be replayed.", w[0].toUpperCase() + w.slice(1) + ".", "warn")}`;
     if (f.source === "file") return html`${top}${banner}<div class="two"><div class="stack">${sendCard(f)}${flowCard(f)}</div><div class="stack">${fileCard(f)}${storeCard(f)}</div></div>${delivCard(f)}`;
     if (f.tenant && data.quotas && data.quotas.tenant === f.tenant) return html`${top}${banner}<div class="two"><div class="stack">${sendCard(f)}${flowCard(f)}</div><div class="stack">${quotasCard("Set by the server operator. Above the rate, senders get 429.", "tenants")}${storeCard(f)}</div></div>${delivCard(f)}`;
     return html`${top}${banner}${sendCard(f)}<div class="two"><div class="stack">${flowCard(f)}</div><div class="stack">${storeCard(f)}</div></div>${delivCard(f)}`;
@@ -609,7 +615,7 @@ feeds:
     const why = firstLine(d.last_error);
     const sick = ["stalled", "failing"].includes(d.status);
     const p = { paused: pill("Paused", "", "pause"), stalled: pill("Stalled", "bad", "alert"), failing: pill("Failing", "warn", "alert"), held: pill("Held", "warn", "alert"), needs_approval: pill("Needs approval", "warn", "clock"), setting_up: pill("Setting up", "", "clock") }[d.status] || pill("Delivering", "ok", "check");
-    const top = html`${dhead(feedTabs(f), deliveryActions(f, d), backToFeed(f))}${deliverySwitch(f, d)}${head(d.name, [p, d.template ? html`<span>runs ${lnk(d.template.id, href.template(d.template.id))} <span class="mono">${verLabel(version(d))}</span></span>` : html`<span>runs <span class="mono">${d.pipeline}</span></span>`, d.claim ? html`<span>a run is in progress</span>` : ""])}`;
+    const top = html`${dhead(feedTabs(f), deliveryActions(f, d), backToFeed(f))}${deliverySwitch(f, d)}${head(d.name, [p, d.template ? html`<span>runs ${lnk(d.template.id, href.template(d.template.id))} <span class="mono">${verLabel(version(d))}</span></span>` : html`<span>runs <span class="mono">${d.pipeline}</span></span>`, d.guarantee ? html`<span>${guaranteeWords(d.guarantee)}</span>` : "", d.claim ? html`<span>a run is in progress</span>` : ""])}`;
     const lastRunBtn = d.last_run && d.last_run.run_id ? btn("Open the last run", { icon: "right", href: href.run(d.last_run.run_id) }) : "";
     if (sick) {
       const stalled = d.status === "stalled";
@@ -1330,7 +1336,7 @@ feeds:
 
   async function removeFeed(f) {
     const und = lagOf(f);
-    await dialog(`Delete ${f.name}?`, html`<span>Its URL stops accepting events at once, and its <b>${bytes(f.stored_bytes || 0)}</b> of stored events are removed${und ? html`, including <b>${fmtInt(und)} that ${und === 1 ? "is" : "are"} not delivered yet</b>` : ""}. Runs it already started stay in history.</span>${field(html`Type <code>${f.name}</code> to confirm`, input("", { name: "confirm", mono: true }))}<div class="help bad" data-err hidden></div>`,
+    await dialog(`Delete ${f.name}?`, html`<span>Its URL stops accepting events at once, and its <b>${bytes(f.retained_bytes || 0)}</b> of stored events are removed${und ? html`, including <b>${fmtInt(und)} that ${und === 1 ? "is" : "are"} not delivered yet</b>` : ""}. Runs it already started stay in history.</span>${field(html`Type <code>${f.name}</code> to confirm`, input("", { name: "confirm", mono: true }))}<div class="help bad" data-err hidden></div>`,
       html`${btn("Cancel", { data: { act: "no" } })}${btn("Delete feed and its events", { kind: "danger", icon: "trash", data: { act: "yes", keep: "1" } })}`, { icon: "trash", onOpen: (el) => {
         el.addEventListener("click", (ev) => { if (ev.target.closest("[data-err] a")) el.querySelector('[data-act="no"]').click(); });
         el.querySelector('[data-act="yes"]').addEventListener("click", async () => {

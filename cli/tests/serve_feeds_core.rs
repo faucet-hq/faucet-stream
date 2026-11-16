@@ -3375,3 +3375,47 @@ async fn every_tenants_feeds_are_listed_in_one_paged_call() {
     .unwrap();
     assert!(whole.quotas.is_none() && whole.feeds.len() == 3);
 }
+
+/// A feed's own page says each delivery's guarantee, derived from its
+/// template, and its history lists what was done to its deliveries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feeds_page_carries_each_deliverys_guarantee_and_its_moves() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let srv = Srv::start(root, &[]).await;
+    register(&srv.state, "orders_lake", &root.join("state")).await;
+    let out = root.join("lake.jsonl");
+    service::create(
+        &srv.state,
+        &admin(),
+        None,
+        feed_spec("orders", json!([delivery("lake", "orders_lake", &out)])),
+    )
+    .await
+    .unwrap();
+    let base = srv.http().await;
+    let client = reqwest::Client::new();
+    let paused = client
+        .post(format!("{base}/v1/feeds/orders/deliveries/lake/pause"))
+        .json(&json!({"reason": "maintenance"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(paused.status(), 200);
+    let detail = service::get(&srv.state, &admin(), None, "orders")
+        .await
+        .unwrap();
+    assert_eq!(
+        detail.feed.deliveries[0].guarantee.as_deref(),
+        Some("at-least-once")
+    );
+    let pause = detail
+        .changes
+        .iter()
+        .find(|c| c.action == "pause")
+        .expect("the pause is in the feed's history");
+    assert_eq!(pause.detail[0], "delivery lake");
+    assert!(pause.detail.iter().any(|d| d == "maintenance"));
+    let listed = service::list(&srv.state, &admin(), None).await.unwrap();
+    assert!(listed[0].deliveries[0].guarantee.is_none());
+}
