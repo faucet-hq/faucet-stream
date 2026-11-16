@@ -1283,22 +1283,29 @@ fn without_token(query: &str) -> Option<(String, String)> {
     token.map(|t| (t, kept.finish()))
 }
 
+/// Take `?token=` out of `req`'s URL and return it. Nothing is registered
+/// for redaction: the request is not authenticated yet.
+fn take_url_token(req: &mut Request) -> Option<String> {
+    let (token, kept) = req.uri().query().and_then(without_token)?;
+    let path = req.uri().path().to_string();
+    let rebuilt = if kept.is_empty() {
+        path.clone()
+    } else {
+        format!("{path}?{kept}")
+    };
+    let mut parts = req.uri().clone().into_parts();
+    parts.path_and_query = rebuilt.parse().ok().or_else(|| path.parse().ok());
+    *req.uri_mut() = axum::http::Uri::from_parts(parts)
+        .ok()
+        .or_else(|| path.parse().ok())
+        .unwrap_or_else(|| axum::http::Uri::from_static("/"));
+    Some(token)
+}
+
 /// Take `?token=` out of the request before anything can log, trace or
 /// count its URL; the handler finds it in the request's extensions.
 pub async fn strip_url_token(mut req: Request, next: axum::middleware::Next) -> Response {
-    if let Some((token, kept)) = req.uri().query().and_then(without_token) {
-        let path = req.uri().path();
-        let rebuilt = if kept.is_empty() {
-            path.to_string()
-        } else {
-            format!("{path}?{kept}")
-        };
-        let mut parts = req.uri().clone().into_parts();
-        parts.path_and_query = rebuilt.parse().ok();
-        if let Ok(uri) = axum::http::Uri::from_parts(parts) {
-            *req.uri_mut() = uri;
-        }
-        crate::secrets::registry::register_server(&token);
+    if let Some(token) = take_url_token(&mut req) {
         req.extensions_mut().insert(UrlToken(token));
     }
     next.run(req).await
@@ -1726,6 +1733,26 @@ mod tests {
         );
         assert_eq!(without_token("a=1&tokens=2"), None);
         assert_eq!(without_token(""), None);
+    }
+
+    #[test]
+    fn a_url_token_leaves_the_url_and_is_never_registered_as_a_secret() {
+        let word = "unauthenticated-url-token-word";
+        let mut req = Request::builder()
+            .uri(format!("/v1/feeds/orders/events?a=1&token={word}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(take_url_token(&mut req).as_deref(), Some(word));
+        assert_eq!(req.uri().to_string(), "/v1/feeds/orders/events?a=1");
+        let line = format!("a log line with {word} in it");
+        assert_eq!(crate::secrets::registry::redact(&line), line);
+
+        let mut bare = Request::builder()
+            .uri(format!("/v1/feeds/orders/events?token={word}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(take_url_token(&mut bare).is_some());
+        assert_eq!(bare.uri().to_string(), "/v1/feeds/orders/events");
     }
 
     #[test]
