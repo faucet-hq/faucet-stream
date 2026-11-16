@@ -1348,9 +1348,9 @@ mod tests {
     #[test]
     #[serial_test::serial(env)]
     fn substitutes_env_var() {
-        unsafe { std::env::set_var("FAUCET_TEST_VAR", "hello") };
+        unsafe { std::env::set_var("FAUCET_TEST_VAR", "fz-env-value-41") };
         let out = interpolate("token=${env:FAUCET_TEST_VAR}").unwrap();
-        assert_eq!(out, "token=hello");
+        assert_eq!(out, "token=fz-env-value-41");
         unsafe { std::env::remove_var("FAUCET_TEST_VAR") };
     }
 
