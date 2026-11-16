@@ -3056,3 +3056,47 @@ async fn a_changed_tenant_byte_quota_reaches_its_existing_feeds() {
     let full = store.append(&calls, &feed.uid, big()).await.unwrap_err();
     assert!(full.to_string().contains("is full"), "{full}");
 }
+
+/// A delivery whose definition was stored but whose store position was
+/// not (the store call failed) is shown as being set up, never `ok`, and
+/// the scheduler creates the position.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_defined_delivery_without_a_store_position_is_set_up_by_the_scheduler() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut srv = Srv::start(root, &[]).await;
+    register(&srv.state, "orders_lake", &root.join("state")).await;
+    let out = root.join("lake.jsonl");
+    let mut lake = delivery("lake", "orders_lake", &out);
+    lake["start"] = json!("earliest");
+    service::create(
+        &srv.state,
+        &admin(),
+        None,
+        feed_spec("orders", json!([lake])),
+    )
+    .await
+    .unwrap();
+    let (store, uid) = srv.store("orders").await;
+    let found = service::find(&srv.state, None, "orders").await.unwrap();
+    let dref = found.feed.delivery("lake").unwrap().clone();
+    store
+        .delete_delivery(&store_calls(), &dref.uid)
+        .await
+        .unwrap();
+    srv.append("orders", 1..=2).await;
+    let status = |detail: &service::FeedDetail| detail.feed.deliveries[0].status.clone();
+    let before = service::get(&srv.state, &admin(), None, "orders")
+        .await
+        .unwrap();
+    assert_eq!(status(&before), "setting_up");
+
+    srv.tick().await;
+    assert_eq!(delivery_ids(&store, &uid).await, [dref.uid.id()]);
+    let after = service::get(&srv.state, &admin(), None, "orders")
+        .await
+        .unwrap();
+    assert_eq!(status(&after), "ok");
+    srv.delivered("orders", "lake", 3).await;
+    assert_eq!(ids(&out), [1, 2]);
+}

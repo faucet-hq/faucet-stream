@@ -806,6 +806,8 @@ pub struct Scheduler {
     reload_at: Option<Instant>,
     maintain_at: Option<Instant>,
     warned: HashMap<String, usize>,
+    /// Feeds and deliveries this server is creating in the store.
+    setting_up: HashSet<String>,
     /// The limits this server last wrote to each feed's store row.
     limits: HashMap<String, StoreLimits>,
 }
@@ -890,6 +892,8 @@ impl Scheduler {
             let heads: HashMap<_, _> = heads.into_iter().map(|h| (h.feed.clone(), h)).collect();
             for feed in feeds {
                 let Some(head) = heads.get(&feed.uid) else {
+                    let limits = feed.tenant().and_then(|t| snapshot.tenant_limits.get(t));
+                    self.set_up(&*store, feed, None, limits).await;
                     continue;
                 };
                 maintain.push((store.clone(), (*feed).clone()));
@@ -907,6 +911,7 @@ impl Scheduler {
                         continue;
                     };
                     let Some(dh) = head.deliveries.iter().find(|x| x.delivery == dref.uid) else {
+                        self.set_up(&*store, feed, Some(d), limits.as_ref()).await;
                         continue;
                     };
                     let key = dref.uid.to_string();
@@ -998,6 +1003,41 @@ impl Scheduler {
             self.maintain_at = Some(Instant::now() + MAINTENANCE_INTERVAL);
         }
         report
+    }
+
+    /// Create what the store lacks of a defined feed: its row, or the
+    /// position of delivery `d`. A change that stored the definition and
+    /// stopped before the store call leaves this.
+    async fn set_up(
+        &mut self,
+        store: &dyn FeedStore,
+        feed: &Feed,
+        d: Option<&DeliverySpec>,
+        tenant_limits: Option<&TenantLimits>,
+    ) {
+        let label = feed.label();
+        let name = d.map(|d| d.name.as_str()).unwrap_or_default();
+        let key = format!("{}/{name}", feed.uid);
+        if self.setting_up.insert(key.clone()) {
+            metrics::delivery_setup(&label, name);
+            tracing::warn!(feed = %label, delivery = name, "a defined feed or delivery is missing from the feed store; creating it");
+        }
+        let made = match d.and_then(|d| feed.delivery(&d.name).map(|r| (d, r))) {
+            Some((d, dref)) => store
+                .ensure_delivery(&store_calls(), &dref.uid, super::start_of(d.start))
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            None => super::ensure_in_store(store, feed, tenant_limits).await,
+        };
+        match made {
+            Ok(()) => {
+                self.setting_up.remove(&key);
+            }
+            Err(e) => {
+                tracing::debug!(feed = %label, delivery = name, error = %e, "could not create it yet; retrying")
+            }
+        }
     }
 
     /// Write `feed`'s limits (its own and its tenant's) to its store row

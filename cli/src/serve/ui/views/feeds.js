@@ -608,7 +608,7 @@ feeds:
     if (!d) return html`${dhead(feedTabs(f), feedActions(f), back())}${feedHead(f)}${delivCard(f)}`;
     const why = firstLine(d.last_error);
     const sick = ["stalled", "failing"].includes(d.status);
-    const p = { paused: pill("Paused", "", "pause"), stalled: pill("Stalled", "bad", "alert"), failing: pill("Failing", "warn", "alert"), held: pill("Held", "warn", "alert"), needs_approval: pill("Needs approval", "warn", "clock") }[d.status] || pill("Delivering", "ok", "check");
+    const p = { paused: pill("Paused", "", "pause"), stalled: pill("Stalled", "bad", "alert"), failing: pill("Failing", "warn", "alert"), held: pill("Held", "warn", "alert"), needs_approval: pill("Needs approval", "warn", "clock"), setting_up: pill("Setting up", "", "clock") }[d.status] || pill("Delivering", "ok", "check");
     const top = html`${dhead(feedTabs(f), deliveryActions(f, d), backToFeed(f))}${deliverySwitch(f, d)}${head(d.name, [p, d.template ? html`<span>runs ${lnk(d.template.id, href.template(d.template.id))} <span class="mono">${verLabel(version(d))}</span></span>` : html`<span>runs <span class="mono">${d.pipeline}</span></span>`, d.claim ? html`<span>a run is in progress</span>` : ""])}`;
     const lastRunBtn = d.last_run && d.last_run.run_id ? btn("Open the last run", { icon: "right", href: href.run(d.last_run.run_id) }) : "";
     if (sick) {

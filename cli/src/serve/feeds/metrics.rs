@@ -50,6 +50,11 @@ pub fn describe() {
         "Ranges of events a delivery skipped (an admin skip or a recover)"
     );
     describe_counter!(
+        "faucet_feed_setup_total",
+        "Feeds (`delivery` empty) and deliveries found defined but missing from the feed store, \
+         which the scheduler then creates"
+    );
+    describe_counter!(
         "faucet_feed_orphan_deliveries_total",
         "Delivery positions deleted from the feed store because no definition listed them"
     );
@@ -187,6 +192,15 @@ pub fn dedupe_hits(feed: &str, events: u64) {
 
 pub fn orphan_delivery(feed: &str) {
     counter!("faucet_feed_orphan_deliveries_total", "feed" => feed.to_string()).increment(1);
+}
+
+pub fn delivery_setup(feed: &str, delivery: &str) {
+    counter!(
+        "faucet_feed_setup_total",
+        "feed" => feed.to_string(),
+        "delivery" => delivery.to_string()
+    )
+    .increment(1);
 }
 
 pub fn scheduler_restarted() {

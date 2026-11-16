@@ -51,7 +51,8 @@ pub struct DeliveryView {
     pub uid: String,
     #[serde(flatten)]
     pub spec: DeliverySpec,
-    /// `ok`, `failing`, `stalled`, `held`, `paused` or `needs_approval`.
+    /// `ok`, `failing`, `stalled`, `held`, `paused`, `needs_approval`, or
+    /// `setting_up` while the store has no position for it yet.
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paused_by: Option<String>,
@@ -263,7 +264,11 @@ pub fn view(
             Some(DeliveryView {
                 name: d.name.clone(),
                 uid: dref.uid.id().to_string(),
-                status: status_word(d, &s).to_string(),
+                status: match (head, dh) {
+                    (Some(_), None) => "setting_up",
+                    _ => status_word(d, &s),
+                }
+                .to_string(),
                 paused_by: s
                     .paused
                     .as_ref()
