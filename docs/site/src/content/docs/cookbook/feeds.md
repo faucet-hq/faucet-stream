@@ -59,9 +59,16 @@ pipeline:
     type: file
     config:
       path: ./state
+# A template is launched only once its tests pass; this bundle checks that the
+# template still loads with its default params.
+tests:
+  suite:
+    auto: { defaults_baseline: true }
 ```
 
-Register and launch it, then create the feed with one delivery:
+Register and launch it, then create the feed with one delivery. Registering
+runs the template's `tests:` block, and `launch: true` is refused for a
+template without one:
 
 ```bash
 jq -Rs '{id: "orders-archive", config: ., config_format: "yaml", launch: true}' orders-archive.yaml \
@@ -512,6 +519,14 @@ lists the requests the server refused lately, with the reason. `/readyz` has a
 lagging one, a feed close to full, repeated failed runs, a failing feed store
 and a feed that answers many ingest requests with a `5xx` or a refusal.
 See [metrics and alerts](/faucet-stream/reference/feeds/#metrics).
+
+The web console's **Feeds** page shows the same: every feed with what needs
+attention first, a feed's ingest URL, last 24 hours, storage against its
+limits, deliveries with their position and runs, stored events (payloads for
+admins, never a sealed feed's), refusals, tokens and history. Operators create
+and edit feeds, add deliveries, pause, resume and deliver now there; admins
+replay, skip, recover and delete. See the
+[web console](/faucet-stream/cookbook/web-console/#feeds).
 
 The `faucet feed` command manages feeds straight in their stores, without a
 server: see [the reference](/faucet-stream/reference/feeds/#faucet-feed).

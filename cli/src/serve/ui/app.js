@@ -78,7 +78,8 @@ function registerRoutes() {
   route("#/triggers/:id", renderTriggers, { group: "triggers" });
   route("#/schedules", renderSchedules, { group: "schedules" });
   route("#/schedules/:id", renderSchedules, { group: "schedules" });
-  route("#/feeds", renderFeeds);
+  route("#/feeds", renderFeeds, { group: "feeds" });
+  route("#/feeds/:id", renderFeeds, { group: "feeds" });
   route("#/catalog", renderDatasets, { group: "catalog" });
   route("#/catalog/:id", renderDatasets, { group: "catalog" });
   route("#/lineage", renderLineage, { group: "lineage" });

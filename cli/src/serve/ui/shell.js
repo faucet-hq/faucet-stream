@@ -17,7 +17,7 @@ export const NAV = [
     ["changes", "changes", "Changes", "#/changes"],
     ["triggers", "trig", "Triggers", "#/triggers"],
     ["schedules", "sched", "Schedules", "#/schedules"],
-    ["feeds", "feed", "Feeds", "#/feeds", "", true],
+    ["feeds", "feed", "Feeds", "#/feeds"],
   ]],
   ["Data", [
     ["datasets", "db", "Datasets", "#/catalog"],
@@ -158,7 +158,7 @@ function setBadge(key, n, { hot = false } = {}) {
 
 let badgeTimer = null;
 let badgeAt = 0;
-/** Sidebar counts: active runs, pending changes, schedules, datasets, templates, tenants.
+/** Sidebar counts: active runs, pending changes, schedules, feeds, datasets, templates, tenants.
  *  One cheap request each; a failure hides its badge. */
 export function refreshBadges(force = false) {
   if (!force && Date.now() - badgeAt < 5000) return;
@@ -175,6 +175,12 @@ export function refreshBadges(force = false) {
   api(`/v1/schedules?${withTenant(new URLSearchParams())}`)
     .then((s) => setBadge("schedules", s && s.available !== false ? (s.schedules || []).length : 0))
     .catch(() => setBadge("schedules", 0));
+  const feedCount = (t) => api(`/v1/feeds${t ? `?tenant=${encodeURIComponent(t)}` : ""}`).then((f) => ((f && f.feeds) || []).length);
+  const feedScope = withTenant(new URLSearchParams()).get("tenant");
+  // An operator looking at every tenant counts each tenant's feeds too, as the Feeds page lists them.
+  Promise.all(feedScope || scoped ? [feedCount(feedScope)] : [feedCount(""), ...(tenantList() || []).slice(0, 50).map((t) => feedCount(t.id).catch(() => 0))])
+    .then((ns) => setBadge("feeds", ns.reduce((a, b) => a + b, 0)))
+    .catch(() => setBadge("feeds", 0));
   if (scoped) return;
   api("/v1/catalog/datasets?limit=1")
     .then((d) => (d && d.total != null ? d : api("/v1/catalog/datasets?limit=1000")))
