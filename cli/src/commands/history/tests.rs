@@ -78,6 +78,8 @@ fn record(id: &str, status: RunStatus, rows: u64, elapsed: Option<f64>) -> RunRe
         dlq_location: None,
         policy_pin: None,
         policy_projection: None,
+        feed: None,
+        pipeline_name_suffix: None,
     }
 }
 
