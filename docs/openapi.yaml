@@ -1032,14 +1032,16 @@ paths:
         Every feed this principal may see (#1034): feeds made through the API
         (kept in the run history) and those of the `--feeds` file (read-only),
         each with its store position, its deliveries and their status, and what
-        the last 24 hours brought. With a tenant, the tenant's quotas too.
+        the last 24 hours brought (`events_24h`, `bytes_24h`, `last_event_at`).
+        With a tenant, the tenant's quotas too. `ingest_on_api` is `false` when
+        `--feeds-listen` serves the ingest routes on another listener.
         Requires `FeedRead` (viewer+).
       operationId: listFeeds
       parameters:
         - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
       responses:
         "200":
-          description: "`{feeds, quotas?, stores, approval}`."
+          description: "`{feeds, quotas?, stores, ingest_on_api, approval}`."
           content:
             application/json:
               schema: { type: object }
@@ -1084,7 +1086,10 @@ paths:
       summary: Read a feed
       description: >
         One feed with its deliveries, gaps, tokens (never their text) and change
-        log. Secrets show as markers. Requires `FeedRead` (viewer+).
+        log, who made it (`created_by`, `created_at`; absent for a `--feeds`
+        file feed) and `hourly_24h`, the retained events stored in each of the
+        last 24 hours, oldest first. Secrets show as markers. Requires
+        `FeedRead` (viewer+).
       operationId: getFeed
       parameters:
         - { name: name, in: path, required: true, schema: { type: string } }
@@ -1468,7 +1473,8 @@ paths:
       description: >
         A page of retained events without their payloads, newest first: number,
         id, times, content type, size, kept headers and which deliveries have
-        delivered each. `before` pages back; `from` lists forward instead.
+        delivered each. `before` pages back; `from` lists forward instead, and
+        `at` lists forward from the first event stored at or after that time.
         Requires `FeedRead` (viewer+).
       operationId: listFeedEvents
       parameters:
@@ -1476,6 +1482,7 @@ paths:
         - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
         - { name: before, in: query, required: false, schema: { type: integer } }
         - { name: from, in: query, required: false, schema: { type: integer } }
+        - { name: at, in: query, required: false, schema: { type: string, format: date-time }, description: "List from the first event stored at or after this time on; `from` wins when both are given." }
         - { name: limit, in: query, required: false, schema: { type: integer, default: 50, maximum: 200 } }
       responses:
         "200":

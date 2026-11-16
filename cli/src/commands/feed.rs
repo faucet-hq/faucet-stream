@@ -230,7 +230,7 @@ async fn events_from(
     limit: u64,
     payload: bool,
 ) -> CliResult<(Vec<service::EventView>, u64)> {
-    let page = service::events(state, who, tenant, name, None, from, Some(limit))
+    let page = service::events(state, who, tenant, name, None, from, None, Some(limit))
         .await
         .map_err(failed)?;
     let mut events = Vec::with_capacity(page.events.len());
@@ -838,7 +838,7 @@ pub async fn run(args: FeedArgs) -> CliResult<()> {
             from,
             limit,
         } => {
-            let page = service::events(&state, &who, tenant, name, *before, *from, *limit)
+            let page = service::events(&state, &who, tenant, name, *before, *from, None, *limit)
                 .await
                 .map_err(failed)?;
             print(json, &page, || {

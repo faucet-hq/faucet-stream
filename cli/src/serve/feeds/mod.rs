@@ -369,6 +369,11 @@ impl FeedsRuntime {
         self.settings.tenant_delivery_min_interval
     }
 
+    /// Whether the API listener serves the ingest routes too.
+    pub fn ingest_on_api(&self) -> bool {
+        self.settings.listen.is_none()
+    }
+
     /// The current definitions.
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.snapshot

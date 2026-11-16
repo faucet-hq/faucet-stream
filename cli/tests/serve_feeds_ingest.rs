@@ -1367,6 +1367,66 @@ async fn a_stale_definitions_snapshot_answers_503_while_the_history_is_unreachab
     assert!(rt.snapshot().fresh());
 }
 
+/// What the console's Feeds page reads beyond the definition: when the
+/// newest event arrived, the last day by the hour, who made the feed, whether
+/// this listener takes events, and a page of events from a point in time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_feed_views_carry_what_the_console_shows() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &[]).await;
+    let (_, token) = srv
+        .feed(json!({"name": "orders", "ingest": {"auth": {"tokens": "managed"}}}))
+        .await;
+    let before = chrono::Utc::now();
+    for n in 1..=3 {
+        let sent = srv
+            .push("orders", &token, &format!(r#"{{"n": {n}}}"#))
+            .await;
+        assert_eq!(sent.status, 202, "{}", sent.body);
+    }
+    let get = async |path: &str| srv.send(srv.client.get(srv.url(path))).await;
+
+    let list = get("/v1/feeds").await;
+    assert_eq!(list.status, 200, "{}", list.body);
+    assert_eq!(list.body["ingest_on_api"], true);
+    let feed = &list.body["feeds"][0];
+    let last: chrono::DateTime<chrono::Utc> =
+        serde_json::from_value(feed["last_event_at"].clone()).unwrap();
+    assert!(last >= before - chrono::Duration::seconds(1), "{last}");
+    assert_eq!(feed["events_24h"], 3);
+
+    let detail = get("/v1/feeds/orders").await;
+    assert_eq!(detail.body["created_by"], "alice", "{}", detail.body);
+    assert!(detail.body["created_at"].is_string());
+    let hourly = detail.body["hourly_24h"].as_array().unwrap();
+    assert_eq!(hourly.len(), 24);
+    assert_eq!(hourly.iter().map(|n| n.as_u64().unwrap()).sum::<u64>(), 3);
+    assert_eq!(hourly[23], 3);
+
+    let earlier = (before - chrono::Duration::hours(1)).to_rfc3339();
+    let since = get(&format!(
+        "/v1/feeds/orders/events?limit=1&at={}",
+        earlier.replace('+', "%2B")
+    ))
+    .await;
+    assert_eq!(since.status, 200, "{}", since.body);
+    assert_eq!(since.body["events"][0]["seq"], 1);
+    let later = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let none = get(&format!(
+        "/v1/feeds/orders/events?limit=1&at={}",
+        later.replace('+', "%2B")
+    ))
+    .await;
+    assert_eq!(none.body["events"].as_array().unwrap().len(), 0);
+
+    let other = tempfile::tempdir().unwrap();
+    let listener = Srv::start(other.path(), &["--feeds-listen", "127.0.0.1:0"]).await;
+    let list = listener
+        .send(listener.client.get(listener.url("/v1/feeds")))
+        .await;
+    assert_eq!(list.body["ingest_on_api"], false, "{}", list.body);
+}
+
 /// A server that starts while the run history is unreachable has never read
 /// its feed definitions: it answers `503` with a retry time, never `401`,
 /// which could make a sender drop its events. With the definitions read, a

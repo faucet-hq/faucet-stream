@@ -57,6 +57,8 @@ pub struct DeliveryView {
     pub paused_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pause_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<DateTime<Utc>>,
     /// The next event the delivery reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<u64>,
@@ -107,6 +109,9 @@ pub struct FeedView {
     pub events_24h: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_24h: Option<u64>,
+    /// When the newest retained event was received.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_at: Option<DateTime<Utc>>,
     /// `receiving`, `stalled`, `held`, `full` or `paused`.
     pub status: String,
     /// The path senders post events to.
@@ -216,6 +221,14 @@ pub struct FeedDetail {
     pub gaps: Vec<GapView>,
     pub tokens: Vec<TokenView>,
     pub changes: Vec<FeedChange>,
+    /// Who made the feed and when; absent for a `--feeds` file feed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    /// Retained events stored in each of the last 24 hours, oldest first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hourly_24h: Vec<u64>,
 }
 
 /// The status word a delivery shows.
@@ -261,6 +274,7 @@ pub fn view(
                     .as_ref()
                     .and_then(|p| p.reason.clone())
                     .or_else(|| dref.meta.pause_reason.clone()),
+                paused_at: s.paused.as_ref().map(|p| p.at).or(dref.meta.paused_at),
                 position: dh.map(|x| x.cursor.get()),
                 epoch: dh.map(|x| x.epoch.0),
                 lag: match (dh, head) {
@@ -297,6 +311,7 @@ pub fn view(
         stored_bytes: head.map(|h| h.bytes),
         events_24h: None,
         bytes_24h: None,
+        last_event_at: None,
         deliveries,
     }
 }
@@ -399,8 +414,39 @@ async fn view_of(state: &ServerState, feed: &Feed) -> Result<FeedView, ServeErro
                 d.delivered_24h = d.position.map(|p| from.distance_to(Seq(p).max(from)));
             }
         }
+        if head.end() > head.oldest
+            && let Ok(batch) = store
+                .read(&calls, &feed.uid, head.watermark, head.end())
+                .await
+        {
+            out.last_event_at = batch.events.last().map(|e| e.received_at);
+        }
     }
     Ok(out)
+}
+
+/// Retained events stored in each of the last 24 hours, oldest first; empty
+/// when the store cannot say.
+async fn hourly_24h(state: &ServerState, feed: &Feed) -> Vec<u64> {
+    let Ok(store) = state.feeds().store_for(feed).await else {
+        return Vec::new();
+    };
+    let Ok(Some(head)) = head_of(&*store, feed).await else {
+        return Vec::new();
+    };
+    let calls = store_calls();
+    let mut marks = Vec::with_capacity(25);
+    for hours in (1..=24).rev() {
+        match store
+            .seq_at(&calls, &feed.uid, head.now - chrono::Duration::hours(hours))
+            .await
+        {
+            Ok(seq) => marks.push(seq),
+            Err(_) => return Vec::new(),
+        }
+    }
+    marks.push(head.end());
+    marks.windows(2).map(|w| w[0].distance_to(w[1])).collect()
 }
 
 /// A tenant's feed quotas and what it uses of them.
@@ -426,6 +472,9 @@ pub struct FeedList {
     pub quotas: Option<Quotas>,
     /// The stores a new feed may name.
     pub stores: Vec<String>,
+    /// Whether this listener serves the ingest routes; `false` with
+    /// `--feeds-listen`, where only that listener does.
+    pub ingest_on_api: bool,
     /// Whether creating or changing a feed here needs an approved change
     /// request (`always`, `deliveries` or `never`).
     pub approval: &'static str,
@@ -469,6 +518,7 @@ pub async fn overview(
         feeds,
         quotas,
         stores,
+        ingest_on_api: state.feeds().ingest_on_api(),
         approval: if state.requires_approval(ChangeKind::Feed) {
             "always"
         } else if state.requires_approval(ChangeKind::Run) {
@@ -569,7 +619,8 @@ fn event_view(
 
 /// A page of a feed's retained events without their payloads, newest first:
 /// the `limit` events before `before` (default: the newest), or, with
-/// `from`, the `limit` events from there on.
+/// `from` (or `at`, the first event stored at or after that time), the
+/// `limit` events from there on.
 pub async fn events(
     state: &ServerState,
     actor: &AuthContext,
@@ -577,6 +628,7 @@ pub async fn events(
     name: &str,
     before: Option<u64>,
     from: Option<u64>,
+    at: Option<DateTime<Utc>>,
     limit: Option<u64>,
 ) -> Result<EventsPage, ServeError> {
     let tenant = scope(actor, tenant)?;
@@ -584,6 +636,17 @@ pub async fn events(
     let feed = &found.feed;
     let store = state.feeds().store_for(feed).await.map_err(store_error)?;
     let head = head_of(&*store, feed).await?.ok_or(ServeError::NotFound)?;
+    let from = match (from, at) {
+        (Some(from), _) => Some(from),
+        (None, Some(at)) => Some(
+            store
+                .seq_at(&store_calls(), &feed.uid, at)
+                .await
+                .map_err(store_error)?
+                .get(),
+        ),
+        (None, None) => None,
+    };
     let limit = limit.unwrap_or(50).clamp(1, MAX_EVENTS_PAGE);
     let (oldest, end) = (head.oldest.get(), head.end().get());
     let (lo, hi) = match from {
@@ -722,6 +785,9 @@ pub async fn get(
         feed: view_of(state, feed).await?,
         gaps,
         tokens: tokens.iter().map(TokenView::from).collect(),
+        hourly_24h: hourly_24h(state, feed).await,
+        created_at: found.record.as_ref().map(|r| r.created_at),
+        created_by: found.record.as_ref().map(|r| r.created_by.clone()),
         changes: found.record.map(|r| r.changes).unwrap_or_default(),
     })
 }

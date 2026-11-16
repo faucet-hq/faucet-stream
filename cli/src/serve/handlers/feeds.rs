@@ -619,6 +619,9 @@ pub struct EventsQuery {
     /// List the events from this one on instead.
     #[serde(default)]
     pub from: Option<u64>,
+    /// List from the first event stored at or after this time on instead.
+    #[serde(default)]
+    pub at: Option<DateTime<Utc>>,
     /// At most this many (default 50, at most 200).
     #[serde(default)]
     pub limit: Option<u64>,
@@ -637,6 +640,7 @@ pub async fn events(
         &name,
         q.before,
         q.from,
+        q.at,
         q.limit,
     )
     .await
