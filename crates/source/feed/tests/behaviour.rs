@@ -871,3 +871,26 @@ async fn the_source_declares_what_it_is() {
         Some("feed:acme.orders:main")
     );
 }
+
+/// The bookmark is state other releases read back: its shape is frozen. A
+/// new shape needs a new fixture and a reader for this one.
+#[tokio::test]
+async fn the_bookmark_shape_is_frozen() {
+    let fixture: faucet_core::Value =
+        serde_json::from_str(include_str!("fixtures/bookmark-v1.json")).unwrap();
+    let parsed: faucet_source_feed::FeedBookmark = serde_json::from_value(fixture.clone()).unwrap();
+    assert_eq!(
+        parsed.to_value(),
+        fixture,
+        "the fixture reads and writes back unchanged"
+    );
+
+    let fx = Fixture::with_events(5).await;
+    let result = Pipeline::new(&fx.source(), &RecordingSink::new())
+        .run()
+        .await
+        .unwrap();
+    let mut expected = fixture;
+    expected["id"] = json!(fx.id(5));
+    assert_eq!(result.bookmark, Some(expected));
+}
