@@ -951,17 +951,21 @@ async fn handle(
             RETRY_SOON_SECS,
         )));
     };
+    let stale = || {
+        Refusal::unavailable(
+            "definitions_stale",
+            "the server cannot read its feed definitions right now; retry shortly",
+            RETRY_STORE_SECS,
+        )
+    };
+    let usable = |s: &Snapshot| s.loaded() && s.fresh();
     let mut snapshot = rt.snapshot();
-    if !snapshot.fresh() {
+    if !usable(&snapshot) {
         if let Ok(fresh) = rt.refresh_now(&state).await {
             snapshot = fresh;
         }
-        if !snapshot.fresh() {
-            return Err(before(Refusal::unavailable(
-                "definitions_stale",
-                "the server cannot read its feed definitions right now; retry shortly",
-                RETRY_STORE_SECS,
-            )));
+        if !usable(&snapshot) {
+            return Err(before(stale()));
         }
     }
     let peer = req
@@ -992,7 +996,9 @@ async fn handle(
                 snapshot = fresh;
                 again
             }
-            Err(_) => None,
+            // Nothing can be said about a credential the definitions cannot
+            // be read for: a 401 here could make a sender drop its events.
+            Err(_) => return Err(before(stale())),
         },
     };
     let Some(Admitted { feed, token }) = admitted else {

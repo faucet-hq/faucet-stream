@@ -1367,6 +1367,98 @@ async fn a_stale_definitions_snapshot_answers_503_while_the_history_is_unreachab
     assert!(rt.snapshot().fresh());
 }
 
+/// A server that starts while the run history is unreachable has never read
+/// its feed definitions: it answers `503` with a retry time, never `401`,
+/// which could make a sender drop its events. With the definitions read, a
+/// credential it cannot look up afresh is answered `503` too, and once the
+/// history is back an unknown feed and a bad token get the same `401`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_that_never_read_its_definitions_answers_503_not_401() {
+    use faucet_cli::serve::history::fallback::FallbackHistory;
+    use faucet_cli::serve::history::sqlite::SqliteHistory;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), &[]);
+    let primary = SqliteHistory::connect(
+        &format!("sqlite:{}", dir.path().join("history.db").display()),
+        cfg.idempotency_retention,
+        cfg.lease_ttl,
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .await
+    .unwrap();
+    let history = Arc::new(FallbackHistory::healthy(
+        Box::new(primary),
+        cfg.idempotency_retention,
+        "sqlite",
+    ));
+    let state = ServerState::new(
+        &cfg,
+        None,
+        tokio_util::sync::CancellationToken::new(),
+        history.clone(),
+        faucet_cli::serve::logs::LogHub::new(),
+        None,
+        #[cfg(feature = "triggers")]
+        faucet_cli::serve::triggers::health::TriggersHandle::empty(),
+    );
+    state.set_feeds(FeedsRuntime::new(
+        cfg.feeds.clone(),
+        spec::LoadedFile::default(),
+        stores::Stores::from_config(&cfg),
+    ));
+    let router = faucet_cli::serve::server::build_router(state.clone(), &cfg, &Default::default());
+    let srv = Srv {
+        addr: listen(router).await,
+        state,
+        scheduler: Scheduler::default(),
+        client: reqwest::Client::new(),
+    };
+    let (_, token) = srv
+        .feed(json!({"name": "orders", "ingest": {"auth": {"tokens": "managed"}}}))
+        .await;
+    assert_eq!(srv.push("orders", &token, r#"{"n": 1}"#).await.status, 202);
+
+    // The history goes away and the server starts over knowing nothing.
+    history.mark_unreachable();
+    srv.state.feeds().forget_snapshot();
+    let rt = srv.state.feeds();
+    assert!(rt.snapshot().fresh() && !rt.snapshot().loaded());
+    for (name, credential) in [
+        ("orders", token.as_str()),
+        ("orders", "fdt_wrong"),
+        ("no-such-feed", token.as_str()),
+    ] {
+        let cold = srv.push(name, credential, r#"{"n": 2}"#).await;
+        assert_eq!(cold.status, 503, "{name}: {}", cold.body);
+        assert!(cold.retry_after.is_some(), "{name}");
+        assert_eq!(cold.body["error"]["code"], "unavailable");
+    }
+
+    assert!(history.try_recover().await);
+    let back = srv.push("orders", &token, r#"{"n": 2}"#).await;
+    assert_eq!(back.status, 202, "{}", back.body);
+    assert!(rt.snapshot().loaded());
+
+    // Read once, then unreachable: a known token is still accepted, and a
+    // credential the server cannot look up afresh is told to retry.
+    history.mark_unreachable();
+    assert_eq!(srv.push("orders", &token, r#"{"n": 3}"#).await.status, 202);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    for (name, credential) in [("orders", "fdt_wrong"), ("no-such-feed", token.as_str())] {
+        let unknown = srv.push(name, credential, "{}").await;
+        assert_eq!(unknown.status, 503, "{name}: {}", unknown.body);
+        assert!(unknown.retry_after.is_some(), "{name}");
+    }
+
+    assert!(history.try_recover().await);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let bad_token = srv.push("orders", "fdt_wrong", "{}").await;
+    let no_feed = srv.push("no-such-feed", &token, "{}").await;
+    assert_eq!(bad_token.status, 401, "{}", bad_token.body);
+    assert_eq!(no_feed.status, 401, "{}", no_feed.body);
+    assert_eq!(bad_token.body, no_feed.body);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_requests_share_commits_and_lose_or_repeat_nothing() {
     let dir = tempfile::tempdir().unwrap();

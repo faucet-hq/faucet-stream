@@ -157,11 +157,15 @@ pub struct Snapshot {
     tokens: HashMap<String, FeedTokenRecord>,
     pub tenant_limits: HashMap<String, TenantLimits>,
     pub loaded_at: Instant,
+    loaded: bool,
 }
 
 impl Default for Snapshot {
     fn default() -> Self {
-        Self::new(Vec::new(), Vec::new(), HashMap::new())
+        Self {
+            loaded: false,
+            ..Self::new(Vec::new(), Vec::new(), HashMap::new())
+        }
     }
 }
 
@@ -181,7 +185,14 @@ impl Snapshot {
             feeds,
             tenant_limits,
             loaded_at: Instant::now(),
+            loaded: true,
         }
+    }
+
+    /// Whether the definitions were ever read; a server that started while
+    /// the run history was unreachable holds an empty snapshot that was not.
+    pub fn loaded(&self) -> bool {
+        self.loaded
     }
 
     /// The feed named `name` of `tenant`.
@@ -379,6 +390,16 @@ impl FeedsRuntime {
             aged.loaded_at = earlier;
         }
         *held = Arc::new(aged);
+    }
+
+    /// Drop the definitions, as a server that has not read them yet holds
+    /// them. For tests of what such a server answers.
+    #[doc(hidden)]
+    pub fn forget_snapshot(&self) {
+        *self
+            .snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(Snapshot::default());
     }
 
     pub fn started(&self) -> bool {
