@@ -20,8 +20,7 @@ use crate::serve::history::{ListFilter, RunRecord, RunStatus, labels::LabelFilte
 use crate::serve::state::ServerState;
 use chrono::{DateTime, Utc};
 use faucet_common_feed::{
-    BatchLimits, ClaimId, DeliveryHead, DeliveryUid, FeedBinding, FeedStore, Head, Seq,
-    StoreLimits,
+    BatchLimits, ClaimId, DeliveryHead, DeliveryUid, FeedBinding, FeedStore, Head, Seq, StoreLimits,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -100,12 +99,14 @@ pub fn effective_batch(d: &DeliverySpec, tenant: Option<&TenantLimits>) -> (u64,
     (events.max(1), bytes.max(1))
 }
 
-/// Decide what to do with a delivery from the store's view (`head`, `dh`)
+/// Decide what to do with a delivery from the store's view (`head`, `dh`,
+/// and `undelivered_bytes`: the bytes from its cursor on, or an upper bound)
 /// and the last status this server read. Pure.
 pub fn decide(
     d: &DeliverySpec,
     head: &Head,
     dh: &DeliveryHead,
+    undelivered_bytes: u64,
     status: &DeliveryStatus,
     gap: Duration,
     now: DateTime<Utc>,
@@ -127,7 +128,7 @@ pub fn decide(
     let by_age = dh.oldest_undelivered_at.is_some_and(|t| {
         (head.now - t).num_seconds() >= d.flush.max_age.secs().min(i64::MAX as u64) as i64
     });
-    let maybe_bytes = head.bytes >= d.flush.max_bytes.bytes();
+    let maybe_bytes = undelivered_bytes >= d.flush.max_bytes.bytes();
     if !(by_events || by_age || maybe_bytes) {
         return Decision::Idle;
     }
@@ -459,7 +460,10 @@ pub async fn drop_orphans(
         if defined.contains(orphan.delivery.id()) {
             continue;
         }
-        match store.delete_delivery(&store_calls(), &orphan.delivery).await {
+        match store
+            .delete_delivery(&store_calls(), &orphan.delivery)
+            .await
+        {
             Ok(()) => {
                 status::forget(&*state.history(), feed.uid.as_str(), orphan.delivery.id()).await;
                 metrics::orphan_delivery(&feed.label());
@@ -481,6 +485,7 @@ struct Work {
     uid: DeliveryUid,
     head: Head,
     dh: DeliveryHead,
+    undelivered_bytes: u64,
     store: Arc<dyn FeedStore>,
     tenant_limits: Option<TenantLimits>,
     gap: Duration,
@@ -521,7 +526,16 @@ async fn claim_step(
     let fresh = status::read(&*state.history(), w.feed_uid(), w.uid.id())
         .await
         .ok()?;
-    let Decision::Claim { .. } = decide(&w.delivery, &w.head, &w.dh, &fresh, w.gap, now) else {
+    let decided = decide(
+        &w.delivery,
+        &w.head,
+        &w.dh,
+        w.undelivered_bytes,
+        &fresh,
+        w.gap,
+        now,
+    );
+    let Decision::Claim { .. } = decided else {
         return Some(fresh);
     };
     if let Some(why) = approval_missing(state, &w.feed, &w.delivery) {
@@ -808,11 +822,31 @@ pub struct Scheduler {
     reload_at: Option<Instant>,
     maintain_at: Option<Instant>,
     warned: HashMap<String, usize>,
+    /// Per delivery: the retained bytes below its cursor, as last counted.
+    below: HashMap<String, Below>,
     /// Feeds and deliveries this server is creating in the store.
-    setting_up: HashSet<String>,
+    setting_up: HashMap<String, Instant>,
     /// The limits this server last wrote to each feed's store row.
     limits: HashMap<String, StoreLimits>,
 }
+
+/// The payload bytes a feed retains below one delivery's cursor (delivered
+/// to it, kept for replay), valid while the cursor and the oldest retained
+/// event stay where they were.
+#[derive(Debug, Clone, Copy)]
+struct Below {
+    cursor: Seq,
+    oldest: Seq,
+    bytes: u64,
+    counted_at: Instant,
+}
+
+/// How long a defined feed may be missing from its store before the
+/// scheduler creates it.
+const FEED_SETUP_GRACE: Duration = Duration::from_secs(10);
+
+/// How long a count of delivered bytes is trusted without a recount.
+const BELOW_MAX_AGE: Duration = Duration::from_secs(60);
 
 /// What one tick did, for tests and logs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -895,12 +929,28 @@ impl Scheduler {
             for feed in feeds {
                 let Some(head) = heads.get(&feed.uid) else {
                     let limits = feed.tenant().and_then(|t| snapshot.tenant_limits.get(t));
-                    self.set_up(&*store, feed, None, limits).await;
+                    self.set_up(state, &*store, feed, None, limits).await;
                     continue;
                 };
                 maintain.push((store.clone(), (*feed).clone()));
                 drop_orphans(state, &*store, feed, head).await;
-                if let Some((crossed, ratio)) = self.observe(feed, head) {
+                let mut undelivered: HashMap<String, u64> = HashMap::new();
+                for dh in &head.deliveries {
+                    let bytes = self.undelivered(&*store, head, dh).await;
+                    undelivered.insert(dh.delivery.to_string(), bytes);
+                }
+                let most = undelivered.values().copied().max().unwrap_or(0);
+                if let Some(lowest) = head.deliveries.iter().map(|d| d.cursor).min() {
+                    rt.publish_bytes(
+                        feed.uid.as_str(),
+                        super::FeedBytes {
+                            lowest,
+                            oldest: head.oldest,
+                            delivered: head.bytes.saturating_sub(most),
+                        },
+                    );
+                }
+                if let Some((crossed, ratio)) = self.observe(feed, head, most) {
                     crossings.push(((*feed).clone(), crossed, ratio));
                 }
                 let limits = feed
@@ -913,15 +963,18 @@ impl Scheduler {
                         continue;
                     };
                     let Some(dh) = head.deliveries.iter().find(|x| x.delivery == dref.uid) else {
-                        self.set_up(&*store, feed, Some(d), limits.as_ref()).await;
+                        self.set_up(state, &*store, feed, Some(d), limits.as_ref())
+                            .await;
                         continue;
                     };
                     let key = dref.uid.to_string();
+                    let key_of = key.clone();
                     seen.insert(key.clone());
                     let local = self.local.entry(key).or_default();
                     let gap = min_interval(d, feed.tenant().is_some(), rt.tenant_min_interval());
                     let never_read = local.read_at.is_none();
-                    let decision = decide(d, head, dh, &local.status, gap, now);
+                    let pending_bytes = undelivered.get(&key_of).copied().unwrap_or(head.bytes);
+                    let decision = decide(d, head, dh, pending_bytes, &local.status, gap, now);
                     let recent = |t: Option<Instant>| t.is_some_and(|t| t.elapsed() < CLAIM_CHECK);
                     let step = match decision {
                         Decision::Claim { bytes_only } => Some(Step::Claim { bytes_only }),
@@ -945,6 +998,7 @@ impl Scheduler {
                             uid: dref.uid.clone(),
                             head: head.clone(),
                             dh: dh.clone(),
+                            undelivered_bytes: pending_bytes,
                             store: store.clone(),
                             tenant_limits: limits.clone(),
                             gap,
@@ -955,6 +1009,7 @@ impl Scheduler {
             }
         }
         self.local.retain(|k, _| seen.contains(k));
+        self.below.retain(|k, _| seen.contains(k));
         self.limits.retain(|uid, _| snapshot.by_uid(uid).is_some());
         use futures::StreamExt;
         let rt_ref = &rt;
@@ -1009,9 +1064,12 @@ impl Scheduler {
 
     /// Create what the store lacks of a defined feed: its row, or the
     /// position of delivery `d`. A change that stored the definition and
-    /// stopped before the store call leaves this.
+    /// stopped before the store call leaves this. Nothing is created for a
+    /// definition that is gone by now, and a missing feed row is given
+    /// [`FEED_SETUP_GRACE`] first: a feed being deleted looks the same.
     async fn set_up(
         &mut self,
+        state: &ServerState,
         store: &dyn FeedStore,
         feed: &Feed,
         d: Option<&DeliverySpec>,
@@ -1020,11 +1078,25 @@ impl Scheduler {
         let label = feed.label();
         let name = d.map(|d| d.name.as_str()).unwrap_or_default();
         let key = format!("{}/{name}", feed.uid);
-        if self.setting_up.insert(key.clone()) {
-            metrics::delivery_setup(&label, name);
-            tracing::warn!(feed = %label, delivery = name, "a defined feed or delivery is missing from the feed store; creating it");
+        let first_seen = match self.setting_up.get(&key) {
+            Some(at) => *at,
+            None => {
+                metrics::delivery_setup(&label, name);
+                tracing::warn!(feed = %label, delivery = name, "a defined feed or delivery is missing from the feed store; creating it");
+                let now = Instant::now();
+                self.setting_up.insert(key.clone(), now);
+                now
+            }
+        };
+        let target = d.and_then(|d| feed.delivery(&d.name).map(|r| (d, r)));
+        if target.is_none() && first_seen.elapsed() < FEED_SETUP_GRACE {
+            return;
         }
-        let made = match d.and_then(|d| feed.delivery(&d.name).map(|r| (d, r))) {
+        let Some(defined) = defined_ids(state, feed).await else {
+            return;
+        };
+        let made = match target {
+            Some((_, dref)) if !defined.contains(dref.uid.id()) => return,
             Some((d, dref)) => store
                 .ensure_delivery(&store_calls(), &dref.uid, super::start_of(d.start))
                 .await
@@ -1112,7 +1184,51 @@ impl Scheduler {
     /// Emit a feed's gauges; returns how many `warn_at` thresholds it is
     /// past, with the ratio, when that differs from what this server last
     /// recorded.
-    fn observe(&mut self, feed: &Feed, head: &Head) -> Option<(usize, f64)> {
+    /// The payload bytes from `dh`'s cursor on. The store counts them when
+    /// the cursor or the oldest retained event moved; between counts the
+    /// feed's total minus the bytes below the cursor says the same.
+    async fn undelivered(&mut self, store: &dyn FeedStore, head: &Head, dh: &DeliveryHead) -> u64 {
+        if dh.cursor <= head.oldest {
+            return head.bytes;
+        }
+        if dh.cursor >= head.end() {
+            return 0;
+        }
+        let key = dh.delivery.to_string();
+        if let Some(b) = self.below.get(&key)
+            && b.cursor == dh.cursor
+            && b.oldest == head.oldest
+            && b.counted_at.elapsed() < BELOW_MAX_AGE
+        {
+            return head.bytes.saturating_sub(b.bytes);
+        }
+        match store
+            .bytes_from(&store_calls(), &head.feed, dh.cursor)
+            .await
+        {
+            Ok(Some(from_cursor)) => {
+                let from_cursor = from_cursor.min(head.bytes);
+                self.below.insert(
+                    key,
+                    Below {
+                        cursor: dh.cursor,
+                        oldest: head.oldest,
+                        bytes: head.bytes - from_cursor,
+                        counted_at: Instant::now(),
+                    },
+                );
+                from_cursor
+            }
+            _ => head.bytes,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        feed: &Feed,
+        head: &Head,
+        undelivered_bytes: u64,
+    ) -> Option<(usize, f64)> {
         let label = feed.label();
         let mut depth = 0u64;
         let mut oldest = 0f64;
@@ -1133,9 +1249,8 @@ impl Scheduler {
         metrics::depth(&label, depth);
         let limits = &feed.spec.retention.undelivered;
         let by_age = oldest / limits.max_age.secs().max(1) as f64;
-        // The feed's stored bytes bound its undelivered bytes from above.
         let by_bytes = if depth > 0 {
-            head.bytes as f64 / limits.max_bytes.bytes().max(1) as f64
+            undelivered_bytes as f64 / limits.max_bytes.bytes().max(1) as f64
         } else {
             0.0
         };

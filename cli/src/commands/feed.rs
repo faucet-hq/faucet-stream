@@ -159,7 +159,7 @@ fn feed_text(d: &service::FeedDetail) -> String {
             "  events {}..{} · {} stored byte(s) · {} in the last 24h",
             f.oldest.unwrap_or(0),
             f.watermark.unwrap_or(0),
-            f.stored_bytes.unwrap_or(0),
+            f.retained_bytes.unwrap_or(0),
             f.events_24h.unwrap_or(0)
         ),
     ];
@@ -368,7 +368,7 @@ fn stats_of(d: &service::FeedDetail) -> Stats {
             (Some(oldest), Some(watermark)) => Some((watermark + 1).saturating_sub(oldest)),
             _ => None,
         },
-        stored_bytes: f.stored_bytes,
+        stored_bytes: f.retained_bytes,
         events_24h: f.events_24h,
         bytes_24h: f.bytes_24h,
         undelivered_ratio: f.undelivered_ratio,

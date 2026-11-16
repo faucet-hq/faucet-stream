@@ -50,8 +50,9 @@ fn a_delivery_is_claimed_only_when_its_flush_policy_is_met() {
     let now = Utc::now();
     let gap = std::time::Duration::from_secs(30);
     let idle = DeliveryStatus::default();
-    let at =
-        |h: &(Head, DeliveryHead), s: &DeliveryStatus| runner::decide(&d, &h.0, &h.1, s, gap, now);
+    let at = |h: &(Head, DeliveryHead), s: &DeliveryStatus| {
+        runner::decide(&d, &h.0, &h.1, h.0.bytes, s, gap, now)
+    };
 
     assert_eq!(at(&head(5, 10, 6, 0), &idle), Decision::Idle);
     assert_eq!(at(&head(5, 10, 3, 1), &idle), Decision::Idle);
@@ -69,6 +70,12 @@ fn a_delivery_is_claimed_only_when_its_flush_policy_is_met() {
         at(&head(5, 5000, 3, 1), &idle),
         Decision::Claim { bytes_only: true },
         "the store has to confirm the byte limit"
+    );
+    // Delivered events kept for replay are not waiting bytes.
+    let kept = head(5, 5000, 3, 1);
+    assert_eq!(
+        runner::decide(&d, &kept.0, &kept.1, 40, &idle, gap, now),
+        Decision::Idle
     );
 
     // The shortest gap between two runs.
@@ -120,7 +127,7 @@ fn a_delivery_is_claimed_only_when_its_flush_policy_is_met() {
     let in_spec = delivery(json!({"name": "lake", "template": {"id": "t"}, "paused": true}));
     let h = head(9000, 10, 3, 1);
     assert_eq!(
-        runner::decide(&in_spec, &h.0, &h.1, &idle, gap, now),
+        runner::decide(&in_spec, &h.0, &h.1, h.0.bytes, &idle, gap, now),
         Decision::Blocked
     );
 
@@ -258,7 +265,10 @@ fn a_run_counts_by_where_it_left_the_cursor() {
         Outcome::ClaimLost
     );
     assert!(matches!(
-        runner::outcome_of(&said("delivery f1/d is held: event 9", Some(FeedFailure::Held)), false),
+        runner::outcome_of(
+            &said("delivery f1/d is held: event 9", Some(FeedFailure::Held)),
+            false
+        ),
         Outcome::Held(_)
     ));
     assert_eq!(
@@ -449,9 +459,9 @@ fn a_view_masks_secrets_and_shows_each_deliverys_position() {
             ..Default::default()
         },
     );
-    let v = service::view(&f, Some(&h), &statuses);
+    let v = service::view(&f, Some(&h), Some(100), &statuses);
     assert_eq!(
-        (v.name.as_str(), v.revision, v.watermark, v.stored_bytes),
+        (v.name.as_str(), v.revision, v.watermark, v.retained_bytes),
         ("orders", 3, Some(20), Some(512))
     );
     assert_eq!(
@@ -483,7 +493,7 @@ fn a_view_masks_secrets_and_shows_each_deliverys_position() {
         !text.contains("s3cret") && !text.contains("\"ct\""),
         "{text}"
     );
-    assert!(service::view(&f, None, &statuses).watermark.is_none());
+    assert!(service::view(&f, None, None, &statuses).watermark.is_none());
 
     let d = &f.spec.deliveries[0];
     let mut s = DeliveryStatus::default();

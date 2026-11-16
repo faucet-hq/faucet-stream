@@ -218,6 +218,19 @@ impl Snapshot {
     }
 }
 
+/// The retained bytes below a feed's lowest delivery position (delivered,
+/// kept for replay) as the scheduler last counted them. They stay the same
+/// while that position and the oldest retained event do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedBytes {
+    pub lowest: faucet_common_feed::Seq,
+    pub oldest: faucet_common_feed::Seq,
+    pub delivered: u64,
+}
+
+/// How long a published [`FeedBytes`] answers for the feed.
+const BYTES_MAX_AGE: Duration = Duration::from_secs(60);
+
 /// What `/readyz` reports about feeds.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Readiness {
@@ -315,6 +328,7 @@ pub struct FeedsRuntime {
     changed: Arc<tokio::sync::Notify>,
     last_refresh: tokio::sync::Mutex<Option<Instant>>,
     readiness: Mutex<Readiness>,
+    bytes: Mutex<HashMap<String, (FeedBytes, Instant)>>,
 }
 
 impl std::fmt::Debug for FeedsRuntime {
@@ -345,6 +359,7 @@ impl FeedsRuntime {
             changed: Arc::new(tokio::sync::Notify::new()),
             last_refresh: tokio::sync::Mutex::new(None),
             readiness: Mutex::new(Readiness::default()),
+            bytes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -467,6 +482,25 @@ impl FeedsRuntime {
             .readiness
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = readiness;
+    }
+
+    pub(crate) fn publish_bytes(&self, feed_uid: &str, bytes: FeedBytes) {
+        let mut held = self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.retain(|_, (_, at)| at.elapsed() < BYTES_MAX_AGE);
+        held.insert(feed_uid.to_string(), (bytes, Instant::now()));
+    }
+
+    /// What the scheduler counted for the feed within the last minute.
+    pub fn bytes(&self, feed_uid: &str) -> Option<FeedBytes> {
+        self.bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(feed_uid)
+            .filter(|(_, at)| at.elapsed() < BYTES_MAX_AGE)
+            .map(|(b, _)| *b)
     }
 
     /// The store that holds `feed`, opened on first use.

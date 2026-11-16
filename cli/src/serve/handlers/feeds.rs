@@ -132,10 +132,24 @@ pub async fn list(
     State(state): State<ServerState>,
     Extension(actor): Extension<AuthContext>,
     Query(q): Query<Scope>,
+    Query(page): Query<PageQuery>,
 ) -> Result<Json<FeedList>, ServeError> {
-    service::overview(&state, &actor, q.tenant.as_deref())
+    let page = service::Page {
+        after: page.after,
+        limit: page.limit,
+    };
+    service::overview(&state, &actor, q.tenant.as_deref(), page)
         .await
         .map(Json)
+}
+
+/// Where a page of `GET /v1/feeds` starts and how long it is.
+#[derive(Debug, Default, Deserialize)]
+pub struct PageQuery {
+    #[serde(default)]
+    pub after: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 pub async fn get(

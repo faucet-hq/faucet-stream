@@ -2580,7 +2580,9 @@ async fn a_schedule_change_belongs_to_the_tenant_that_owns_the_schedule() {
     // Made before the gate: the tenant's own schedule.
     let open = spawn(dir.path(), Some(db.clone()), &rows.uri()).await;
     for t in ["acme", "globex"] {
-        let (code, _) = open.post("admin-tok", "/v1/tenants", json!({"id": t})).await;
+        let (code, _) = open
+            .post("admin-tok", "/v1/tenants", json!({"id": t}))
+            .await;
         assert_eq!(code, 201);
     }
     let (code, reg) = open
@@ -2591,7 +2593,8 @@ async fn a_schedule_change_belongs_to_the_tenant_that_owns_the_schedule() {
         )
         .await;
     assert_eq!(code, 201, "{reg}");
-    let nightly = json!({"name": "acme-nightly", "cron": "0 2 * * *", "template": {"id": "plain-sync"}});
+    let nightly =
+        json!({"name": "acme-nightly", "cron": "0 2 * * *", "template": {"id": "plain-sync"}});
     let (code, made) = open.post("acme-tok", "/v1/schedules", nightly).await;
     assert_eq!(code, 201, "{made}");
 
@@ -2605,7 +2608,8 @@ async fn a_schedule_change_belongs_to_the_tenant_that_owns_the_schedule() {
         vec!["schedule".to_string()],
     )
     .await;
-    let edit = json!({"name": "acme-nightly", "cron": "0 3 * * *", "template": {"id": "plain-sync"}});
+    let edit =
+        json!({"name": "acme-nightly", "cron": "0 3 * * *", "template": {"id": "plain-sync"}});
     let (code, pending) = api
         .put("admin-tok", "/v1/schedules/acme-nightly", edit)
         .await;

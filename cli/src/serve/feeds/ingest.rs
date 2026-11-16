@@ -1818,7 +1818,12 @@ mod tests {
         assert_eq!(without_token(""), None);
     }
 
-    fn jobs(n: usize) -> (Vec<Job>, Vec<oneshot::Receiver<Result<AppendAck, FeedError>>>) {
+    fn jobs(
+        n: usize,
+    ) -> (
+        Vec<Job>,
+        Vec<oneshot::Receiver<Result<AppendAck, FeedError>>>,
+    ) {
         (0..n)
             .map(|i| {
                 let (reply, answer) = oneshot::channel();
@@ -1844,12 +1849,19 @@ mod tests {
         let (group, answers) = jobs(3);
         commit_with("f", group, |_| {
             calls.fetch_add(1, Ordering::SeqCst);
-            async { Err(FeedError::Unavailable("connection reset during commit".into())) }
+            async {
+                Err(FeedError::Unavailable(
+                    "connection reset during commit".into(),
+                ))
+            }
         })
         .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1, "nothing is appended again");
         for answer in answers {
-            assert!(matches!(answer.await.unwrap(), Err(FeedError::Unavailable(_))));
+            assert!(matches!(
+                answer.await.unwrap(),
+                Err(FeedError::Unavailable(_))
+            ));
         }
     }
 
@@ -1889,7 +1901,11 @@ mod tests {
         assert!(matches!(got[1], Err(FeedError::Full { .. })));
         assert!(matches!(got[2], Err(FeedError::Backend(_))));
         assert!(matches!(got[3], Err(FeedError::Unavailable(_))));
-        assert_eq!(calls.load(Ordering::SeqCst), 4, "the last request is not tried");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "the last request is not tried"
+        );
     }
 
     #[test]

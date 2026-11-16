@@ -16,9 +16,9 @@ use crate::serve::history::feeds::{
 use crate::serve::rbac::{AuthContext, Role};
 use crate::serve::state::ServerState;
 use chrono::{DateTime, Utc};
-use faucet_common_feed::{ClaimOwner, DeliveryUid, FeedStore, Head, Move, Seq};
+use faucet_common_feed::{ClaimOwner, DeliveryUid, FeedStore, FeedUid, Head, Move, Seq};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 const REPLACE_ATTEMPTS: usize = 5;
@@ -103,8 +103,14 @@ pub struct FeedView {
     /// The oldest retained event's number.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest: Option<u64>,
+    /// Payload bytes of every retained event: the undelivered ones and the
+    /// delivered ones kept for replay.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stored_bytes: Option<u64>,
+    pub retained_bytes: Option<u64>,
+    /// Payload bytes the slowest delivery has not delivered yet: what the
+    /// feed's undelivered limit counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub undelivered_bytes: Option<u64>,
     /// Retained events and their payload bytes stored in the last 24 hours.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub events_24h: Option<u64>,
@@ -138,17 +144,10 @@ pub fn ingest_path(tenant: Option<&str>, name: &str) -> String {
 }
 
 /// How full a feed is: its undelivered bytes or age against its limits.
-fn undelivered_ratio(feed: &Feed, head: &Head) -> f64 {
+/// `undelivered` is the bytes from the lowest cursor on.
+fn undelivered_ratio(feed: &Feed, head: &Head, undelivered: u64) -> f64 {
     let limits = &feed.spec.retention.undelivered;
-    let pending = head
-        .deliveries
-        .iter()
-        .any(|d| d.cursor.distance_to(head.end()) > 0);
-    let by_bytes = if pending {
-        head.bytes as f64 / limits.max_bytes.bytes().max(1) as f64
-    } else {
-        0.0
-    };
+    let by_bytes = undelivered as f64 / limits.max_bytes.bytes().max(1) as f64;
     let oldest = head
         .deliveries
         .iter()
@@ -156,6 +155,19 @@ fn undelivered_ratio(feed: &Feed, head: &Head) -> f64 {
         .map(|t| (head.now - t).num_milliseconds().max(0) as f64 / 1000.0)
         .fold(0.0, f64::max);
     by_bytes.max(oldest / limits.max_age.secs().max(1) as f64)
+}
+
+/// The bytes of `head` no delivery has delivered yet, when no count is
+/// needed to know: none pending, or nothing delivered is still retained.
+fn undelivered_known(head: &Head) -> Option<u64> {
+    let lowest = head.deliveries.iter().map(|d| d.cursor).min()?;
+    if lowest >= head.end() {
+        Some(0)
+    } else if lowest <= head.oldest {
+        Some(head.bytes)
+    } else {
+        None
+    }
 }
 
 /// The status word a feed shows, worst first.
@@ -253,6 +265,7 @@ pub fn status_word(d: &DeliverySpec, s: &DeliveryStatus) -> &'static str {
 pub fn view(
     feed: &Feed,
     head: Option<&Head>,
+    undelivered: Option<u64>,
     statuses: &std::collections::BTreeMap<String, DeliveryStatus>,
 ) -> FeedView {
     let masked = secrets::masked(&feed.spec);
@@ -300,7 +313,14 @@ pub fn view(
             })
         })
         .collect::<Vec<DeliveryView>>();
-    let ratio = head.map(|h| undelivered_ratio(feed, h));
+    let no_delivery = head.is_some_and(|h| h.deliveries.is_empty());
+    let undelivered = head
+        .and_then(undelivered_known)
+        .or(undelivered)
+        .or(no_delivery.then_some(0));
+    let ratio = head
+        .zip(undelivered)
+        .map(|(h, bytes)| undelivered_ratio(feed, h, bytes));
     FeedView {
         status: feed_status(&deliveries, ratio).to_string(),
         ingest_path: ingest_path(feed.tenant(), feed.name()),
@@ -317,7 +337,8 @@ pub fn view(
         spec: masked,
         watermark: head.map(|h| h.watermark.get()),
         oldest: head.map(|h| h.oldest.get()),
-        stored_bytes: head.map(|h| h.bytes),
+        retained_bytes: head.map(|h| h.bytes),
+        undelivered_bytes: undelivered,
         events_24h: None,
         bytes_24h: None,
         last_event_at: None,
@@ -400,38 +421,118 @@ async fn statuses(
     Ok(out)
 }
 
-async fn view_of(state: &ServerState, feed: &Feed) -> Result<FeedView, ServeError> {
-    let store = state.feeds().store_for(feed).await.ok();
-    let head = match &store {
-        Some(store) => head_of(&**store, feed).await.ok().flatten(),
-        None => None,
-    };
-    let mut out = view(feed, head.as_ref(), &statuses(state, feed).await?);
-    out.refused_recent = state.feeds().ingest().refusals(feed.uid.as_str()).len() as u64;
-    // What the last 24 hours brought, by the store's own clock.
-    if let (Some(store), Some(head)) = (&store, &head) {
-        let calls = store_calls();
-        let since = head.now - chrono::Duration::hours(24);
-        if let Ok(from) = store.seq_at(&calls, &feed.uid, since).await {
-            out.events_24h = Some(from.distance_to(head.end()));
-            out.bytes_24h = store
-                .bytes_from(&calls, &feed.uid, from)
-                .await
-                .ok()
-                .flatten();
-            for d in &mut out.deliveries {
-                d.delivered_24h = d.position.map(|p| from.distance_to(Seq(p).max(from)));
+/// The bytes no delivery of `feed` has delivered yet: what the scheduler
+/// counted a moment ago, else counted now from the lowest cursor.
+async fn undelivered_of(
+    state: &ServerState,
+    store: &dyn FeedStore,
+    feed: &Feed,
+    head: &Head,
+) -> Option<u64> {
+    if let Some(known) = undelivered_known(head) {
+        return Some(known);
+    }
+    let lowest = head.deliveries.iter().map(|d| d.cursor).min()?;
+    if let Some(counted) = state.feeds().bytes(feed.uid.as_str())
+        && counted.lowest == lowest
+        && counted.oldest == head.oldest
+    {
+        return Some(head.bytes.saturating_sub(counted.delivered));
+    }
+    store
+        .bytes_from(&store_calls(), &feed.uid, lowest)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Feeds viewed side by side.
+const VIEWS_AT_ONCE: usize = 8;
+
+/// The views of `feeds`: one `heads` and one newest-event query per store,
+/// then each feed's statuses and last-24-hours figures side by side.
+async fn views(state: &ServerState, feeds: &[Arc<Feed>]) -> Result<Vec<FeedView>, ServeError> {
+    use futures::StreamExt;
+    let rt = state.feeds();
+    let mut by_store: std::collections::BTreeMap<&str, Vec<FeedUid>> = Default::default();
+    for f in feeds {
+        by_store
+            .entry(f.spec.store.as_str())
+            .or_default()
+            .push(f.uid.clone());
+    }
+    let mut stores: HashMap<&str, Arc<dyn FeedStore>> = HashMap::new();
+    let mut heads: HashMap<FeedUid, Head> = HashMap::new();
+    let mut newest: HashMap<FeedUid, DateTime<Utc>> = HashMap::new();
+    let mut unbatched: HashSet<&str> = HashSet::new();
+    let calls = store_calls();
+    for (name, uids) in &by_store {
+        let Ok(store) = rt.stores().get(name).await else {
+            continue;
+        };
+        if let Ok(found) = store.heads(&calls, uids).await {
+            heads.extend(found.into_iter().map(|h| (h.feed.clone(), h)));
+        }
+        match store.newest_received(&calls, uids).await {
+            Ok(Some(found)) => newest.extend(found),
+            _ => {
+                unbatched.insert(name);
             }
         }
-        if head.end() > head.oldest
-            && let Ok(batch) = store
-                .read(&calls, &feed.uid, head.watermark, head.end())
-                .await
-        {
-            out.last_event_at = batch.events.last().map(|e| e.received_at);
-        }
+        stores.insert(name, store);
     }
-    Ok(out)
+    let (stores, heads, newest, unbatched) = (&stores, &heads, &newest, &unbatched);
+    let one = |feed: &Arc<Feed>| {
+        let feed = feed.clone();
+        async move {
+            let store = stores.get(feed.spec.store.as_str());
+            let head = heads.get(&feed.uid);
+            let undelivered = match (store, head) {
+                (Some(store), Some(head)) => undelivered_of(state, &**store, &feed, head).await,
+                _ => None,
+            };
+            let mut out = view(&feed, head, undelivered, &statuses(state, &feed).await?);
+            out.refused_recent = state.feeds().ingest().refusals(feed.uid.as_str()).len() as u64;
+            let (Some(store), Some(head)) = (store, head) else {
+                return Ok(out);
+            };
+            // What the last 24 hours brought, by the store's own clock.
+            let calls = store_calls();
+            let since = head.now - chrono::Duration::hours(24);
+            if let Ok(from) = store.seq_at(&calls, &feed.uid, since).await {
+                out.events_24h = Some(from.distance_to(head.end()));
+                out.bytes_24h = store
+                    .bytes_from(&calls, &feed.uid, from)
+                    .await
+                    .ok()
+                    .flatten();
+                for d in &mut out.deliveries {
+                    d.delivered_24h = d.position.map(|p| from.distance_to(Seq(p).max(from)));
+                }
+            }
+            out.last_event_at = newest.get(&feed.uid).copied();
+            if unbatched.contains(feed.spec.store.as_str())
+                && head.end() > head.oldest
+                && let Ok(batch) = store
+                    .read(&calls, &feed.uid, head.watermark, head.end())
+                    .await
+            {
+                out.last_event_at = batch.events.last().map(|e| e.received_at);
+            }
+            Ok::<FeedView, ServeError>(out)
+        }
+    };
+    let viewed: Vec<Result<FeedView, ServeError>> = futures::stream::iter(feeds.iter().map(one))
+        .buffered(VIEWS_AT_ONCE)
+        .collect()
+        .await;
+    viewed.into_iter().collect()
+}
+
+async fn view_of(state: &ServerState, feed: &Feed) -> Result<FeedView, ServeError> {
+    let mut one = views(state, &[Arc::new(feed.clone())]).await?;
+    one.pop()
+        .ok_or_else(|| ServeError::Internal("a feed has no view".into()))
 }
 
 /// Retained events stored in each of the last 24 hours, oldest first; empty
@@ -440,10 +541,13 @@ async fn hourly_24h(state: &ServerState, feed: &Feed) -> Vec<u64> {
     let Ok(store) = state.feeds().store_for(feed).await else {
         return Vec::new();
     };
+    let calls = store_calls();
+    if let Ok(Some(counts)) = store.hourly_counts(&calls, &feed.uid, 24).await {
+        return counts;
+    }
     let Ok(Some(head)) = head_of(&*store, feed).await else {
         return Vec::new();
     };
-    let calls = store_calls();
     let mut marks = Vec::with_capacity(25);
     for hours in (1..=24).rev() {
         match store
@@ -487,6 +591,23 @@ pub struct FeedList {
     /// Whether creating or changing a feed here needs an approved change
     /// request (`always`, `deliveries` or `never`).
     pub approval: &'static str,
+    /// Pass as `after` for the next page; absent on the last one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// The `tenant` value that lists the server's feeds and every tenant's.
+pub const ALL_TENANTS: &str = "*";
+/// Feeds on one page of the list, by default and at most.
+pub const DEFAULT_PAGE: usize = 200;
+pub const MAX_PAGE: usize = 1000;
+
+/// Where a page of the list starts and how long it is.
+#[derive(Debug, Clone, Default)]
+pub struct Page {
+    /// The `next` of the page before.
+    pub after: Option<String>,
+    pub limit: Option<usize>,
 }
 
 /// The feeds `actor` sees for `tenant`, with the tenant's quotas.
@@ -494,10 +615,16 @@ pub async fn overview(
     state: &ServerState,
     actor: &AuthContext,
     tenant: Option<&str>,
+    page: Page,
 ) -> Result<FeedList, ServeError> {
     use crate::serve::changes::ChangeKind;
-    let feeds = list(state, actor, tenant).await?;
-    let scoped = scope(actor, tenant)?;
+    let (feeds, next) = list_page(state, actor, tenant, &page).await?;
+    let everyone = tenant == Some(ALL_TENANTS) && actor.tenant.is_none();
+    let scoped = if everyone {
+        None
+    } else {
+        scope(actor, tenant.filter(|t| *t != ALL_TENANTS))?
+    };
     let quotas = match &scoped {
         Some(t) => {
             let limits = state
@@ -511,7 +638,7 @@ pub async fn overview(
                 tenant: t.clone(),
                 feeds: feeds.len() as u64,
                 max_feeds: limits.max_feeds,
-                stored_bytes: feeds.iter().filter_map(|f| f.stored_bytes).sum(),
+                stored_bytes: feeds.iter().filter_map(|f| f.retained_bytes).sum(),
                 max_feed_bytes: limits.max_feed_bytes,
                 max_feed_events_per_sec: limits.max_feed_events_per_sec,
             })
@@ -535,6 +662,7 @@ pub async fn overview(
         } else {
             "never"
         },
+        next,
     })
 }
 
@@ -749,24 +877,61 @@ pub async fn refusals(
     Ok(all)
 }
 
+/// The definitions a listing reads: the server's snapshot, reloaded only
+/// when it is older than the scheduler would let it get.
+async fn listed(state: &ServerState) -> Result<Arc<super::Snapshot>, ServeError> {
+    let rt = state.feeds();
+    let held = rt.snapshot();
+    if held.loaded() && held.age() <= super::REFRESH_INTERVAL {
+        return Ok(held);
+    }
+    rt.refresh_now(state).await.map_err(ServeError::Unavailable)
+}
+
 /// The feeds `actor` sees for `tenant`.
 pub async fn list(
     state: &ServerState,
     actor: &AuthContext,
     tenant: Option<&str>,
 ) -> Result<Vec<FeedView>, ServeError> {
-    let tenant = scope(actor, tenant)?;
-    let rt = state.feeds();
-    let snapshot = rt.refresh(state).await.map_err(ServeError::Unavailable)?;
-    let mut out = Vec::new();
-    for feed in snapshot
+    let all = Page {
+        after: None,
+        limit: Some(usize::MAX),
+    };
+    Ok(list_page(state, actor, tenant, &all).await?.0)
+}
+
+/// One page of the feeds `actor` sees for `tenant`, ordered by tenant and
+/// name, and where the next page starts. `tenant` [`ALL_TENANTS`] lists the
+/// server's feeds and every tenant's for a principal that is not confined
+/// to one tenant.
+pub async fn list_page(
+    state: &ServerState,
+    actor: &AuthContext,
+    tenant: Option<&str>,
+    page: &Page,
+) -> Result<(Vec<FeedView>, Option<String>), ServeError> {
+    let everyone = tenant == Some(ALL_TENANTS) && actor.tenant.is_none();
+    let tenant = scope(actor, tenant.filter(|t| *t != ALL_TENANTS))?;
+    let snapshot = listed(state).await?;
+    let mut seen: Vec<Arc<Feed>> = snapshot
         .feeds
         .iter()
-        .filter(|f| f.tenant() == tenant.as_deref())
-    {
-        out.push(view_of(state, feed).await?);
-    }
-    Ok(out)
+        .filter(|f| everyone || f.tenant() == tenant.as_deref())
+        .filter(|f| page.after.as_ref().is_none_or(|after| f.key() > *after))
+        .cloned()
+        .collect();
+    seen.sort_by_key(|f| f.key());
+    let limit = page.limit.unwrap_or(DEFAULT_PAGE).max(1);
+    let limit = if limit == usize::MAX {
+        limit
+    } else {
+        limit.min(MAX_PAGE)
+    };
+    let more = seen.len() > limit;
+    seen.truncate(limit);
+    let next = more.then(|| seen.last().map(|f| f.key())).flatten();
+    Ok((views(state, &seen).await?, next))
 }
 
 /// One feed with its gaps, tokens and change log.

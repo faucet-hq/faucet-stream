@@ -1008,7 +1008,7 @@ async fn feed_tool(ctx: &McpContext, tool: &str, args: &Value) -> Result<String,
     let tenant = args.get("tenant").and_then(Value::as_str);
     let message = |e: crate::serve::error::ServeError| e.api_error().error.message;
     let out = if tool == "list_feeds" {
-        let list = service::overview(&server.state, &server.actor, tenant)
+        let list = service::overview(&server.state, &server.actor, tenant, Default::default())
             .await
             .map_err(message)?;
         serde_json::to_string_pretty(&list)

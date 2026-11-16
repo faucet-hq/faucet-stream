@@ -831,7 +831,9 @@ async fn a_signed_feed_checks_the_signature_and_its_timestamp() {
     assert_eq!(again.body["duplicate"], true, "{}", again.body);
     assert_eq!(again.body["ids"], good.body["ids"]);
     assert_eq!(srv.watermark("hooks", &uid).await, 1);
-    let view = service::get(&srv.state, &admin(), None, "hooks").await.unwrap();
+    let view = service::get(&srv.state, &admin(), None, "hooks")
+        .await
+        .unwrap();
     assert!(view.feed.warnings.is_empty());
     // Without a signed timestamp nothing tells a replay from a new request.
     srv.feed(json!({
@@ -839,8 +841,14 @@ async fn a_signed_feed_checks_the_signature_and_its_timestamp() {
         "ingest": {"auth": {"signature": {"header": "X-Signature", "secret": "hmac-secret-2"}}}
     }))
     .await;
-    let bare = service::get(&srv.state, &admin(), None, "bare").await.unwrap();
-    assert!(bare.feed.warnings[0].contains("timestamp_header"), "{:?}", bare.feed.warnings);
+    let bare = service::get(&srv.state, &admin(), None, "bare")
+        .await
+        .unwrap();
+    assert!(
+        bare.feed.warnings[0].contains("timestamp_header"),
+        "{:?}",
+        bare.feed.warnings
+    );
 
     let refused = [
         // The wrong secret, a body changed after signing, no prefix.
@@ -1124,7 +1132,10 @@ async fn a_sealed_feed_stores_ciphertext_and_delivers_what_was_sent() {
     let sent = r#"{"card": "4111-secret-pan"}"#.len();
     assert!(stored.events[0].payload.len() < sent + 96);
     assert_eq!(stored.events[0].size as usize, sent);
-    let large = format!(r#"{{"card": "9999-large-pan", "pad": "{}"}}"#, "x".repeat(100_000));
+    let large = format!(
+        r#"{{"card": "9999-large-pan", "pad": "{}"}}"#,
+        "x".repeat(100_000)
+    );
     let b = srv.push("private", &token, &large).await;
     assert_eq!(b.status, 202, "{}", b.body);
     let big = srv
@@ -2594,7 +2605,10 @@ async fn a_feed_change_belongs_to_the_tenant_that_owns_the_feed() {
     let id = change["id"].as_str().unwrap().to_string();
     let at = format!("/v1/changes/{id}");
 
-    assert_eq!(call(M::GET, &at, "globex-admin-tok", None).await.status, 404);
+    assert_eq!(
+        call(M::GET, &at, "globex-admin-tok", None).await.status,
+        404
+    );
     let approve = format!("{at}/approve");
     assert_eq!(
         call(M::POST, &approve, "globex-admin-tok", Some(json!({})))
@@ -2615,7 +2629,13 @@ async fn a_feed_change_belongs_to_the_tenant_that_owns_the_feed() {
     assert_eq!(made.status, 200, "{}", made.body);
     assert_eq!(made.body["created_by"], "alice");
     assert_eq!(made.body["tenant"], "acme");
-    let audit = call(M::GET, "/v1/audit?action=change.requested", "admin-tok", None).await;
+    let audit = call(
+        M::GET,
+        "/v1/audit?action=change.requested",
+        "admin-tok",
+        None,
+    )
+    .await;
     assert_eq!(audit.body["entries"][0]["tenant"], "acme", "{}", audit.body);
 
     // A server feed's change stays out of every tenant's sight.
@@ -2624,5 +2644,8 @@ async fn a_feed_change_belongs_to_the_tenant_that_owns_the_feed() {
     assert_eq!(own.status, 202, "{}", own.body);
     assert!(own.body["change"].get("tenant").is_none());
     let own_at = format!("/v1/changes/{}", own.body["change"]["id"].as_str().unwrap());
-    assert_eq!(call(M::GET, &own_at, "acme-admin-tok", None).await.status, 404);
+    assert_eq!(
+        call(M::GET, &own_at, "acme-admin-tok", None).await.status,
+        404
+    );
 }

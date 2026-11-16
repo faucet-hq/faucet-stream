@@ -2968,9 +2968,14 @@ async fn a_delivery_position_no_definition_lists_is_removed_from_the_store() {
     register(&srv.state, "orders_lake", &root.join("state")).await;
     let mut wide = delivery("lake", "orders_lake", &root.join("api.jsonl"));
     wide["flush"]["max_events"] = json!(1000);
-    service::create(&srv.state, &admin(), None, feed_spec("stored", json!([wide])))
-        .await
-        .unwrap();
+    service::create(
+        &srv.state,
+        &admin(),
+        None,
+        feed_spec("stored", json!([wide])),
+    )
+    .await
+    .unwrap();
     srv.tick().await;
 
     for feed in ["stored", "filed"] {
@@ -2989,7 +2994,9 @@ async fn a_delivery_position_no_definition_lists_is_removed_from_the_store() {
 
     // An id the stored record lists is another server's newer definition.
     let (store, uid) = srv.store("filed").await;
-    let key = faucet_cli::serve::feeds::file_ids_key(&faucet_cli::serve::history::feeds::feed_key(None, "filed"));
+    let key = faucet_cli::serve::feeds::file_ids_key(&faucet_cli::serve::history::feeds::feed_key(
+        None, "filed",
+    ));
     let history = srv.state.history();
     let raw = history.meta_get(&key).await.unwrap().unwrap();
     let mut ids: faucet_cli::serve::feeds::FileIds = serde_json::from_str(&raw).unwrap();
@@ -3197,10 +3204,174 @@ async fn a_bookmark_past_the_store_holds_the_delivery_by_the_sources_own_word() 
         })
         .await;
     assert_eq!(pos.cursor, 3, "nothing was read or skipped");
-    let run_id = pos.status.last_run.as_ref().unwrap().run_id.clone().unwrap();
+    let run_id = pos
+        .status
+        .last_run
+        .as_ref()
+        .unwrap()
+        .run_id
+        .clone()
+        .unwrap();
     let rec = srv.state.history().get(&run_id).await.unwrap().unwrap();
     assert_eq!(
         rec.invocations[0].feed_error,
         Some(faucet_cli::serve::history::FeedFailure::Held)
     );
+}
+
+/// A store that is slow to open holds up nobody who asks for another store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_store_open_does_not_block_another_store() {
+    let dir = tempfile::tempdir().unwrap();
+    // A listener that accepts and never answers: the open hangs on it.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    let targets = [
+        (
+            "slow".to_string(),
+            stores::StoreTarget::Postgres(format!("postgres://u:p@127.0.0.1:{port}/db")),
+        ),
+        (
+            "default".to_string(),
+            stores::StoreTarget::Sqlite(dir.path().join("feeds.db")),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let all = Arc::new(stores::Stores::new(targets, false));
+    let slow = all.clone();
+    let hung = tokio::spawn(async move { slow.get("slow").await.map(|_| ()) });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!hung.is_finished(), "the slow open is still going");
+    let (a, b) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(all.get("default"), all.get("default"))
+    })
+    .await
+    .expect("another store opens while the slow one hangs");
+    assert!(Arc::ptr_eq(&a.unwrap(), &b.unwrap()), "one open, shared");
+    hung.abort();
+}
+
+/// Delivered events kept for replay are retained bytes, not undelivered
+/// ones: a feed whose deliveries caught up is not full, however much it
+/// keeps, and the views say both numbers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivered_events_kept_for_replay_do_not_count_as_undelivered() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut srv = Srv::start(root, &[]).await;
+    register(&srv.state, "orders_lake", &root.join("state")).await;
+    let out = root.join("lake.jsonl");
+    let mut spec = feed_spec("orders", json!([delivery("lake", "orders_lake", &out)]));
+    spec.retention = serde_json::from_value(json!({"undelivered": {"max_bytes": 40}})).unwrap();
+    service::create(&srv.state, &admin(), None, spec)
+        .await
+        .unwrap();
+    // 8 bytes each: three delivered events are 24 bytes kept for replay.
+    srv.append("orders", 1..=3).await;
+    srv.delivered("orders", "lake", 4).await;
+    service::pause(&srv.state, &admin(), None, "orders", "lake", None)
+        .await
+        .unwrap();
+    srv.append("orders", 4..=5).await;
+    srv.tick().await;
+
+    let view = &service::list(&srv.state, &admin(), None).await.unwrap()[0];
+    assert_eq!(view.retained_bytes, Some(40));
+    assert_eq!(view.undelivered_bytes, Some(16));
+    assert!(view.undelivered_ratio.unwrap() < 0.5, "{view:?}");
+    assert_ne!(view.status, "full");
+    // The store agrees: the limit counts from the lowest position.
+    srv.append("orders", 6..=7).await;
+    let after = service::get(&srv.state, &admin(), None, "orders")
+        .await
+        .unwrap();
+    assert_eq!(after.feed.retained_bytes, Some(56));
+    assert_eq!(after.feed.undelivered_bytes, Some(32));
+    assert_eq!(after.hourly_24h.iter().sum::<u64>(), 7);
+    assert!(after.feed.last_event_at.is_some());
+}
+
+/// One call lists the server's feeds and every tenant's for a principal
+/// that is not confined to a tenant, a page at a time; a tenant's principal
+/// asking for everything still gets its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_tenants_feeds_are_listed_in_one_paged_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &[]).await;
+    let now = chrono::Utc::now();
+    for id in ["acme", "globex"] {
+        let rec = serde_json::from_value(json!({
+            "id": id, "limits": {}, "created_at": now, "updated_at": now, "created_by": "alice"
+        }))
+        .unwrap();
+        srv.state.history().tenant_upsert(&rec).await.unwrap();
+    }
+    for (tenant, name) in [(None, "ops"), (Some("acme"), "a1"), (Some("globex"), "g1")] {
+        service::create(&srv.state, &admin(), tenant, feed_spec(name, json!([])))
+            .await
+            .unwrap();
+    }
+    let names = |feeds: &[service::FeedView]| -> Vec<String> {
+        feeds.iter().map(|f| f.name.clone()).collect()
+    };
+    let all = service::list(&srv.state, &admin(), Some(service::ALL_TENANTS))
+        .await
+        .unwrap();
+    assert_eq!(names(&all), ["ops", "a1", "g1"]);
+    let page = |after: Option<String>| service::Page {
+        after,
+        limit: Some(2),
+    };
+    let (first, next) = service::list_page(
+        &srv.state,
+        &admin(),
+        Some(service::ALL_TENANTS),
+        &page(None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(names(&first), ["ops", "a1"]);
+    let (rest, end) = service::list_page(
+        &srv.state,
+        &admin(),
+        Some(service::ALL_TENANTS),
+        &page(next),
+    )
+    .await
+    .unwrap();
+    assert_eq!(names(&rest), ["g1"]);
+    assert!(end.is_none());
+
+    let acme = AuthContext {
+        principal: "acme-app".into(),
+        role: Role::Operator,
+        source_ip: None,
+        tenant: Some("acme".into()),
+    };
+    let own = service::overview(
+        &srv.state,
+        &acme,
+        Some(service::ALL_TENANTS),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(names(&own.feeds), ["a1"]);
+    assert_eq!(own.quotas.unwrap().tenant, "acme");
+    let whole = service::overview(
+        &srv.state,
+        &admin(),
+        Some(service::ALL_TENANTS),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    assert!(whole.quotas.is_none() && whole.feeds.len() == 3);
 }
