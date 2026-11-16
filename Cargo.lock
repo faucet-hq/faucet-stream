@@ -4779,6 +4779,7 @@ dependencies = [
  "faucet-state-redis",
  "faucet-transform-sql",
  "faucet-transform-wasm",
+ "flate2",
  "futures",
  "futures-core",
  "glob",

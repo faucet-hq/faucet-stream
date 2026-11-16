@@ -274,6 +274,13 @@ async fn raw(addr: SocketAddr, request: &[u8], pause_before_close: Duration) -> 
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn gz(plain: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(plain).unwrap();
+    enc.finish().unwrap()
+}
+
 fn sign(secret: &str, signed: &[u8]) -> String {
     use hmac::{Hmac, Mac};
     let mut mac =
@@ -575,18 +582,19 @@ async fn every_refusal_has_its_status_and_an_unknown_feed_looks_like_a_bad_token
             a.body
         );
     }
-    // A compressed body is refused rather than stored unread.
-    let gz = srv
+    // An encoding the route does not decode is refused rather than stored
+    // unread.
+    let br = srv
         .send(
             srv.client
                 .post(srv.url("/v1/feeds/orders/events"))
                 .bearer_auth(&token)
                 .header("content-type", "application/json")
-                .header("content-encoding", "gzip")
+                .header("content-encoding", "br")
                 .body("{}"),
         )
         .await;
-    assert_eq!(gz.status, 415, "{}", gz.body);
+    assert_eq!(br.status, 415, "{}", br.body);
     // The server's own ceiling applies whatever a feed says.
     let (_, wide_token) = srv
         .feed(json!({
@@ -645,6 +653,137 @@ async fn every_refusal_has_its_status_and_an_unknown_feed_looks_like_a_bad_token
         )
         .await;
     assert_eq!(get.status, 405);
+}
+
+/// A gzip body is stored as what it expands to, under the limits an
+/// uncompressed body has; an expansion past the request limit is cut off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gzip_body_is_expanded_under_the_feeds_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &["--feeds-max-request-bytes", "4096"]).await;
+    let (uid, token) = srv
+        .feed(json!({
+            "name": "orders",
+            "ingest": {
+                "auth": {"tokens": "managed"},
+                "accept": ["application/json", "application/x-ndjson", "application/octet-stream"],
+                "max_event_bytes": 64,
+                "max_request_bytes": "1KiB"
+            }
+        }))
+        .await;
+    let (_, other_token) = srv
+        .feed(json!({
+            "name": "other",
+            "ingest": {"auth": {"tokens": "managed"}, "max_request_bytes": "1MiB"}
+        }))
+        .await;
+    let encoded = |encoding: &'static str, content_type: &'static str, body: Vec<u8>| {
+        srv.send(
+            srv.client
+                .post(srv.url("/v1/feeds/orders/events"))
+                .bearer_auth(&token)
+                .header("content-type", content_type)
+                .header("content-encoding", encoding)
+                .body(body),
+        )
+    };
+    let before = srv.watermark("orders", &uid).await;
+    let packed = encoded(
+        "gzip",
+        "application/x-ndjson",
+        gz(b"{\"z\":1}\n{\"z\":2}\n"),
+    )
+    .await;
+    assert_eq!(packed.status, 202, "{}", packed.body);
+    assert_eq!(packed.body["ids"].as_array().unwrap().len(), 2);
+    let last = packed.body["last_seq"].as_u64().unwrap();
+    let stored = service::event(&srv.state, &admin(), None, "orders", last)
+        .await
+        .unwrap();
+    assert_eq!(stored.payload.as_deref(), Some("{\"z\":2}"));
+    assert_eq!(srv.watermark("orders", &uid).await, before + 2);
+
+    let bomb = gz(format!("\"{}\"", "0".repeat(2 * 1024 * 1024)).as_bytes());
+    assert!(bomb.len() < 4096, "{}", bomb.len());
+    let gz_cases: Vec<(&str, Vec<u8>, u16, &str)> = vec![
+        (
+            "gzip",
+            gz(format!("\"{}\"", "0".repeat(2000)).as_bytes()),
+            413,
+            "expands to more than the 1024 bytes",
+        ),
+        (
+            "gzip",
+            gz(format!("\"{}\"", "0".repeat(512 * 1024)).as_bytes()),
+            413,
+            "expands to more than the 1024 bytes",
+        ),
+        (
+            "gzip",
+            gz(format!("{{\"k\": \"{}\"}}", "v".repeat(80)).as_bytes()),
+            413,
+            "at most 64 per event",
+        ),
+        ("gzip", b"{}".to_vec(), 400, "not valid gzip"),
+        (
+            "gzip",
+            {
+                let mut torn = gz(b"{\"k\": \"cut short\"}");
+                torn.truncate(torn.len() - 5);
+                torn
+            },
+            400,
+            "not valid gzip",
+        ),
+        ("gzip", gz(b"{"), 400, "not JSON"),
+        ("br", b"{}".to_vec(), 415, "Content-Encoding: gzip"),
+        ("zstd", b"{}".to_vec(), 415, "Content-Encoding: gzip"),
+        ("gzip, gzip", gz(&gz(b"{}")), 415, "Content-Encoding: gzip"),
+    ];
+    for (encoding, body, status, want) in gz_cases {
+        let a = encoded(encoding, "application/json", body).await;
+        assert_eq!(a.status, status, "{encoding} {want}: {}", a.body);
+        assert!(
+            a.body["error"]["message"].as_str().unwrap().contains(want),
+            "{want}: {}",
+            a.body
+        );
+    }
+    assert_eq!(
+        encoded("identity", "application/json", b"{}".to_vec())
+            .await
+            .status,
+        202
+    );
+    assert_eq!(srv.watermark("orders", &uid).await, before + 3);
+    // A compressed body larger than the request limit is refused before it is
+    // expanded, and one that expands far past the server's ceiling is cut off
+    // there.
+    let noise: Vec<u8> = (0..6000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    let big = encoded("gzip", "application/octet-stream", gz(&noise)).await;
+    assert_eq!(big.status, 413, "{}", big.body);
+    let wide_bomb = srv
+        .send(
+            srv.client
+                .post(srv.url("/v1/feeds/other/events"))
+                .bearer_auth(&other_token)
+                .header("content-type", "application/json")
+                .header("content-encoding", "gzip")
+                .body(bomb),
+        )
+        .await;
+    assert_eq!(wide_bomb.status, 413, "{}", wide_bomb.body);
+    assert!(
+        wide_bomb.body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("expands to more than the 4096 bytes"),
+        "{}",
+        wide_bomb.body
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

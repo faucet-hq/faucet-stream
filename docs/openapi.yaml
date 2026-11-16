@@ -1498,7 +1498,11 @@ paths:
         the events are stored. `duplicate` / `duplicates` report events already
         stored under their dedupe key (409 when the feed asks for it). An unknown
         feed, a bad credential and a disallowed sender address get the same 401.
-        With `--feeds-listen` only that listener serves this route.
+        With `--feeds-listen` only that listener serves this route. A body may be
+        sent with `Content-Encoding: gzip`: the signature is checked over the
+        bytes as sent, the body is then expanded, and the request and event size
+        limits apply to the expanded bytes (413 once the expansion passes the
+        request limit; 400 when it is not valid gzip). Any other encoding is 415.
       operationId: pushFeedEvents
       parameters:
         - { name: name, in: path, required: true, schema: { type: string } }

@@ -560,7 +560,7 @@ tenants = ["serve", "encryption", "templates", "notify"]
 # run history (SQLite file, or PostgreSQL with `serve-history-postgres`);
 # sealing payloads and secret params needs `encryption`. CLI-only; not in
 # `default`; included in `full`.
-feeds = ["serve", "templates", "schedule", "source-feed", "faucet-common-feed/sqlite"]
+feeds = ["serve", "templates", "schedule", "source-feed", "faucet-common-feed/sqlite", "dep:flate2"]
 # Template hosting + sync (RFC 0006 / #589): pull templates into the registry
 # from a remote origin (GitHub, S3, GCS, Azure Blob) and publish one back.
 # GitHub goes over the HTTP client already linked; the object-store origins
@@ -610,6 +610,7 @@ faucet-source-csv = { workspace = true, optional = true }
 faucet-source-file = { workspace = true, optional = true }
 faucet-source-feed = { workspace = true, optional = true }
 faucet-common-feed = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
 faucet-source-elasticsearch = { workspace = true, optional = true }
 faucet-source-kafka = { workspace = true, optional = true }
 faucet-source-kinesis = { workspace = true, optional = true }
@@ -791,6 +792,8 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 # `faucet run` over the `feed` source: seeds a real SQLite feed store.
 faucet-common-feed = { workspace = true, features = ["sqlite"] }
+# Feed ingest tests send gzip bodies.
+flate2 = { workspace = true }
 
 [package.metadata.docs.rs]
 # Every feature but bundled DuckDB, librdkafka and Oracle (docs.rs OOM, #794); see scripts/full-feature-coverage.py.

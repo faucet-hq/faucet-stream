@@ -7,6 +7,10 @@
 //! address the feed does not allow get the same `401`, after the same steps,
 //! so names cannot be enumerated.
 //!
+//! A body may arrive gzip-encoded. The signature covers the bytes as sent;
+//! the body is expanded after it, never past the request limit, and every
+//! size limit applies to the expanded bytes.
+//!
 //! A request is all or nothing: its events are validated at the door,
 //! sealed when the feed says so, appended to the feed's store in one
 //! transaction (shared with concurrent requests to the same feed), and
@@ -886,6 +890,44 @@ pub async fn push_local(
 
 type Refused = (Option<Arc<Feed>>, Refusal);
 
+/// Whether the body is gzip; `Err` for an encoding the ingest route does not
+/// decode.
+fn content_encoding(headers: &HeaderMap) -> Result<bool, ()> {
+    let mut values = headers.get_all(header::CONTENT_ENCODING).iter();
+    let Some(first) = values.next() else {
+        return Ok(false);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    match first.to_str().map(|v| v.trim().to_ascii_lowercase()) {
+        Ok(v) if v.is_empty() || v == "identity" => Ok(false),
+        Ok(v) if v == "gzip" || v == "x-gzip" => Ok(true),
+        _ => Err(()),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Inflate {
+    TooLarge,
+    Corrupt,
+}
+
+/// Expand a gzip body, stopping one byte past `limit`: an expansion is never
+/// held beyond the size an uncompressed request may have.
+fn gunzip(packed: &[u8], limit: u64) -> Result<axum::body::Bytes, Inflate> {
+    use std::io::Read;
+    let mut plain = Vec::new();
+    flate2::read::MultiGzDecoder::new(packed)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut plain)
+        .map_err(|_| Inflate::Corrupt)?;
+    if plain.len() as u64 > limit {
+        return Err(Inflate::TooLarge);
+    }
+    Ok(plain.into())
+}
+
 async fn handle(
     state: ServerState,
     tenant: Option<String>,
@@ -983,18 +1025,17 @@ async fn handle(
         }
         _ => None,
     };
-    if headers
-        .get(header::CONTENT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| !v.trim().eq_ignore_ascii_case("identity"))
-    {
-        return Err(refuse(Refusal::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_media_type",
-            "content_encoding",
-            "send the body without a Content-Encoding",
-        )));
-    }
+    let gzipped = match content_encoding(&headers) {
+        Ok(gzipped) => gzipped,
+        Err(()) => {
+            return Err(refuse(Refusal::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type",
+                "content_encoding",
+                "send the body as it is or with Content-Encoding: gzip",
+            )));
+        }
+    };
     let limit = spec.max_request_bytes.bytes().min(ingest.max_request_bytes);
     let too_large = || {
         Refusal::too_large(format!(
@@ -1040,6 +1081,25 @@ async fn handle(
     if let Some(token) = &token {
         ingest.touch(&state, token);
     }
+    let body = if gzipped {
+        let packed = body;
+        match tokio::task::spawn_blocking(move || gunzip(&packed, limit)).await {
+            Ok(Ok(plain)) => plain,
+            Ok(Err(Inflate::TooLarge)) => {
+                return Err(refuse(Refusal::too_large(format!(
+                    "the request body expands to more than the {limit} bytes the feed accepts \
+                     per request"
+                ))));
+            }
+            Ok(Err(Inflate::Corrupt)) | Err(_) => {
+                return Err(refuse(Refusal::bad_request(
+                    "the request body is not valid gzip",
+                )));
+            }
+        }
+    } else {
+        body
+    };
     if !crate::serve::guard::content_type_accepted(&headers, body.is_empty(), &spec.accept) {
         return Err(refuse(Refusal::new(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -1285,6 +1345,54 @@ pub fn listener_router(state: ServerState, settings: &FeedSettings, listen: Sock
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gz(plain: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(plain).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn a_gzip_body_expands_up_to_the_limit_and_no_further() {
+        assert_eq!(&gunzip(&gz(b"hello"), 5).unwrap()[..], b"hello");
+        assert_eq!(gunzip(&gz(b"hello!"), 5), Err(Inflate::TooLarge));
+        let bomb = gz(&vec![0u8; 8 * 1024 * 1024]);
+        assert!(bomb.len() < 16 * 1024);
+        assert_eq!(gunzip(&bomb, 1024), Err(Inflate::TooLarge));
+        assert_eq!(gunzip(b"not gzip", 1024), Err(Inflate::Corrupt));
+        let mut torn = gz(b"a body that is cut short");
+        torn.truncate(torn.len() - 6);
+        assert_eq!(gunzip(&torn, 1024), Err(Inflate::Corrupt));
+        let mut two = gz(b"ab");
+        two.extend(gz(b"cd"));
+        assert_eq!(&gunzip(&two, 4).unwrap()[..], b"abcd");
+        assert_eq!(gunzip(&two, 3), Err(Inflate::TooLarge));
+    }
+
+    #[test]
+    fn only_gzip_and_identity_are_decoded() {
+        let with = |values: &[&str]| {
+            let mut h = HeaderMap::new();
+            for v in values {
+                h.append(header::CONTENT_ENCODING, v.parse().unwrap());
+            }
+            content_encoding(&h)
+        };
+        assert_eq!(with(&[]), Ok(false));
+        assert_eq!(with(&["identity"]), Ok(false));
+        assert_eq!(with(&[" GZIP "]), Ok(true));
+        assert_eq!(with(&["x-gzip"]), Ok(true));
+        for refused in [
+            &["br"][..],
+            &["zstd"],
+            &["deflate"],
+            &["gzip, gzip"],
+            &["gzip", "gzip"],
+        ] {
+            assert_eq!(with(refused), Err(()), "{refused:?}");
+        }
+    }
 
     fn payloads(pieces: &[Piece]) -> Vec<&str> {
         pieces
