@@ -899,7 +899,7 @@ Defaults: `transform-flatten`, `transform-rename-keys`, `transform-keys-case`.
 | `quality-jsonschema` | Adds the `json_schema` record check (pulls `jsonschema`) |
 | `contract` | Versioned data contracts (the `contract:` config block + enforcement pass) |
 | `masking` | PII detection + column-level masking (the `masking:` config block; pulls `regex`+`sha2`+`hmac`) |
-| `signature` | `faucet_core::signature`: HMAC request-signature verification (`SignatureSpec`, `SignatureCheck`) and constant-time token comparison (pulls `hmac`+`subtle`) |
+| `signature` | `faucet_core::signature`: HMAC request signatures (`SignatureSpec`; `SignatureCheck::verify` checks a request, `SignatureCheck::sign` produces the header value a sender sets) and constant-time token comparison (pulls `hmac`+`subtle`) |
 | `compression` | `CompressionConfig` + gzip/zstd helpers |
 | `file-format-csv` / `-xml` / `-excel` | The CSV, XML and Excel codecs in `file_format` |
 | `file-format-avro` | Avro Object Container Files (`apache-avro`) — read with an optional reader schema, write with a supplied or inferred schema and a `null` / `deflate` / `snappy` / `zstd` codec |
