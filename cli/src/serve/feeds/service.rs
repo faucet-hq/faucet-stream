@@ -559,6 +559,49 @@ pub async fn check_delivery(
     check_rows(&loaded).map_err(|e| unprocessable(format!("delivery '{}': {e}", d.name)))
 }
 
+/// Check every `pipeline:` delivery of the `--feeds` file as a delivery made
+/// through the API is checked: the file loads, and it is one root row that
+/// reads the feed. `Err` names the feed and the delivery. A tenant feed
+/// whose tenant does not exist yet is left to its first run.
+pub async fn check_file_deliveries(state: &ServerState) -> Result<(), String> {
+    let rt = state.feeds();
+    for spec in &rt.file().feeds {
+        if let Some(t) = &spec.tenant
+            && !matches!(state.history().tenant_get(t).await, Ok(Some(_)))
+        {
+            tracing::warn!(feed = %spec.name, tenant = %t, "the feed's tenant does not exist yet: its pipeline files are checked when they first run");
+            continue;
+        }
+        let uid = faucet_common_feed::FeedUid::generate();
+        let feed = Feed {
+            deliveries: spec
+                .deliveries
+                .iter()
+                .map(|d| {
+                    let uid = DeliveryUid::generate(uid.clone());
+                    let meta = crate::serve::history::feeds::DeliveryMeta {
+                        uid: uid.id().to_string(),
+                        ..Default::default()
+                    };
+                    (d.name.clone(), DeliveryRef { uid, meta })
+                })
+                .collect(),
+            uid,
+            spec: spec.clone(),
+            source: Source::File,
+            approved: true,
+            revision: 0,
+            ensured: false,
+        };
+        for d in spec.deliveries.iter().filter(|d| d.pipeline.is_some()) {
+            check_delivery(state, &feed, d).await.map_err(|e| {
+                format!("feeds: '{}': {}", feed.label(), e.api_error().error.message)
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// Screen a delivery's params as its creator's and seal the secret ones.
 async fn prepare_delivery(
     state: &ServerState,

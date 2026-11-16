@@ -1463,6 +1463,9 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
             feeds_file,
             stores,
         ));
+        crate::serve::feeds::service::check_file_deliveries(&state)
+            .await
+            .map_err(CliError::Serve)?;
         state.feeds().lease_tick(&state).await;
     }
 

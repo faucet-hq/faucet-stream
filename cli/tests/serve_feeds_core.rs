@@ -79,6 +79,7 @@ fn try_config(
 struct Srv {
     state: ServerState,
     scheduler: Scheduler,
+    config: ServeConfig,
 }
 
 /// What a test looks at between ticks.
@@ -123,7 +124,28 @@ impl Srv {
         Self {
             state,
             scheduler: Scheduler::default(),
+            config: config.clone(),
         }
+    }
+
+    /// Serve the full router on a loopback port; returns its base URL.
+    async fn http(&self) -> String {
+        let router = faucet_cli::serve::server::build_router(
+            self.state.clone(),
+            &self.config,
+            &Default::default(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        format!("http://{addr}")
     }
 
     async fn start(dir: &Path, extra: &[&str]) -> Self {
@@ -1147,6 +1169,7 @@ async fn a_feeds_file_delivers_a_pipeline_file_and_is_read_only() {
     );
     srv.tick().await;
 
+    service::check_file_deliveries(&srv.state).await.unwrap();
     let listed = service::list(&srv.state, &admin(), None).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(serde_json::to_value(listed[0].source).unwrap(), "file");
@@ -2311,4 +2334,316 @@ async fn a_stall_and_a_nearly_full_feed_each_notify_once() {
     assert!(!crossing(&*history, &uid, 1).await.unwrap());
     assert!(!crossing(&*history, &uid, 0).await.unwrap());
     assert!(crossing(&*history, &uid, 1).await.unwrap());
+}
+
+/// Rolling back a delivery run through the API removes the run's rows from
+/// the sink, pauses the delivery (audited) and says whether a replay is
+/// needed; the feed's position is left alone.
+#[cfg(feature = "sink-sqlite")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rolling_back_a_delivery_run_through_the_api_pauses_the_delivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut srv = Srv::start(root, &[]).await;
+    let db = root.join("lake.db");
+    let config = format!(
+        "version: 1\nkind: pipeline\nname: orders_db\npipeline:\n  source: {{ type: feed, config: {{ include_metadata: false }} }}\n  sink:\n    type: sqlite\n    config:\n      database_url: \"sqlite:{}?mode=rwc\"\n      table_name: orders\n      column_mapping: auto_map\n  state: {{ type: file, config: {{ path: \"{}\" }} }}\nrollback: {{}}\n",
+        db.display(),
+        root.join("state").display()
+    );
+    faucet_cli::templates::register(
+        &srv.state.history(),
+        faucet_cli::templates::store::RegisterRequest {
+            id: Some("orders_db".into()),
+            body: format!("{config}tests:\n  suite:\n    auto: {{ defaults_baseline: true }}\n"),
+            format: faucet_cli::serve::load::ConfigFormat::Yaml,
+            description: None,
+            tags: Vec::new(),
+            launch: true,
+            created_by: None,
+        },
+    )
+    .await
+    .unwrap();
+    let d = json!({
+        "name": "db",
+        "template": {"id": "orders_db"},
+        "flush": {"max_events": 1, "min_interval": "0s"}
+    });
+    service::create(&srv.state, &admin(), None, feed_spec("orders", json!([d])))
+        .await
+        .unwrap();
+    srv.append("orders", 1..=2).await;
+    let first = srv.delivered("orders", "db", 3).await;
+    let first_run = first.status.last_run.unwrap().run_id.unwrap();
+    srv.append("orders", 3..=3).await;
+    let second = srv.delivered("orders", "db", 4).await;
+    let second_run = second.status.last_run.unwrap().run_id.unwrap();
+    let rows = |db: std::path::PathBuf| async move {
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db.display()))
+            .await
+            .unwrap();
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM orders ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        ids
+    };
+    assert_eq!(rows(db.clone()).await, vec![1, 2, 3]);
+
+    let base = srv.http().await;
+    let client = reqwest::Client::new();
+    let rollback = |run: String, dry_run: bool| {
+        let (client, base, config) = (client.clone(), base.clone(), config.clone());
+        async move {
+            let resp = client
+                .post(format!("{base}/v1/runs/{run}/rollback"))
+                .json(&json!({"config": config, "config_format": "yaml", "dry_run": dry_run}))
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status().as_u16();
+            (status, resp.json::<Value>().await.unwrap())
+        }
+    };
+    // A dry run changes nothing and pauses nothing.
+    let (status, dry) = rollback(second_run.clone(), true).await;
+    assert_eq!(status, 200, "{dry}");
+    assert_eq!(dry["deleted"], 1, "{dry}");
+    assert!(srv.pos("orders", "db").await.status.paused.is_none());
+    assert_eq!(rows(db.clone()).await, vec![1, 2, 3]);
+
+    // The newest run: its row goes, the delivery is paused, and since the
+    // delivery already moved past the run's events a replay is named.
+    let (status, report) = rollback(second_run.clone(), false).await;
+    assert_eq!(status, 200, "{report}");
+    assert_eq!(report["applied"], true, "{report}");
+    assert_eq!(report["deleted"], 1, "{report}");
+    assert_eq!(rows(db.clone()).await, vec![1, 2]);
+    let note = report["note"].as_str().unwrap();
+    assert!(
+        note.contains("delivery 'db' of feed 'orders' is paused")
+            && note.contains("replay the delivery from event 3"),
+        "{note}"
+    );
+    let paused = srv.pos("orders", "db").await;
+    assert_eq!(paused.cursor, 4, "the feed's position is left alone");
+    let pause = paused.status.paused.unwrap();
+    assert_eq!(
+        pause.reason.as_deref(),
+        Some(format!("its run {second_run} was rolled back").as_str())
+    );
+    let audit = srv
+        .state
+        .history()
+        .list_audit(&faucet_cli::serve::history::AuditFilter {
+            limit: 50,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let paused_entry = audit
+        .iter()
+        .find(|a| a.action == "feed.pause")
+        .expect("the pause is audited");
+    assert_eq!(paused_entry.target.as_deref(), Some("feed:orders/db"));
+    assert!(
+        paused_entry
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains(&second_run)
+    );
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "run.rollback" && a.run_id.as_deref() == Some(&second_run))
+    );
+
+    // Paused: new events wait. A replay then a resume delivers the rolled
+    // back event again.
+    srv.append("orders", 4..=4).await;
+    for _ in 0..5 {
+        srv.tick().await;
+    }
+    assert_eq!(srv.pos("orders", "db").await.cursor, 4);
+    service::replay(
+        &srv.state,
+        &admin(),
+        None,
+        "orders",
+        "db",
+        service::Position::Seq(3),
+    )
+    .await
+    .unwrap();
+    service::resume(&srv.state, &admin(), None, "orders", "db")
+        .await
+        .unwrap();
+    srv.delivered("orders", "db", 5).await;
+    assert_eq!(rows(db.clone()).await, vec![1, 2, 3, 4]);
+
+    // An older run is refused while later runs wrote the destination: a
+    // rollback that did nothing pauses nothing.
+    let (status, blocked) = rollback(first_run.clone(), false).await;
+    assert_eq!(status, 200, "{blocked}");
+    assert_eq!(
+        (&blocked["applied"], &blocked["blocked"]),
+        (&json!(false), &json!(true))
+    );
+    assert!(srv.pos("orders", "db").await.status.paused.is_none());
+    assert_eq!(rows(db.clone()).await, vec![1, 2, 3, 4]);
+    // Forced, it removes that run's rows and pauses the delivery again.
+    let resp = client
+        .post(format!("{base}/v1/runs/{first_run}/rollback"))
+        .json(&json!({"config": config, "config_format": "yaml", "force": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let older: Value = resp.json().await.unwrap();
+    assert_eq!(older["applied"], true, "{older}");
+    assert_eq!(rows(db.clone()).await, vec![3, 4]);
+    assert!(
+        older["note"]
+            .as_str()
+            .unwrap()
+            .contains("replay the delivery from event 1")
+    );
+    assert!(srv.pos("orders", "db").await.status.paused.is_some());
+}
+
+/// A submit refused for a reason that passes with time (the server is
+/// draining) backs off without counting as a failure, and the same events
+/// are delivered once the server takes runs again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transient_submit_refusal_backs_off_and_does_not_count_as_failing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let config = config(
+        root,
+        &format!("sqlite:{}", root.join("history.db").display()),
+        &["--max-queued-runs", "1"],
+    );
+    let mut srv = Srv::over(&config).await;
+    register(&srv.state, "orders_lake", &root.join("state")).await;
+    let out = root.join("lake.jsonl");
+    let mut d = delivery("lake", "orders_lake", &out);
+    d["retries"] = json!(1);
+    service::create(&srv.state, &admin(), None, feed_spec("orders", json!([d])))
+        .await
+        .unwrap();
+    // The one queue slot is taken: the queue is full.
+    assert!(srv.state.registry().try_reserve());
+    srv.append("orders", 1..=3).await;
+    let mut refused = 0;
+    for _ in 0..8 {
+        let pos = srv
+            .until("orders", "lake", false, "a refused submit", |p| {
+                p.status.backoff_until.is_some() && p.status.claim.is_none()
+            })
+            .await;
+        assert_eq!(pos.cursor, 1);
+        assert!(!pos.claimed, "the claim of a refused submit is released");
+        assert_eq!(pos.status.health, Health::Ok);
+        assert_eq!(pos.status.consecutive_failures, 0);
+        assert_eq!(pos.status.failures_at_one, 0);
+        assert_eq!(pos.status.batch_events, None, "the batch is not halved");
+        let last = pos.status.last_run.as_ref().unwrap();
+        assert_eq!(last.outcome, "refused");
+        assert!(
+            pos.status.last_error.as_deref().unwrap().contains("queue"),
+            "{pos:?}"
+        );
+        refused += 1;
+        let found = service::find(&srv.state, None, "orders").await.unwrap();
+        let id = found.feed.delivery("lake").unwrap().uid.id().to_string();
+        status::update(&*srv.state.history(), found.feed.uid.as_str(), &id, |s| {
+            s.backoff_until = None;
+            true
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(refused, 8, "far past `retries` and the failing threshold");
+    assert!(srv.state.feeds().readiness().stalled.is_empty());
+    srv.state.registry().release_reservation();
+    srv.delivered("orders", "lake", 4).await;
+    assert_eq!(ids(&out), vec![1, 2, 3]);
+}
+
+/// A `--feeds` file whose `pipeline:` file cannot be a delivery fails the
+/// server's start, naming the feed and the delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feeds_file_pipeline_that_cannot_deliver_fails_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let history = format!("sqlite:{}", root.join("history.db").display());
+    let feeds = root.join("feeds.yaml");
+    let feeds_arg = feeds.display().to_string();
+    let write = |pipeline: &str, tenant: &str| {
+        std::fs::write(root.join("lake.yaml"), pipeline).unwrap();
+        std::fs::write(
+            &feeds,
+            format!("version: 1\nfeeds:\n  - name: orders\n{tenant}    ingest: {{ auth: {{ tokens: managed }} }}\n    deliveries:\n      - name: ok\n        template: {{ id: not-registered-yet }}\n      - name: lake\n        pipeline: lake.yaml\n"),
+        )
+        .unwrap();
+    };
+    let out = root.join("out.jsonl").display().to_string();
+    let reads_rest = format!(
+        "version: 1\nname: lake\npipeline:\n  source: {{ type: rest, config: {{ base_url: \"http://127.0.0.1:9\", path: /x }} }}\n  sink: {{ type: file, config: {{ path: \"{out}\", format: json_lines, if_exists: append }} }}\n"
+    );
+    let cases = [
+        (reads_rest.as_str(), "must read the feed"),
+        ("version: 1\npipeline: [\n", "delivery 'lake'"),
+        (
+            &format!(
+                "version: 1\nname: lake\npipeline:\n  source: {{ type: feed, config: {{ feed: other }} }}\n  sink: {{ type: file, config: {{ path: \"{out}\", format: json_lines, if_exists: append }} }}\n"
+            ),
+            "sets the source's `feed`",
+        ),
+    ];
+    for (pipeline, want) in cases {
+        write(pipeline, "");
+        let cfg = config(root, &history, &["--feeds", &feeds_arg]);
+        let srv = Srv::over(&cfg).await;
+        let err = service::check_file_deliveries(&srv.state)
+            .await
+            .unwrap_err();
+        assert!(
+            err.starts_with("feeds: 'orders': delivery 'lake': ") && err.contains(want),
+            "{want}: {err}"
+        );
+    }
+    // The server itself refuses to start.
+    let port = ports::free_port();
+    let mut cfg = try_config(
+        root,
+        &history,
+        &format!("127.0.0.1:{port}"),
+        &["--feeds", &feeds_arg],
+    )
+    .unwrap();
+    cfg.log_level = "error".into();
+    let started = tokio::time::timeout(
+        Duration::from_secs(60),
+        faucet_cli::serve::run_server(
+            cfg,
+            faucet_cli::serve::McpServeSettings {
+                enabled: false,
+                allow_mutations: false,
+            },
+        ),
+    )
+    .await
+    .expect("the server refuses at once");
+    let err = started.unwrap_err().to_string();
+    assert!(err.contains("feeds: 'orders': delivery 'lake'"), "{err}");
+
+    // A tenant that does not exist yet does not hold the start.
+    write(&reads_rest, "    tenant: later\n");
+    let cfg = config(root, &history, &["--feeds", &feeds_arg]);
+    let srv = Srv::over(&cfg).await;
+    service::check_file_deliveries(&srv.state).await.unwrap();
 }
