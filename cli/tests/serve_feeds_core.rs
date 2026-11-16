@@ -3010,3 +3010,49 @@ async fn a_delivery_position_no_definition_lists_is_removed_from_the_store() {
     srv.tick().await;
     assert!(delivery_ids(&store, &uid).await.iter().any(|d| d == newer));
 }
+
+/// A tenant's stored-bytes quota reaches the feeds it already has when it
+/// is raised or lowered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_changed_tenant_byte_quota_reaches_its_existing_feeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut srv = Srv::start(dir.path(), &[]).await;
+    let history = srv.state.history();
+    let now = chrono::Utc::now();
+    let tenant = |bytes: u64| -> faucet_cli::serve::history::tenants::TenantRecord {
+        serde_json::from_value(json!({
+            "id": "acme", "limits": {"max_feed_bytes": bytes},
+            "created_at": now, "updated_at": now, "created_by": "alice"
+        }))
+        .unwrap()
+    };
+    history.tenant_upsert(&tenant(4096)).await.unwrap();
+    let spec: FeedSpec = serde_json::from_value(json!({
+        "name": "orders", "seal": false, "ingest": {"auth": {"tokens": "managed"}}
+    }))
+    .unwrap();
+    service::create(&srv.state, &admin(), Some("acme"), spec)
+        .await
+        .unwrap();
+    let feed = srv
+        .state
+        .feeds()
+        .snapshot()
+        .feed(Some("acme"), "orders")
+        .unwrap();
+    let store = srv.state.feeds().store_for(&feed).await.unwrap();
+    let big = || vec![NewEvent::new("application/json", vec![b'x'; 3000])];
+    let calls = store_calls();
+    store.append(&calls, &feed.uid, big()).await.unwrap();
+    srv.tick().await;
+    assert!(store.append(&calls, &feed.uid, big()).await.is_err());
+
+    history.tenant_upsert(&tenant(100_000)).await.unwrap();
+    srv.tick().await;
+    store.append(&calls, &feed.uid, big()).await.unwrap();
+
+    history.tenant_upsert(&tenant(7000)).await.unwrap();
+    srv.tick().await;
+    let full = store.append(&calls, &feed.uid, big()).await.unwrap_err();
+    assert!(full.to_string().contains("is full"), "{full}");
+}

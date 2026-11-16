@@ -21,6 +21,7 @@ use crate::serve::state::ServerState;
 use chrono::{DateTime, Utc};
 use faucet_common_feed::{
     BatchLimits, ClaimId, DeliveryHead, DeliveryUid, FeedBinding, FeedStore, Head, Seq,
+    StoreLimits,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -805,6 +806,8 @@ pub struct Scheduler {
     reload_at: Option<Instant>,
     maintain_at: Option<Instant>,
     warned: HashMap<String, usize>,
+    /// The limits this server last wrote to each feed's store row.
+    limits: HashMap<String, StoreLimits>,
 }
 
 /// What one tick did, for tests and logs.
@@ -898,6 +901,7 @@ impl Scheduler {
                     .tenant()
                     .and_then(|t| snapshot.tenant_limits.get(t))
                     .cloned();
+                self.apply_limits(&*store, feed, limits.as_ref()).await;
                 for d in &feed.spec.deliveries {
                     let Some(dref) = feed.delivery(&d.name) else {
                         continue;
@@ -944,6 +948,7 @@ impl Scheduler {
             }
         }
         self.local.retain(|k, _| seen.contains(k));
+        self.limits.retain(|uid, _| snapshot.by_uid(uid).is_some());
         use futures::StreamExt;
         let rt_ref = &rt;
         let results: Vec<(String, bool, Option<DeliveryStatus>)> = futures::stream::iter(work)
@@ -993,6 +998,39 @@ impl Scheduler {
             self.maintain_at = Some(Instant::now() + MAINTENANCE_INTERVAL);
         }
         report
+    }
+
+    /// Write `feed`'s limits (its own and its tenant's) to its store row
+    /// when they differ from what this server last wrote there.
+    async fn apply_limits(
+        &mut self,
+        store: &dyn FeedStore,
+        feed: &Feed,
+        tenant_limits: Option<&TenantLimits>,
+    ) -> bool {
+        let want = super::store_limits(&feed.spec, tenant_limits);
+        let uid = feed.uid.as_str();
+        if self.limits.get(uid) == Some(&want) {
+            return false;
+        }
+        let tenant = match feed.tenant().map(faucet_common_feed::TenantId::new) {
+            Some(Ok(t)) => Some(t),
+            Some(Err(_)) => return false,
+            None => None,
+        };
+        match store
+            .ensure_feed(&store_calls(), &feed.uid, tenant.as_ref(), &want)
+            .await
+        {
+            Ok(()) => {
+                self.limits.insert(uid.to_string(), want);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(feed = %feed.label(), error = %e, "could not write a feed's limits to its store; retrying");
+                false
+            }
+        }
     }
 
     /// Record a change in how many `warn_at` thresholds a feed is past; the
