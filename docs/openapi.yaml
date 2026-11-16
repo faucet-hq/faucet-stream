@@ -1035,13 +1035,29 @@ paths:
         the last 24 hours brought (`events_24h`, `bytes_24h`, `last_event_at`).
         With a tenant, the tenant's quotas too. `ingest_on_api` is `false` when
         `--feeds-listen` serves the ingest routes on another listener.
+        Each feed carries `retained_bytes` (every retained event, the
+        delivered ones kept for replay included) and `undelivered_bytes`
+        (what its slowest delivery has not delivered yet, which is what the
+        undelivered limit and `undelivered_ratio` count), and `warnings`
+        when its definition has a weakness worth knowing (a signature with
+        no `timestamp_header` and no dedupe key). A delivery's `status` is
+        `ok`, `failing`, `stalled`, `held`, `paused`, `needs_approval` or
+        `setting_up` (defined, but the store has no position for it yet).
+        The list is read from the server's definitions snapshot (at most a
+        few seconds old) and is ordered by tenant and name. `tenant=*` lists
+        the server's feeds and every tenant's in one call for a principal
+        that is not confined to a tenant (a tenant principal still gets its
+        own). Pages hold `limit` feeds (default 200, at most 1000); pass
+        `next` back as `after` for the following page.
         Requires `FeedRead` (viewer+).
       operationId: listFeeds
       parameters:
-        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feeds are meant (operators; a tenant principal's own is implied). `*`: the server's feeds and every tenant's." }
+        - { name: after, in: query, required: false, schema: { type: string }, description: "The `next` of the page before." }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000, default: 200 } }
       responses:
         "200":
-          description: "`{feeds, quotas?, stores, ingest_on_api, approval}`."
+          description: "`{feeds, quotas?, stores, ingest_on_api, approval, next?}`."
           content:
             application/json:
               schema: { type: object }
@@ -1088,8 +1104,13 @@ paths:
         One feed with its deliveries, gaps, tokens (never their text) and change
         log, who made it (`created_by`, `created_at`; absent for a `--feeds`
         file feed) and `hourly_24h`, the retained events stored in each of the
-        last 24 hours, oldest first. Secrets show as markers. Requires
-        `FeedRead` (viewer+).
+        last 24 hours, oldest first. Each delivery carries `guarantee`, the
+        delivery guarantee derived from its template as `faucet validate`
+        derives it (`at-least-once`, `effectively-once (…)`, or `unknown`).
+        `changes` merges the definition's change log with what the audit log
+        records for its deliveries (pause, resume, deliver now, replay, skip,
+        recover; from the most recent audit entries), newest first. Secrets
+        show as markers. Requires `FeedRead` (viewer+).
       operationId: getFeed
       parameters:
         - { name: name, in: path, required: true, schema: { type: string } }
