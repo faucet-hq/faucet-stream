@@ -106,9 +106,19 @@ async fn the_conformance_suite_passes() {
         eprintln!("postgres conformance: {}", check.name);
         check.run(&backend).await;
     }
-    let caps = backend.open().await.expect("open").capabilities();
+    let store = backend.open().await.expect("open");
+    let caps = store.capabilities();
     assert_eq!(caps.backend, "postgres");
     assert!(caps.cluster_safe);
+    let none = FeedUid::generate();
+    assert_eq!(
+        store
+            .bytes_from(&CallContext::new(), &none, Seq(1))
+            .await
+            .expect("bytes_from"),
+        Some(0),
+        "the backend sums retained bytes itself"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -129,6 +129,19 @@ async fn the_sqlite_store_is_not_cluster_safe() {
     let caps = store.capabilities();
     assert_eq!(caps.backend, "sqlite");
     assert!(!caps.cluster_safe);
+    let none = faucet_common_feed::FeedUid::generate();
+    assert_eq!(
+        store
+            .bytes_from(
+                &faucet_core::io::CallContext::new(),
+                &none,
+                faucet_common_feed::Seq(1)
+            )
+            .await
+            .expect("bytes_from"),
+        Some(0),
+        "the backend sums retained bytes itself"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

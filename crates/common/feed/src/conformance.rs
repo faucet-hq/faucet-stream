@@ -1148,8 +1148,9 @@ pub async fn trim_respects_age_cursors_and_claims(backend: &dyn Backend) {
     ));
 }
 
-/// `bound` fits events and bytes, `seq_at` finds a position by store time,
-/// and `heads` reports every listed feed at once.
+/// `bound` fits events and bytes, `bytes_from` sums what is retained from a
+/// position on, `seq_at` finds a position by store time, and `heads` reports
+/// every listed feed at once.
 pub async fn bound_seq_at_and_heads(backend: &dyn Backend) {
     let f = Fixture::open(backend).await;
     let feed = f.feed(StoreLimits::new()).await;
@@ -1181,6 +1182,44 @@ pub async fn bound_seq_at_and_heads(backend: &dyn Backend) {
         bound(7, 100, 1000).await,
         Err(FeedError::PastWatermark { .. })
     ));
+
+    let bytes_from = |from: u64| {
+        let (store, calls, feed) = (f.store.clone(), f.calls.clone(), feed.clone());
+        async move {
+            store
+                .bytes_from(&calls, &feed, Seq(from))
+                .await
+                .expect("bytes_from")
+        }
+    };
+    if let Some(all) = bytes_from(1).await {
+        assert_eq!(all, 90, "every retained payload byte");
+        assert_eq!(bytes_from(0).await, Some(90));
+        assert_eq!(bytes_from(4).await, Some(60));
+        assert_eq!(bytes_from(5).await, Some(10));
+        assert_eq!(bytes_from(6).await, Some(0), "nothing at the feed's end");
+        assert_eq!(bytes_from(1000).await, Some(0), "nor past it");
+        let other = f.feed(StoreLimits::new()).await;
+        f.append(&other, vec![sized(7)]).await;
+        assert_eq!(
+            bytes_from(1).await,
+            Some(90),
+            "another feed's bytes are not counted"
+        );
+        assert_eq!(
+            f.store
+                .bytes_from(&f.calls, &other, Seq(1))
+                .await
+                .expect("bytes_from"),
+            Some(7)
+        );
+    } else {
+        assert_eq!(
+            bytes_from(4).await,
+            None,
+            "a backend answers every range or none"
+        );
+    }
 
     let before = f.head(&feed).await.now;
     f.wait(Duration::from_millis(50)).await;
