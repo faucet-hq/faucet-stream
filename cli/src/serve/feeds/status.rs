@@ -110,6 +110,9 @@ pub struct DeliveryStatus {
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run: Option<LastRun>,
+    /// When a run last moved the delivery's position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_delivered_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_submit_at: Option<DateTime<Utc>>,
     /// No run starts before this (a back-off after a failure or a refusal).
@@ -251,6 +254,7 @@ impl DeliveryStatus {
                 self.last_error = None;
                 self.backoff_secs = 0;
                 self.backoff_until = None;
+                self.last_delivered_at = Some(now);
             }
             Outcome::Failed(e) => {
                 self.consecutive_failures = self.consecutive_failures.saturating_add(1);

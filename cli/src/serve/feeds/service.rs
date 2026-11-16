@@ -88,6 +88,17 @@ pub struct DeliveryView {
     /// Only on a feed's own page.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guarantee: Option<String>,
+    /// No run starts before this: the back-off after a failed or refused
+    /// run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<DateTime<Utc>>,
+    /// When a run last moved the delivery's position.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_delivered_at: Option<DateTime<Utc>>,
+    /// Payload bytes from the delivery's position on. Only on a feed's own
+    /// page, and only when the store can count them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub undelivered_bytes: Option<u64>,
 }
 
 /// One feed as a response shows it.
@@ -316,6 +327,9 @@ pub fn view(
                 consecutive_failures: s.consecutive_failures,
                 delivered_24h: None,
                 guarantee: None,
+                next_run_at: s.backoff_until,
+                last_delivered_at: s.last_delivered_at,
+                undelivered_bytes: None,
                 spec: d.clone(),
             })
         })
@@ -452,6 +466,38 @@ async fn undelivered_of(
         .await
         .ok()
         .flatten()
+}
+
+/// Per delivery of `feed`: the payload bytes from its position on. A
+/// delivery the store cannot count for is left out.
+async fn delivery_bytes(state: &ServerState, feed: &Feed) -> HashMap<String, u64> {
+    let mut out = HashMap::new();
+    let Ok(store) = state.feeds().store_for(feed).await else {
+        return out;
+    };
+    let Ok(Some(head)) = head_of(&*store, feed).await else {
+        return out;
+    };
+    for (name, dref) in &feed.deliveries {
+        let Some(dh) = head.deliveries.iter().find(|x| x.delivery == dref.uid) else {
+            continue;
+        };
+        let bytes = if dh.cursor >= head.end() {
+            Some(0)
+        } else if dh.cursor <= head.oldest {
+            Some(head.bytes)
+        } else {
+            store
+                .bytes_from(&store_calls(), &feed.uid, dh.cursor)
+                .await
+                .ok()
+                .flatten()
+        };
+        if let Some(b) = bytes {
+            out.insert(name.clone(), b);
+        }
+    }
+    out
 }
 
 /// Feeds viewed side by side.
@@ -1060,8 +1106,10 @@ pub async fn get(
         .map_err(ServeError::from)?;
     let mut view = view_of(state, feed).await?;
     let derived = guarantees(state, feed).await;
+    let waiting = delivery_bytes(state, feed).await;
     for d in &mut view.deliveries {
         d.guarantee = derived.get(&d.name).cloned();
+        d.undelivered_bytes = waiting.get(&d.name).copied();
     }
     Ok(FeedDetail {
         feed: view,

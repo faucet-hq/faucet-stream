@@ -3433,6 +3433,75 @@ async fn a_feeds_page_carries_each_deliverys_guarantee_and_its_moves() {
     assert!(listed[0].deliveries[0].guarantee.is_none());
 }
 
+/// A feed's own page says, per delivery, when a run last moved it, how many
+/// bytes wait from its position on and, after a failed run, when the next
+/// one may start. A list leaves the byte count out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feeds_page_carries_each_deliverys_last_delivery_waiting_bytes_and_next_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let history = format!("sqlite:{}", root.join("history.db").display());
+    let mut srv = hand_driven(&config(root, &history, &[])).await;
+    register(&srv.state, "orders_lake", &root.join("state")).await;
+    let blocker = root.join("blocked");
+    std::fs::write(&blocker, "not a directory").unwrap();
+    service::create(
+        &srv.state,
+        &admin(),
+        None,
+        feed_spec(
+            "orders",
+            json!([
+                delivery("lake", "orders_lake", &root.join("lake.jsonl")),
+                delivery("stuck", "orders_lake", &blocker.join("stuck.jsonl")),
+            ]),
+        ),
+    )
+    .await
+    .unwrap();
+    let before = chrono::Utc::now();
+    srv.append("orders", 1..=3).await;
+    srv.delivered("orders", "lake", 4).await;
+    srv.until("orders", "stuck", false, "a failed run", |p| {
+        p.status.consecutive_failures >= 1 && p.status.claim.is_none()
+    })
+    .await;
+    service::pause(&srv.state, &admin(), None, "orders", "lake", None)
+        .await
+        .unwrap();
+    srv.append("orders", 4..=5).await;
+
+    let detail = service::get(&srv.state, &admin(), None, "orders")
+        .await
+        .unwrap();
+    let of = |name: &str| {
+        detail
+            .feed
+            .deliveries
+            .iter()
+            .find(|d| d.name == name)
+            .unwrap()
+    };
+    let lake = of("lake");
+    assert!(lake.last_delivered_at.is_some_and(|t| t >= before));
+    assert_eq!(lake.next_run_at, None);
+    assert_eq!(lake.undelivered_bytes, Some(16), "events 4 and 5");
+    let stuck = of("stuck");
+    assert_eq!(stuck.last_delivered_at, None);
+    assert!(stuck.next_run_at.is_some_and(|t| t > before));
+    assert_eq!(stuck.undelivered_bytes, detail.feed.retained_bytes);
+    assert_eq!(stuck.undelivered_bytes, Some(40));
+
+    let listed = service::list(&srv.state, &admin(), None).await.unwrap();
+    assert!(
+        listed[0]
+            .deliveries
+            .iter()
+            .all(|d| d.undelivered_bytes.is_none())
+    );
+    assert!(listed[0].deliveries.iter().any(|d| d.next_run_at.is_some()));
+}
+
 fn files_in(dir: &Path) -> usize {
     std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0)
 }

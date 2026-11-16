@@ -61,6 +61,14 @@ function since(iso) {
   if (s < 86400) return plural(Math.floor(s / 3600), "hour");
   return plural(Math.floor(s / 86400), "day");
 }
+/** How long until `iso`, in words: `40 seconds`, `3 minutes`; "" once it has passed. */
+function until(iso) {
+  const s = Math.ceil((Date.parse(iso) - Date.now()) / 1000);
+  if (!(s > 0)) return "";
+  if (s < 90) return plural(s, "second");
+  if (s < 5400) return plural(Math.round(s / 60), "minute");
+  return plural(Math.round(s / 3600), "hour");
+}
 /** What a person typed as a size, in the API's form (`64MiB`), or null. */
 const sizeText = (x) => (sizeBytes(x) > 0 ? String(x).replace(/[\s,]/g, "") : null);
 /** What a person typed as a span, in the API's form (`7d`), or null. */
@@ -552,11 +560,15 @@ feeds:
   function positionCard(f, d, extra = null) {
     const delivered = d.position != null ? d.position - 1 : null;
     const tone = d.status === "stalled" ? "bad" : d.status === "failing" ? "warn" : "";
-    const lastOk = d.last_run && d.last_run.outcome === "delivered" ? d.last_run.at : null;
+    const lastOk = d.last_delivered_at || (d.last_run && d.last_run.outcome === "delivered" ? d.last_run.at : null);
+    const sick = ["stalled", "failing"].includes(d.status);
+    const waiting = d.undelivered_bytes != null && d.lag ? bytes(d.undelivered_bytes) : "";
+    const oldest = d.oldest_undelivered_at && d.lag ? `oldest ${fmtAge(d.oldest_undelivered_at)}` : "";
+    const behindNote = !d.lag ? "up to date" : sick && waiting ? waiting : [oldest, waiting].filter(Boolean).join(" · ");
     return card({ icon: "feed", title: "Position", body: grid(4, [
       kv("Delivered to", delivered != null ? seqNo(delivered) : "—", extra ? (lastOk ? ago(lastOk, " ago") : "") : "the cursor"),
       kv("Newest event", f.watermark != null ? seqNo(f.watermark) : "—"),
-      kv("Behind", html`<span class="${tone}">${plural(d.lag || 0, "event")}</span>`, d.oldest_undelivered_at && d.lag ? `oldest ${fmtAge(d.oldest_undelivered_at)}` : d.lag ? "" : "up to date"),
+      kv("Behind", html`<span class="${tone}">${plural(d.lag || 0, "event")}</span>`, behindNote),
       extra || kv("Replay from", f.oldest != null ? seqNo(f.oldest) : "—", `kept ${span(spanSecs(f.spec.retention.max_age))}`),
     ]) });
   }
@@ -616,7 +628,7 @@ feeds:
       const stalled = d.status === "stalled";
       const banner = stalled
         ? alert("One event cannot be delivered. Nothing was skipped.", html`Runs were cut down to a single event, and ${seqNo(d.position)} still fails${why ? html` with <code>${why}</code>` : ""}. New events are still stored. Fix the template or the destination and try again, or skip this event.`, "bad", html`${lastRunBtn}${btn("Open the event", { icon: "code", href: feedHref(f, { dtab: "Events", event: d.position }) })}${btn("Skip this event…", { icon: "right", perm: "feed_admin", data: { act: "skip" } })}`)
-        : alert(`The last ${d.consecutive_failures > 1 ? `${fmtInt(d.consecutive_failures)} runs` : "run"} failed. Still trying, with smaller batches.`, html`${why ? html`Each run failed with <code>${why}</code>. ` : ""}The next run takes ${plural(d.batch_events, "event")}. Nothing is skipped, and new events are still stored.`, "warn", lastRunBtn);
+        : alert(`The last ${d.consecutive_failures > 1 ? `${fmtInt(d.consecutive_failures)} runs` : "run"} failed. Still trying, with smaller batches.`, html`${why ? html`Each run failed with <code>${why}</code>. ` : ""}The next run takes ${plural(d.batch_events, "event")}${d.next_run_at && until(d.next_run_at) ? ` and starts in ${until(d.next_run_at)}` : ""}. Nothing is skipped, and new events are still stored.`, "warn", lastRunBtn);
       return html`${top}${banner}<div class="two"><div class="stack">${positionCard(f, d, kv("Next run takes", plural(d.batch_events, "event"), stalled ? "cannot go smaller" : "halved after each failure"))}</div><div class="stack">${storeCard(f)}</div></div>${failedRunsCard(f, d)}`;
     }
     if (d.status === "paused") {
