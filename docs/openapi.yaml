@@ -3397,6 +3397,16 @@ paths:
                       properties:
                         name: { type: string }
                         healthy: { type: boolean, description: "false when the watcher is in error backoff." }
+                  feeds:
+                    type: object
+                    nullable: true
+                    description: "Feeds (#1034); null in a build without the `feeds` feature. It never makes the server unready: a store problem holds deliveries while runs and the API keep working."
+                    properties:
+                      started: { type: boolean, description: "Whether this server runs the feed scheduler (it starts when the first feed exists)." }
+                      store_ok: { type: boolean, description: "false when a feed store could not be opened or read on the last pass." }
+                      feeds: { type: integer }
+                      stalled: { type: array, items: { type: string }, description: "`<feed>/<delivery>` of every stalled delivery." }
+                      held: { type: array, items: { type: string }, description: "`<feed>/<delivery>` of every held delivery." }
         "503":
           description: Not ready (history degraded or queue full).
           content:

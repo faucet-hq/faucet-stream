@@ -1047,6 +1047,10 @@ pub struct DeleteReport {
     pub catalog_config_snapshots: usize,
     /// Versions of the tenant's own data-flow policy (#1043).
     pub policy_versions: u64,
+    /// The tenant's feeds, purged from their stores with their events,
+    /// positions and tokens (#1034).
+    #[serde(default)]
+    pub feeds: usize,
     /// State keys that could not be deleted, with why. The tenant is deleted
     /// anyway; these keys are left for the operator.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1188,6 +1192,15 @@ pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteRe
         .policy_versions_delete(&crate::serve::history::policies::tenant_scope(tenant))
         .await
         .map_err(store_err)?;
+
+    // The tenant's feeds leave their stores before the definitions go with
+    // the tenant's rows (#1034).
+    #[cfg(feature = "feeds")]
+    {
+        report.feeds = crate::serve::feeds::service::purge_tenant(state, tenant)
+            .await
+            .map_err(|e| ServeError::Unavailable(format!("purging the tenant's feeds: {e}")))?;
+    }
 
     let rt = state.tenants();
     for r in history.tenant_state_refs(tenant).await.map_err(store_err)? {

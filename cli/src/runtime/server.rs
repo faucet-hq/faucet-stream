@@ -1363,6 +1363,31 @@ pub async fn rollback(
         outcome
     })
     .await??;
+    // A rolled-back delivery run leaves the feed's position alone; the
+    // delivery is paused so nothing else is delivered before the operator
+    // decides (#1034).
+    #[cfg(feature = "feeds")]
+    let report = {
+        let mut report = report;
+        if let Some(binding) = rec
+            .feed
+            .as_ref()
+            .filter(|_| !dry_run && report.outcome.applied)
+            && let Some(note) = crate::serve::feeds::service::pause_for_rollback(
+                state,
+                &principal.actor(),
+                id,
+                binding,
+            )
+            .await
+        {
+            report.outcome.note = Some(match report.outcome.note.take() {
+                Some(own) => format!("{own}. {note}"),
+                None => note,
+            });
+        }
+        report
+    };
     Ok(report)
 }
 

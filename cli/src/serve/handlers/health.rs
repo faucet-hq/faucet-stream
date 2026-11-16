@@ -39,6 +39,12 @@ pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
     let policy_seed = state.policy_seed_pending().then_some("pending");
     #[cfg(not(feature = "policy"))]
     let policy_seed: Option<&str> = None;
+    // Feeds never make the server unready: a store problem holds deliveries
+    // and answers ingest with 503, while runs and the API keep working.
+    #[cfg(feature = "feeds")]
+    let feeds = serde_json::to_value(state.feeds().readiness()).unwrap_or(serde_json::Value::Null);
+    #[cfg(not(feature = "feeds"))]
+    let feeds = serde_json::Value::Null;
     let body = json!({
         "status": if code == StatusCode::OK { "ready" } else { "not_ready" },
         "history_ok": history_ok,
@@ -65,6 +71,7 @@ pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
             })).collect::<Vec<_>>(),
         },
         "triggers": triggers,
+        "feeds": feeds,
     });
     (code, Json(body))
 }
