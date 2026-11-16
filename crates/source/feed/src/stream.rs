@@ -188,7 +188,10 @@ impl FeedDriver {
             .ok_or_else(|| FeedSourceError::Missing {
                 what: format!("feed {feed}"),
             })?;
-        let ttl = self.config.claim_ttl();
+        let ttl = match &target.bound {
+            Some(_) => self.config.claim_ttl(),
+            None => self.config.standalone_claim_ttl(),
+        };
         let holder = match &target.bound {
             Some(execution) => {
                 let holder = target

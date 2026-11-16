@@ -101,7 +101,7 @@ just `type: feed` validates.
 | `store.type: postgres` | `config.url` | | Connection URL of the database that holds the store. Use a `${env:…}` or secret reference for the password. |
 | `page_events` | integer | one page per run | Split a run into pages of this many events; each page is written and committed on its own. |
 | `include_metadata` | bool | `true` | Add `_feed: {seq, id, received_at, headers}` to every record. |
-| `claim_ttl_secs` | integer | `300` | How long the range claim lasts without a renewal. The source renews it every tenth of this. |
+| `claim_ttl_secs` | integer | `60` under `faucet run`, `300` under `faucet serve` | How long the range claim lasts without a renewal. The source renews it every tenth of this so a `faucet run` that died leaves its claim for at most a minute. |
 | `max_events` | integer | `10000` | Most events one `faucet run` drain reads. |
 | `max_bytes` | integer | `67108864` | Most payload bytes one `faucet run` drain reads; a single larger event is still read. |
 

@@ -5,8 +5,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Default [`FeedSourceConfig::claim_ttl_secs`]: 5 minutes.
+/// Default [`FeedSourceConfig::claim_ttl_secs`] of a delivery run under
+/// `faucet serve`: 5 minutes.
 pub const DEFAULT_CLAIM_TTL_SECS: u64 = 300;
+
+/// Default [`FeedSourceConfig::claim_ttl_secs`] of a `faucet run` drain: one
+/// minute, so a drain that died leaves its claim no longer than that.
+pub const DEFAULT_STANDALONE_CLAIM_TTL_SECS: u64 = 60;
 
 /// Largest accepted [`FeedSourceConfig::claim_ttl_secs`]: one day.
 pub const MAX_CLAIM_TTL_SECS: u64 = 86_400;
@@ -47,7 +52,8 @@ pub struct FeedSourceConfig {
     #[serde(default = "default_true")]
     pub include_metadata: bool,
     /// How long the range claim lasts without a renewal, in seconds. The
-    /// source renews it every tenth of this while it runs.
+    /// source renews it every tenth of this while it runs. Default: 60 under
+    /// `faucet run`, 300 for a delivery run under `faucet serve`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_ttl_secs: Option<u64>,
     /// Most events one `faucet run` drain reads.
@@ -124,9 +130,17 @@ impl FeedSourceConfig {
         self
     }
 
-    /// The claim's time to live.
+    /// The claim's time to live for a delivery run under `faucet serve`.
     pub fn claim_ttl(&self) -> Duration {
         Duration::from_secs(self.claim_ttl_secs.unwrap_or(DEFAULT_CLAIM_TTL_SECS))
+    }
+
+    /// The claim's time to live for a `faucet run` drain.
+    pub fn standalone_claim_ttl(&self) -> Duration {
+        Duration::from_secs(
+            self.claim_ttl_secs
+                .unwrap_or(DEFAULT_STANDALONE_CLAIM_TTL_SECS),
+        )
     }
 
     /// Refuse values no run could use.
@@ -216,6 +230,13 @@ mod tests {
         assert_eq!(cfg, FeedSourceConfig::new());
         assert!(cfg.include_metadata);
         assert_eq!(cfg.claim_ttl(), Duration::from_secs(DEFAULT_CLAIM_TTL_SECS));
+        assert_eq!(cfg.standalone_claim_ttl(), Duration::from_secs(60));
+        assert_eq!(
+            FeedSourceConfig::new()
+                .claim_ttl_secs(7)
+                .standalone_claim_ttl(),
+            Duration::from_secs(7)
+        );
         cfg.validate().unwrap();
     }
 

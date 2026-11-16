@@ -27486,7 +27486,7 @@
                       "default": true
                     },
                     "claim_ttl_secs": {
-                      "description": "How long the range claim lasts without a renewal, in seconds. The\nsource renews it every tenth of this while it runs.",
+                      "description": "How long the range claim lasts without a renewal, in seconds. The\nsource renews it every tenth of this while it runs. Default: 60 under\n`faucet run`, 300 for a delivery run under `faucet serve`.",
                       "type": [
                         "integer",
                         "null",
