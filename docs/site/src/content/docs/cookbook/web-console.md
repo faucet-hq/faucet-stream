@@ -236,15 +236,18 @@ is pending and the share of requests refused (`GET /v1/feeds`). With nothing
 selected the page names what needs attention and lists every delivery, most
 behind first. With **All tenants** picked an operator sees each tenant's feeds
 too; with one tenant picked, or as a tenant's own principal, the page shows
-that tenant's feeds and its quotas.
+that tenant's feeds and its quotas. The quotas card's rate line is the sum of
+the rate limits set on the tenant's feeds against its quota, not live traffic.
 
 A feed's page has six tabs:
 
 - **Overview**: the URL senders post to, how they sign in, what the feed
   accepts, the last 24 hours (received, delivered, pending, refused), storage
-  against the feed's limits and its deliveries.
+  (what is not delivered yet against the feed's limits, and the delivered
+  events kept for replay) and its deliveries.
 - **Deliveries**: one delivery's position (delivered to, newest event, behind,
-  replay from), the template, version and params it runs (secret ones as
+  replay from), its delivery guarantee (derived from its template), the
+  template, version and params it runs (secret ones as
   *sealed*), when it flushes, and its recent runs with the events each read.
   A failing delivery shows its failed runs and the size of the next run; a
   stalled one names the event it cannot deliver, with **Try again now** and
@@ -256,7 +259,9 @@ A feed's page has six tabs:
   and sender. Payloads of refused requests are never kept.
 - **Tokens**: the feed's tokens (never their text) with **New token** and
   **Revoke**, and the signature check's settings.
-- **History**: the feed's changes, its tokens and every skipped range.
+- **History**: the feed's changes, its tokens, every skipped range, and what
+  was done to its deliveries (pause, resume, deliver now, replay, skip,
+  recover), read from the audit log's most recent entries.
 
 Operators get **New**, **Edit**, **Add delivery**, **Pause** / **Resume**,
 **Deliver now** and **Send test event**; admins also get **Replay…**,

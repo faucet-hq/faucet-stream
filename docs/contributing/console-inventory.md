@@ -362,23 +362,24 @@ Every capability of the console before the redesign, and the new ones, checked a
 The page before this build was a designed "soon" placeholder; every capability is new. Checked against the mock inventory (`console-redesign/spec/functionality-inventory.md`) and the 40 mock states.
 
 ### Feeds (views/feeds.js)
-- 🆕 Nav entry is a real page with a count badge (`GET /v1/feeds`; an operator on "All tenants" counts each tenant's feeds); routes `#/feeds` and `#/feeds/{name}` with `?dtab=`, `?delivery=`, `?event=`, `?t=<tenant>`, `?mode=new`
+- 🆕 Nav entry is a real page with a count badge (`GET /v1/feeds`; an operator on "All tenants" asks once with `tenant=*`, page by page, with no cap on tenants); routes `#/feeds` and `#/feeds/{name}` with `?dtab=`, `?delivery=`, `?event=`, `?t=<tenant>`, `?mode=new`
 - 🆕 List: *Needs attention* / *Receiving* / *Delivery paused*, stats (feeds, today, pending, refused share; a tenant sees feeds of its limit and stored bytes), tabs All / Needs attention
-- 🆕 Nothing selected: what needs attention, every delivery most behind first; a tenant's quotas card
+- 🆕 Nothing selected: what needs attention, every delivery most behind first; a tenant's quotas card, whose rate line reads "Rate limits set on its feeds" (the sum of configured limits, not live traffic)
 - 🆕 Overview: ingest URL (copy), sign-in, accepted content, duplicates, last 24 hours with an hourly line, storage against the limits, deliveries
-- ⚠️ Storage card: "Stored, kept for replay" is every retained byte and "Not delivered yet" is an upper bound (`up to …`): the API reports one stored size, not the delivered / undelivered split the mock drew
+- ✅ Storage card: "Not delivered yet" is `undelivered_bytes` (counted from the slowest delivery's position) against the limit, and "Delivered, kept for replay" is `retained_bytes` minus it, as the mock drew
 - 🆕 Delivery: position, what it runs (template, version, pool, params; secret params as *sealed*), flush policy, recent runs with their event ranges (`GET /v1/runs?label=feed:…&label=feed_delivery:…`); a switch between a feed's deliveries
-- ❌ The delivery guarantee line ("exactly once" / "at least once") is not shown: the feed API does not report it
+- ✅ The delivery guarantee line ("exactly once" / "at least once" / "effectively once, by key" / "guarantee unknown") comes from `guarantee` on the feed's own page, derived from the delivery's template
 - 🆕 Failing and stalled deliveries: banner, next run size, failed runs with why, **Try again now**, **Skip this event…**, **Open the event**
 - 🆕 Events: newest first, older pages, go to a number; an event's envelope and kept headers; payload for `feed_admin` only; a sealed feed never shows one
 - ⚠️ Event card shows *Stored* and the kept headers where the mock drew *Sender* and the token's name: events do not record them
 - 🆕 Refused: by reason and most recent (this server's own, as the API says)
 - 🆕 Tokens: list, **New token** (shown once, optional expiry), **Revoke**; signature settings with **Change secret**
-- ⚠️ History: the feed's change log, token events and skipped ranges; pauses, resumes and replays are in the audit log only
+- ✅ History: the feed's change log, token events, skipped ranges, and each delivery's pauses, resumes, deliver-now, replays, skips and recovers read from the audit log's most recent entries
 - 🆕 Create / edit a feed with inline validation and a "what changes" diff; a first token is made on create and shown once with a ready `curl`; add / edit / delete a delivery
 - 🆕 Pause (reason), resume, deliver now, replay (from an event number or a time, with the count), skip (count, reason required), recover a held feed, delete (type the name; a run in flight is named with a link)
 - ⚠️ **Send test event** posts to the feed's own ingest URL with a pasted feed token; a signed feed, or a server with `--feeds-listen`, gets the `faucet feed send` / `curl` commands instead (there is no console-only credential)
 - 🆕 States: empty, feeds not built in (404), memory history (no store), loading, load error, store not answering, feed full, feed held, from the feeds file (read-only), approval (`Request approval` → change request page), viewer (no write controls, no payloads), tenant principal, operator scoped to a tenant, tenant at `max_feeds`, tenant rate above its quota
+- 🆕 A delivery the store has no position for yet shows *Setting up*; a signed feed with no timestamp header and no dedupe key shows a replay warning
 - 🆕 Changes page: kind `feed` (and `schedule`) has a label, a one-line summary and plan lines
 - ✅ Permission gating through `data-perm` (`feed_write`, `feed_admin` added to access.js)
 - ✅ Narrow widths: detail with a back link at 1000px; action rows wrap at 420px

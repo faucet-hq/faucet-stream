@@ -316,6 +316,7 @@ The [MCP server](/faucet-stream/cookbook/mcp/) has two read tools,
 | `held` | Its bookmark and the feed store disagree (a restored store). | no, until recover |
 | `paused` | Paused by an operator, by its definition, or because its run was cancelled or rolled back. | no, until resume |
 | `needs_approval` | The server requires approval for runs and this delivery has none (or follows a channel). | no |
+| `setting_up` | The delivery is defined but the feed store has no position for it yet (the store call failed when it was made). The scheduler creates it, at the delivery's `start`, on its next pass. | no, until it is set up |
 
 A delivery's last run has one of these outcomes: `delivered`, `failed`,
 `refused`, `cancelled`, `claim_lost`, `held`.
@@ -323,6 +324,19 @@ A delivery's last run has one of these outcomes: `delivered`, `failed`,
 **A feed** shows the worst of its deliveries: `held`, then `stalled`, then
 `full` (an undelivered limit is reached and new events are refused), then
 `paused` (every delivery is paused), else `receiving`.
+
+A feed reports two sizes. `retained_bytes` is every event it still holds,
+including delivered events kept for replay. `undelivered_bytes` is what its
+slowest delivery has not delivered yet; the undelivered limit, the
+`undelivered_ratio`, `feed_near_full` and the `full` status count only that.
+A delivery's byte flush (`flush.max_bytes`) likewise counts the bytes from
+its own position on.
+
+**Self-repair.** On every pass the scheduler compares each feed's store rows
+with its definition: a delivery position no definition lists (a change that
+stopped halfway) is deleted unless a run holds it, a defined delivery with no
+position is created, and a changed tenant byte quota is written to the
+tenant's existing feeds.
 
 ## `faucet serve` flags
 

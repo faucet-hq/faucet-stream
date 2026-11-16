@@ -380,6 +380,9 @@ A feed keeps two promises, and neither drops data silently:
   50 GiB), the feed is **full** and **refuses new events** with `503` and
   `Retry-After` instead of dropping old ones. Senders retry; the feed accepts
   again once a delivery has caught up.
+  Only undelivered bytes count toward the limit: delivered events kept for
+  replay do not fill a feed. The API reports both (`undelivered_bytes`,
+  `retained_bytes`).
 
 So a failing delivery stalls and a full feed refuses. There is no option that
 drops the oldest events or skips a failing one automatically.
@@ -409,7 +412,10 @@ is stored once.
 Two limits on the first row. An exactly-once pipeline has no dead-letter
 queue, so one record the sink rejects stalls the delivery; where bad records
 are expected, use a keyed upsert with a [DLQ](/faucet-stream/cookbook/dlq/)
-and a `state:` block. And a run that loses its claim (the feed store was
+and a `state:` block. A delivery's dead-lettered records are replayed with
+`POST /v1/dlq/replay` and the delivery's own config: the replay reads the DLQ
+in place of the feed, so the `type: feed` source is accepted there (and in
+`POST /v1/plan`), while running that config directly is still refused. And a run that loses its claim (the feed store was
 unreachable for the claim's whole five minutes) cannot move the position, but
 a successor may write the same page: the claim protects the position, not the
 destination.
