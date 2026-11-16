@@ -55,6 +55,10 @@ pub fn schema_targets() -> Vec<&'static str> {
     targets.push("triggers");
     #[cfg(all(feature = "schedule", feature = "templates"))]
     targets.push("schedules");
+    #[cfg(feature = "feeds")]
+    targets.push("feed");
+    #[cfg(feature = "feeds")]
+    targets.push("feeds");
     #[cfg(feature = "notify")]
     targets.push("notifications");
     #[cfg(feature = "catalog")]
