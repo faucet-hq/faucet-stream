@@ -4,7 +4,7 @@ import { html, ic, row, ring, sect, tabs, ibtn, stats, empty, skelRows, skelCard
 import { layout, setQuery, patch, poll, errorAlert, hashFor, ago, dialog, toast } from "../page.js";
 import { setCrumbs, refreshBadges } from "../shell.js";
 import { fmtInt, fmtAge } from "../utils.js";
-import { formatTs } from "../tz.js";
+import { formatTs, getTz } from "../tz.js";
 import { href } from "../links.js";
 import { can, whoami } from "../access.js";
 import { currentTenant, tenantList } from "../tenant.js";
@@ -62,7 +62,7 @@ function since(iso) {
   return plural(Math.floor(s / 86400), "day");
 }
 /** How long until `iso`, in words: `40 seconds`, `3 minutes`; "" once it has passed. */
-function until(iso) {
+function startsIn(iso) {
   const s = Math.ceil((Date.parse(iso) - Date.now()) / 1000);
   if (!(s > 0)) return "";
   if (s < 90) return plural(s, "second");
@@ -80,6 +80,12 @@ function spanText(x) {
 }
 const intText = (x) => (/^\s*[\d,]+\s*$/.test(String(x)) ? Number(String(x).replace(/[\s,]/g, "")) : NaN);
 const seqNo = (n) => html`<span class="mono">#${fmtInt(n)}</span>`;
+/** `16 Nov 18:54` in the display timezone. */
+const dayTime = (iso) => {
+  const zone = getTz() === "local" ? {} : { timeZone: getTz() };
+  const p = (opts) => new Intl.DateTimeFormat("en-GB", { ...opts, ...zone }).format(new Date(iso));
+  return `${p({ day: "numeric", month: "short" })} ${p({ hour: "2-digit", minute: "2-digit", hour12: false })}`;
+};
 const dayMonth = (iso) => new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", timeZone: "UTC" }).format(new Date(iso));
 const until = (iso) => {
   const s = Math.round((Date.parse(iso) - Date.now()) / 1000);
@@ -454,7 +460,7 @@ feeds:
     const pts = f.hourly_24h || [];
     const known = f.events_24h != null;
     return card({ icon: "usage", title: "Last 24 hours", right: pts.length > 1 && pts.some((x) => x) ? spark(pts, "var(--text-2)", 170, 30) : "",
-      body: grid(4, [kv("Received", known ? fmtInt(f.events_24h) : "—", "stored and answered"), kv("Delivered", known ? fmtInt(delivered) : "—", "written by a run"), kv("Pending", html`<span class="${f.status === "full" ? "bad" : ""}">${fmtInt(lagOf(f))}</span>`, "waiting for the next flush"), kv("Refused", fmtInt(f.refused_recent || 0), "never stored")]) });
+      body: grid(4, [kv("Received", known ? fmtInt(f.events_24h) : "—", "stored and answered"), kv("Delivered", known ? fmtInt(delivered) : "—", "written by a run"), kv("Pending", html`<span class="${f.status === "full" ? "bad" : ""}">${known ? fmtInt(lagOf(f)) : "—"}</span>`, "waiting for the next flush"), kv("Refused", fmtInt(f.refused_recent || 0), "never stored")]) });
   }
 
   function storeCard(f) {
@@ -507,7 +513,7 @@ feeds:
       ${created.token ? alert("Copy the token now. It is not shown again.", "", "warn") : alert("This feed checks a signature only.", "Senders sign each request with the secret you set; no token was made.", "")}
       <div class="two"><div class="stack">${created.token ? card({ icon: "key", title: `Token ${created.tokenName}`, body: html`<div class="pad">${urlBox(created.token)}</div>`, note: "Stored only as a hash. Lost it? Make a new token and revoke this one." }) : ""}
         ${card({ icon: "code", title: "Send the first event", body: code(curl, { box: false, lang: "text" }), note: sig ? html`This feed also checks a signature: add the <code>${sig.header}</code> header, or use <code>faucet feed send --signing-secret-env</code>.` : "" })}</div>
-      <div class="stack">${card({ icon: "check", title: "What happens next", body: html`<div class="pad stack" style="gap:8px"><span>1. The sender posts to the URL and gets <b>202</b> once the event is stored.</span>${d0 ? html`<span>2. Within ${span(spanSecs(d0.flush.max_age))}, ${d0.name} runs <b>${d0.template ? d0.template.id : d0.pipeline}</b> over the new events.</span><span>3. The delivery moves forward only after that run has written them.</span>` : html`<span>2. Events are stored and wait. Add a delivery to run a template over them.</span>`}</div>` })}</div></div>
+      <div class="stack">${card({ icon: "check", title: "What happens next", body: html`<div class="pad stack" style="gap:8px"><span>1. The sender posts to the URL and gets <b>202</b> once the event is stored.</span>${d0 ? html`<span>2. Within ${spanSecs(d0.flush.max_age) < 120 ? plural(spanSecs(d0.flush.max_age), "second") : span(spanSecs(d0.flush.max_age))}, ${d0.name} runs <b>${d0.template ? d0.template.id : d0.pipeline}</b> over the new events.</span><span>3. The delivery moves forward only after that run has written them.</span>` : html`<span>2. Events are stored and wait. Add a delivery to run a template over them.</span>`}</div>` })}</div></div>
       <div class="actions" style="border:0;padding:4px 0 0">${btn("Done", { kind: "primary", icon: "check", data: { act: "created-done" } })}</div>`;
   }
 
@@ -584,7 +590,7 @@ feeds:
     const ps = Object.entries(d.template.params || {});
     const pinned = /^\d+$/.test(String(version(d)));
     return card({ icon: "tpl", title: "What it runs", right: lnk("open template", href.template(d.template.id)),
-      body: html`${grid(2, [kv("Template", lnk(d.template.id, href.template(d.template.id)), d.template.sink ? `into ${d.template.sink}` : ""), kv("Version", html`<span class="mono">${verLabel(version(d))}</span>`, pinned ? "never moves" : "resolved at each run"), kv("Pool", d.pool || "default"), failing])}
+      body: html`${grid(2, [kv("Template", lnk(d.template.id, href.template(d.template.id)), d.template.sink ? `into ${d.template.sink}` : "pipeline"), kv("Version", html`<span class="mono">${verLabel(version(d))}</span>`, pinned ? "never moves" : "resolved at each run"), kv("Pool", d.pool || "default"), failing])}
         ${ps.length ? html`<div class="pad" style="padding-top:0">${tbl(["Param", "Value"], ps.map(([k, val]) => [html`<span class="mono">${k}</span>`, paramValue(val)]))}</div>` : ""}` });
   }
 
@@ -628,7 +634,7 @@ feeds:
       const stalled = d.status === "stalled";
       const banner = stalled
         ? alert("One event cannot be delivered. Nothing was skipped.", html`Runs were cut down to a single event, and ${seqNo(d.position)} still fails${why ? html` with <code>${why}</code>` : ""}. New events are still stored. Fix the template or the destination and try again, or skip this event.`, "bad", html`${lastRunBtn}${btn("Open the event", { icon: "code", href: feedHref(f, { dtab: "Events", event: d.position }) })}${btn("Skip this event…", { icon: "right", perm: "feed_admin", data: { act: "skip" } })}`)
-        : alert(`The last ${d.consecutive_failures > 1 ? `${fmtInt(d.consecutive_failures)} runs` : "run"} failed. Still trying, with smaller batches.`, html`${why ? html`Each run failed with <code>${why}</code>. ` : ""}The next run takes ${plural(d.batch_events, "event")}${d.next_run_at && until(d.next_run_at) ? ` and starts in ${until(d.next_run_at)}` : ""}. Nothing is skipped, and new events are still stored.`, "warn", lastRunBtn);
+        : alert(`The last ${d.consecutive_failures > 1 ? `${fmtInt(d.consecutive_failures)} runs` : "run"} failed. Still trying, with smaller batches.`, html`${why ? html`Each run failed with <code>${why}</code>. ` : ""}The next run takes ${plural(d.batch_events, "event")}${d.next_run_at && startsIn(d.next_run_at) ? ` and starts in ${startsIn(d.next_run_at)}` : ""}. Nothing is skipped, and new events are still stored.`, "warn", lastRunBtn);
       return html`${top}${banner}<div class="two"><div class="stack">${positionCard(f, d, kv("Next run takes", plural(d.batch_events, "event"), stalled ? "cannot go smaller" : "halved after each failure"))}</div><div class="stack">${storeCard(f)}</div></div>${failedRunsCard(f, d)}`;
     }
     if (d.status === "paused") {
@@ -735,7 +741,7 @@ feeds:
     }
     items.sort((a, b) => b.at.localeCompare(a.at));
     if (!items.length) return html`${top}${card({ title: "Change history", body: html`<div class="empty-line">${f.source === "file" ? "Defined in the feeds file; it has no history here." : "No changes recorded."}</div>` })}`;
-    return html`${top}${card({ title: "Change history", right: "newest first", body: html`<div class="log fd-log">${items.map((c) => html`<div><span class="muted fd-when" >${formatTs(c.at)}</span><span class="dot ${c.tone}"></span><span>${c.text}</span></div>`)}</div>`,
+    return html`${top}${card({ title: "Change history", right: "newest first", body: html`<div class="log fd-log">${items.map((c) => html`<div><span class="muted fd-when" title="${formatTs(c.at)}">${dayTime(c.at)}</span><span class="dot ${c.tone}"></span><span>${c.text}</span></div>`)}</div>`,
       note: "Skipped ranges stay on the feed for good. Every change is also in the audit log." })}`;
   }
 
@@ -1082,7 +1088,7 @@ feeds:
 
   function detailHtml() {
     if (loadErr) return alert("Feeds cannot be listed right now.", "Their settings are kept in the run-history database, which this server cannot reach. Senders are still answered for up to a minute, and stored events are safe.", "bad", btn("Retry", { icon: "refresh", data: { reload: "1" } }));
-    if (!data) return html`<span class="skel t"></span><span class="skel w30"></span>${skelCards(3)}`;
+    if (!data) return skelCards(3);
     if (requested) return requestedHtml();
     if (form) return formHtml();
     if (dform) return deliveryFormHtml();
@@ -1201,7 +1207,7 @@ feeds:
   async function deliverNow(f, d) {
     const lag = d.lag || 0;
     const take = Math.min(lag, d.batch_events || lag);
-    const r = await dialog(`Deliver ${d.name} now?`, html`<span>Starts one run over the <b>${plural(take, "event")}</b> that ${take === 1 ? "is" : "are"} waiting${lag > take ? ` (of ${fmtInt(lag)})` : ""}, without waiting for the flush policy.</span>
+    const r = await dialog(`Deliver ${d.name} now?`, html`<span>${take ? html`Starts one run over the <b>${plural(take, "event")}</b> that ${take === 1 ? "is" : "are"} waiting${lag > take ? ` (of ${fmtInt(lag)})` : ""}` : "Starts one run over the events that are waiting"}, without waiting for the flush policy.</span>
       ${d.claim ? alert("A run of this delivery is in progress.", "The next run starts when it ends.", "warn") : !lag ? alert("Nothing is waiting.", "No run starts until an event arrives.", "") : alert("No run of this delivery is in progress.", "", "ok")}`,
       html`${btn("Cancel", { data: { act: "no" } })}${btn("Deliver now", { kind: "primary", icon: "play", data: { act: "yes" } })}`, { icon: "play" });
     if (!r || r.act !== "yes") return;
@@ -1216,7 +1222,7 @@ feeds:
     let reason = "";
     if (on) {
       const r = await dialog(`Pause ${d.name}?`, html`<span>No runs start while it is paused. Events keep arriving and are stored, and they count toward the feed’s limit of ${undelivered(f.spec)}.</span>
-        ${field("Reason", html`<textarea class="area sans fd-area" name="reason" rows="2" placeholder="Warehouse maintenance tonight"></textarea>`, { help: "Optional · shown on the delivery and in the audit log" })}`,
+        ${field("Reason", input("", { name: "reason", ph: "Warehouse maintenance tonight" }), { help: "Optional · shown on the delivery and in the audit log" })}`,
         html`${btn("Cancel", { data: { act: "no" } })}${btn("Pause", { kind: "primary", icon: "pause", data: { act: "yes" } })}`, { icon: "pause" });
       if (!r || r.act !== "yes") return;
       reason = (r.values.reason || "").trim();
@@ -1398,7 +1404,8 @@ feeds:
           try {
             const t = await api(`${base(f)}/tokens${q(f.tenant)}`, { method: "POST", body: days ? { name, expires_at: new Date(Date.now() + days * 864e5).toISOString() } : { name } });
             made = true;
-            el.querySelector('[data-step="form"]').hidden = true;
+            for (const x of el.querySelectorAll('[data-step="form"] input, [data-step="form"] select')) x.disabled = true;
+            err.hidden = true;
             el.querySelector('[data-step="made"]').hidden = false;
             el.querySelector("[data-token]").textContent = t.token;
             el.querySelector("[data-copy]").dataset.copy = t.token;
