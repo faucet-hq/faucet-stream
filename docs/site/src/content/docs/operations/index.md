@@ -7,7 +7,7 @@ description: "Deploy faucet, run it on a schedule, keep it healthy and upgrade i
 
 <div class="fs-cards fs-cards-3">
 <a class="fs-card fs-card-left" href="/faucet-stream/operations/deploying/"><span class="fs-card-title">Deploy & run</span><span class="fs-card-text">Containers, Helm, the server, the console and clusters.</span><span class="fs-card-more">5 pages</span></a>
-<a class="fs-card fs-card-left" href="/faucet-stream/cookbook/scheduling/"><span class="fs-card-title">Schedule & trigger</span><span class="fs-card-text">Cron, schedules, events and orchestrators.</span><span class="fs-card-more">4 pages</span></a>
+<a class="fs-card fs-card-left" href="/faucet-stream/cookbook/scheduling/"><span class="fs-card-title">Schedule & trigger</span><span class="fs-card-text">Cron, schedules, events, feeds and orchestrators.</span><span class="fs-card-more">5 pages</span></a>
 <a class="fs-card fs-card-left" href="/faucet-stream/operations/observability/"><span class="fs-card-title">Keep it healthy</span><span class="fs-card-text">Metrics, chaos tests, tuning and troubleshooting.</span><span class="fs-card-more">6 pages</span></a>
 <a class="fs-card fs-card-left" href="/faucet-stream/operations/pinning/"><span class="fs-card-title">Upgrade & maintain</span><span class="fs-card-text">Pinning, upgrades, migrations and backups.</span><span class="fs-card-more">4 pages</span></a>
 </div>
@@ -23,6 +23,7 @@ description: "Deploy faucet, run it on a schedule, keep it healthy and upgrade i
 <a href="/faucet-stream/cookbook/scheduling/"><b>Scheduling</b></a>
 <a href="/faucet-stream/cookbook/triggers/"><b>Event-driven triggers</b></a>
 <a href="/faucet-stream/cookbook/schedules/"><b>Schedules</b></a>
+<a href="/faucet-stream/cookbook/feeds/"><b>Feeds</b></a>
 <a href="/faucet-stream/cookbook/orchestration/"><b>Orchestration</b></a>
 <a href="/faucet-stream/operations/observability/"><b>Observability</b></a>
 <a href="/faucet-stream/operations/reliability-testing/"><b>Reliability testing</b></a>

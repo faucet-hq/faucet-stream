@@ -26,7 +26,9 @@ crates/
   interop-tests/              — unpublished: tests that need two connectors (round trips, fidelity)
 faucet-stream/                — umbrella crate with feature-gated re-exports
 cli/                          — faucet-cli: `faucet` binary, YAML/JSON pipeline runner
+  src/serve/feeds/            — feeds for `faucet serve`: ingest, the delivery scheduler, the stores and the management rules (`src/commands/feed.rs` is the `faucet feed` command)
   examples/                   — ready-to-run pipeline YAMLs
+  examples/feeds/             — a feeds file for `faucet serve --feeds` and its delivery pipeline
   tests/                      — assert_cmd + wiremock + testcontainers integration tests
 hub/                          — Template Hub: sink templates + example source templates
 skills/                       — agent skills (Claude Code / Codex plugin), versioned with faucet-cli

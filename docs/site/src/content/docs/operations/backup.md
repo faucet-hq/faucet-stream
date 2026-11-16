@@ -41,9 +41,20 @@ What the database holds:
 Pipeline **bookmarks are not here** — they live in each pipeline's `state:`
 backend. Back that up on its own schedule.
 
+**Feed events are not here either.** A [feed's](/faucet-stream/cookbook/feeds/)
+events, delivery positions, dedupe keys and gaps live in its feed store. With
+a SQLite history the default store is a second file, `feeds.db`, beside
+`history.db`; with a Postgres history it is the `faucet_feed_*` tables of the
+same database (`faucet_feed_events`, `faucet_feed_heads`,
+`faucet_feed_deliveries`, `faucet_feed_dedupe`, `faucet_feed_gaps`,
+`faucet_feed_meta`), which the `faucet_*` pattern below already covers. A
+store defined with `--feed-store` is wherever its URL points. Back the feed
+store up together with the history.
+
 ## The vault key is part of the backup
 
-Tenant connections and tenant notification settings are sealed with the
+Tenant connections, tenant notification settings, and a feed's sealed event
+payloads, signature secret and secret delivery params are sealed with the
 `--vault-key` (`FAUCET_VAULT_KEY`). A restored database is unreadable without
 the key that sealed it, so store the key (and any `--vault-previous-key`
 still needed) in your secret manager alongside the backup procedure — never
@@ -54,6 +65,7 @@ next to the database dump itself.
 - **SQLite:** use SQLite's online backup so a running server's WAL is
   included: `sqlite3 /var/lib/faucet/history.db ".backup '/backups/history-$(date +%F).db'"`.
   Copying the file alone while the server runs can miss the `-wal` file.
+  Do the same for `feeds.db` when the server has feeds.
 - **Postgres:** `pg_dump --format=custom --table='faucet_*' "$HISTORY_URL" > history.dump`,
   or rely on your managed database's point-in-time recovery.
 
@@ -64,6 +76,12 @@ Stop every `faucet serve` instance that uses the database, restore it
 the same vault key is configured, and start the servers. Runs that were in
 flight when the backup was taken read as `running` until their lease expires;
 the lease loop then marks them failed (or, in cluster mode, requeues them).
+
+A restored feed store is older than what destinations may already hold. A
+delivery whose bookmark names an event the restored store does not have is
+**held**: nothing is delivered or skipped until an admin runs
+[recover](/faucet-stream/cookbook/feeds/#skip-and-recover) on it. Events the
+server accepted after the backup was taken are not in it.
 
 ## Schema version
 

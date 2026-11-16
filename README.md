@@ -329,6 +329,7 @@ faucet serve                    # HTTP control plane with a web console
 - **`faucet serve`** is a long-running control plane. It covers:
   - a REST API for submitting, polling and cancelling runs ([serve](https://faucet-hq.github.io/faucet-stream/cookbook/serve/) · [HTTP API](https://faucet-hq.github.io/faucet-stream/reference/http-api/))
   - event triggers on object arrival, webhooks and queue depth ([triggers](https://faucet-hq.github.io/faucet-stream/reference/triggers/))
+  - feeds: durable HTTP push ingestion, where senders are answered once their events are stored and each delivery runs a pipeline over them with its own position and replay ([feeds](https://faucet-hq.github.io/faucet-stream/cookbook/feeds/))
   - clustered execution ([cluster](https://faucet-hq.github.io/faucet-stream/cookbook/cluster/))
   - an MCP server for agents ([MCP](https://faucet-hq.github.io/faucet-stream/cookbook/mcp/))
   - multi-tenant embedding with per-tenant credentials, hosted OAuth and isolated state ([embedded integrations](https://faucet-hq.github.io/faucet-stream/cookbook/embedded-integrations/))

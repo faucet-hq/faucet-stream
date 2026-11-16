@@ -109,6 +109,23 @@ cardinality and never a Prometheus label.
   worth alerting on; `reason="pre_existing"` is benign (files faucet did
   not create are never deleted). Distinct from `faucet_cleanup_*`, which counts
   destination *rows* removed by [scoped cleanup](/faucet-stream/cookbook/upsert/).
+- **Feeds** (`faucet serve` with [feeds](/faucet-stream/cookbook/feeds/)):
+  ingest by status and refusal reason
+  (`faucet_feed_ingest_requests_total{feed,status}`,
+  `faucet_feed_ingest_refused_total{feed,reason}`), what was stored
+  (`faucet_feed_events_total`, `faucet_feed_bytes_total`,
+  `faucet_feed_dedupe_hits_total`), the store
+  (`faucet_feed_append_duration_seconds`, `faucet_feed_store_errors_total`),
+  and delivery health: `faucet_feed_delivery_lag{feed,delivery}`,
+  `faucet_feed_oldest_undelivered_seconds{feed,delivery}`,
+  `faucet_feed_runs_total{feed,delivery,outcome}`,
+  `faucet_feed_delivery_stalled{feed,delivery}`, `faucet_feed_held{feed}` and
+  `faucet_feed_undelivered_ratio{feed}` (at 1 the feed refuses new events).
+  The `feed` label is `<tenant>/<name>` for a tenant's feed. `/readyz` reports
+  a `feeds` object (`started`, `store_ok`, `feeds`, `stalled`, `held`); a feed
+  store that cannot be reached sets `store_ok: false` without failing
+  readiness. The full list and the shipped alerts are in the
+  [feeds reference](/faucet-stream/reference/feeds/#metrics).
 - **Build:** `faucet_build_info{version}` is set to `1` — `group_left` it onto
   other metrics to annotate dashboards with the running version. `version` is
   the binary's own version (what `faucet --version` prints); a library

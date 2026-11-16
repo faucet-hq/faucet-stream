@@ -174,6 +174,10 @@ someone does.
 | `GET /v1/templates/{id}/versions/{version}/tests` | ✓ | ✓ | ✓ |
 | `POST /v1/templates/{id}/versions/{version}/test` | — | — | ✓ |
 | `POST /v1/templates/sync`, `POST /v1/templates/{id}/publish` | — | — | ✓ |
+| `GET /v1/feeds`, `/v1/feeds/{name}`, `/v1/feeds/{name}/tokens`, `/v1/feeds/{name}/events`, `/v1/feeds/{name}/refusals` | ✓ | ✓ | ✓ |
+| `POST /v1/feeds`, `PUT /v1/feeds/{name}`, `POST /v1/feeds/{name}/deliveries`, `PUT`/`DELETE …/deliveries/{delivery}`, `POST …/deliveries/{delivery}/{pause,resume,deliver-now}`, `POST /v1/feeds/{name}/tokens`, `DELETE …/tokens/{id}` | — | ✓ | ✓ |
+| `DELETE /v1/feeds/{name}`, `POST …/deliveries/{delivery}/{replay,skip,recover}`, `GET /v1/feeds/{name}/events/{seq}` | — | — | ✓ |
+| `POST /v1/feeds/{name}/events`, `POST /v1/tenants/{tenant}/feeds/{name}/events` (feed ingest) | ⁴ | ⁴ | ⁴ |
 | `GET /v1/whoami` | ✓ | ✓ | ✓ |
 | `GET /v1/changes`, `GET /v1/changes/counts`, `GET /v1/changes/{id}` | ✓ | ✓ | ✓ |
 | `POST /v1/changes` | — | ✓ | ✓ |
@@ -192,6 +196,7 @@ someone does.
 - ¹ Reaching the route; the `approvals:` policy then decides whether the approval counts.
 - ² With a registered `template` and its declared param defaults. An inline `config` is loaded on the server, and caller `params` decide what it connects to, so either needs `operator` (`403` for a viewer).
 - ³ Below an unscoped admin, credential-looking values come back masked.
+- ⁴ Outside the role checks: these routes accept a feed token or a signature, never a serve token. See [feed ingest](/faucet-stream/reference/feeds/#ingest).
 
 </div>
 
@@ -1265,6 +1270,31 @@ interval (`422` naming the limit); on an operator's fan-out it sees only its
 own tick errors and none of the change history.
 Without the `schedule` and `templates` features `GET /v1/schedules` answers
 `{"available": false}` and no other route exists.
+
+### `/v1/feeds` (feeds)
+
+Durable event logs senders push into, and the deliveries that run pipelines
+over them. See the [Feeds cookbook](/faucet-stream/cookbook/feeds/) and the
+[feeds reference](/faucet-stream/reference/feeds/), which has the full route
+table with permissions, the definition's fields and every ingest status code.
+
+| Routes | Purpose |
+|---|---|
+| `GET`/`POST /v1/feeds`, `GET`/`PUT`/`DELETE /v1/feeds/{name}` | List, create, read, replace and delete feeds. `?tenant=` names a tenant's feed. |
+| `POST /v1/feeds/{name}/deliveries`, `PUT`/`DELETE …/deliveries/{delivery}` | Add, replace and remove one delivery. |
+| `POST …/deliveries/{delivery}/pause`, `/resume`, `/deliver-now` | Stop, restart, or start a run now. |
+| `POST …/deliveries/{delivery}/replay`, `/skip`, `/recover` | Move a delivery's position (admin). |
+| `GET`/`POST /v1/feeds/{name}/tokens`, `DELETE …/tokens/{id}` | Ingest tokens. |
+| `GET /v1/feeds/{name}/events`, `/events/{seq}`, `/refusals` | Browse retained events (a payload needs admin) and recently refused requests. |
+| `POST /v1/feeds/{name}/events`, `POST /v1/tenants/{tenant}/feeds/{name}/events` | **Ingest.** Outside the bearer authentication: a feed token or a signature. `202` once the events are stored. |
+
+`FeedRead` is granted to viewers and up, `FeedWrite` to operators and up,
+`FeedAdmin` to admins. A create, update or delete answers `202` with a pending
+change request under `--require-approval feed`, and so does a change that adds
+or edits a delivery under `--require-approval run`. A feed from the `--feeds`
+file answers `409` to update and delete. With `--feeds-listen` the two ingest
+routes are served on that listener only. Without the `feeds` feature none of
+these routes exists.
 
 ### `/v1/tenants*` (multi-tenant embedded integrations)
 

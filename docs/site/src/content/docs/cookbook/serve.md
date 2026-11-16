@@ -70,6 +70,11 @@ Mitigations are deployment-level and **mandatory**:
 - Use long random tokens (`openssl rand -hex 32`): the server warns about one
   under 16 characters, and refuses an address for a minute after 20 invalid
   tokens.
+- The [feed](/faucet-stream/cookbook/feeds/) ingest routes
+  (`POST /v1/feeds/{name}/events`) are the part meant to face senders. They
+  take a feed token or a signature, never a serve token, and
+  `--feeds-listen` puts them on their own port so senders never reach the
+  control API.
 - Run single-tenant, behind authentication, behind egress controls / network
   policy. The default loopback bind (`127.0.0.1`) is deliberate — exposing
   externally is an explicit choice.

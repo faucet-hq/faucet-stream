@@ -228,6 +228,12 @@ approval** under `--require-approval schedule`. Schedules from the
 page shows the schedules that run for it, and its runs only. See
 [Schedules](/faucet-stream/cookbook/schedules/).
 
+### Feeds
+
+The **Feeds** page is a placeholder in this release: it describes feeds and
+does not list or manage them yet. Manage feeds through `/v1/feeds` or
+`faucet feed`; see [Feeds](/faucet-stream/cookbook/feeds/).
+
 ### Submit
 
 Submit builds a pipeline config and runs it, step by step: **Source**,

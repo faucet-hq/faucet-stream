@@ -17,6 +17,11 @@ cargo install faucet-cli --features "triggers,triggers-redis"          # + Redis
 cargo install faucet-cli --features full                               # everything
 ```
 
+A trigger starts a run when something happens. To receive and keep the events
+a system pushes over HTTP, use a [feed](/faucet-stream/cookbook/feeds/)
+instead: its senders have their own credentials and its events are stored
+before they are acknowledged.
+
 ## Triggers file grammar
 
 ```yaml

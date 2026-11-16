@@ -36,6 +36,8 @@ contract as lineage and SLA monitoring.
 | `change_requested` | a [change request](/faucet-stream/cookbook/approvals/) awaits approval — sent through the proposed config's own `notifications:` rules | info |
 | `budget_exceeded` | a run crossed a [`budget:`](/faucet-stream/cookbook/usage/#run-budgets) ceiling and was stopped | error |
 | `connection_needs_reauth` | a tenant connection's token endpoint revoked its credentials (`faucet serve` with tenants) — sent through the tenant's `notifications:` | error |
+| `feed_near_full` | a [feed's](/faucet-stream/cookbook/feeds/#retention-and-a-full-feed) undelivered data crossed one of its `retention.warn_at` fractions (`faucet serve`) — sent through the `notifications:` of each delivery's pipeline and, for a tenant's feed, the tenant's | warning |
+| `feed_stalled` | a feed delivery stalled: one event kept failing, so it starts no more runs — sent the same way | error |
 | `log_export_failed` | a run's [log export](/faucet-stream/operations/observability/#shipping-logs) kept failing past `notify_after_secs`, or buffered lines were dropped before delivery | warning |
 
 Events fire from every runtime — `faucet run`, `faucet schedule`,
@@ -220,7 +222,8 @@ faucet notify test pipeline.yaml --event run_failure
 `--event` accepts any event kind (`run_failure`, `run_success`, `sla_breach`,
 `circuit_open`, `contract_abort`, `dlq_threshold`, `scheduler_stuck`,
 `profile_drift`, `change_requested`, `budget_exceeded`,
-`connection_needs_reauth`, `log_export_failed`); `--profile` selects a `profiles:` overlay.
+`connection_needs_reauth`, `log_export_failed`, `feed_near_full`,
+`feed_stalled`); `--profile` selects a `profiles:` overlay.
 
 The synthetic event uses the row `faucet-notify-test`, so its PagerDuty dedup
 key (`<pipeline>:faucet-notify-test`) never matches a real run's, and a

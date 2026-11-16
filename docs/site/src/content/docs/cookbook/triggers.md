@@ -12,6 +12,13 @@ This cookbook walks through three trigger types with worked examples. See the
 [Triggers reference](/faucet-stream/reference/triggers/) for the complete field reference,
 `${trigger.*}` token table, idempotency-key shapes, and metrics.
 
+:::note[A webhook that carries data]
+A webhook trigger starts a run; it does not keep what the request carried. If
+the sender pushes the data itself and cannot send it again, use a
+[feed](/faucet-stream/cookbook/feeds/): it stores every event before it
+answers and delivers it with its own retries.
+:::
+
 All examples use the file at
 [`cli/examples/triggers/triggers.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/triggers/triggers.yaml).
 

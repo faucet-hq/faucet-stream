@@ -1461,7 +1461,8 @@ pool_override: [private, gpu]
 A list of rules that fan pipeline lifecycle / health events out to Slack,
 PagerDuty, or a signed webhook. Events: `run_failure`, `run_success`,
 `sla_breach`, `circuit_open`, `contract_abort`, `dlq_threshold`,
-`scheduler_stuck`, `profile_drift`, `change_requested`, `budget_exceeded`. Fires from every runtime; delivery never
+`scheduler_stuck`, `profile_drift`, `change_requested`, `budget_exceeded`,
+`feed_near_full`, `feed_stalled` (both for [feeds](/faucet-stream/cookbook/feeds/) under `faucet serve`). Fires from every runtime; delivery never
 fails a run.
 
 ```yaml

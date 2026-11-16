@@ -17,7 +17,7 @@ list with a reason (#1004).
 | `faucet-governance.json` | `faucet-governance` | Quality checks, quarantines and aborts, contract violations, schema drift, PII masking, policy violations, column-profile drift / runs / baseline, rows unaccounted, non-finite values, verify runs / differences / ranges / duration, scoped-cleanup deletes and runs. |
 | `faucet-cost.json` | `faucet-cost` | Estimated cost vs the hosted-ELT equivalent (counters are thousandths of a currency unit, divided by 1000), budget refusals, usage bytes, source / sink bytes, cost signals, local-output retention, backend round trips and p95 by op, rate limits and retries on both sides. |
 | `faucet-schedule.json` | `faucet-schedule` | Scheduled runs by outcome, heartbeat staleness (alert at 90 s), next-tick countdown, lateness p95, overlap policy hits, consecutive-failure streak, time since the last run started / completed, config reloads. |
-| `faucet-serve.json` | `faucet-serve` | HTTP request rate/latency by path, run queue depth, terminal run statuses, history-degraded flag, idempotency replays, cluster membership + claim/reclaim rates, trigger health/fires/drops; pending runs by pool, trigger enqueues / coalescing / missed ticks / tenant failures, tenant runs and limit rejections, connections and connect flows, change requests, template sync / tests / revalidations, run-log persistence. |
+| `faucet-serve.json` | `faucet-serve` | HTTP request rate/latency by path, run queue depth, terminal run statuses, history-degraded flag, idempotency replays, cluster membership + claim/reclaim rates, trigger health/fires/drops; pending runs by pool, trigger enqueues / coalescing / missed ticks / tenant failures, tenant runs and limit rejections, connections and connect flows, change requests, template sync / tests / revalidations, run-log persistence; feeds (depth, delivery lag, runs by outcome, stalled and held deliveries, scheduler restarts). |
 
 Every dashboard has a **Data source** picker and a **Pipeline** template
 variable — import them anywhere.
@@ -55,6 +55,11 @@ exactly that (`examples/infra/grafana/`).
 | `FaucetServePoolRunsFailed` | runs failed with `pool_unavailable` in 1 h | warning |
 | `FaucetServeScheduleTicksMissed` | a schedule trigger skipped ticks in 1 h | warning |
 | `FaucetServeConnectionsNeedReauth` | a tenant connection needs re-authorization ≥15 m | warning |
+| `FaucetFeedDeliveryStalled` | a feed delivery stalled on one event ≥1 m | critical |
+| `FaucetFeedDeliveryHeld` | a feed has a held delivery ≥1 m | critical |
+| `FaucetFeedDeliveryLagging` | oldest undelivered event waited >10 m, for 10 m | warning |
+| `FaucetFeedNearFull` | a feed at ≥80% of its undelivered limits for 5 m | warning |
+| `FaucetFeedRunsFailing` | ≥3 delivery runs failed or were refused in 30 m | warning |
 | `FaucetServeTemplateSyncFailing` | a template sync origin failed in 1 h | warning |
 | `FaucetNotificationsFailing` | notification deliveries failed in 1 h | warning |
 | `FaucetOtelExportFailures` | OTLP exports failing | info |

@@ -168,6 +168,11 @@ Whenever schedule changes are gated (`run`, `schedule` or both), the server
 refuses to start when the principals in `--auth-config` could not meet one of
 the rules they need.
 
+A [feed](/faucet-stream/cookbook/feeds/#approvals) change follows the same
+two-rule model: under `--require-approval feed` it needs the `feed` rule, and
+under `--require-approval run` a change that adds or edits a delivery needs
+both `feed` and `run`, because a delivery starts runs.
+
 ## Making it mandatory
 
 ```bash
@@ -190,6 +195,14 @@ faucet serve --auth-config auth.yaml --require-approval run,template_launch
   fire per event would otherwise file one request per file or tick, and a
   rejected one would lose the event. Leave a pipeline out of `--triggers` if
   every run of it needs review.
+- `feed`: creating, editing or deleting a feed or one of its deliveries
+  (`POST`/`PUT`/`DELETE /v1/feeds…`) answers `202` with a pending change
+  request of kind `feed`. Under `run` alone, a feed change that adds or edits
+  a delivery is gated the same way, and an approved feed's deliveries then run
+  without a per-run request only while their template versions are pinned to
+  numbers; a delivery that follows a channel shows `needs_approval` and starts
+  no runs. Feeds in the server's `--feeds` file are a standing approval, like
+  the triggers file. Pausing, resuming and issuing tokens are not gated.
 - `template_register` / `template_launch`: those kinds must come through
   `POST /v1/changes`. `POST /v1/templates` (both kinds when it also launches or
   assigns channels), `/launch`, `/rollback`, `/tags` and a non-dry-run

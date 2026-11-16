@@ -416,6 +416,16 @@ helm install faucet-public  deploy/helm/faucet-stream -f deploy/helm/faucet-stre
 
 The two releases form one cluster: submit to either Service.
 
+### Feeds in a cluster
+
+[Feeds](/faucet-stream/cookbook/feeds/#clusters) work on every replica: any
+replica accepts events, every replica runs the delivery scheduler, and the
+feed store picks one run per range of events. The feed store must be
+PostgreSQL. With `--cluster` the server refuses to start with a `--feeds` file
+on a SQLite history or with a `--feed-store` that is a SQLite file. Every
+member needs the `feeds` feature; while a live member lacks it, creating a
+feed and starting delivery runs wait.
+
 ## Distributing one big source across workers (Mode B)
 
 Everything above is **Mode A**: whole *runs* pull-balance across instances, but a

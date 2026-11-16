@@ -54,6 +54,11 @@ Alert rules (`observability/prometheus/alerts.yml`):
 | `FaucetServePoolRunsFailed` | runs failed because no replica served their pool, in the last hour | warning |
 | `FaucetServeScheduleTicksMissed` | a schedule trigger skipped ticks in the last hour | warning |
 | `FaucetServeConnectionsNeedReauth` | a tenant connection needs re-authorization, for 15 m | warning |
+| `FaucetFeedDeliveryStalled` | a feed delivery is stalled on one event, for 1 m | critical |
+| `FaucetFeedDeliveryHeld` | a feed has a held delivery (a restored store), for 1 m | critical |
+| `FaucetFeedDeliveryLagging` | a delivery's oldest undelivered event has waited > 10 m, for 10 m | warning |
+| `FaucetFeedNearFull` | a feed is at 80% or more of its undelivered limits, for 5 m | warning |
+| `FaucetFeedRunsFailing` | three or more of a delivery's runs failed or were refused in 30 m | warning |
 | `FaucetServeTemplateSyncFailing` | a template sync origin failed in the last hour | warning |
 | `FaucetNotificationsFailing` | notification deliveries failed in the last hour | warning |
 | `FaucetOtelExportFailures` / `FaucetLineageEventsDropped` | telemetry/lineage export failing | info |

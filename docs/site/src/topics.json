@@ -333,6 +333,10 @@
           {
             "label": "Triggers",
             "slug": "reference/triggers"
+          },
+          {
+            "label": "Feeds",
+            "slug": "reference/feeds"
           }
         ]
       }
@@ -383,6 +387,10 @@
           {
             "label": "Schedules",
             "slug": "cookbook/schedules"
+          },
+          {
+            "label": "Feeds",
+            "slug": "cookbook/feeds"
           },
           {
             "label": "Orchestration",

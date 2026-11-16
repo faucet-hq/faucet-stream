@@ -147,6 +147,8 @@ Every `faucet serve` feature has a values block, so nothing needs raw
 | Values block | What it turns on |
 |---|---|
 | `serve.triggers` | event-driven triggers (`--triggers`) |
+| `serve.schedules` | schedules from a file (`--schedules`) |
+| `serve.feeds` | [feeds](/faucet-stream/cookbook/feeds/): the feeds file (`--feeds`), named feed stores, and `serve.feeds.listen` for an ingest-only port with its own Service and Ingress (`--feeds-listen`) |
 | `serve.templatesSync` | template hosting + sync (`--templates-sync`) |
 | `serve.policy` | data-flow policy on every submission (`--policy`) |
 | `serve.connectProviders` | hosted OAuth connect for tenants (`--connect-providers`) |
