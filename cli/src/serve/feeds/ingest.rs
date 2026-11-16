@@ -478,30 +478,68 @@ fn ack_of(events: Vec<Appended>) -> AppendAck {
     }
 }
 
+/// Whether `e` proves the append stored nothing and may hold for one
+/// request of a group only.
+fn refused_whole(e: &FeedError) -> bool {
+    matches!(e, FeedError::Full { .. })
+}
+
+fn group_failed(e: &FeedError) -> FeedError {
+    FeedError::Unavailable(format!(
+        "the append this request shared failed; whether it was stored is unknown: {e}"
+    ))
+}
+
 /// Append the requests of `jobs` in one store transaction and answer each.
-/// When the shared append is refused (one request would cross a limit),
-/// each request is appended on its own, so one sender's refusal is never
-/// another's.
+/// Only a refusal that stored nothing (a limit one request would cross)
+/// is tried again request by request; any other failure fails the group.
 async fn commit(store: &dyn FeedStore, uid: &FeedUid, label: &str, jobs: Vec<Job>) {
     let calls = store_calls();
+    commit_with(label, jobs, |events| store.append(&calls, uid, events)).await;
+}
+
+async fn commit_with<F, Fut>(label: &str, jobs: Vec<Job>, append: F)
+where
+    F: Fn(Vec<NewEvent>) -> Fut,
+    Fut: Future<Output = Result<AppendAck, FeedError>>,
+{
     metrics::append_group(label, jobs.len());
     if jobs.len() > 1 {
         let all: Vec<NewEvent> = jobs.iter().flat_map(|j| j.events.iter().cloned()).collect();
         let started = Instant::now();
-        if let Ok(ack) = store.append(&calls, uid, all).await {
-            metrics::append_duration(label, started.elapsed());
-            let mut events = ack.events.into_iter();
-            for job in jobs {
-                let own: Vec<Appended> = events.by_ref().take(job.events.len()).collect();
-                let _ = job.reply.send(Ok(ack_of(own)));
+        match append(all).await {
+            Ok(ack) => {
+                metrics::append_duration(label, started.elapsed());
+                let mut events = ack.events.into_iter();
+                for job in jobs {
+                    let own: Vec<Appended> = events.by_ref().take(job.events.len()).collect();
+                    let _ = job.reply.send(Ok(ack_of(own)));
+                }
+                return;
             }
-            return;
+            Err(e) if refused_whole(&e) => {}
+            Err(e) => {
+                for job in jobs {
+                    let _ = job.reply.send(Err(group_failed(&e)));
+                }
+                return;
+            }
         }
     }
+    let mut broken: Option<FeedError> = None;
     for job in jobs {
+        if let Some(e) = &broken {
+            let _ = job.reply.send(Err(group_failed(e)));
+            continue;
+        }
         let started = Instant::now();
-        let result = store.append(&calls, uid, job.events).await;
+        let result = append(job.events).await;
         metrics::append_duration(label, started.elapsed());
+        if let Err(e) = &result
+            && !refused_whole(e)
+        {
+            broken = Some(group_failed(e));
+        }
         let _ = job.reply.send(result.map(|a| ack_of(a.events)));
     }
 }
@@ -1733,6 +1771,80 @@ mod tests {
         );
         assert_eq!(without_token("a=1&tokens=2"), None);
         assert_eq!(without_token(""), None);
+    }
+
+    fn jobs(n: usize) -> (Vec<Job>, Vec<oneshot::Receiver<Result<AppendAck, FeedError>>>) {
+        (0..n)
+            .map(|i| {
+                let (reply, answer) = oneshot::channel();
+                let events = vec![NewEvent::new("text/plain", format!("e{i}").into_bytes())];
+                (Job { events, reply }, answer)
+            })
+            .unzip()
+    }
+
+    fn full() -> FeedError {
+        FeedError::Full {
+            feed: FeedUid::new("f1").unwrap(),
+            limit: faucet_common_feed::FullLimit::UndeliveredEvents,
+            max: 1,
+            actual: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_group_failure_fails_every_request_and_appends_nothing_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let (group, answers) = jobs(3);
+        commit_with("f", group, |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(FeedError::Unavailable("connection reset during commit".into())) }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "nothing is appended again");
+        for answer in answers {
+            assert!(matches!(answer.await.unwrap(), Err(FeedError::Unavailable(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_group_is_tried_request_by_request_until_a_store_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let (group, answers) = jobs(4);
+        commit_with("f", group, |events| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                match n {
+                    0 | 2 => Err(full()),
+                    1 => Ok(AppendAck {
+                        first_seq: None,
+                        last_seq: None,
+                        duplicates: 0,
+                        events: events
+                            .iter()
+                            .map(|_| Appended {
+                                id: "a".into(),
+                                seq: faucet_common_feed::Seq(1),
+                                duplicate: false,
+                            })
+                            .collect(),
+                    }),
+                    _ => Err(FeedError::Backend("timeout".into())),
+                }
+            }
+        })
+        .await;
+        let mut got = Vec::new();
+        for answer in answers {
+            got.push(answer.await.unwrap());
+        }
+        assert!(got[0].as_ref().is_ok_and(|a| a.stored() == 1));
+        assert!(matches!(got[1], Err(FeedError::Full { .. })));
+        assert!(matches!(got[2], Err(FeedError::Backend(_))));
+        assert!(matches!(got[3], Err(FeedError::Unavailable(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "the last request is not tried");
     }
 
     #[test]
