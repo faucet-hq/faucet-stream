@@ -114,11 +114,14 @@ fn not_cluster_safe(name: &str) -> String {
     )
 }
 
+/// One store's slot: opened once, by whoever asks first.
+type Cell = Arc<tokio::sync::OnceCell<Arc<dyn FeedStore>>>;
+
 /// The stores of one server: targets by name, opened on first use.
 pub struct Stores {
     targets: BTreeMap<String, StoreTarget>,
     cluster: bool,
-    open: tokio::sync::Mutex<BTreeMap<String, Arc<dyn FeedStore>>>,
+    cells: Mutex<BTreeMap<String, Cell>>,
     opened: Mutex<BTreeMap<String, Arc<dyn FeedStore>>>,
     locks: Mutex<Vec<std::fs::File>>,
 }
@@ -146,7 +149,7 @@ impl Stores {
         Self {
             targets,
             cluster,
-            open: tokio::sync::Mutex::new(BTreeMap::new()),
+            cells: Mutex::new(BTreeMap::new()),
             opened: Mutex::new(BTreeMap::new()),
             locks: Mutex::new(Vec::new()),
         }
@@ -187,22 +190,35 @@ impl Stores {
     /// Use `store` as the store named `name` (tests, and a host that builds
     /// its own).
     pub async fn install(&self, name: &str, store: Arc<dyn FeedStore>) {
-        self.open
+        let cell = Cell::default();
+        let _ = cell.set(store.clone());
+        self.cells
             .lock()
-            .await
-            .insert(name.to_string(), store.clone());
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.to_string(), cell);
         self.opened
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(name.to_string(), store);
     }
 
-    /// The store named `name`, opened on first use. `Err` is user-facing.
+    /// The store named `name`, opened on first use; callers asking for the
+    /// same store share one open, and another store's open never waits on
+    /// it. `Err` is user-facing.
     pub async fn get(&self, name: &str) -> Result<Arc<dyn FeedStore>, String> {
-        let mut open = self.open.lock().await;
-        if let Some(s) = open.get(name) {
-            return Ok(s.clone());
-        }
+        let cell = self
+            .cells
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(name.to_string())
+            .or_default()
+            .clone();
+        cell.get_or_try_init(|| self.open_named(name))
+            .await
+            .cloned()
+    }
+
+    async fn open_named(&self, name: &str) -> Result<Arc<dyn FeedStore>, String> {
         if let Some(why) = self.refusal(name) {
             return Err(why);
         }
@@ -214,7 +230,6 @@ impl Stores {
         if self.cluster && !store.capabilities().cluster_safe {
             return Err(not_cluster_safe(name));
         }
-        open.insert(name.to_string(), store.clone());
         self.opened
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
