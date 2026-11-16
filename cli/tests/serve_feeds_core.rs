@@ -702,19 +702,6 @@ async fn a_failing_sink_halves_the_batch_until_one_event_stalls_and_a_skip_moves
         )
         .contains("needs a reason")
     );
-    std::fs::remove_file(&blocker).unwrap();
-    let moved = service::skip(
-        &srv.state,
-        &admin(),
-        None,
-        "orders",
-        "lake",
-        None,
-        "event 1 is malformed",
-    )
-    .await
-    .unwrap();
-    assert_eq!((moved.from, moved.to), (1, 2));
     assert!(
         message(
             service::skip(&srv.state, &admin(), None, "orders", "lake", Some(99), "x")
@@ -731,6 +718,19 @@ async fn a_failing_sink_halves_the_batch_until_one_event_stalls_and_a_skip_moves
         )
         .contains("a skip goes forward")
     );
+    std::fs::remove_file(&blocker).unwrap();
+    let moved = service::skip(
+        &srv.state,
+        &admin(),
+        None,
+        "orders",
+        "lake",
+        None,
+        "event 1 is malformed",
+    )
+    .await
+    .unwrap();
+    assert_eq!((moved.from, moved.to), (1, 2));
     let detail = service::get(&srv.state, &admin(), None, "orders")
         .await
         .unwrap();
@@ -970,6 +970,81 @@ async fn a_feed_source_runs_only_as_a_delivery() {
         )
         .contains("another store")
     );
+}
+
+/// A recovered claim whose run finished before any scheduler looked at it
+/// is recorded as delivered: progress is measured from the claim's start,
+/// which the run's own record keeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovered_claim_whose_run_already_finished_is_recorded_as_delivered() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut srv = Srv::start(root, &[]).await;
+    srv.state.feeds().stop_scheduling();
+    register(&srv.state, "orders_lake", &root.join("state")).await;
+    let out = root.join("lake.jsonl");
+    service::create(
+        &srv.state,
+        &admin(),
+        None,
+        feed_spec("orders", json!([delivery("lake", "orders_lake", &out)])),
+    )
+    .await
+    .unwrap();
+    srv.append("orders", 1..=2).await;
+    let rt = srv.state.feeds();
+    let found = service::find(&srv.state, None, "orders").await.unwrap();
+    let dref = found.feed.delivery("lake").unwrap().clone();
+    let (store, _) = srv.store("orders").await;
+    let claim = store
+        .claim(
+            &store_calls(),
+            &dref.uid,
+            Seq(1),
+            Seq(3),
+            rt.owner(),
+            runner::CLAIM_TTL,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let binding = FeedBinding::new(
+        dref.uid.clone(),
+        claim.epoch,
+        claim.id.clone(),
+        claim.from,
+        claim.to,
+        "default",
+    );
+    let run_id = runner::submit(
+        &srv.state,
+        &rt,
+        &found.feed,
+        &found.feed.spec.deliveries[0],
+        &binding,
+    )
+    .await
+    .unwrap();
+    let history = srv.state.history();
+    let ended = || async {
+        let rec = history.get(&run_id).await.unwrap().unwrap();
+        rec.status.is_terminal()
+    };
+    for _ in 0..600 {
+        if ended().await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ended().await, "the run ends");
+
+    let done = srv.delivered("orders", "lake", 3).await;
+    let last = done.status.last_run.unwrap();
+    assert_eq!(last.outcome, "delivered");
+    assert_eq!((last.from, last.to), (1, 3));
+    assert_eq!(last.run_id.as_deref(), Some(run_id.as_str()));
+    assert_eq!(done.status.consecutive_failures, 0);
+    assert_eq!(ids(&out), vec![1, 2]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2554,7 +2629,7 @@ async fn a_transient_submit_refusal_backs_off_and_does_not_count_as_failing() {
     for _ in 0..8 {
         let pos = srv
             .until("orders", "lake", false, "a refused submit", |p| {
-                p.status.backoff_until.is_some() && p.status.claim.is_none()
+                p.status.backoff_until.is_some() && p.status.claim.is_none() && !p.claimed
             })
             .await;
         assert_eq!(pos.cursor, 1);
@@ -3085,6 +3160,7 @@ async fn a_defined_delivery_without_a_store_position_is_set_up_by_the_scheduler(
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let mut srv = Srv::start(root, &[]).await;
+    srv.state.feeds().stop_scheduling();
     register(&srv.state, "orders_lake", &root.join("state")).await;
     let out = root.join("lake.jsonl");
     let mut lake = delivery("lake", "orders_lake", &out);
@@ -3314,6 +3390,40 @@ async fn delivered_events_kept_for_replay_do_not_count_as_undelivered() {
 /// One call lists the server's feeds and every tenant's for a principal
 /// that is not confined to a tenant, a page at a time; a tenant's principal
 /// asking for everything still gets its own.
+/// A reload that started before a feed was made never replaces the reload
+/// that saw it: once `create` returns, the server knows the feed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reload_in_flight_never_hides_a_feed_just_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &[]).await;
+    srv.state.feeds().stop_scheduling();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let reloads: Vec<_> = (0..8)
+        .map(|_| {
+            let (state, stop) = (srv.state.clone(), stop.clone());
+            tokio::spawn(async move {
+                while !stop.is_cancelled() {
+                    state.feeds().refresh(&state).await.unwrap();
+                }
+            })
+        })
+        .collect();
+    for i in 0..150 {
+        let name = format!("f{i}");
+        service::create(&srv.state, &admin(), None, feed_spec(&name, json!([])))
+            .await
+            .unwrap();
+        assert!(
+            srv.state.feeds().snapshot().feed(None, &name).is_some(),
+            "feed {name} is known as soon as it is made"
+        );
+    }
+    stop.cancel();
+    for task in reloads {
+        task.await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_tenants_feeds_are_listed_in_one_paged_call() {
     let dir = tempfile::tempdir().unwrap();

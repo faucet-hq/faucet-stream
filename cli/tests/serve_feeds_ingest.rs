@@ -1530,6 +1530,8 @@ async fn a_server_that_never_read_its_definitions_answers_503_not_401() {
         scheduler: Scheduler::default(),
         client: reqwest::Client::new(),
     };
+    // No scheduler: only a request reloads the definitions in this test.
+    srv.state.feeds().stop_scheduling();
     let (_, token) = srv
         .feed(json!({"name": "orders", "ingest": {"auth": {"tokens": "managed"}}}))
         .await;

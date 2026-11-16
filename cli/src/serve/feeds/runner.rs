@@ -751,6 +751,14 @@ async fn check_step(state: &ServerState, rt: &FeedsRuntime, w: &Work) -> Option<
         }
         return finish(state, w, &live, &Outcome::ClaimLost).await;
     };
+    let mut live = live;
+    if let Some(b) = rec
+        .as_ref()
+        .and_then(|r| r.feed.as_ref())
+        .filter(|b| b.claim == live.id)
+    {
+        (live.from, live.to) = (b.from, b.to);
+    }
     if let Some(r) = rec.as_ref().filter(|r| !r.status.is_terminal()) {
         if claim_live
             && let Ok(id) = ClaimId::new(live.id.clone())
@@ -789,7 +797,6 @@ async fn check_step(state: &ServerState, rt: &FeedsRuntime, w: &Work) -> Option<
         .find(|d| d.delivery == w.uid)
         .map(|d| d.cursor)?;
     let moved = cursor > Seq(live.from);
-    let mut live = live;
     let outcome = match &rec {
         Some(r) => {
             live.run_id = Some(r.run_id.clone());

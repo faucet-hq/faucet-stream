@@ -347,6 +347,7 @@ pub struct FeedsRuntime {
     stop_after: AtomicU8,
     changed: Arc<tokio::sync::Notify>,
     last_refresh: tokio::sync::Mutex<Option<Instant>>,
+    refreshing: tokio::sync::Mutex<()>,
     readiness: Mutex<Readiness>,
     bytes: Mutex<HashMap<String, (FeedBytes, Instant)>>,
     guarantees: Mutex<HashMap<String, (String, Instant)>>,
@@ -380,6 +381,7 @@ impl FeedsRuntime {
             stop_after: AtomicU8::new(0),
             changed: Arc::new(tokio::sync::Notify::new()),
             last_refresh: tokio::sync::Mutex::new(None),
+            refreshing: tokio::sync::Mutex::new(()),
             readiness: Mutex::new(Readiness::default()),
             bytes: Mutex::new(HashMap::new()),
             guarantees: Mutex::new(HashMap::new()),
@@ -398,8 +400,14 @@ impl FeedsRuntime {
     /// A runtime that never starts the scheduler: the `faucet feed` verbs
     /// change definitions and positions and leave delivering to a server.
     pub fn offline(self) -> Self {
-        self.scheduling.store(false, Ordering::Release);
+        self.stop_scheduling();
         self
+    }
+
+    /// Never start the scheduler on this runtime from here on; one already
+    /// running keeps running.
+    pub fn stop_scheduling(&self) {
+        self.scheduling.store(false, Ordering::Release);
     }
 
     /// Stop every removal after `step` (`None`: run them through). For
@@ -605,8 +613,10 @@ impl FeedsRuntime {
         Ok(snapshot)
     }
 
-    /// Reload the definitions from the run history and the file.
+    /// Reload the definitions from the run history and the file. Reloads
+    /// run one at a time, so an older read never replaces a newer one.
     pub async fn refresh(&self, state: &ServerState) -> Result<Arc<Snapshot>, String> {
+        let _one_at_a_time = self.refreshing.lock().await;
         let history = state.history();
         if history.degraded() {
             return Err("the run history is unreachable".into());
