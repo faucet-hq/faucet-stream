@@ -438,6 +438,12 @@ The shipped rules (`observability/prometheus/alerts.yml`, group
 | `FaucetFeedDeliveryLagging` | The oldest undelivered event has waited more than 10 minutes, for 10 minutes | warning |
 | `FaucetFeedNearFull` | `faucet_feed_undelivered_ratio >= 0.8` for 5 minutes | warning |
 | `FaucetFeedRunsFailing` | Three or more runs failed or were refused in 30 minutes | warning |
+| `FaucetFeedStoreErrors` | `faucet_feed_store_errors_total` kept growing for 5 minutes: appends to the feed's store fail and senders get `503` | critical |
+| `FaucetFeedIngestErrors` | More than 5% of a feed's ingest requests were answered with a `5xx` over 5 minutes | warning |
+| `FaucetFeedIngestRefusals` | More than 20% of a feed's ingest requests were refused for one sender-side reason (`unauthorized`, `malformed`, `too_large`, `content_type`, `content_encoding`, `rate_limited`, `tenant_rate_limited`, `timeout`) over 15 minutes | warning |
+
+The two ingest alerts carry an empty `feed` label for requests no feed
+admitted (an unknown feed or a credential no feed accepts).
 
 ### `/readyz`
 

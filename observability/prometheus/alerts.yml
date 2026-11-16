@@ -527,3 +527,48 @@ groups:
             Three or more runs failed or could not start in the last half
             hour. The batch shrinks after each failure; if a single event
             keeps failing the delivery stalls.
+
+      - alert: FaucetFeedStoreErrors
+        expr: sum by (feed) (increase(faucet_feed_store_errors_total[10m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "the store of feed {{ $labels.feed }} is failing"
+          description: >-
+            Appends to the feed's store have been failing for five minutes or
+            more, so senders get 503 and retry. Nothing acknowledged is lost.
+            Check the feed store (the database or the disk under `feeds.db`)
+            and `/readyz`, whose `feeds.store_ok` says the same.
+
+      - alert: FaucetFeedIngestErrors
+        expr: |
+          sum by (feed) (rate(faucet_feed_ingest_requests_total{status=~"5.."}[5m]))
+            / sum by (feed) (rate(faucet_feed_ingest_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "feed {{ $labels.feed }} answers more than 5% of its ingest requests with a 5xx"
+          description: >-
+            Senders are told to retry: the feed is full, its store is failing,
+            the server is at its ingest concurrency limit, or it cannot read
+            its feed definitions. `faucet_feed_ingest_refused_total` gives
+            the reason. An empty `feed` label is requests no feed admitted.
+
+      - alert: FaucetFeedIngestRefusals
+        expr: |
+          sum by (feed, reason) (rate(faucet_feed_ingest_refused_total{reason=~"unauthorized|malformed|too_large|content_type|content_encoding|rate_limited|tenant_rate_limited|timeout"}[15m]))
+            / on (feed) group_left sum by (feed) (rate(faucet_feed_ingest_requests_total[15m])) > 0.2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "feed {{ $labels.feed }} refuses more than 20% of its ingest requests ({{ $labels.reason }})"
+          description: >-
+            A sender keeps sending requests the feed will not take: a wrong or
+            revoked credential, a body that does not parse or is too large, a
+            content type or encoding the feed does not accept, or more than
+            its rate limit. The feed's refusals listing shows the sender
+            address and the message. An empty `feed` label is requests for an
+            unknown feed or with a credential no feed accepts.

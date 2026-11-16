@@ -509,7 +509,8 @@ Delivery runs go through the usual claim loop and
 the feed's gaps, its tokens and its change log. `GET /v1/feeds/{name}/refusals`
 lists the requests the server refused lately, with the reason. `/readyz` has a
 `feeds` section, and the shipped alerts cover a stalled or held delivery, a
-lagging one, a feed close to full and repeated failed runs.
+lagging one, a feed close to full, repeated failed runs, a failing feed store
+and a feed that answers many ingest requests with a `5xx` or a refusal.
 See [metrics and alerts](/faucet-stream/reference/feeds/#metrics).
 
 The `faucet feed` command manages feeds straight in their stores, without a
