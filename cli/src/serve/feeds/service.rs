@@ -938,7 +938,7 @@ pub fn check_rows(loaded: &crate::serve::load::LoadedSubmission) -> Result<(), S
             loaded.nodes.len()
         ));
     };
-    if node.source.kind != crate::runtime::server::FEED_SOURCE_KIND {
+    if node.source.kind != crate::executor::FEED_KIND {
         return Err(format!(
             "a delivery's pipeline must read the feed (`source: {{type: feed}}`); row '{}' \
              reads `{}`",

@@ -119,7 +119,7 @@ impl std::fmt::Debug for FeedRun {
 }
 
 /// The connector kind of the `feed` source.
-const FEED_KIND: &str = "feed";
+pub const FEED_KIND: &str = "feed";
 
 /// Hold a run to its [`FeedRun`]: an ordinary server run has no `feed`
 /// source, and a delivery run is exactly one root row reading the feed.

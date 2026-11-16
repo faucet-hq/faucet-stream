@@ -3100,3 +3100,59 @@ async fn a_defined_delivery_without_a_store_position_is_set_up_by_the_scheduler(
     srv.delivered("orders", "lake", 3).await;
     assert_eq!(ids(&out), [1, 2]);
 }
+
+/// A delivery's dead-lettered records are replayed through its own config:
+/// the replay swaps the `feed` source for the DLQ, so nothing reads a feed.
+/// The same config still cannot be run, and may not name a store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deliverys_dlq_is_replayed_through_its_feed_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let srv = Srv::start(root, &[]).await;
+    let (out, dlq) = (root.join("lake.jsonl"), root.join("dlq.jsonl"));
+    let envelope = |id: u64| {
+        json!({
+            "error": {"kind": "Sink", "message": "boom"}, "reason": "sink_error",
+            "payload": {"id": id}, "ts_ms": 1_751_760_000_000i64,
+            "sink": "file", "pipeline": "orders_lake", "row": "", "record_index": 0,
+        })
+        .to_string()
+    };
+    std::fs::write(&dlq, format!("{}\n{}\n", envelope(1), envelope(2))).unwrap();
+    let config = |source: &str| {
+        format!(
+            "version: 1\nname: orders_lake\npipeline:\n  source: {source}\n  sink: {{ type: file, config: {{ path: \"{}\", format: json_lines, if_exists: append }} }}\n  dlq:\n    sink: {{ type: file, config: {{ path: \"{}\", format: json_lines, if_exists: append }} }}\n",
+            out.display(),
+            dlq.display()
+        )
+    };
+    let principal = faucet_cli::runtime::Principal::caller(&srv.state, admin());
+    let replay = |config: String| {
+        let req = serde_json::from_value(json!({
+            "config": config, "from": dlq.display().to_string(), "all_rows": true,
+            "failed_dlq": root.join("failed.jsonl").display().to_string()
+        }))
+        .unwrap();
+        faucet_cli::runtime::server::replay_dlq(&srv.state, &principal, req)
+    };
+    let done = replay(config("{ type: feed }")).await.unwrap();
+    assert_eq!(done["records_written"], 2, "{done}");
+    assert_eq!(ids(&out), [1, 2]);
+
+    let placed = replay(config(
+        "{ type: feed, config: { store: /tmp/other.db, feed: f, delivery: d } }",
+    ))
+    .await
+    .unwrap_err();
+    assert!(message(placed).contains("may not set"));
+    let req = serde_json::from_value(json!({"config": config("{ type: feed }")})).unwrap();
+    let run = faucet_cli::runtime::server::submit(
+        &srv.state,
+        &principal,
+        req,
+        faucet_cli::runtime::server::Approval::Required,
+    )
+    .await
+    .unwrap_err();
+    assert!(message(run).contains("runs only as a delivery of a feed"));
+}

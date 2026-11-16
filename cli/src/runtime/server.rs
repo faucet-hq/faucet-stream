@@ -34,6 +34,9 @@ pub struct Submission<'a> {
     /// The run is (or was) a feed delivery bound to a claimed range, so a
     /// `feed` source in its config is expected whoever passes the config.
     pub feed_bound: bool,
+    /// The operation never reads the config's source (a plan, a DLQ replay,
+    /// which swaps it), so an unbound `feed` source in it is harmless.
+    pub source_unread: bool,
 }
 
 impl<'a> Submission<'a> {
@@ -47,7 +50,14 @@ impl<'a> Submission<'a> {
             policy_pin: None,
             name_suffix: None,
             feed_bound: false,
+            source_unread: false,
         }
+    }
+
+    /// For an operation that never reads the config's source.
+    pub fn without_reading_source(mut self) -> Self {
+        self.source_unread = true;
+        self
     }
 
     /// As the feed delivery a run record or request describes (#1034): its
@@ -207,17 +217,26 @@ pub async fn load(
     if let Some(suffix) = sub.name_suffix {
         loaded.cfg.name = Some(delivery_pipeline_name(loaded.cfg.name.as_deref(), suffix));
     }
-    if principal.caller_body()
-        && !sub.feed_bound
-        && loaded
-            .nodes
-            .iter()
-            .any(|n| n.source.kind == FEED_SOURCE_KIND)
-    {
-        return Err(ServeError::Unprocessable {
-            message: FEED_SOURCE_REFUSAL.to_string(),
-            details: None,
-        });
+    if principal.caller_body() && !sub.feed_bound {
+        let feeds = || loaded.nodes.iter().filter(|n| n.source.kind == FEED_KIND);
+        let names_a_store = |n: &crate::expand::ExpandedNode| {
+            FEED_PLACE_FIELDS
+                .iter()
+                .any(|f| n.source.config.get(f).is_some_and(|v| !v.is_null()))
+        };
+        let message = if !sub.source_unread && feeds().next().is_some() {
+            Some(FEED_SOURCE_REFUSAL)
+        } else if feeds().any(names_a_store) {
+            Some(FEED_PLACE_REFUSAL)
+        } else {
+            None
+        };
+        if let Some(message) = message {
+            return Err(ServeError::Unprocessable {
+                message: message.to_string(),
+                details: None,
+            });
+        }
     }
     if principal.caller_body() {
         let policy =
@@ -259,7 +278,14 @@ pub async fn load(
 }
 
 /// The connector kind of the `feed` source.
-pub const FEED_SOURCE_KIND: &str = "feed";
+pub use crate::executor::FEED_KIND;
+
+/// The `feed` source's fields that say where to read; only `faucet run` sets them.
+const FEED_PLACE_FIELDS: &[&str] = &["store", "feed", "delivery"];
+
+/// The refusal of a submitted config whose `feed` source names its own store.
+pub const FEED_PLACE_REFUSAL: &str = "a `feed` source in a config sent to the server may not set \
+     `store`, `feed` or `delivery`: the server binds a delivery to its feed";
 
 /// The refusal of a submitted config that reads a feed (#1034).
 pub const FEED_SOURCE_REFUSAL: &str = "a `feed` source runs only as a delivery of a feed: the      server binds it to a claimed range of events. Add this pipeline as a delivery of the feed      (a registered template), or run it with `faucet run` against the feed's store";
@@ -970,7 +996,7 @@ pub async fn plan(
     let loaded = load(
         state,
         principal,
-        Submission::new(&req.config, req.config_format.into()),
+        Submission::new(&req.config, req.config_format.into()).without_reading_source(),
     )
     .await?;
     loaded.require_matrix()?;
@@ -1420,7 +1446,7 @@ pub async fn replay_dlq(
     let admitted = admit(
         state,
         &principal,
-        Submission::new(&req.config, req.config_format.into()),
+        Submission::new(&req.config, req.config_format.into()).without_reading_source(),
         Gates {
             policy: !req.dry_run,
             budget: None,
