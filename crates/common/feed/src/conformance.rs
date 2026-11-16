@@ -1221,6 +1221,37 @@ pub async fn bound_seq_at_and_heads(backend: &dyn Backend) {
         );
     }
 
+    if let Some(hourly) = f
+        .store
+        .hourly_counts(&f.calls, &feed, 24)
+        .await
+        .expect("hourly_counts")
+    {
+        assert_eq!(hourly.len(), 24, "one count per hour, oldest first");
+        assert_eq!(hourly[23], 5, "everything was stored in the last hour");
+        assert_eq!(hourly.iter().sum::<u64>(), 5);
+    }
+    let empty = f.feed(StoreLimits::new()).await;
+    if let Some(newest) = f
+        .store
+        .newest_received(&f.calls, &[feed.clone(), empty.clone()])
+        .await
+        .expect("newest_received")
+    {
+        let last = f
+            .store
+            .read(&f.calls, &feed, Seq(5), Seq(6))
+            .await
+            .expect("read")
+            .events[0]
+            .received_at;
+        assert_eq!(
+            newest,
+            vec![(feed.clone(), last)],
+            "a feed with no event is left out"
+        );
+    }
+
     let before = f.head(&feed).await.now;
     f.wait(Duration::from_millis(50)).await;
     let between = f.head(&feed).await.now;

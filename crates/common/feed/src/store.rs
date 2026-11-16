@@ -92,6 +92,31 @@ pub trait FeedStore: Send + Sync {
         Ok(None)
     }
 
+    /// Retained events stored in each of the last `hours` hours by the
+    /// store's clock, oldest hour first, in one query. `None`: the backend
+    /// cannot say.
+    async fn hourly_counts(
+        &self,
+        calls: &CallContext,
+        feed: &FeedUid,
+        hours: u32,
+    ) -> Result<Option<Vec<u64>>> {
+        let _ = (calls, feed, hours);
+        Ok(None)
+    }
+
+    /// When the newest retained event of each of `feeds` was received, in
+    /// one query; a feed with no event is left out. `None`: the backend
+    /// cannot say.
+    async fn newest_received(
+        &self,
+        calls: &CallContext,
+        feeds: &[FeedUid],
+    ) -> Result<Option<Vec<(FeedUid, Timestamp)>>> {
+        let _ = (calls, feeds);
+        Ok(None)
+    }
+
     /// Claim `[expected_cursor, to)` for `ttl`. `None` when the cursor moved,
     /// another claim is live, or `to` is past the watermark: exactly one of
     /// several concurrent claimers wins.

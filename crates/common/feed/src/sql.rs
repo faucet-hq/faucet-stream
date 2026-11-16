@@ -1207,6 +1207,67 @@ macro_rules! impl_feed_store {
                 Ok(Some(u64::try_from(bytes).unwrap_or(0)))
             }
 
+            async fn do_hourly_counts(
+                &self,
+                feed: &$crate::FeedUid,
+                hours: u32,
+            ) -> $crate::Result<Option<Vec<u64>>> {
+                use sqlx::Row;
+                use $crate::sql::{count_of, stmt};
+                let hours = hours.clamp(1, 24 * 31);
+                let rows = sqlx::query(stmt!(
+                    Self::D,
+                    "SELECT CAST(({now} - stored_at) / 3600000 AS BIGINT), \
+                     CAST(COUNT(*) AS BIGINT) FROM faucet_feed_events \
+                     WHERE feed = ? AND lane = 0 AND stored_at > {now} - ? GROUP BY 1"
+                ))
+                .bind(feed.as_str())
+                .bind(i64::from(hours) * 3_600_000)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(Self::be)?;
+                let mut counts = vec![0u64; hours as usize];
+                for row in rows {
+                    let ago: i64 = row.try_get(0).map_err(Self::be)?;
+                    let n: i64 = row.try_get(1).map_err(Self::be)?;
+                    let ago = usize::try_from(ago.max(0)).unwrap_or(usize::MAX);
+                    if let Some(slot) = (hours as usize)
+                        .checked_sub(1 + ago)
+                        .and_then(|i| counts.get_mut(i))
+                    {
+                        *slot += count_of(n);
+                    }
+                }
+                Ok(Some(counts))
+            }
+
+            async fn do_newest_received(
+                &self,
+                feeds: &[$crate::FeedUid],
+            ) -> $crate::Result<Option<Vec<($crate::FeedUid, $crate::Timestamp)>>> {
+                use sqlx::Row;
+                use $crate::sql::{placeholders, time_of};
+                let mut out = Vec::new();
+                for feeds in feeds.chunks($crate::sql::HEADS_CHUNK) {
+                    let sql = Self::D.render(&format!(
+                        "SELECT e.feed, e.received_at FROM faucet_feed_events e \
+                         JOIN faucet_feed_heads h ON h.feed = e.feed AND h.head = e.seq \
+                         WHERE e.lane = 0 AND e.feed IN ({})",
+                        placeholders(feeds.len())
+                    ));
+                    let mut query = sqlx::query(&sql);
+                    for feed in feeds {
+                        query = query.bind(feed.as_str());
+                    }
+                    for row in query.fetch_all(&self.pool).await.map_err(Self::be)? {
+                        let feed: String = row.try_get(0).map_err(Self::be)?;
+                        let at: i64 = row.try_get(1).map_err(Self::be)?;
+                        out.push(($crate::FeedUid::new(feed)?, time_of(at)?));
+                    }
+                }
+                Ok(Some(out))
+            }
+
             async fn do_claim(
                 &self,
                 delivery: &$crate::DeliveryUid,
@@ -1795,6 +1856,27 @@ macro_rules! impl_feed_store {
                 from: $crate::Seq,
             ) -> $crate::Result<Option<u64>> {
                 $crate::sql::each(calls, "bytes_from", || self.do_bytes_from(feed, from)).await
+            }
+
+            async fn hourly_counts(
+                &self,
+                calls: &faucet_core::io::CallContext,
+                feed: &$crate::FeedUid,
+                hours: u32,
+            ) -> $crate::Result<Option<Vec<u64>>> {
+                $crate::sql::each(calls, "hourly_counts", || {
+                    self.do_hourly_counts(feed, hours)
+                })
+                .await
+            }
+
+            async fn newest_received(
+                &self,
+                calls: &faucet_core::io::CallContext,
+                feeds: &[$crate::FeedUid],
+            ) -> $crate::Result<Option<Vec<($crate::FeedUid, $crate::Timestamp)>>> {
+                $crate::sql::each(calls, "newest_received", || self.do_newest_received(feeds))
+                    .await
             }
 
             async fn claim(
