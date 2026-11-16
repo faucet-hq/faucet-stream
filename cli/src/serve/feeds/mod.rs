@@ -162,10 +162,9 @@ pub struct Snapshot {
 
 impl Default for Snapshot {
     fn default() -> Self {
-        Self {
-            loaded: false,
-            ..Self::new(Vec::new(), Vec::new(), HashMap::new())
-        }
+        let mut never_read = Self::new(Vec::new(), Vec::new(), HashMap::new());
+        never_read.loaded = false;
+        never_read
     }
 }
 

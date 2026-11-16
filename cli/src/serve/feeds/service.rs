@@ -617,6 +617,19 @@ fn event_view(
     }
 }
 
+/// Which events a page of the browser holds.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EventsWindow {
+    /// The events before this one (default: the newest).
+    pub before: Option<u64>,
+    /// The events from this one on instead.
+    pub from: Option<u64>,
+    /// The events from the first one stored at or after this time on.
+    pub at: Option<DateTime<Utc>>,
+    /// At most this many (default 50, at most [`MAX_EVENTS_PAGE`]).
+    pub limit: Option<u64>,
+}
+
 /// A page of a feed's retained events without their payloads, newest first:
 /// the `limit` events before `before` (default: the newest), or, with
 /// `from` (or `at`, the first event stored at or after that time), the
@@ -626,11 +639,14 @@ pub async fn events(
     actor: &AuthContext,
     tenant: Option<&str>,
     name: &str,
-    before: Option<u64>,
-    from: Option<u64>,
-    at: Option<DateTime<Utc>>,
-    limit: Option<u64>,
+    window: EventsWindow,
 ) -> Result<EventsPage, ServeError> {
+    let EventsWindow {
+        before,
+        from,
+        at,
+        limit,
+    } = window;
     let tenant = scope(actor, tenant)?;
     let found = find(state, tenant.as_deref(), name).await?;
     let feed = &found.feed;

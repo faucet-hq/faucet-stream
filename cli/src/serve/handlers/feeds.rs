@@ -638,10 +638,12 @@ pub async fn events(
         &actor,
         q.tenant.as_deref(),
         &name,
-        q.before,
-        q.from,
-        q.at,
-        q.limit,
+        service::EventsWindow {
+            before: q.before,
+            from: q.from,
+            at: q.at,
+            limit: q.limit,
+        },
     )
     .await
     .map(Json)
