@@ -49,10 +49,10 @@
   const actions = ({ file = false } = {}) => file
     ? btn('Send test event', { icon: 'play', act: true })
     : `${btn('Send test event', { icon: 'play', act: true })}${btn('Edit', { icon: 'edit', act: true })}${ibtn('more', { act: true })}`;
-  const sendCard = ({ name = 'support-tickets', tenant = '', auth = 'token + signature', sig = 'X-Signature-256' } = {}) => card({
+  const sendCard = ({ name = 'support-tickets', tenant = '', auth = 'token + signature', sig = 'X-Signature-256', dedupe = true } = {}) => card({
     icon: 'link', title: 'Send events here', right: lnk('how senders connect'),
     body: `<div class="pad" style="padding-bottom:6px">${input(`<span class="faint">POST</span>&nbsp; ${url(name, tenant)}${cpi()}`, { mono: true })}</div>
-      ${grid(4, [kv('Sign-in', auth, sig ? `signature header <span class="mono">${sig}</span>` : 'write-only feed token'), kv('Accepts', 'JSON, NDJSON', 'up to 1 MiB per event'), kv('Duplicates', '<span class="mono">X-Event-Id</span>', 'same id within 24h is stored once'), kv('Answers', '202 once stored', 'never before the event is durable')])}`,
+      ${grid(4, [kv('Sign-in', auth, sig ? `signature header <span class="mono">${sig}</span>` : 'write-only feed token'), kv('Accepts', 'JSON, NDJSON', 'up to 1 MiB per event'), dedupe ? kv('Duplicates', '<span class="mono">X-Event-Id</span>', 'same id within 24h is stored once') : kv('Duplicates', 'stored again', 'no duplicate key'), kv('Answers', '202 once stored', 'never before the event is durable')])}`,
     note: 'A feed token can only add events to this feed. It cannot read events, start runs or reach any other part of the server.',
   });
   const flowCard = ({ rec = '41,208', del = '40,896', pend = '312', ref = '96', pts = [22, 30, 28, 41, 36, 52, 47, 60, 44, 38, 51, 49, 63, 58, 40, 46], pendCls = '' } = {}) => card({
@@ -77,7 +77,19 @@
   const overview = () => `${dhead(dtab('Overview'), actions(), 'Feeds')}${ticketsHead()}
     ${sendCard()}<div class="two"><div class="stack">${flowCard()}</div><div class="stack">${storeCard()}</div></div>${delivCard()}`;
 
+  const delivSwitch = (on) => `<div><span class="seg">${['to-warehouse', 'to-search'].map((n) => `<span class="${n === on ? 'on' : ''}">${n}</span>`).join('')}</span></div>`;
+  const settingUp = () => `${dhead(dtab('Deliveries'), `${btn('Deliver now', { icon: 'play', act: true })}${btn('Pause', { icon: 'pause', act: true })}${btn('Edit', { icon: 'edit', act: true })}${ibtn('more', { act: true })}`, 'support-tickets')}
+    ${delivSwitch('to-search')}
+    ${head('to-search', [pill('Setting up', '', 'clock'), `<span>runs ${lnk('faucet-hq/events-to-index')} <span class="mono">stable</span></span>`, '<span>at least once</span>'])}
+    <div class="two"><div class="stack">
+      ${card({ icon: 'feed', title: 'Position', body: grid(4, [kv('Delivered to', '—', 'the cursor'), kv('Newest event', '<span class="mono">#1,205,193</span>'), kv('Behind', '0 events', 'up to date'), kv('Replay from', '<span class="mono">#1,163,400</span>', 'kept 7 days')]) })}
+      ${card({ icon: 'tpl', title: 'What it runs', right: lnk('open template'), body: grid(2, [kv('Template', lnk('faucet-hq/events-to-index'), 'pipeline'), kv('Version', '<span class="mono">stable</span>', 'resolved at each run'), kv('Pool', 'default'), kv('If an event keeps failing', 'stall and alert', 'after 5 tries at one event')]) })}
+    </div><div class="stack">
+      ${card({ icon: 'clock', title: 'When it flushes', body: grid(2, [kv('Events', '500', 'or'), kv('Size', '64 MiB', 'or'), kv('Oldest waiting', '10s', 'whichever comes first'), kv('At most every', '0s')]), note: 'One run per flush, never one per event. A backlog is delivered in runs of up to 10,000 events.' })}
+    </div></div>
+      ${card({ icon: 'runs', title: 'Recent runs', right: lnk('open in Runs'), body: '<div class="empty-line">No runs yet: the first one starts at the first flush.</div>', note: 'A run that fails is tried again with half as many events, until it gets through or one event is left. Runs carry the labels <code>feed=support-tickets</code> and <code>feed_delivery=to-search</code>.' })}`;
   const delivery = ({ paused = false, stalled = false } = {}) => `${dhead(dtab('Deliveries'), `${btn('Deliver now', { icon: 'play', act: true })}${paused ? btn('Resume', { icon: 'play', kind: 'primary', act: true }) : btn('Pause', { icon: 'pause', act: true })}${btn('Edit', { icon: 'edit', act: true })}${ibtn('more', { act: true })}`, 'support-tickets')}
+    ${delivSwitch('to-warehouse')}
     ${head('to-warehouse', [stalled ? pill('Stalled', 'bad', 'alert') : paused ? pill('Paused', '', 'pause') : pill('Delivering', 'ok', 'check'), `<span>runs ${lnk('acme/tickets-to-lake')} <span class="mono">pin v4</span></span>`, '<span>exactly once</span>'])}
     <div class="two"><div class="stack">
       ${card({ icon: 'feed', title: 'Position', body: grid(4, [kv('Delivered to', '<span class="mono">#1,204,881</span>', 'the cursor'), kv('Newest event', '<span class="mono">#1,205,193</span>'), kv('Behind', '312 events', '38s · 1.1 MiB'), kv('Replay from', '<span class="mono">#1,163,400</span>', '7 days ago')]) })}
@@ -110,15 +122,15 @@
       ['<span class="mono">#1,204,879</span>', '<span class="mono">01JCX8…2K8B</span>', '25s ago', 'JSON', '377 B', 'to-warehouse · to-search'],
     ];
     return `${dhead(dtab('Events'), actions(), 'Feeds')}${ticketsHead()}
-      ${card({ icon: 'logs', title: 'Newest events', right: `${input('Go to event number or id', { ph: true, icon: 'search' })}`, body: tbl(['Event', 'Id', 'Received', 'Type', ['Size', 'num'], 'Delivered by'], rows),
+      ${card({ icon: 'logs', title: 'Newest events', right: `${input('Go to event number', { ph: true, icon: 'search' })}`, body: tbl(['Event', 'Id', 'Received', 'Type', ['Size', 'num'], 'Delivered by'], rows),
         note: 'Event numbers only go up and are assigned when the event is stored. Events older than the replay window are gone.' })}
-      ${open ? card({ icon: 'code', title: 'Event #1,205,192', aside: 'received 2s ago · 388 B · JSON', right: sealed ? '' : tag('admins only'), body: `${grid(3, [kv('Id', '<span class="mono">01JCX9…7Q1D</span>'), kv('Duplicate key', '<span class="mono">evt_5f02a1</span>'), kv('Sender', '203.0.113.24', 'token helpdesk-prod')])}<div class="pad" style="padding-top:0">${payload}</div>`,
+      ${open ? card({ icon: 'code', title: 'Event #1,205,192', aside: 'received 2s ago · 388 B · JSON', right: sealed ? '' : tag('admins only'), body: `${grid(3, [kv('Id', '<span class="mono">01JCX9…7Q1D</span>'), kv('Duplicate key', '<span class="mono">evt_5f02a1</span>'), kv('Stored', '16 Nov 09:41:07', 'not delivered yet')])}<div class="pad" style="padding-top:0">${tbl(['Header', 'Value'], [['<span class="mono">x-event-id</span>', '<span class="mono">evt_5f02a1</span>'], ['<span class="mono">user-agent</span>', '<span class="mono">helpdesk-sync/4.2</span>']])}</div><div class="pad" style="padding-top:0">${payload}</div>`,
         note: sealed ? '' : 'Opening a payload is recorded in the audit log.' }) : ''}`;
   };
 
   const refused = () => `${dhead(dtab('Refused'), actions(), 'Feeds')}${ticketsHead()}
-    ${card({ title: 'Refused in the last 24 hours', aside: '96 of 41,304 requests · 0.2%', body: `<div class="pad">${bar([[52, 'var(--bad)'], [27, 'var(--warn)'], [14, 'var(--info)'], [7, 'var(--text-2)']])}${legend([['Bad signature · 50', 'var(--bad)'], ['Rate limited · 26', 'var(--warn)'], ['Not valid JSON · 13', 'var(--info)'], ['Too large · 7', 'var(--text-2)']])}</div>`,
-      note: 'A refused request stores nothing and the sender gets the status shown. 212 repeats of an event already stored were answered 202 and are not counted here.' })}
+    ${card({ title: 'Refused lately', aside: '96 of 41,304 requests · 0.2%', body: `<div class="pad">${bar([[52, 'var(--bad)'], [27, 'var(--warn)'], [14, 'var(--info)'], [7, 'var(--text-2)']])}${legend([['Bad signature · 50', 'var(--bad)'], ['Rate limited · 26', 'var(--warn)'], ['Not valid JSON · 13', 'var(--info)'], ['Too large · 7', 'var(--text-2)']])}</div>`,
+      note: 'A refused request stores nothing and the sender gets the status shown. Each server lists its own latest 200. A repeat of an event already stored is answered 202 and is not counted here.' })}
     ${card({ icon: 'alert', title: 'Most recent', body: tbl(['When', 'Why', ['Answer', 'num'], 'Sender', 'Detail'], [
       ['1m ago', 'Bad signature', '401', '198.51.100.7', 'X-Signature-256 does not match the body'],
       ['4m ago', 'Rate limited', '429', '203.0.113.24', 'over 200 events/s · retry after 2s'],
@@ -198,6 +210,8 @@
       invalid: { label: 'New feed · validation errors', covers: ['bad name', 'required param missing'] },
       created: { label: 'Feed created · URL and token', covers: ['token shown once', 'copyable curl'] },
       edit: { label: 'Edit feed', covers: ['PUT /v1/feeds/{name}', 'what changes'] },
+      'setting-up': { label: 'Delivery being set up', covers: ['defined, no store position yet', 'the scheduler creates it'] },
+      'replayable': { label: 'Signature without a timestamp · warning', covers: ['warnings on GET /v1/feeds/{name}', 'no timestamp header and no dedupe key'] },
       'delivery-new': { label: 'Add a delivery', covers: ['POST /v1/feeds/{name}/deliveries', 'start from now or the oldest event'] },
       test: { label: 'Send test event dialog', covers: ['POST …/events from the console', 'copy as curl'] },
       'deliver-now': { label: 'Deliver now dialog', covers: ['POST …/deliveries/{d}/flush'] },
@@ -286,10 +300,10 @@ feeds:
         return;
       }
 
-      const sel = { stalled: 'partner', skip: 'partner', failing: 'partner', full: 'pings', held: 'billing', file: 'audit', paused: 'legacy', create: '', invalid: '', approval: '', requested: '', created: 'tickets' }[state];
+      const sel = { replayable: 'billing', stalled: 'partner', skip: 'partner', failing: 'partner', full: 'pings', held: 'billing', file: 'audit', paused: 'legacy', create: '', invalid: '', approval: '', requested: '', created: 'tickets' }[state];
       const selected = sel === undefined ? 'tickets' : sel;
       const title = { partner: 'partner-callbacks', pings: 'device-pings', billing: 'billing-events', audit: 'audit-trail', legacy: 'legacy-import', tickets: 'support-tickets', '': 'New feed' }[selected];
-      const sub = { delivery: 'to-warehouse', 'deliver-now': 'to-warehouse', pause: 'to-warehouse', replay: 'to-warehouse', 'delivery-new': 'New delivery', paused: 'to-lake', stalled: 'to-warehouse', skip: 'to-warehouse', failing: 'to-warehouse' }[state];
+      const sub = { 'setting-up': 'to-search', delivery: 'to-warehouse', 'deliver-now': 'to-warehouse', pause: 'to-warehouse', replay: 'to-warehouse', 'delivery-new': 'New delivery', paused: 'to-lake', stalled: 'to-warehouse', skip: 'to-warehouse', failing: 'to-warehouse' }[state];
       M.top(crumbs(state === 'list' ? '' : title, sub));
       M.list(listPane(state === 'list' ? '' : selected));
 
@@ -399,6 +413,10 @@ feeds:
       }
       const viewerNote = ctx.role === 'viewer';
       if (state === 'delivery' || state === 'deliver-now' || state === 'pause' || state === 'replay') M.detail(delivery());
+      else if (state === 'setting-up') M.detail(settingUp());
+      else if (state === 'replayable') M.detail(`${dhead(dtab('Overview', { deliveries: 1, refused: 0, tokens: 0 }), actions(), 'Feeds')}${head('billing-events', [pill('Receiving', 'ok', 'check'), '<span>last event 11s ago</span>', '<span>1 delivery</span>', `<span>created by ${lnk('ops-admin')}</span>`])}
+        ${alert('Requests to this feed can be replayed.', 'The signature has no timestamp_header, so a captured signed request can be sent again at any time and is stored again; set timestamp_header (replays inside the tolerance are then stored once) or a dedupe key.', 'warn')}
+        ${sendCard({ name: 'billing-events', auth: 'signature', dedupe: false })}<div class="two"><div class="stack">${flowCard({ rec: '9,870', del: '9,870', pend: '0', ref: '0' })}</div><div class="stack">${storeCard({ und: '0 B of 50 GiB', undPct: 0, oldest: 'nothing', oldPct: 0, kept: '64 MiB' })}</div></div>${card({ icon: 'runs', title: 'Deliveries', right: btn('Add delivery', { icon: 'plus', act: true }), body: tbl(['Delivery', 'Runs', 'Flushes at', 'Behind', 'Last run'], [[lnk('to-ledger'), lnk('acme/events-to-lake'), '5,000 events or 60s', '0 · up to date', '<span class="ok">● completed</span> 11s ago']]) })}`);
       else if (state === 'events') M.detail(events());
       else if (state === 'event-open') M.detail(events({ open: true }));
       else if (state === 'sealed') M.detail(events({ open: true, sealed: true }));
