@@ -1265,6 +1265,108 @@ async fn a_store_that_cannot_commit_answers_503_and_acknowledges_nothing() {
 
 /// Many senders at once: every acknowledged event is stored exactly once,
 /// each request gets its own consecutive range, and requests share commits.
+/// While the run history is unreachable a server keeps accepting events
+/// from the definitions it holds, for as long as they are fresh; once they
+/// are older than the maximum age it answers `503` and stores nothing, and
+/// it accepts again when the history is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_definitions_snapshot_answers_503_while_the_history_is_unreachable() {
+    use faucet_cli::serve::feeds::MAX_SNAPSHOT_AGE;
+    use faucet_cli::serve::history::fallback::FallbackHistory;
+    use faucet_cli::serve::history::sqlite::SqliteHistory;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path(), &[]);
+    let primary = SqliteHistory::connect(
+        &format!("sqlite:{}", dir.path().join("history.db").display()),
+        cfg.idempotency_retention,
+        cfg.lease_ttl,
+        uuid::Uuid::new_v4().to_string(),
+    )
+    .await
+    .unwrap();
+    let history = Arc::new(FallbackHistory::healthy(
+        Box::new(primary),
+        cfg.idempotency_retention,
+        "sqlite",
+    ));
+    let state = ServerState::new(
+        &cfg,
+        None,
+        tokio_util::sync::CancellationToken::new(),
+        history.clone(),
+        faucet_cli::serve::logs::LogHub::new(),
+        None,
+        #[cfg(feature = "triggers")]
+        faucet_cli::serve::triggers::health::TriggersHandle::empty(),
+    );
+    state.set_feeds(FeedsRuntime::new(
+        cfg.feeds.clone(),
+        spec::LoadedFile::default(),
+        stores::Stores::from_config(&cfg),
+    ));
+    let router = faucet_cli::serve::server::build_router(state.clone(), &cfg, &Default::default());
+    let srv = Srv {
+        addr: listen(router).await,
+        state,
+        scheduler: Scheduler::default(),
+        client: reqwest::Client::new(),
+    };
+    let (uid, token) = srv
+        .feed(json!({"name": "orders", "ingest": {"auth": {"tokens": "managed"}}}))
+        .await;
+    assert_eq!(srv.push("orders", &token, r#"{"n": 1}"#).await.status, 202);
+    let rt = srv.state.feeds();
+    let store = srv.store("orders").await;
+    let watermark = async || {
+        store
+            .heads(&store_calls(), std::slice::from_ref(&uid))
+            .await
+            .unwrap()
+            .remove(0)
+            .watermark
+            .get()
+    };
+
+    // Unreachable, definitions still fresh: events are accepted and stored.
+    history.mark_unreachable();
+    assert!(rt.refresh(&srv.state).await.is_err());
+    let held = srv.push("orders", &token, r#"{"n": 2}"#).await;
+    assert_eq!(held.status, 202, "{}", held.body);
+    assert_eq!(watermark().await, 2);
+    rt.backdate_snapshot(MAX_SNAPSHOT_AGE - Duration::from_secs(5));
+    assert_eq!(srv.push("orders", &token, r#"{"n": 3}"#).await.status, 202);
+
+    // Past the maximum age: every sender is told to retry, whatever it sent,
+    // and nothing is acknowledged or appended.
+    rt.backdate_snapshot(Duration::from_secs(10));
+    assert!(!rt.snapshot().fresh());
+    for (name, credential, body) in [
+        ("orders", token.as_str(), r#"{"n": 4}"#),
+        ("orders", "fdt_wrong", "{}"),
+        ("no-such-feed", token.as_str(), "{}"),
+        ("orders", token.as_str(), "{"),
+    ] {
+        let stale = srv.push(name, credential, body).await;
+        assert_eq!(stale.status, 503, "{name}: {}", stale.body);
+        assert!(stale.retry_after.is_some(), "{name}");
+        assert_eq!(stale.body["error"]["code"], "unavailable");
+        assert!(stale.body.get("ids").is_none(), "{}", stale.body);
+    }
+    assert_eq!(watermark().await, 3);
+    let read = store
+        .read(&store_calls(), &uid, Seq(1), Seq(10))
+        .await
+        .unwrap();
+    assert_eq!(read.events.len(), 3);
+
+    // The history answers again: the next request reloads and is stored.
+    assert!(history.try_recover().await);
+    let back = srv.push("orders", &token, r#"{"n": 4}"#).await;
+    assert_eq!(back.status, 202, "{}", back.body);
+    assert_eq!(back.body["first_seq"], 4);
+    assert!(rt.snapshot().fresh());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_requests_share_commits_and_lose_or_repeat_nothing() {
     let dir = tempfile::tempdir().unwrap();

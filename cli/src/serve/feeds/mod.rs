@@ -366,6 +366,21 @@ impl FeedsRuntime {
             .clone()
     }
 
+    /// Make the definitions snapshot look `by` older. For tests of what a
+    /// server answers from a stale snapshot.
+    #[doc(hidden)]
+    pub fn backdate_snapshot(&self, by: Duration) {
+        let mut held = self
+            .snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut aged = (**held).clone();
+        if let Some(earlier) = aged.loaded_at.checked_sub(by) {
+            aged.loaded_at = earlier;
+        }
+        *held = Arc::new(aged);
+    }
+
     pub fn started(&self) -> bool {
         self.started.load(Ordering::Acquire)
     }

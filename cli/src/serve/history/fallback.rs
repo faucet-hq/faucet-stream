@@ -222,6 +222,13 @@ impl FallbackHistory {
         !saturated
     }
 
+    /// Enter degraded mode as a refused call to the primary would. For tests
+    /// that need an unreachable history over a real backend.
+    #[doc(hidden)]
+    pub fn mark_unreachable(&self) {
+        self.trip(&HistoryError::Unreachable("marked unreachable".into()));
+    }
+
     /// Record a primary-backend failure and flip to degraded (log + metric once).
     fn trip(&self, err: &HistoryError) {
         self.mark_since();
