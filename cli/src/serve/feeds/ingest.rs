@@ -372,6 +372,22 @@ pub fn dedupe_key(
     }
 }
 
+/// The key that stands for a request signed with a timestamp, so the store
+/// keeps one copy of it on every server while its timestamp is accepted.
+/// `None` when the feed's signature has no timestamp header.
+pub fn replay_key(
+    sig: &faucet_core::signature::SignatureSpec,
+    headers: &HeaderMap,
+    now_unix: u64,
+) -> Option<String> {
+    use sha2::Digest;
+    let lookup = |h: &str| headers.get(h).and_then(|v| v.to_str().ok());
+    let signed = sig.check().signed_request(lookup, now_unix)?;
+    let digest = sha2::Sha256::digest(format!("{}.{}", signed.timestamp, signed.signature));
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    Some(format!("signed:{hex}"))
+}
+
 /// Whether `ip` is one of `allowed` (addresses or CIDR ranges); an empty
 /// list allows any.
 pub fn address_allowed(allowed: &[String], ip: IpAddr) -> bool {
@@ -834,6 +850,7 @@ fn build_events(
     feed: &Feed,
     headers: &HeaderMap,
     pieces: Vec<Piece>,
+    replay: Option<&str>,
 ) -> Result<(Vec<NewEvent>, Vec<u64>), Refusal> {
     let spec = &feed.spec.ingest;
     let count = pieces.len();
@@ -850,7 +867,8 @@ fn build_events(
         let key = spec
             .dedupe
             .as_ref()
-            .and_then(|d| dedupe_key(d, headers, &piece, i, count));
+            .and_then(|d| dedupe_key(d, headers, &piece, i, count))
+            .or_else(|| replay.map(|r| format!("{r}:{i}")));
         sizes.push(piece.payload.len() as u64);
         let payload = match &context {
             Some(context) => {
@@ -911,7 +929,7 @@ pub async fn push_local(
         headers.insert(name, value);
     }
     let pieces = split(content_type, body, spec.max_event_bytes.bytes())?;
-    let (events, _) = build_events(state, feed, &headers, pieces)?;
+    let (events, _) = build_events(state, feed, &headers, pieces, None)?;
     let store = state
         .feeds()
         .store_for(feed)
@@ -1115,12 +1133,14 @@ async fn handle(
         }
         Ok(Ok(bytes)) => bytes,
     };
+    let mut replay = None;
     if let Some(sig) = &spec.auth.signature {
         let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
         let lookup = |h: &str| headers.get(h).and_then(|v| v.to_str().ok());
         if !sig.check().verify(lookup, &body, now) {
             return Err(refuse(Refusal::unauthorized()));
         }
+        replay = replay_key(sig, &headers, now);
     }
     if let Some(token) = &token {
         ingest.touch(&state, token);
@@ -1196,7 +1216,8 @@ async fn handle(
             .retry(wait),
         ));
     }
-    let (events, sizes) = build_events(&state, &feed, &headers, pieces).map_err(refuse)?;
+    let (events, sizes) =
+        build_events(&state, &feed, &headers, pieces, replay.as_deref()).map_err(refuse)?;
     let store = rt.store_for(&feed).await.map_err(|e| {
         refuse(store_refusal(
             &feed,
@@ -1226,6 +1247,9 @@ async fn handle(
     metrics::ingested(&label, ack.stored(), bytes);
     if ack.duplicates > 0 {
         metrics::dedupe_hits(&label, ack.duplicates);
+    }
+    if replay.is_some() && ack.duplicates as usize == count {
+        metrics::replayed(&label);
     }
     let all_duplicates = ack.duplicates as usize == count;
     let conflict = all_duplicates

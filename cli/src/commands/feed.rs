@@ -698,6 +698,12 @@ async fn send(args: &FeedSendArgs, json: bool) -> CliResult<()> {
 }
 
 /// Run `faucet feed …`.
+fn warn(view: &service::FeedView) {
+    for w in &view.warnings {
+        eprintln!("warning: {w}");
+    }
+}
+
 pub async fn run(args: FeedArgs) -> CliResult<()> {
     if let FeedCommand::Send(send_args) = &args.command {
         return send(send_args, args.json).await;
@@ -727,6 +733,7 @@ pub async fn run(args: FeedArgs) -> CliResult<()> {
             let made = service::create(&state, &who, tenant, spec)
                 .await
                 .map_err(failed)?;
+            warn(&made);
             print(json, &made, || format!("created feed {}", made.name))
         }
         FeedCommand::Apply { file } => {
@@ -743,6 +750,7 @@ pub async fn run(args: FeedArgs) -> CliResult<()> {
                 service::create(&state, &who, tenant, spec).await
             }
             .map_err(failed)?;
+            warn(&view);
             print(json, &view, || {
                 format!(
                     "{} feed {name} (revision {})",

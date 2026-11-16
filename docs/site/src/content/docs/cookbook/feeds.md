@@ -207,6 +207,9 @@ A feed must have at least one credential.
   secret (HMAC SHA-256 or SHA-512, hex or base64, an optional prefix, and an
   optional signed timestamp header that rejects old requests). For a gzip
   body the signature covers the bytes as sent.
+  Set `timestamp_header` as well: a signed request that is sent again inside
+  its tolerance is then stored once, on any server. Without it, a captured
+  request can be replayed unless the feed has a `dedupe:` key.
 - **Both.** With both set, a request needs a valid token and a valid
   signature.
 - **Allowed addresses** (`allowed_addresses`). Addresses or CIDR ranges that

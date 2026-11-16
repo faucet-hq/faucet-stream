@@ -62,6 +62,16 @@ request must satisfy both.
 | `timestamp_header` | string | | A header carrying the Unix-seconds time the sender signed. When set, the signed content is `<timestamp>.<body>` and a timestamp more than `tolerance_secs` from now is rejected. |
 | `tolerance_secs` | integer | `300` | Accepted clock difference for `timestamp_header`. |
 
+**Replays.** With `timestamp_header`, a signed request that arrives again
+while its timestamp is still accepted is stored once: the second copy is
+answered `202` with `"duplicate": true` and the first copy's ids. This holds
+on every server of a cluster, because the feed store keeps the record. An
+event that carries its own dedupe key (`dedupe:`) is matched by that key
+instead. Without `timestamp_header` a captured signed request can be sent
+again at any time and is stored again unless the feed has a `dedupe:` key;
+creating such a feed answers with a `warnings` entry (and `faucet feed
+create` prints it), and the feed is still created.
+
 **`dedupe`**
 
 | Field | Type | Default | Meaning |
@@ -410,6 +420,9 @@ The `feed` label is the feed's name, `<tenant>/<name>` for a tenant's feed.
 | `faucet_feed_events_total{feed}` | counter | Events stored. |
 | `faucet_feed_bytes_total{feed}` | counter | Payload bytes stored. |
 | `faucet_feed_dedupe_hits_total{feed}` | counter | Events not stored because their key was already seen. |
+| `faucet_feed_ingest_replays_total{feed}` | counter | Signed requests received again inside their timestamp tolerance and not stored again. |
+| `faucet_feed_setup_total{feed,delivery}` | counter | Feeds (`delivery` empty) and deliveries found defined but missing from the store, which the scheduler then creates. |
+| `faucet_feed_orphan_deliveries_total{feed}` | counter | Delivery positions deleted from the store because no definition listed them. |
 | `faucet_feed_append_duration_seconds{feed}` | histogram | Time of one store transaction. |
 | `faucet_feed_append_group_requests{feed}` | histogram | Requests stored together in one transaction. |
 | `faucet_feed_store_errors_total{feed}` | counter | Feed store failures. |

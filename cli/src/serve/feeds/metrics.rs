@@ -50,6 +50,10 @@ pub fn describe() {
         "Ranges of events a delivery skipped (an admin skip or a recover)"
     );
     describe_counter!(
+        "faucet_feed_ingest_replays_total",
+        "Signed requests received again inside their timestamp tolerance and not stored again"
+    );
+    describe_counter!(
         "faucet_feed_setup_total",
         "Feeds (`delivery` empty) and deliveries found defined but missing from the feed store, \
          which the scheduler then creates"
@@ -188,6 +192,10 @@ pub fn store_error(feed: &str) {
 
 pub fn dedupe_hits(feed: &str, events: u64) {
     counter!("faucet_feed_dedupe_hits_total", "feed" => feed.to_string()).increment(events);
+}
+
+pub fn replayed(feed: &str) {
+    counter!("faucet_feed_ingest_replays_total", "feed" => feed.to_string()).increment(1);
 }
 
 pub fn orphan_delivery(feed: &str) {

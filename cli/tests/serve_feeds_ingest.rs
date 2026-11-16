@@ -825,6 +825,22 @@ async fn a_signed_feed_checks_the_signature_and_its_timestamp() {
     };
     let good = post(Some(now), Some(signed(now, "hmac-secret-1", body)), body).await;
     assert_eq!(good.status, 202, "{}", good.body);
+    // The same signed request again, inside its tolerance: stored once.
+    let again = post(Some(now), Some(signed(now, "hmac-secret-1", body)), body).await;
+    assert_eq!(again.status, 202, "{}", again.body);
+    assert_eq!(again.body["duplicate"], true, "{}", again.body);
+    assert_eq!(again.body["ids"], good.body["ids"]);
+    assert_eq!(srv.watermark("hooks", &uid).await, 1);
+    let view = service::get(&srv.state, &admin(), None, "hooks").await.unwrap();
+    assert!(view.feed.warnings.is_empty());
+    // Without a signed timestamp nothing tells a replay from a new request.
+    srv.feed(json!({
+        "name": "bare",
+        "ingest": {"auth": {"signature": {"header": "X-Signature", "secret": "hmac-secret-2"}}}
+    }))
+    .await;
+    let bare = service::get(&srv.state, &admin(), None, "bare").await.unwrap();
+    assert!(bare.feed.warnings[0].contains("timestamp_header"), "{:?}", bare.feed.warnings);
 
     let refused = [
         // The wrong secret, a body changed after signing, no prefix.
@@ -919,6 +935,16 @@ async fn a_signed_feed_checks_the_signature_and_its_timestamp() {
             .status,
         401
     );
+    // Signed at another second, it is another request.
+    let later = post(
+        Some(now - 1),
+        Some(signed(now - 1, "hmac-secret-1", body)),
+        body,
+    )
+    .await;
+    assert_eq!(later.status, 202, "{}", later.body);
+    assert!(later.body.get("duplicate").is_none());
+    assert_eq!(srv.watermark("hooks", &uid).await, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

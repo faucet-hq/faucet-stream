@@ -251,10 +251,42 @@ pub fn store_limits(spec: &FeedSpec, tenant: Option<&TenantLimits>) -> StoreLimi
     if let Some(d) = &spec.ingest.dedupe {
         limits = limits.dedupe_window(d.window.duration());
     }
+    if let Some(window) = replay_window(spec) {
+        let longer = limits.dedupe_window.max(window);
+        limits = limits.dedupe_window(longer);
+    }
     if let Some(bytes) = tenant.and_then(|t| t.max_feed_bytes) {
         limits = limits.tenant_max_bytes(bytes);
     }
     limits
+}
+
+/// How long the store remembers a signed request so a replay is not stored
+/// again: as long as its timestamp can still be accepted. `None` when the
+/// feed's signature carries no timestamp.
+pub fn replay_window(spec: &FeedSpec) -> Option<Duration> {
+    let sig = spec.ingest.auth.signature.as_ref()?;
+    sig.timestamp_header.as_ref()?;
+    Some(Duration::from_secs(
+        sig.tolerance_secs.saturating_mul(2).saturating_add(60),
+    ))
+}
+
+/// What a reader of `spec` should know before relying on it.
+pub fn warnings(spec: &FeedSpec) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(sig) = &spec.ingest.auth.signature
+        && sig.timestamp_header.is_none()
+        && spec.ingest.dedupe.is_none()
+    {
+        out.push(
+            "the signature has no timestamp_header, so a captured signed request can be sent \
+             again at any time and is stored again; set timestamp_header (replays inside the \
+             tolerance are then stored once) or a dedupe key"
+                .to_string(),
+        );
+    }
+    out
 }
 
 /// Where a new delivery starts in the store.

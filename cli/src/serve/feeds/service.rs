@@ -123,6 +123,9 @@ pub struct FeedView {
     pub undelivered_ratio: Option<f64>,
     /// Requests this server refused lately (see the refusals listing).
     pub refused_recent: u64,
+    /// What to know before relying on the definition as it is.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     pub deliveries: Vec<DeliveryView>,
 }
 
@@ -303,6 +306,7 @@ pub fn view(
         ingest_path: ingest_path(feed.tenant(), feed.name()),
         undelivered_ratio: ratio,
         refused_recent: 0,
+        warnings: super::warnings(&feed.spec),
         name: feed.name().to_string(),
         tenant: feed.tenant().map(str::to_string),
         uid: feed.uid.as_str().to_string(),
