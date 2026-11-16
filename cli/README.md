@@ -387,12 +387,45 @@ faucet feed list | show <feed> | delete <feed>
 faucet feed token create <feed> <name> [--expires-at <RFC 3339>] | token list <feed> | token revoke <feed> <id>
 faucet feed push <feed> [events.ndjson] [--content-type application/x-ndjson] [--dedupe-key K]
 faucet feed events <feed> [--before N | --from N] [--limit N]
+faucet feed tail <feed> [-n N] [--payload] [-f|--follow [--interval-secs N]]
+faucet feed stats <feed>
+faucet feed cursor <feed> [<delivery>]
 faucet feed pause|resume|deliver-now|recover <feed> <delivery>
 faucet feed replay <feed> <delivery> --to-seq N | --to-time <RFC 3339>
 faucet feed skip <feed> <delivery> [--to N] --reason "why"
 ```
 
-Every verb takes `--json`, `--tenant <id>`, `--vault-key` (for a feed with
+`tail` prints the newest retained events oldest first (`--json`: one object
+per line; `--payload` adds each payload, never a sealed one's) and with
+`--follow` keeps printing events as they are stored, which needs a
+PostgreSQL feed store, since nothing else can write to a SQLite store while
+`tail` holds it. `stats` shows the feed's retained events and bytes, what the
+last 24 hours brought and each delivery's pending events. `cursor` shows where
+each delivery reads next (position, epoch, pending events, live claim, gaps);
+it is read-only, and `replay`, `skip` and `recover` are what move a position.
+
+`faucet feed send` is the one verb that talks to a running server: it posts
+a file or stdin to the feed's ingest URL the way a sender does, so the
+feed's credential, limits, rate limit and tenant quota all apply (`push`
+writes to the store directly and skips them). It takes no `--store`:
+
+```bash
+FEED_TOKEN=fdt_… faucet feed send --url https://faucet.example.com/v1/feeds/orders/events \
+  --token-env FEED_TOKEN -f events.ndjson --content-type application/x-ndjson [--gzip]
+FEED_SECRET=… faucet feed send --url … --signature-secret-env FEED_SECRET \
+  --signature-header X-Signature [--signature-prefix sha256=] \
+  [--signature-timestamp-header X-Timestamp] [--signature-algorithm sha256|sha512] \
+  [--signature-encoding hex|base64] < event.json
+```
+
+The token (`--token-env`, or `--token`) and the signing secret are never
+printed or logged; `--header NAME=VALUE` adds a header such as the feed's
+dedupe header, and a refusal exits non-zero with the server's status and
+message. The ingest route also accepts `Content-Encoding: gzip` from any
+sender: the signature covers the bytes as sent and the feed's size limits
+apply to the expanded body.
+
+Every store verb takes `--json`, `--tenant <id>`, `--vault-key` (for a feed with
 a signature secret, secret delivery params or sealed events) and
 `--feed-store NAME=URL`. `faucet schema feed` prints the schema of one feed
 definition, `faucet schema feeds` that of the `--feeds` file

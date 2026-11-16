@@ -705,7 +705,6 @@ pub enum FeedCommand {
     /// Append events from a file or stdin straight to the feed's store, with
     /// the checks, dedupe and sealing the ingest route applies. An operator
     /// tool: no sender credential, rate limit or tenant quota applies.
-    #[command(alias = "send")]
     Push {
         name: String,
         /// The body: one JSON value, a JSON array or NDJSON (`-` or omitted
@@ -717,9 +716,94 @@ pub enum FeedCommand {
         #[arg(long)]
         dedupe_key: Option<String>,
     },
+    /// Print a feed's newest retained events, oldest first; with `--follow`
+    /// keep printing events as they are stored (on a PostgreSQL feed store:
+    /// nothing else can write to a SQLite store while this runs).
+    Tail {
+        name: String,
+        /// How many of the newest events to start with (at most 200).
+        #[arg(short = 'n', long, default_value_t = 10, value_name = "N")]
+        lines: u64,
+        /// Keep running and print each new event.
+        #[arg(short = 'f', long)]
+        follow: bool,
+        /// How often `--follow` looks for new events.
+        #[arg(long, default_value_t = 2, value_name = "SECS")]
+        interval_secs: u64,
+        /// Print each event's payload too (never a sealed event's).
+        #[arg(long)]
+        payload: bool,
+    },
+    /// A feed's size and what the last 24 hours brought, with each delivery's
+    /// backlog.
+    Stats { name: String },
+    /// Where each delivery of a feed reads next: its position, epoch,
+    /// pending events, live claim and gaps. Read-only; `replay`, `skip` and
+    /// `recover` move a position.
+    Cursor {
+        name: String,
+        /// Only this delivery.
+        delivery: Option<String>,
+    },
+    /// Post events to a running server's ingest route over HTTP, as a sender
+    /// does: with the feed's token, its signature, or both. Needs no
+    /// `--store`.
+    Send(FeedSendArgs),
     /// Issue, list and revoke the feed's ingest tokens.
     #[command(subcommand)]
     Token(FeedTokenCommand),
+}
+
+/// `faucet feed send` arguments.
+#[cfg(feature = "feeds")]
+#[derive(Debug, clap::Args)]
+pub struct FeedSendArgs {
+    /// The feed's ingest URL, e.g.
+    /// `https://faucet.example.com/v1/feeds/orders/events`.
+    #[arg(long, value_name = "URL")]
+    pub url: String,
+    /// The body: one JSON value, a JSON array or NDJSON (`-` or omitted =
+    /// stdin).
+    #[arg(short = 'f', long, value_name = "FILE")]
+    pub file: Option<PathBuf>,
+    #[arg(long, default_value = "application/json")]
+    pub content_type: String,
+    /// The feed token. Prefer `--token-env`: an argument is visible to other
+    /// processes on the host.
+    #[arg(long, value_name = "TOKEN", conflicts_with = "token_env")]
+    pub token: Option<String>,
+    /// The environment variable that holds the feed token.
+    #[arg(long, value_name = "VAR")]
+    pub token_env: Option<String>,
+    /// The environment variable that holds the feed's signing secret; the
+    /// body is signed as the feed's `ingest.auth.signature` describes.
+    #[arg(long, value_name = "VAR", requires = "signature_header")]
+    pub signature_secret_env: Option<String>,
+    /// The header the feed reads the signature from.
+    #[arg(long, value_name = "NAME", requires = "signature_secret_env")]
+    pub signature_header: Option<String>,
+    /// `sha256` or `sha512`.
+    #[arg(long, default_value = "sha256", value_name = "ALGORITHM")]
+    pub signature_algorithm: String,
+    /// `hex` or `base64`.
+    #[arg(long, default_value = "hex", value_name = "ENCODING")]
+    pub signature_encoding: String,
+    /// Text the feed expects before the digest (e.g. `sha256=`).
+    #[arg(long, value_name = "TEXT")]
+    pub signature_prefix: Option<String>,
+    /// The header that carries the signed Unix-seconds timestamp, when the
+    /// feed sets one.
+    #[arg(long, value_name = "NAME")]
+    pub signature_timestamp_header: Option<String>,
+    /// Another request header, e.g. the feed's dedupe header (repeatable).
+    #[arg(long = "header", value_name = "NAME=VALUE")]
+    pub headers: Vec<String>,
+    /// Send the body gzip-compressed.
+    #[arg(long)]
+    pub gzip: bool,
+    /// How long the request may take.
+    #[arg(long, default_value_t = 30, value_name = "SECS")]
+    pub timeout_secs: u64,
 }
 
 /// `faucet feed token` subcommands.

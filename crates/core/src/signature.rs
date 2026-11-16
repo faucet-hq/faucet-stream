@@ -196,18 +196,8 @@ impl SignatureCheck<'_> {
             signed.push(b'.');
         }
         signed.extend_from_slice(body);
-        let Some(digest) = self.digest(&signed) else {
+        let Some(expected) = self.encoded_digest(&signed) else {
             return false;
-        };
-        let expected = match self.encoding {
-            DigestEncoding::Hex => digest
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>(),
-            DigestEncoding::Base64 => {
-                use base64::Engine;
-                base64::engine::general_purpose::STANDARD.encode(&digest)
-            }
         };
         let provided = match self.encoding {
             DigestEncoding::Hex => provided.to_ascii_lowercase(),
@@ -234,6 +224,32 @@ impl SignatureCheck<'_> {
             signature,
             timestamp,
             oldest_accepted: now_unix.saturating_sub(self.tolerance_secs),
+        })
+    }
+
+    /// The signature header value a sender sets for `body`: the prefix, then
+    /// the digest over `<timestamp>.<body>` when `timestamp_unix` is given
+    /// (send the same number in the timestamp header) or over `body` alone.
+    /// `None` when the secret cannot key the digest.
+    pub fn sign(&self, body: &[u8], timestamp_unix: Option<u64>) -> Option<String> {
+        let mut signed: Vec<u8> = Vec::with_capacity(body.len() + 21);
+        if let Some(ts) = timestamp_unix {
+            signed.extend_from_slice(ts.to_string().as_bytes());
+            signed.push(b'.');
+        }
+        signed.extend_from_slice(body);
+        let digest = self.encoded_digest(&signed)?;
+        Some(format!("{}{digest}", self.prefix.unwrap_or_default()))
+    }
+
+    fn encoded_digest(&self, signed: &[u8]) -> Option<String> {
+        let digest = self.digest(signed)?;
+        Some(match self.encoding {
+            DigestEncoding::Hex => digest.iter().map(|b| format!("{b:02x}")).collect(),
+            DigestEncoding::Base64 => {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode(&digest)
+            }
         })
     }
 
@@ -285,6 +301,31 @@ mod tests {
     use std::collections::HashMap;
 
     const BODY: &[u8] = br#"{"event":"created","id":7}"#;
+
+    #[test]
+    fn a_signed_header_value_verifies_under_the_same_settings() {
+        let now = 1_700_000_000;
+        for spec in [
+            SignatureSpec::new("X-Sig", "k1"),
+            SignatureSpec::new("X-Sig", "k1").prefix("sha256="),
+            SignatureSpec::new("X-Sig", "k1")
+                .algorithm(HmacAlgorithm::Sha512)
+                .encoding(DigestEncoding::Base64),
+            SignatureSpec::new("X-Sig", "k1").timestamp_header("X-Ts"),
+        ] {
+            let check = spec.check();
+            let ts = check.timestamp_header.map(|_| now);
+            let value = check.sign(BODY, ts).unwrap();
+            let stamp = now.to_string();
+            let headers = |h: &str| match h {
+                "X-Sig" => Some(value.as_str()),
+                "X-Ts" => Some(stamp.as_str()),
+                _ => None,
+            };
+            assert!(check.verify(headers, BODY, now), "{spec:?}");
+            assert!(!check.verify(headers, b"another body", now), "{spec:?}");
+        }
+    }
 
     fn mac(algorithm: HmacAlgorithm, secret: &[u8], signed: &[u8]) -> Vec<u8> {
         match algorithm {
