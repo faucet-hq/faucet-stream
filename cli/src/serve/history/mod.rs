@@ -129,6 +129,20 @@ pub struct InvocationRecord {
     /// existed; derive it from `error` / `skipped` there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<InvocationStatus>,
+    /// Why a feed delivery's read ended without delivering, when the `feed`
+    /// source said so: the scheduler acts on this, never on the error text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed_error: Option<FeedFailure>,
+}
+
+/// A `feed` source failure the feed scheduler acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedFailure {
+    /// The delivery is held until an admin recovers it.
+    Held,
+    /// The run's range claim was lost; it stopped before committing.
+    ClaimLost,
 }
 
 /// One invocation's outcome in a run record.
@@ -172,6 +186,13 @@ impl From<&InvocationOutcome> for InvocationRecord {
                 o.error.as_deref(),
                 o.error_kind == Some(crate::executor::InvocationErrorKind::Skipped),
             )),
+            feed_error: match o.error_kind {
+                Some(crate::executor::InvocationErrorKind::FeedHeld) => Some(FeedFailure::Held),
+                Some(crate::executor::InvocationErrorKind::FeedClaimLost) => {
+                    Some(FeedFailure::ClaimLost)
+                }
+                _ => None,
+            },
         }
     }
 }
@@ -2865,6 +2886,7 @@ pub(crate) async fn assert_list_filters_agree(h: &dyn RunHistory) {
                 rows: None,
                 skipped: false,
                 status: None,
+                feed_error: None,
             });
             h.upsert(&rec).await.unwrap();
         };

@@ -55,6 +55,7 @@ fn record(id: &str, status: RunStatus, rows: u64, elapsed: Option<f64>) -> RunRe
             rows: None,
             skipped: false,
             status: None,
+            feed_error: None,
         }],
         error: (status == RunStatus::Failed).then(|| "boom".to_string()),
         idempotency_key: None,

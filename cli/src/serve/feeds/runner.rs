@@ -178,10 +178,12 @@ pub fn outcome_of(rec: &RunRecord, moved: bool) -> Outcome {
     if rec.status == RunStatus::Cancelled {
         return Outcome::Cancelled;
     }
-    if text.contains("is no longer held by this run") {
+    use crate::serve::history::FeedFailure;
+    let said = |kind: FeedFailure| rec.invocations.iter().any(|i| i.feed_error == Some(kind));
+    if said(FeedFailure::ClaimLost) {
         return Outcome::ClaimLost;
     }
-    if text.contains("is held") {
+    if said(FeedFailure::Held) {
         return Outcome::Held(text);
     }
     match rec.status {

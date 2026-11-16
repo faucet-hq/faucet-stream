@@ -4548,6 +4548,7 @@ components:
         parent_record_key: { type: string, nullable: true }
         run_id: { type: string, nullable: true, description: "The invocation's own run id — what `POST /v1/runs/{id}/rollback` undoes (#706)." }
         records_written: { type: integer }
+        feed_error: { type: string, enum: [held, claim_lost], description: "Set when a feed delivery's `feed` source ended the read itself: `held` (an admin has to recover the delivery) or `claim_lost` (the run's range claim was lost before it committed). The feed scheduler acts on this field, never on the error text." }
         duration_ms: { type: integer, description: "Wall-clock duration of this invocation in milliseconds (#645)." }
         error: { type: string, nullable: true }
         batches: { $ref: "#/components/schemas/BatchOutcomes" }

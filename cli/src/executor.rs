@@ -365,6 +365,10 @@ pub enum InvocationErrorKind {
     /// [`CliError::LeaseHeld`] — another run holds the row's live run lease.
     /// Orchestrators fail the whole run on it rather than retrying the unit.
     LeaseHeld,
+    /// The `feed` source held its delivery: an admin has to recover it.
+    FeedHeld,
+    /// The `feed` source lost its range claim and stopped before committing.
+    FeedClaimLost,
     /// The invocation never ran because its parent or a `depends_on` row
     /// failed or was skipped.
     Skipped,
@@ -512,6 +516,14 @@ pub fn classify_error(err: &CliError) -> InvocationErrorKind {
         CliError::Faucet(FaucetError::BudgetExceeded { .. })
         | CliError::BudgetSinkNotAllowed { .. } => InvocationErrorKind::BudgetExceeded,
         CliError::LeaseHeld(_) => InvocationErrorKind::LeaseHeld,
+        #[cfg(feature = "source-feed")]
+        CliError::Faucet(e) => match faucet_source_feed::FeedSourceError::of(e) {
+            Some(faucet_source_feed::FeedSourceError::Held { .. }) => InvocationErrorKind::FeedHeld,
+            Some(faucet_source_feed::FeedSourceError::ClaimLost { .. }) => {
+                InvocationErrorKind::FeedClaimLost
+            }
+            _ => InvocationErrorKind::Other,
+        },
         _ => InvocationErrorKind::Other,
     }
 }

@@ -430,6 +430,7 @@ async fn postgres_list_filters_match_name_pool_and_usage_dataset() {
                 rows: None,
                 skipped: false,
                 status: None,
+                feed_error: None,
             });
         h.upsert(&r).await.unwrap();
     };

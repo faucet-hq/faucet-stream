@@ -231,21 +231,34 @@ fn a_run_counts_by_where_it_left_the_cursor() {
         runner::outcome_of(&run(RunStatus::Cancelled, None), false),
         Outcome::Cancelled
     );
+    // Only the source's own typed failure holds a delivery or reads as a
+    // lost claim: an error that merely says so is an ordinary failure.
+    use crate::serve::history::{FeedFailure, InvocationRecord};
+    let said = |text: &str, kind: Option<FeedFailure>| {
+        let mut r = run(RunStatus::Failed, Some(text));
+        let mut inv: InvocationRecord = serde_json::from_value(
+            serde_json::json!({"row_id": "row", "records_written": 0, "error": text}),
+        )
+        .unwrap();
+        inv.feed_error = kind;
+        r.invocations.push(inv);
+        r
+    };
+    let lock = "IO Error: Conflicting lock is held in another process";
+    assert!(matches!(
+        runner::outcome_of(&said(lock, None), false),
+        Outcome::Failed(_)
+    ));
+    assert!(matches!(
+        runner::outcome_of(&said("claim c1 is no longer held by this run", None), false),
+        Outcome::Failed(_)
+    ));
     assert_eq!(
-        runner::outcome_of(
-            &run(
-                RunStatus::Failed,
-                Some("claim c1 is no longer held by this run")
-            ),
-            false
-        ),
+        runner::outcome_of(&said("stopped", Some(FeedFailure::ClaimLost)), false),
         Outcome::ClaimLost
     );
     assert!(matches!(
-        runner::outcome_of(
-            &run(RunStatus::Failed, Some("delivery f1/d is held: event 9")),
-            false
-        ),
+        runner::outcome_of(&said("delivery f1/d is held: event 9", Some(FeedFailure::Held)), false),
         Outcome::Held(_)
     ));
     assert_eq!(

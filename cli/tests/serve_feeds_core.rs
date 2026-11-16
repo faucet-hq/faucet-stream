@@ -3156,3 +3156,51 @@ async fn a_deliverys_dlq_is_replayed_through_its_feed_config() {
     .unwrap_err();
     assert!(message(run).contains("runs only as a delivery of a feed"));
 }
+
+/// A delivery is held only when its `feed` source says so: a bookmark that
+/// names an event the store does not have (a restored store) holds it
+/// through a real run, by the failure's kind and not its wording.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bookmark_past_the_store_holds_the_delivery_by_the_sources_own_word() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, state_dir) = (dir.path(), dir.path().join("state"));
+    let mut srv = Srv::start(root, &[]).await;
+    register(&srv.state, "orders_lake", &state_dir).await;
+    let out = root.join("lake.jsonl");
+    service::create(
+        &srv.state,
+        &admin(),
+        None,
+        feed_spec("orders", json!([delivery("lake", "orders_lake", &out)])),
+    )
+    .await
+    .unwrap();
+    srv.append("orders", 1..=2).await;
+    srv.delivered("orders", "lake", 3).await;
+
+    let mut edited = 0;
+    for entry in std::fs::read_dir(&state_dir).unwrap() {
+        let path = entry.unwrap().path();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if text.contains("\"next\":3") {
+            std::fs::write(&path, text.replace("\"next\":3", "\"next\":9")).unwrap();
+            edited += 1;
+        }
+    }
+    assert_eq!(edited, 1, "the delivery's bookmark file");
+    srv.append("orders", 3..=3).await;
+    let pos = srv
+        .until("orders", "lake", true, "held", |p| {
+            p.status.health == Health::Held
+        })
+        .await;
+    assert_eq!(pos.cursor, 3, "nothing was read or skipped");
+    let run_id = pos.status.last_run.as_ref().unwrap().run_id.clone().unwrap();
+    let rec = srv.state.history().get(&run_id).await.unwrap().unwrap();
+    assert_eq!(
+        rec.invocations[0].feed_error,
+        Some(faucet_cli::serve::history::FeedFailure::Held)
+    );
+}
