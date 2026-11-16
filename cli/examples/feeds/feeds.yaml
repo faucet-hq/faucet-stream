@@ -6,10 +6,17 @@
 # its flush policy is met. Feeds in this file are read-only at runtime;
 # feeds made through the API or `faucet feed` live in the run history.
 #
+# `faucet feed` finds this file's feeds when it is given the file too
+# (`--feeds`), beside the run history the server uses (`--store`). The file
+# is loaded as the server loads it, so ORDERS_HMAC_SECRET must be set.
 # Issue a token for a feed (the text is shown once):
-#   faucet feed token create orders shop --store sqlite:./history.db
-# Push a test event without a sender:
-#   echo '{"id": 1}' | faucet feed push orders --store sqlite:./history.db
+#   faucet feed token create orders shop --feeds cli/examples/feeds/feeds.yaml --store sqlite:./history.db
+# Push a test event without a sender, straight into the store:
+#   echo '{"id": 1}' | faucet feed push orders --feeds cli/examples/feeds/feeds.yaml --store sqlite:./history.db
+# Or post it to the running server as a sender does:
+#   echo '{"id": 1}' | faucet feed send --url http://127.0.0.1:8080/v1/feeds/orders/events \
+#     --token-env ORDERS_TOKEN --signature-secret-env ORDERS_HMAC_SECRET \
+#     --signature-header X-Signature --signature-prefix sha256=
 version: 1
 feeds:
   - name: orders

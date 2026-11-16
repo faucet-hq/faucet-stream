@@ -1,7 +1,8 @@
 //! `faucet feed` (#1034): manage feeds straight in their stores, the way
 //! `faucet template` manages templates. `--store` names the run history a
 //! server keeps its feed definitions in; the events are in the feed store
-//! that history implies (or a `--feed-store`). Every verb goes through the
+//! that history implies (or a `--feed-store`). `--feeds` names the server's
+//! feeds file, whose feeds are then found like stored ones. Every verb goes through the
 //! rules the HTTP API uses (`serve::feeds::service`); nothing here starts
 //! delivery runs: a server does. `faucet feed send` is the one verb that
 //! talks to a running server: it posts to the ingest route as a sender does.
@@ -52,6 +53,10 @@ async fn open(args: &FeedArgs) -> CliResult<ServerState> {
         ));
     };
     let config = crate::serve::config::ServeConfig::from_args(*serve)?;
+    let file = match &args.feeds {
+        Some(path) => spec::load_file(path).await?,
+        None => spec::LoadedFile::default(),
+    };
     let history = crate::serve::history::connect(
         &config.history,
         config.idempotency_retention,
@@ -79,7 +84,7 @@ async fn open(args: &FeedArgs) -> CliResult<ServerState> {
     state.set_feeds(
         FeedsRuntime::new(
             config.feeds.clone(),
-            spec::LoadedFile::default(),
+            file,
             stores::Stores::from_config(&config),
         )
         .offline(),

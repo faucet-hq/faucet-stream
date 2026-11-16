@@ -654,3 +654,125 @@ async fn tail_follow_prints_events_as_they_are_stored() {
     );
     assert_eq!(third["payload"], "{\"n\": 3}");
 }
+
+/// With `--feeds`, the verbs find the feeds of the server's feeds file; a
+/// file feed is changed in the file, never through a verb.
+#[test]
+fn feeds_of_the_feeds_file_are_found_with_the_feeds_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("archive.yaml"),
+        "version: 1\nname: orders_archive\npipeline:\n  source: { type: feed }\n  sink: { type: file, config: { path: ./out/orders.jsonl, if_exists: append } }\n  state: { type: file, config: { path: ./state } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("feeds.yaml"),
+        "version: 1\nfeeds:\n  - name: orders\n    ingest:\n      auth: { tokens: managed }\n      accept: [application/json, application/x-ndjson]\n    deliveries:\n      - name: archive\n        pipeline: archive.yaml\n",
+    )
+    .unwrap();
+    let with = |args: &[&str]| {
+        let mut all = args.to_vec();
+        all.extend(["--feeds", "feeds.yaml"]);
+        feed(dir, &all)
+    };
+
+    // Without the file the feed is unknown; with it, it is listed and shown.
+    assert!(!feed(dir, &["show", "orders"]).ok);
+    let listed = json_of(with(&["list", "--json"]));
+    assert_eq!(listed[0]["name"], "orders");
+    assert_eq!(listed[0]["source"], "file");
+    let shown = json_of(with(&["show", "orders", "--json"]));
+    assert_eq!(shown["deliveries"][0]["name"], "archive");
+
+    // Tokens, events and positions work as for a stored feed.
+    let token = json_of(with(&["token", "create", "orders", "shop", "--json"]));
+    assert!(token["token"].as_str().unwrap().starts_with("fdt_"));
+    let tokens = json_of(with(&["token", "list", "orders", "--json"]));
+    assert_eq!(tokens.as_array().unwrap().len(), 1);
+    passed(ran(faucet(dir)
+        .args(["feed", "push", "orders", "--feeds", "feeds.yaml", "--store"])
+        .arg(format!("sqlite:{}", dir.join("history.db").display()))
+        .write_stdin("[{\"id\": 1}, {\"id\": 2}, {\"id\": 3}]")));
+    assert_eq!(
+        json_of(with(&["events", "orders", "--json"]))["watermark"],
+        3
+    );
+    assert_eq!(
+        passed(with(&["tail", "orders", "-n", "5"])).lines().count(),
+        3
+    );
+    assert_eq!(
+        json_of(with(&["stats", "orders", "--json"]))["retained_events"],
+        3
+    );
+    assert_eq!(
+        json_of(with(&["cursor", "orders", "archive", "--json"]))[0]["position"],
+        1
+    );
+    passed(with(&[
+        "pause",
+        "orders",
+        "archive",
+        "--reason",
+        "maintenance",
+    ]));
+    assert_eq!(
+        json_of(with(&["show", "orders", "--json"]))["deliveries"][0]["status"],
+        "paused"
+    );
+    passed(with(&["resume", "orders", "archive"]));
+    passed(with(&[
+        "skip",
+        "orders",
+        "archive",
+        "--to",
+        "3",
+        "--reason",
+        "test rows",
+    ]));
+    passed(with(&["replay", "orders", "archive", "--to-seq", "2"]));
+    assert_eq!(
+        json_of(with(&["cursor", "orders", "--json"]))[0]["position"],
+        2
+    );
+    let id = tokens[0]["id"].as_str().unwrap();
+    passed(with(&["token", "revoke", "orders", id]));
+
+    // The file is where a file feed changes.
+    std::fs::write(
+        dir.join("same-name.yaml"),
+        "name: orders\ningest:\n  auth: { tokens: managed }\n",
+    )
+    .unwrap();
+    for (args, want) in [
+        (
+            &["create", "-f", "same-name.yaml"][..],
+            "the --feeds file already defines feed 'orders'",
+        ),
+        (
+            &["apply", "-f", "same-name.yaml"][..],
+            "defined in the --feeds file",
+        ),
+        (&["delete", "orders"][..], "defined in the --feeds file"),
+    ] {
+        let refused = with(args);
+        assert!(!refused.ok, "{args:?}: {}", refused.stdout);
+        assert!(
+            refused.stderr.contains(want),
+            "{args:?}: {}",
+            refused.stderr
+        );
+    }
+    assert_eq!(
+        json_of(with(&["list", "--json"])).as_array().unwrap().len(),
+        1
+    );
+    let missing = feed(dir, &["list", "--feeds", "no-such-file.yaml"]);
+    assert!(!missing.ok);
+    assert!(
+        missing.stderr.contains("no-such-file.yaml"),
+        "{}",
+        missing.stderr
+    );
+}

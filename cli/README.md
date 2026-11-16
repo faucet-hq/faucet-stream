@@ -426,8 +426,12 @@ sender: the signature covers the bytes as sent and the feed's size limits
 apply to the expanded body.
 
 Every store verb takes `--json`, `--tenant <id>`, `--vault-key` (for a feed with
-a signature secret, secret delivery params or sealed events) and
-`--feed-store NAME=URL`. `faucet schema feed` prints the schema of one feed
+a signature secret, secret delivery params or sealed events),
+`--feed-store NAME=URL` and `--feeds <file>`. A feed of the server's `--feeds`
+file is found only when the same file is passed here: then it can be shown,
+pushed to, given tokens, and its deliveries paused, resumed, replayed,
+skipped or recovered. `create`, `apply` and `delete` refuse a file feed: it
+changes in the file. `faucet schema feed` prints the schema of one feed
 definition, `faucet schema feeds` that of the `--feeds` file
 (`cli/examples/feeds/feeds.yaml`).
 

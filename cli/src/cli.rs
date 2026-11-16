@@ -622,6 +622,12 @@ pub struct FeedArgs {
     /// `NAME=postgres://…` (repeatable), as given to `faucet serve`.
     #[arg(long = "feed-store", global = true, value_name = "NAME=URL")]
     pub feed_store: Vec<String>,
+    /// The feeds file the server runs with (`faucet serve --feeds`), so its
+    /// feeds can be read, pushed to, given tokens and have their deliveries
+    /// paused, replayed, skipped or recovered. A file feed is changed by
+    /// editing the file: `create`, `apply` and `delete` refuse one.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub feeds: Option<PathBuf>,
     /// The server's vault key: needed for a feed with a signature secret,
     /// secret delivery params or sealed events.
     #[arg(long, global = true, env = "FAUCET_VAULT_KEY", hide_env_values = true)]

@@ -284,9 +284,12 @@ on the change request when the server gates the change.
   `sealed`, `headers`, `dedupe_key` and `delivered_by` (the deliveries past
   it). Reading one event returns its `payload` with `payload_encoding`
   (`utf8` or `base64`); a sealed event's payload is withheld.
-- **Refusals** lists the requests this server refused lately for the feed (at
-  most 200, kept in memory): time, reason, status, sender address and message,
-  never a payload or a credential.
+- **Refusals** answers `{scope, refusals}`: the requests this server refused
+  lately for the feed (at most 200, kept in memory, lost on restart) with
+  time, reason, status, sender address and message, never a payload or a
+  credential. `scope` is always `this_server`: behind several replicas each
+  one lists what it refused itself, and `faucet_feed_ingest_refused_total`
+  counts refusals across all of them.
 
 The [MCP server](/faucet-stream/cookbook/mcp/) has two read tools,
 `list_feeds` and `get_feed`, for callers that hold `FeedRead`.
@@ -330,13 +333,18 @@ A delivery's last run has one of these outcomes: `delivered`, `failed`,
 
 Manages feeds straight in their stores, the way `faucet template` manages
 templates. It talks to no server (except `send`), and it starts no delivery
-runs: a server does. It sees the feeds stored in the run history, not the
-feeds of a server's `--feeds` file.
+runs: a server does. It sees the feeds stored in the run history, and the
+feeds of a server's `--feeds` file when the same file is passed with
+`--feeds`. A file feed can then be listed, shown, pushed to, tailed, given
+tokens, and have its deliveries paused, resumed, replayed, skipped or
+recovered. `create`, `apply` and `delete` refuse a file feed: it changes in
+the file.
 
 | Global flag | Meaning |
 |---|---|
 | `--store <url>` | The run history the server keeps its feeds in: `sqlite:<path>` or `postgres://…`. Env `FAUCET_FEED_STORE`. The feed store follows it. |
 | `--feed-store <name>=<url>` | A named feed store, as given to `faucet serve` (repeatable). |
+| `--feeds <path>` | The feeds file the server runs with. It is loaded as the server loads it, so the environment variables and secrets it references must resolve. |
 | `--vault-key <key>` | The server's vault key. Env `FAUCET_VAULT_KEY`. |
 | `--tenant <id>` | The tenant whose feeds are meant. |
 | `--json` | Print JSON. |
