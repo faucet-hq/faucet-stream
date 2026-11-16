@@ -59,6 +59,9 @@ Alert rules (`observability/prometheus/alerts.yml`):
 | `FaucetFeedDeliveryLagging` | a delivery's oldest undelivered event has waited > 10 m, for 10 m | warning |
 | `FaucetFeedNearFull` | a feed is at 80% or more of its undelivered limits, for 5 m | warning |
 | `FaucetFeedRunsFailing` | three or more of a delivery's runs failed or were refused in 30 m | warning |
+| `FaucetFeedStoreErrors` | a feed's store returned errors in the last 10 m, for 5 m | critical |
+| `FaucetFeedIngestErrors` | a feed answered more than 5% of its ingest requests with a 5xx, for 5 m | warning |
+| `FaucetFeedIngestRefusals` | a feed refused more than 20% of its ingest requests for one reason, for 15 m | warning |
 | `FaucetServeTemplateSyncFailing` | a template sync origin failed in the last hour | warning |
 | `FaucetNotificationsFailing` | notification deliveries failed in the last hour | warning |
 | `FaucetOtelExportFailures` / `FaucetLineageEventsDropped` | telemetry/lineage export failing | info |
