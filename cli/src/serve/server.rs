@@ -116,6 +116,55 @@ pub fn build_router(
             get(crate::serve::handlers::schedules::list),
         );
     }
+    // Feeds (#1034). The ingest routes are a router of their own.
+    #[cfg(feature = "feeds")]
+    {
+        use crate::serve::handlers::feeds as f;
+        use axum::routing::put;
+        api = api
+            .route("/v1/feeds", get(f::list).post(f::create))
+            .route(
+                "/v1/feeds/{name}",
+                get(f::get).put(f::update).delete(f::delete),
+            )
+            .route("/v1/feeds/{name}/deliveries", post(f::delivery_create))
+            .route(
+                "/v1/feeds/{name}/deliveries/{delivery}",
+                put(f::delivery_update).delete(f::delivery_delete),
+            )
+            .route(
+                "/v1/feeds/{name}/deliveries/{delivery}/pause",
+                post(f::pause),
+            )
+            .route(
+                "/v1/feeds/{name}/deliveries/{delivery}/resume",
+                post(f::resume),
+            )
+            .route(
+                "/v1/feeds/{name}/deliveries/{delivery}/deliver-now",
+                post(f::deliver_now),
+            )
+            .route(
+                "/v1/feeds/{name}/deliveries/{delivery}/replay",
+                post(f::replay),
+            )
+            .route("/v1/feeds/{name}/deliveries/{delivery}/skip", post(f::skip))
+            .route(
+                "/v1/feeds/{name}/deliveries/{delivery}/recover",
+                post(f::recover),
+            )
+            .route(
+                "/v1/feeds/{name}/tokens",
+                get(f::tokens).post(f::token_create),
+            )
+            .route(
+                "/v1/feeds/{name}/tokens/{id}",
+                axum::routing::delete(f::token_revoke),
+            )
+            .route("/v1/feeds/{name}/events", get(f::events))
+            .route("/v1/feeds/{name}/events/{seq}", get(f::event))
+            .route("/v1/feeds/{name}/refusals", get(f::refusals));
+    }
     #[cfg(all(feature = "schedule", feature = "templates"))]
     {
         use crate::serve::handlers::schedules as s;

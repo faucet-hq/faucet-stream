@@ -519,9 +519,25 @@ fn group(first: Job, rx: &mut mpsc::Receiver<Job>) -> Vec<Job> {
     jobs
 }
 
+/// Most refusals a server remembers per feed.
+pub const REFUSALS_KEPT: usize = 200;
+
+/// One refused request, as the feed's page lists it: never its payload or
+/// its credential.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RefusalRecord {
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub reason: &'static str,
+    pub status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
+    pub detail: String,
+}
+
 /// What a server keeps for ingest: limits, rate limiters and one append
 /// task per feed that is receiving events.
 pub struct Ingest {
+    refusals: DashMap<String, Mutex<std::collections::VecDeque<RefusalRecord>>>,
     max_request_bytes: u64,
     request_timeout: Duration,
     permits: Arc<Semaphore>,
@@ -552,7 +568,35 @@ impl Ingest {
             unauthenticated: DashMap::new(),
             batchers: Arc::new(DashMap::new()),
             touched: DashMap::new(),
+            refusals: DashMap::new(),
         }
+    }
+
+    fn refused(&self, feed_uid: &str, record: RefusalRecord) {
+        let ring = self.refusals.entry(feed_uid.to_string()).or_default();
+        let mut ring = ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if ring.len() == REFUSALS_KEPT {
+            ring.pop_front();
+        }
+        ring.push_back(record);
+    }
+
+    /// The requests of `feed_uid` this server refused lately, newest first.
+    /// Kept in memory, per server.
+    pub fn refusals(&self, feed_uid: &str) -> Vec<RefusalRecord> {
+        self.refusals
+            .get(feed_uid)
+            .map(|ring| {
+                ring.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Forget what is kept for a deleted feed.
@@ -560,6 +604,7 @@ impl Ingest {
         self.feeds.0.remove(feed_uid);
         self.unauthenticated.remove(feed_uid);
         self.batchers.remove(feed_uid);
+        self.refusals.remove(feed_uid);
     }
 
     /// Forget a deleted or revoked token.
@@ -809,7 +854,12 @@ async fn handle(
         },
     };
     let Some(Admitted { feed, token }) = admitted else {
-        return Err(before(Refusal::unauthorized()));
+        // The feed's own page lists the refusal when the feed exists; the
+        // sender is told the same either way.
+        return Err((
+            snapshot.feed(tenant.as_deref(), &name),
+            Refusal::unauthorized(),
+        ));
     };
     let refuse = |r: Refusal| (Some(feed.clone()), r);
     let spec = &feed.spec.ingest;
@@ -1040,6 +1090,11 @@ async fn answer(
     name: String,
     req: Request,
 ) -> Response {
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip().to_string());
+    let ingest_state = state.clone();
     match handle(state, tenant, name, req).await {
         Ok((feed, response)) => {
             metrics::ingest_request(&feed.label(), response.status().as_u16());
@@ -1050,6 +1105,18 @@ async fn answer(
             let label = feed.as_ref().map(|f| f.label()).unwrap_or_default();
             metrics::ingest_request(&label, refusal.status.as_u16());
             metrics::ingest_refused(&label, refusal.reason);
+            if let Some(feed) = &feed {
+                ingest_state.feeds().ingest().refused(
+                    feed.uid.as_str(),
+                    RefusalRecord {
+                        at: chrono::Utc::now(),
+                        reason: refusal.reason,
+                        status: refusal.status.as_u16(),
+                        sender: peer,
+                        detail: refusal.message.clone(),
+                    },
+                );
+            }
             tracing::debug!(feed = %label, reason = refusal.reason, status = refusal.status.as_u16(), "ingest request refused");
             refusal.into_response()
         }

@@ -76,6 +76,9 @@ pub struct DeliveryView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     pub consecutive_failures: u32,
+    /// Events stored in the last 24 hours that this delivery has delivered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_24h: Option<u64>,
 }
 
 /// One feed as a response shows it.
@@ -99,12 +102,67 @@ pub struct FeedView {
     pub oldest: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stored_bytes: Option<u64>,
-    /// Events and bytes accepted in the last 24 hours, once ingest counts them.
+    /// Retained events and their payload bytes stored in the last 24 hours.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub events_24h: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_24h: Option<u64>,
+    /// `receiving`, `stalled`, `held`, `full` or `paused`.
+    pub status: String,
+    /// The path senders post events to.
+    pub ingest_path: String,
+    /// Undelivered bytes or age as a fraction of the feed's undelivered
+    /// limits (the larger); at 1 the feed refuses new events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub undelivered_ratio: Option<f64>,
+    /// Requests this server refused lately (see the refusals listing).
+    pub refused_recent: u64,
     pub deliveries: Vec<DeliveryView>,
+}
+
+/// The path senders post a feed's events to.
+pub fn ingest_path(tenant: Option<&str>, name: &str) -> String {
+    match tenant {
+        Some(t) => format!("/v1/tenants/{t}/feeds/{name}/events"),
+        None => format!("/v1/feeds/{name}/events"),
+    }
+}
+
+/// How full a feed is: its undelivered bytes or age against its limits.
+fn undelivered_ratio(feed: &Feed, head: &Head) -> f64 {
+    let limits = &feed.spec.retention.undelivered;
+    let pending = head
+        .deliveries
+        .iter()
+        .any(|d| d.cursor.distance_to(head.end()) > 0);
+    let by_bytes = if pending {
+        head.bytes as f64 / limits.max_bytes.bytes().max(1) as f64
+    } else {
+        0.0
+    };
+    let oldest = head
+        .deliveries
+        .iter()
+        .filter_map(|d| d.oldest_undelivered_at)
+        .map(|t| (head.now - t).num_milliseconds().max(0) as f64 / 1000.0)
+        .fold(0.0, f64::max);
+    by_bytes.max(oldest / limits.max_age.secs().max(1) as f64)
+}
+
+/// The status word a feed shows, worst first.
+fn feed_status(deliveries: &[DeliveryView], ratio: Option<f64>) -> &'static str {
+    let any = |word: &str| deliveries.iter().any(|d| d.status == word);
+    if any("held") {
+        "held"
+    } else if any("stalled") {
+        "stalled"
+    } else if ratio.is_some_and(|r| r >= 1.0) {
+        "full"
+    } else if !deliveries.is_empty() && deliveries.iter().all(|d| d.status == "paused") {
+        "paused"
+    } else {
+        "receiving"
+    }
 }
 
 /// A gap in what a delivery read.
@@ -215,11 +273,17 @@ pub fn view(
                 last_run: s.last_run.clone(),
                 last_error: s.last_error.clone().or(s.needs_approval.clone()),
                 consecutive_failures: s.consecutive_failures,
+                delivered_24h: None,
                 spec: d.clone(),
             })
         })
-        .collect();
+        .collect::<Vec<DeliveryView>>();
+    let ratio = head.map(|h| undelivered_ratio(feed, h));
     FeedView {
+        status: feed_status(&deliveries, ratio).to_string(),
+        ingest_path: ingest_path(feed.tenant(), feed.name()),
+        undelivered_ratio: ratio,
+        refused_recent: 0,
         name: feed.name().to_string(),
         tenant: feed.tenant().map(str::to_string),
         uid: feed.uid.as_str().to_string(),
@@ -313,11 +377,288 @@ async fn statuses(
 }
 
 async fn view_of(state: &ServerState, feed: &Feed) -> Result<FeedView, ServeError> {
-    let head = match state.feeds().store_for(feed).await {
-        Ok(store) => head_of(&*store, feed).await.ok().flatten(),
-        Err(_) => None,
+    let store = state.feeds().store_for(feed).await.ok();
+    let head = match &store {
+        Some(store) => head_of(&**store, feed).await.ok().flatten(),
+        None => None,
     };
-    Ok(view(feed, head.as_ref(), &statuses(state, feed).await?))
+    let mut out = view(feed, head.as_ref(), &statuses(state, feed).await?);
+    out.refused_recent = state.feeds().ingest().refusals(feed.uid.as_str()).len() as u64;
+    // What the last 24 hours brought, by the store's own clock.
+    if let (Some(store), Some(head)) = (&store, &head) {
+        let calls = store_calls();
+        let since = head.now - chrono::Duration::hours(24);
+        if let Ok(from) = store.seq_at(&calls, &feed.uid, since).await {
+            out.events_24h = Some(from.distance_to(head.end()));
+            out.bytes_24h = store
+                .bytes_from(&calls, &feed.uid, from)
+                .await
+                .ok()
+                .flatten();
+            for d in &mut out.deliveries {
+                d.delivered_24h = d.position.map(|p| from.distance_to(Seq(p).max(from)));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A tenant's feed quotas and what it uses of them.
+#[derive(Debug, Clone, Serialize)]
+pub struct Quotas {
+    pub tenant: String,
+    pub feeds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_feeds: Option<u32>,
+    pub stored_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_feed_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_feed_events_per_sec: Option<u32>,
+}
+
+/// What the feeds page lists.
+#[derive(Debug, Clone, Serialize)]
+pub struct FeedList {
+    pub feeds: Vec<FeedView>,
+    /// The tenant's quotas, when the listing is for one tenant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quotas: Option<Quotas>,
+    /// The stores a new feed may name.
+    pub stores: Vec<String>,
+    /// Whether creating or changing a feed here needs an approved change
+    /// request (`always`, `deliveries` or `never`).
+    pub approval: &'static str,
+}
+
+/// The feeds `actor` sees for `tenant`, with the tenant's quotas.
+pub async fn overview(
+    state: &ServerState,
+    actor: &AuthContext,
+    tenant: Option<&str>,
+) -> Result<FeedList, ServeError> {
+    use crate::serve::changes::ChangeKind;
+    let feeds = list(state, actor, tenant).await?;
+    let scoped = scope(actor, tenant)?;
+    let quotas = match &scoped {
+        Some(t) => {
+            let limits = state
+                .history()
+                .tenant_get(t)
+                .await
+                .map_err(ServeError::from)?
+                .map(|r| r.limits)
+                .unwrap_or_default();
+            Some(Quotas {
+                tenant: t.clone(),
+                feeds: feeds.len() as u64,
+                max_feeds: limits.max_feeds,
+                stored_bytes: feeds.iter().filter_map(|f| f.stored_bytes).sum(),
+                max_feed_bytes: limits.max_feed_bytes,
+                max_feed_events_per_sec: limits.max_feed_events_per_sec,
+            })
+        }
+        None => None,
+    };
+    let stores = if actor.role == Role::Admin && actor.tenant.is_none() {
+        state.feeds().stores().names()
+    } else {
+        vec![spec::DEFAULT_STORE.to_string()]
+    };
+    Ok(FeedList {
+        feeds,
+        quotas,
+        stores,
+        approval: if state.requires_approval(ChangeKind::Feed) {
+            "always"
+        } else if state.requires_approval(ChangeKind::Run) {
+            "deliveries"
+        } else {
+            "never"
+        },
+    })
+}
+
+/// Most events one page of the event browser holds.
+pub const MAX_EVENTS_PAGE: u64 = 200;
+
+/// One stored event as the browser shows it.
+#[derive(Debug, Clone, Serialize)]
+pub struct EventView {
+    pub seq: u64,
+    pub id: String,
+    pub received_at: DateTime<Utc>,
+    pub stored_at: DateTime<Utc>,
+    pub content_type: String,
+    pub size: u64,
+    pub sealed: bool,
+    pub headers: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dedupe_key: Option<String>,
+    /// The deliveries that have delivered it.
+    pub delivered_by: Vec<String>,
+    /// The payload: text, or base64 when it is not UTF-8. Only on the
+    /// single-event read, and never for a sealed event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
+    /// `utf8` or `base64`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_encoding: Option<&'static str>,
+    /// Why the payload is not shown (`sealed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_withheld: Option<&'static str>,
+}
+
+/// A page of the event browser, newest first.
+#[derive(Debug, Clone, Serialize)]
+pub struct EventsPage {
+    pub events: Vec<EventView>,
+    /// The oldest retained event's number.
+    pub oldest: u64,
+    /// The last stored event's number.
+    pub watermark: u64,
+    /// Pass as `before` for the next (older) page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_before: Option<u64>,
+}
+
+fn event_view(
+    e: faucet_common_feed::StoredEvent,
+    head: &Head,
+    feed: &Feed,
+    payload: bool,
+) -> EventView {
+    let delivered_by = feed
+        .deliveries
+        .iter()
+        .filter(|(_, dref)| {
+            head.deliveries
+                .iter()
+                .any(|d| d.delivery == dref.uid && d.cursor > e.seq)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    let (mut text, mut encoding, mut withheld) = (None, None, None);
+    if payload && e.sealed {
+        withheld = Some("sealed");
+    } else if payload {
+        match String::from_utf8(e.payload) {
+            Ok(s) => (text, encoding) = (Some(s), Some("utf8")),
+            Err(raw) => {
+                let b64 = faucet_core::fidelity::binary(raw.as_bytes());
+                (text, encoding) = (b64.as_str().map(str::to_string), Some("base64"));
+            }
+        }
+    }
+    EventView {
+        seq: e.seq.get(),
+        id: e.id,
+        received_at: e.received_at,
+        stored_at: e.stored_at,
+        content_type: e.content_type,
+        size: e.size,
+        sealed: e.sealed,
+        headers: e.headers,
+        dedupe_key: e.dedupe_key,
+        delivered_by,
+        payload: text,
+        payload_encoding: encoding,
+        payload_withheld: withheld,
+    }
+}
+
+/// A page of a feed's retained events without their payloads, newest first:
+/// the `limit` events before `before` (default: the newest), or, with
+/// `from`, the `limit` events from there on.
+pub async fn events(
+    state: &ServerState,
+    actor: &AuthContext,
+    tenant: Option<&str>,
+    name: &str,
+    before: Option<u64>,
+    from: Option<u64>,
+    limit: Option<u64>,
+) -> Result<EventsPage, ServeError> {
+    let tenant = scope(actor, tenant)?;
+    let found = find(state, tenant.as_deref(), name).await?;
+    let feed = &found.feed;
+    let store = state.feeds().store_for(feed).await.map_err(store_error)?;
+    let head = head_of(&*store, feed).await?.ok_or(ServeError::NotFound)?;
+    let limit = limit.unwrap_or(50).clamp(1, MAX_EVENTS_PAGE);
+    let (oldest, end) = (head.oldest.get(), head.end().get());
+    let (lo, hi) = match from {
+        Some(from) => {
+            let lo = from.clamp(oldest, end);
+            (lo, lo.saturating_add(limit).min(end))
+        }
+        None => {
+            let hi = before.unwrap_or(end).clamp(oldest, end);
+            (hi.saturating_sub(limit).max(oldest), hi)
+        }
+    };
+    let mut events = Vec::new();
+    if hi > lo {
+        let batch = store
+            .read(&store_calls(), &feed.uid, Seq(lo), Seq(hi))
+            .await
+            .map_err(store_error)?;
+        events = batch
+            .events
+            .into_iter()
+            .rev()
+            .map(|e| event_view(e, &head, feed, false))
+            .collect();
+    }
+    Ok(EventsPage {
+        events,
+        oldest,
+        watermark: head.watermark.get(),
+        next_before: (lo > oldest).then_some(lo),
+    })
+}
+
+/// One retained event with its payload (never a sealed one's).
+pub async fn event(
+    state: &ServerState,
+    actor: &AuthContext,
+    tenant: Option<&str>,
+    name: &str,
+    seq: u64,
+) -> Result<EventView, ServeError> {
+    let tenant = scope(actor, tenant)?;
+    let found = find(state, tenant.as_deref(), name).await?;
+    let feed = &found.feed;
+    let store = state.feeds().store_for(feed).await.map_err(store_error)?;
+    let head = head_of(&*store, feed).await?.ok_or(ServeError::NotFound)?;
+    if seq < head.oldest.get() || seq > head.watermark.get() {
+        return Err(ServeError::NotFound);
+    }
+    let batch = store
+        .read(&store_calls(), &feed.uid, Seq(seq), Seq(seq + 1))
+        .await
+        .map_err(store_error)?;
+    let e = batch
+        .events
+        .into_iter()
+        .next()
+        .ok_or(ServeError::NotFound)?;
+    Ok(event_view(e, &head, feed, true))
+}
+
+/// The requests of a feed this server refused lately, newest first. Kept in
+/// memory per server; payloads and credentials are never kept.
+pub async fn refusals(
+    state: &ServerState,
+    actor: &AuthContext,
+    tenant: Option<&str>,
+    name: &str,
+    limit: Option<usize>,
+) -> Result<Vec<super::ingest::RefusalRecord>, ServeError> {
+    let tenant = scope(actor, tenant)?;
+    let found = find(state, tenant.as_deref(), name).await?;
+    let mut all = state.feeds().ingest().refusals(found.feed.uid.as_str());
+    all.truncate(limit.unwrap_or(super::ingest::REFUSALS_KEPT));
+    Ok(all)
 }
 
 /// The feeds `actor` sees for `tenant`.
@@ -1089,6 +1430,26 @@ async fn refuse_live_claim(
         ))),
         None => Ok(()),
     }
+}
+
+/// The deliveries of the feed (or just `delivery`) with a run in flight, for
+/// a delete to refuse by name. Empty for a `--feeds` file feed, which a
+/// delete refuses for its own reason.
+pub async fn in_flight(
+    state: &ServerState,
+    actor: &AuthContext,
+    tenant: Option<&str>,
+    name: &str,
+    delivery: Option<&str>,
+) -> Result<Vec<(String, Option<String>)>, ServeError> {
+    let tenant = scope(actor, tenant)?;
+    let found = find(state, tenant.as_deref(), name).await?;
+    if found.record.is_none() {
+        return Ok(Vec::new());
+    }
+    let mut runs = runs_in_flight(state, &found.feed).await?;
+    runs.retain(|(d, _)| delivery.is_none_or(|want| want == d));
+    Ok(runs)
 }
 
 /// The deliveries of `feed` with a run in flight: `(delivery, run id)`. The

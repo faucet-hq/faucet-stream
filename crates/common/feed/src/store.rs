@@ -80,6 +80,18 @@ pub trait FeedStore: Send + Sync {
     /// `time`; the feed's end when there is none.
     async fn seq_at(&self, calls: &CallContext, feed: &FeedUid, time: Timestamp) -> Result<Seq>;
 
+    /// Payload bytes of the retained events at or after `from`. `None`: the
+    /// backend cannot say without reading them (the default).
+    async fn bytes_from(
+        &self,
+        calls: &CallContext,
+        feed: &FeedUid,
+        from: Seq,
+    ) -> Result<Option<u64>> {
+        let _ = (calls, feed, from);
+        Ok(None)
+    }
+
     /// Claim `[expected_cursor, to)` for `ttl`. `None` when the cursor moved,
     /// another claim is live, or `to` is past the watermark: exactly one of
     /// several concurrent claimers wins.

@@ -115,6 +115,16 @@ pub enum Permission {
     /// Create, edit, pause, resume, delete and run a schedule now (#1044) —
     /// operator+. A tenant-scoped principal reaches only its tenant's own.
     ScheduleWrite,
+    /// List and read feeds, their deliveries, tokens (never the token text),
+    /// event envelopes and refusals (`GET /v1/feeds*`, #1034) — viewer+.
+    FeedRead,
+    /// Create and edit a feed and its deliveries, pause, resume and deliver
+    /// now, issue and revoke its tokens (#1034) — operator+. A tenant-scoped
+    /// principal reaches only its tenant's feeds.
+    FeedWrite,
+    /// Delete a feed, replay, skip and recover a delivery, and read an
+    /// event's payload (#1034) — admin-only.
+    FeedAdmin,
     /// Read the data-flow policy in force, its versions and its refusals
     /// (`GET /v1/policy*`, `GET /v1/tenants/{tenant}/policy`, #1043) —
     /// viewer+. A tenant principal sees the server rules that apply to it,
@@ -129,7 +139,7 @@ pub enum Permission {
 
 impl Permission {
     /// Every permission, in declaration order.
-    pub const ALL: [Permission; 31] = [
+    pub const ALL: [Permission; 34] = [
         Permission::RunRead,
         Permission::RunWrite,
         Permission::SchemaRead,
@@ -159,6 +169,9 @@ impl Permission {
         Permission::ConnectionManage,
         Permission::ScheduleRead,
         Permission::ScheduleWrite,
+        Permission::FeedRead,
+        Permission::FeedWrite,
+        Permission::FeedAdmin,
         Permission::PolicyRead,
         Permission::PolicyAdmin,
     ];
@@ -199,6 +212,7 @@ impl Role {
                         | StatusRead
                         | TenantRead
                         | ScheduleRead
+                        | FeedRead
                         | PolicyRead
                 )
             }
@@ -228,6 +242,8 @@ impl Role {
                         | ConnectionManage
                         | ScheduleRead
                         | ScheduleWrite
+                        | FeedRead
+                        | FeedWrite
                         | PolicyRead
                 )
             }
@@ -679,6 +695,26 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         (&Method::POST, "/v1/schedules/{name}/pause") => Some(ScheduleWrite),
         (&Method::POST, "/v1/schedules/{name}/resume") => Some(ScheduleWrite),
         (&Method::POST, "/v1/schedules/{name}/run") => Some(ScheduleWrite),
+        // Feeds (#1034). The ingest routes authenticate themselves.
+        (&Method::GET, "/v1/feeds")
+        | (&Method::GET, "/v1/feeds/{name}")
+        | (&Method::GET, "/v1/feeds/{name}/tokens")
+        | (&Method::GET, "/v1/feeds/{name}/events")
+        | (&Method::GET, "/v1/feeds/{name}/refusals") => Some(FeedRead),
+        (&Method::POST, "/v1/feeds")
+        | (&Method::PUT, "/v1/feeds/{name}")
+        | (&Method::POST, "/v1/feeds/{name}/deliveries")
+        | (&Method::PUT | &Method::DELETE, "/v1/feeds/{name}/deliveries/{delivery}")
+        | (&Method::POST, "/v1/feeds/{name}/deliveries/{delivery}/pause")
+        | (&Method::POST, "/v1/feeds/{name}/deliveries/{delivery}/resume")
+        | (&Method::POST, "/v1/feeds/{name}/deliveries/{delivery}/deliver-now")
+        | (&Method::POST, "/v1/feeds/{name}/tokens")
+        | (&Method::DELETE, "/v1/feeds/{name}/tokens/{id}") => Some(FeedWrite),
+        (&Method::DELETE, "/v1/feeds/{name}")
+        | (&Method::POST, "/v1/feeds/{name}/deliveries/{delivery}/replay")
+        | (&Method::POST, "/v1/feeds/{name}/deliveries/{delivery}/skip")
+        | (&Method::POST, "/v1/feeds/{name}/deliveries/{delivery}/recover")
+        | (&Method::GET, "/v1/feeds/{name}/events/{seq}") => Some(FeedAdmin),
         (&Method::POST, "/v1/triggers/{name}") => Some(TriggerFire),
         (&Method::PUT, "/v1/triggers/{name}") => Some(TriggerFire),
         (&Method::GET, "/v1/catalog/datasets") => Some(CatalogRead),
@@ -846,6 +882,23 @@ pub fn tenant_scope_decision(
         | (&Method::GET, "/v1/connect/providers")
         // Schedules (#1044): the handlers confine a tenant principal to its
         // tenant's schedules (and the fan-outs that include it, read-only).
+        // Feeds (#1034): the service confines a tenant principal to its
+        // tenant's feeds.
+        | (_, "/v1/feeds")
+        | (_, "/v1/feeds/{name}")
+        | (_, "/v1/feeds/{name}/deliveries")
+        | (_, "/v1/feeds/{name}/deliveries/{delivery}")
+        | (_, "/v1/feeds/{name}/deliveries/{delivery}/pause")
+        | (_, "/v1/feeds/{name}/deliveries/{delivery}/resume")
+        | (_, "/v1/feeds/{name}/deliveries/{delivery}/deliver-now")
+        | (_, "/v1/feeds/{name}/deliveries/{delivery}/replay")
+        | (_, "/v1/feeds/{name}/deliveries/{delivery}/skip")
+        | (_, "/v1/feeds/{name}/deliveries/{delivery}/recover")
+        | (_, "/v1/feeds/{name}/tokens")
+        | (_, "/v1/feeds/{name}/tokens/{id}")
+        | (_, "/v1/feeds/{name}/events")
+        | (_, "/v1/feeds/{name}/events/{seq}")
+        | (_, "/v1/feeds/{name}/refusals")
         | (_, "/v1/schedules")
         | (_, "/v1/schedules/preview")
         | (_, "/v1/schedules/{name}")
@@ -893,6 +946,26 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::POST, "/v1/schedules/{name}/pause") => "schedule.pause",
         (&Method::POST, "/v1/schedules/{name}/resume") => "schedule.resume",
         (&Method::POST, "/v1/schedules/{name}/run") => "schedule.run",
+        (&Method::GET, "/v1/feeds") => "feed.list",
+        (&Method::GET, "/v1/feeds/{name}") => "feed.get",
+        (&Method::POST, "/v1/feeds") => "feed.create",
+        (&Method::PUT, "/v1/feeds/{name}") => "feed.update",
+        (&Method::DELETE, "/v1/feeds/{name}") => "feed.delete",
+        (&Method::POST, "/v1/feeds/{name}/deliveries")
+        | (&Method::PUT, "/v1/feeds/{name}/deliveries/{delivery}") => "feed.delivery_set",
+        (&Method::DELETE, "/v1/feeds/{name}/deliveries/{delivery}") => "feed.delivery_delete",
+        (&Method::POST, "/v1/feeds/{name}/deliveries/{delivery}/pause") => "feed.pause",
+        (&Method::POST, "/v1/feeds/{name}/deliveries/{delivery}/resume") => "feed.resume",
+        (&Method::POST, "/v1/feeds/{name}/deliveries/{delivery}/deliver-now") => "feed.deliver_now",
+        (&Method::POST, "/v1/feeds/{name}/deliveries/{delivery}/replay") => "feed.replay",
+        (&Method::POST, "/v1/feeds/{name}/deliveries/{delivery}/skip") => "feed.skip",
+        (&Method::POST, "/v1/feeds/{name}/deliveries/{delivery}/recover") => "feed.recover",
+        (&Method::GET, "/v1/feeds/{name}/tokens") => "feed.token_list",
+        (&Method::POST, "/v1/feeds/{name}/tokens") => "feed.token_create",
+        (&Method::DELETE, "/v1/feeds/{name}/tokens/{id}") => "feed.token_revoke",
+        (&Method::GET, "/v1/feeds/{name}/events") => "feed.events_list",
+        (&Method::GET, "/v1/feeds/{name}/events/{seq}") => "feed.events_read",
+        (&Method::GET, "/v1/feeds/{name}/refusals") => "feed.refusals",
         (&Method::POST | &Method::PUT, "/v1/triggers/{name}") => "trigger.fire",
         (&Method::GET, "/v1/catalog/datasets") => "catalog.list",
         (&Method::GET, "/v1/catalog/datasets/{id}") => "catalog.get",

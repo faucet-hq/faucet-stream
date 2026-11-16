@@ -1186,6 +1186,27 @@ macro_rules! impl_feed_store {
                 $crate::sql::seq_of(at)
             }
 
+            async fn do_bytes_from(
+                &self,
+                feed: &$crate::FeedUid,
+                from: $crate::Seq,
+            ) -> $crate::Result<Option<u64>> {
+                use sqlx::Row;
+                use $crate::sql::{seq_param, stmt};
+                let row = sqlx::query(stmt!(
+                    Self::D,
+                    "SELECT CAST(COALESCE(SUM(size), 0) AS BIGINT) FROM faucet_feed_events \
+                     WHERE feed = ? AND lane = 0 AND seq >= ?"
+                ))
+                .bind(feed.as_str())
+                .bind(seq_param(from)?)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(Self::be)?;
+                let bytes: i64 = row.try_get(0).map_err(Self::be)?;
+                Ok(Some(u64::try_from(bytes).unwrap_or(0)))
+            }
+
             async fn do_claim(
                 &self,
                 delivery: &$crate::DeliveryUid,
@@ -1765,6 +1786,15 @@ macro_rules! impl_feed_store {
                 time: $crate::Timestamp,
             ) -> $crate::Result<$crate::Seq> {
                 $crate::sql::each(calls, "seq_at", || self.do_seq_at(feed, time)).await
+            }
+
+            async fn bytes_from(
+                &self,
+                calls: &faucet_core::io::CallContext,
+                feed: &$crate::FeedUid,
+                from: $crate::Seq,
+            ) -> $crate::Result<Option<u64>> {
+                $crate::sql::each(calls, "bytes_from", || self.do_bytes_from(feed, from)).await
             }
 
             async fn claim(

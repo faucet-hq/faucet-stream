@@ -383,11 +383,13 @@ fn a_read_token_can_reach_every_read_route() {
 
     let mut denied: Vec<String> = Vec::new();
     for (method, path) in all_v1_routes() {
-        // The audit log and pipeline state (#735) are admin-only by design.
+        // The audit log, pipeline state (#735) and a feed event's payload
+        // (#1034) are admin-only by design.
         if method != axum::http::Method::GET
             || path == "/v1/audit"
             || path == "/v1/audit/{id}"
             || path == "/v1/state/{pipeline}/{row}"
+            || path == "/v1/feeds/{name}/events/{seq}"
         {
             continue;
         }

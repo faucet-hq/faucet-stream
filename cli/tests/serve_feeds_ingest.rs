@@ -37,6 +37,10 @@ fn admin() -> AuthContext {
 }
 
 fn config(dir: &Path, extra: &[&str]) -> ServeConfig {
+    config_as(dir, &["--no-auth"], extra)
+}
+
+fn config_as(dir: &Path, auth: &[&str], extra: &[&str]) -> ServeConfig {
     let root = dir.display().to_string();
     let history = format!("sqlite:{}", dir.join("history.db").display());
     let mut argv = vec![
@@ -44,7 +48,6 @@ fn config(dir: &Path, extra: &[&str]) -> ServeConfig {
         "serve",
         "--listen",
         "127.0.0.1:0",
-        "--no-auth",
         "--no-env-file",
         "--no-ui",
         "--history",
@@ -54,6 +57,7 @@ fn config(dir: &Path, extra: &[&str]) -> ServeConfig {
         "--allow-path-root",
         &root,
     ];
+    argv.extend_from_slice(auth);
     argv.extend_from_slice(extra);
     let cli = faucet_cli::cli::Cli::try_parse_from(argv).unwrap();
     let faucet_cli::cli::Command::Serve(args) = cli.command else {
@@ -121,7 +125,10 @@ impl Srv {
     }
 
     async fn start(dir: &Path, extra: &[&str]) -> Self {
-        let config = config(dir, extra);
+        Self::over(config(dir, extra)).await
+    }
+
+    async fn over(config: ServeConfig) -> Self {
         let state = Self::state(&config).await;
         let router =
             faucet_cli::serve::server::build_router(state.clone(), &config, &Default::default());
@@ -1347,5 +1354,759 @@ async fn a_token_in_the_url_reaches_no_log_line() {
     assert!(
         !logged.contains("long for this feed"),
         "a payload was logged"
+    );
+}
+
+const AUTH_CONFIG: &str = "principals:\n  - { name: alice, token: admin-tok, role: admin }\n  - { name: bob, token: op-tok, role: operator }\n  - { name: carol, token: view-tok, role: viewer }\n  - { name: acme-app, token: acme-tok, role: operator, tenant: acme }\n";
+
+/// The management API: who may do what, what each answer holds, and the
+/// audit entry every change leaves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_management_api_serves_feeds_to_each_role_and_audits_every_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let auth = root.join("auth.yaml");
+    std::fs::write(&auth, AUTH_CONFIG).unwrap();
+    let auth_arg = auth.display().to_string();
+    let srv = Srv::over(config_as(root, &["--auth-config", &auth_arg], &[])).await;
+    register(&srv.state, "lake", &root.join("state")).await;
+    let now = chrono::Utc::now();
+    let rec = serde_json::from_value(json!({
+        "id": "acme", "limits": {"max_feeds": 3, "max_feed_bytes": 1_000_000, "max_feed_events_per_sec": 50},
+        "created_at": now, "updated_at": now, "created_by": "alice"
+    }))
+    .unwrap();
+    srv.state.history().tenant_upsert(&rec).await.unwrap();
+
+    let call = |method: reqwest::Method, path: &str, token: &str, body: Option<Value>| {
+        let mut req = srv.client.request(method, srv.url(path)).bearer_auth(token);
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        srv.send(req)
+    };
+    use reqwest::Method as M;
+    let out = root.join("lake.jsonl");
+    // Deliveries that wait to be told: the scheduler runs in this server.
+    let lazy = |name: &str, out: &Path| {
+        let mut d = delivery(name, "lake", out);
+        d["flush"] = json!({"max_events": 100_000, "max_bytes": "1GiB", "max_age": "1d", "min_interval": "0s"});
+        d
+    };
+
+    // Nothing yet; what a new feed may name; who may ask.
+    let empty = call(M::GET, "/v1/feeds", "view-tok", None).await;
+    assert_eq!(empty.status, 200, "{}", empty.body);
+    assert_eq!(empty.body["feeds"], json!([]));
+    assert_eq!(empty.body["stores"], json!(["default"]));
+    assert_eq!(empty.body["approval"], "never");
+    assert!(empty.body.get("quotas").is_none());
+    assert_eq!(call(M::GET, "/v1/feeds", "nope", None).await.status, 401);
+    for (token, has) in [
+        ("view-tok", [true, false, false]),
+        ("op-tok", [true, true, false]),
+        ("admin-tok", [true, true, true]),
+    ] {
+        let me = call(M::GET, "/v1/whoami", token, None).await;
+        let perms = me.body["permissions"].as_array().unwrap();
+        for (perm, want) in ["feed_read", "feed_write", "feed_admin"].iter().zip(has) {
+            assert_eq!(perms.contains(&json!(perm)), want, "{token} {perm}");
+        }
+    }
+
+    // Create: an operator may, a viewer may not; the definition is checked.
+    let spec = json!({
+        "name": "orders",
+        "description": "orders from the shop",
+        "ingest": {"auth": {"tokens": "managed", "signature": {"header": "X-Sig", "secret": "hmac-s3cret"}}},
+        "deliveries": [lazy("lake", &out)]
+    });
+    assert_eq!(
+        call(M::POST, "/v1/feeds", "view-tok", Some(spec.clone()))
+            .await
+            .status,
+        403
+    );
+    let made = call(M::POST, "/v1/feeds", "op-tok", Some(spec.clone())).await;
+    assert_eq!(made.status, 201, "{}", made.body);
+    assert_eq!(made.body["name"], "orders");
+    assert_eq!(made.body["status"], "receiving");
+    assert_eq!(made.body["ingest_path"], "/v1/feeds/orders/events");
+    assert_eq!(
+        made.body["spec"]["ingest"]["auth"]["signature"]["secret"],
+        "$sealed"
+    );
+    assert_eq!(made.body["deliveries"][0]["status"], "ok");
+    assert_eq!(
+        call(M::POST, "/v1/feeds", "op-tok", Some(spec.clone()))
+            .await
+            .status,
+        409
+    );
+    let bad = call(
+        M::POST,
+        "/v1/feeds",
+        "op-tok",
+        Some(json!({"name": "Bad Name"})),
+    )
+    .await;
+    assert_eq!(bad.status, 422, "{}", bad.body);
+    let unknown_template = call(
+        M::POST,
+        "/v1/feeds",
+        "op-tok",
+        Some(
+            json!({"name": "x", "ingest": {"auth": {"tokens": "managed"}},
+                    "deliveries": [{"name": "d", "template": {"id": "not-registered"}}]}),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(unknown_template.status, 404 | 422),
+        "{}",
+        unknown_template.body
+    );
+    // A store other than `default` is the server admin's to choose.
+    let other_store = call(
+        M::POST,
+        "/v1/feeds",
+        "op-tok",
+        Some(json!({"name": "y", "store": "big", "ingest": {"auth": {"tokens": "managed"}}})),
+    )
+    .await;
+    assert_eq!(other_store.status, 403, "{}", other_store.body);
+
+    // Update keeps the stored secret behind its marker.
+    let mut edited = made.body["spec"].clone();
+    edited["description"] = json!("edited");
+    edited["ingest"]["auth"]["signature"] = Value::Null;
+    edited["ingest"]["auth"]
+        .as_object_mut()
+        .unwrap()
+        .remove("signature");
+    let updated = call(M::PUT, "/v1/feeds/orders", "op-tok", Some(edited)).await;
+    assert_eq!(updated.status, 200, "{}", updated.body);
+    assert_eq!(updated.body["revision"], 2);
+    assert_eq!(
+        call(M::PUT, "/v1/feeds/nope", "op-tok", Some(spec.clone()))
+            .await
+            .status,
+        404
+    );
+
+    // Tokens: the text is shown once.
+    let token = call(
+        M::POST,
+        "/v1/feeds/orders/tokens",
+        "op-tok",
+        Some(json!({"name": "shop"})),
+    )
+    .await;
+    assert_eq!(token.status, 201, "{}", token.body);
+    let text = token.body["token"].as_str().unwrap().to_string();
+    assert!(text.starts_with("fdt_"));
+    let listed = call(M::GET, "/v1/feeds/orders/tokens", "view-tok", None).await;
+    assert_eq!(listed.body.as_array().unwrap().len(), 1);
+    let shown = serde_json::to_string(&listed.body).unwrap();
+    assert!(!shown.contains(&text) && !shown.contains("hash"), "{shown}");
+    assert_eq!(listed.body[0]["name"], "shop");
+    assert_eq!(
+        call(
+            M::POST,
+            "/v1/feeds/orders/tokens",
+            "view-tok",
+            Some(json!({"name": "x"}))
+        )
+        .await
+        .status,
+        403
+    );
+    let past = call(
+        M::POST,
+        "/v1/feeds/orders/tokens",
+        "op-tok",
+        Some(json!({"name": "old", "expires_at": "2020-01-01T00:00:00Z"})),
+    )
+    .await;
+    assert_eq!(past.status, 422);
+
+    // Events arrive; the browser pages them newest first, without payloads.
+    assert_eq!(
+        srv.push(
+            "orders",
+            &text,
+            r#"[{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}, {"id": 5}]"#
+        )
+        .await
+        .status,
+        202
+    );
+    assert_eq!(srv.push("orders", "fdt_wrong", "{}").await.status, 401);
+    assert_eq!(srv.push("orders", &text, "{").await.status, 400);
+    let page = call(M::GET, "/v1/feeds/orders/events?limit=2", "view-tok", None).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let seqs = |v: &Value| -> Vec<u64> {
+        v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect()
+    };
+    assert_eq!(seqs(&page.body), vec![5, 4]);
+    assert_eq!(
+        (
+            &page.body["oldest"],
+            &page.body["watermark"],
+            &page.body["next_before"]
+        ),
+        (&json!(1), &json!(5), &json!(4))
+    );
+    assert!(page.body["events"][0].get("payload").is_none());
+    assert_eq!(page.body["events"][0]["content_type"], "application/json");
+    assert_eq!(page.body["events"][0]["delivered_by"], json!([]));
+    let older = call(
+        M::GET,
+        "/v1/feeds/orders/events?limit=10&before=4",
+        "view-tok",
+        None,
+    )
+    .await;
+    assert_eq!(seqs(&older.body), vec![3, 2, 1]);
+    assert!(older.body.get("next_before").is_none());
+    let forward = call(
+        M::GET,
+        "/v1/feeds/orders/events?from=2&limit=2",
+        "view-tok",
+        None,
+    )
+    .await;
+    assert_eq!(seqs(&forward.body), vec![3, 2]);
+    let past_end = call(M::GET, "/v1/feeds/orders/events?from=99", "view-tok", None).await;
+    assert_eq!(seqs(&past_end.body), Vec::<u64>::new());
+    // A payload is an admin's to read, and the read is audited.
+    assert_eq!(
+        call(M::GET, "/v1/feeds/orders/events/2", "op-tok", None)
+            .await
+            .status,
+        403
+    );
+    let one = call(M::GET, "/v1/feeds/orders/events/2", "admin-tok", None).await;
+    assert_eq!(one.status, 200, "{}", one.body);
+    assert_eq!(
+        (&one.body["payload"], &one.body["payload_encoding"]),
+        (&json!(r#"{"id": 2}"#), &json!("utf8"))
+    );
+    assert_eq!(
+        call(M::GET, "/v1/feeds/orders/events/99", "admin-tok", None)
+            .await
+            .status,
+        404
+    );
+
+    // What was refused: reason, status and sender, never a payload.
+    let refusals = call(M::GET, "/v1/feeds/orders/refusals", "view-tok", None).await;
+    let reasons: Vec<&str> = refusals
+        .body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["reason"].as_str().unwrap())
+        .collect();
+    assert_eq!(reasons, vec!["malformed", "unauthorized"]);
+    assert_eq!(refusals.body[0]["status"], 400);
+    assert_eq!(refusals.body[0]["sender"], "127.0.0.1");
+    assert_eq!(
+        call(
+            M::GET,
+            "/v1/feeds/orders/refusals?limit=1",
+            "view-tok",
+            None
+        )
+        .await
+        .body
+        .as_array()
+        .unwrap()
+        .len(),
+        1
+    );
+
+    // The feed's page: position, the last day, tokens, the change log.
+    let detail = call(M::GET, "/v1/feeds/orders", "view-tok", None).await;
+    assert_eq!(detail.status, 200, "{}", detail.body);
+    assert_eq!(detail.body["watermark"], 5);
+    assert_eq!(detail.body["events_24h"], 5);
+    assert_eq!(detail.body["bytes_24h"], 45);
+    assert_eq!(detail.body["refused_recent"], 2);
+    assert_eq!(detail.body["deliveries"][0]["lag"], 5);
+    assert_eq!(detail.body["deliveries"][0]["delivered_24h"], 0);
+    assert_eq!(detail.body["tokens"][0]["name"], "shop");
+    assert_eq!(detail.body["changes"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        call(M::GET, "/v1/feeds", "view-tok", None).await.body["feeds"][0]["name"],
+        "orders"
+    );
+
+    // A delivery's moves.
+    let d = "/v1/feeds/orders/deliveries/lake";
+    let paused = call(
+        M::POST,
+        &format!("{d}/pause"),
+        "op-tok",
+        Some(json!({"reason": "maintenance"})),
+    )
+    .await;
+    assert_eq!(paused.status, 200, "{}", paused.body);
+    assert_eq!(paused.body["deliveries"][0]["status"], "paused");
+    assert_eq!(paused.body["deliveries"][0]["pause_reason"], "maintenance");
+    assert_eq!(paused.body["status"], "paused");
+    assert_eq!(
+        call(M::POST, &format!("{d}/pause"), "view-tok", None)
+            .await
+            .status,
+        403
+    );
+    assert_eq!(
+        call(
+            M::POST,
+            "/v1/feeds/orders/deliveries/nope/pause",
+            "op-tok",
+            None
+        )
+        .await
+        .status,
+        404
+    );
+    let resumed = call(M::POST, &format!("{d}/resume"), "op-tok", None).await;
+    assert_eq!(resumed.body["deliveries"][0]["status"], "ok");
+    for verb in ["replay", "skip", "recover"] {
+        let denied = call(
+            M::POST,
+            &format!("{d}/{verb}"),
+            "op-tok",
+            Some(json!({"seq": 1, "reason": "x"})),
+        )
+        .await;
+        assert_eq!(denied.status, 403, "{verb}");
+    }
+    let skipped = call(
+        M::POST,
+        &format!("{d}/skip"),
+        "admin-tok",
+        Some(json!({"to": 3, "reason": "bad rows"})),
+    )
+    .await;
+    assert_eq!(skipped.status, 200, "{}", skipped.body);
+    assert_eq!(
+        (&skipped.body["from"], &skipped.body["to"]),
+        (&json!(1), &json!(3))
+    );
+    let no_reason = call(
+        M::POST,
+        &format!("{d}/skip"),
+        "admin-tok",
+        Some(json!({"to": 4, "reason": " "})),
+    )
+    .await;
+    assert_eq!(no_reason.status, 422);
+    let both = call(
+        M::POST,
+        &format!("{d}/replay"),
+        "admin-tok",
+        Some(json!({"seq": 1, "time": "2026-01-01T00:00:00Z"})),
+    )
+    .await;
+    assert_eq!(both.status, 422, "{}", both.body);
+    let replayed = call(
+        M::POST,
+        &format!("{d}/replay"),
+        "admin-tok",
+        Some(json!({"seq": 2})),
+    )
+    .await;
+    assert_eq!(
+        (&replayed.body["from"], &replayed.body["to"]),
+        (&json!(3), &json!(2))
+    );
+    let by_time = call(
+        M::POST,
+        &format!("{d}/replay"),
+        "admin-tok",
+        Some(json!({"time": "2020-01-01T00:00:00Z"})),
+    )
+    .await;
+    assert_eq!(by_time.body["to"], 1, "{}", by_time.body);
+    let recovered = call(M::POST, &format!("{d}/recover"), "admin-tok", None).await;
+    assert_eq!(recovered.status, 200, "{}", recovered.body);
+    let gaps = call(M::GET, "/v1/feeds/orders", "view-tok", None)
+        .await
+        .body["gaps"]
+        .clone();
+    assert!(
+        gaps.as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["reason"] == "bad rows" && g["by"] == "alice"),
+        "{gaps}"
+    );
+    assert_eq!(
+        call(M::POST, &format!("{d}/deliver-now"), "op-tok", None)
+            .await
+            .status,
+        200
+    );
+    let mut after = Value::Null;
+    for _ in 0..600 {
+        after = call(M::GET, "/v1/feeds/orders", "view-tok", None)
+            .await
+            .body;
+        if after["deliveries"][0]["lag"] == 0 && after["deliveries"][0].get("claim").is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(after["deliveries"][0]["lag"], 0, "{after}");
+    assert_eq!(after["deliveries"][0]["delivered_24h"], 5);
+    assert_eq!(after["deliveries"][0]["last_run"]["outcome"], "delivered");
+    assert_eq!(
+        call(
+            M::GET,
+            "/v1/feeds/orders/events?limit=1&before=2",
+            "view-tok",
+            None
+        )
+        .await
+        .body["events"][0]["delivered_by"],
+        json!(["lake"])
+    );
+
+    // Deliveries: add, replace, remove.
+    let second = lazy("audit", &root.join("audit.jsonl"));
+    let added = call(
+        M::POST,
+        "/v1/feeds/orders/deliveries",
+        "op-tok",
+        Some(second.clone()),
+    )
+    .await;
+    assert_eq!(added.status, 201, "{}", added.body);
+    assert_eq!(added.body["deliveries"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        call(
+            M::POST,
+            "/v1/feeds/orders/deliveries",
+            "op-tok",
+            Some(second.clone())
+        )
+        .await
+        .status,
+        409
+    );
+    let mut slower = second.clone();
+    slower["flush"]["max_events"] = json!(10);
+    let replaced = call(
+        M::PUT,
+        "/v1/feeds/orders/deliveries/audit",
+        "op-tok",
+        Some(slower.clone()),
+    )
+    .await;
+    assert_eq!(replaced.status, 200, "{}", replaced.body);
+    assert_eq!(
+        call(
+            M::PUT,
+            "/v1/feeds/orders/deliveries/other",
+            "op-tok",
+            Some(slower.clone())
+        )
+        .await
+        .status,
+        422
+    );
+    slower["name"] = json!("ghost");
+    assert_eq!(
+        call(
+            M::PUT,
+            "/v1/feeds/orders/deliveries/ghost",
+            "op-tok",
+            Some(slower)
+        )
+        .await
+        .status,
+        404
+    );
+    assert_eq!(
+        call(
+            M::DELETE,
+            "/v1/feeds/orders/deliveries/ghost",
+            "op-tok",
+            None
+        )
+        .await
+        .status,
+        404
+    );
+
+    // A run in flight holds a delete, and the answer names it.
+    let found = service::find(&srv.state, None, "orders").await.unwrap();
+    let audit_uid = found.feed.delivery("audit").unwrap().uid.clone();
+    let store = srv.store("orders").await;
+    let owner = faucet_common_feed::ClaimOwner::new("serve:test").unwrap();
+    let claim = store
+        .claim(
+            &store_calls(),
+            &audit_uid,
+            Seq(1),
+            Seq(3),
+            &owner,
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    for path in ["/v1/feeds/orders/deliveries/audit", "/v1/feeds/orders"] {
+        let token = if path.ends_with("orders") {
+            "admin-tok"
+        } else {
+            "op-tok"
+        };
+        let held = call(M::DELETE, path, token, None).await;
+        assert_eq!(held.status, 409, "{}", held.body);
+        assert_eq!(
+            held.body["error"]["details"]["runs"],
+            json!([{"delivery": "audit", "run_id": null}])
+        );
+        assert!(
+            held.body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("'audit'")
+        );
+    }
+    store.release(&store_calls(), &claim.id).await.unwrap();
+    let removed = call(
+        M::DELETE,
+        "/v1/feeds/orders/deliveries/audit",
+        "op-tok",
+        None,
+    )
+    .await;
+    assert_eq!(removed.status, 200, "{}", removed.body);
+    assert_eq!(removed.body["deliveries"].as_array().unwrap().len(), 1);
+
+    // Tokens are revoked by those who issue them; a delete is an admin's.
+    let id = token.body["id"].as_str().unwrap();
+    let revoked = call(
+        M::DELETE,
+        &format!("/v1/feeds/orders/tokens/{id}"),
+        "op-tok",
+        None,
+    )
+    .await;
+    assert_eq!(revoked.status, 200, "{}", revoked.body);
+    assert!(revoked.body["revoked_at"].is_string());
+    assert_eq!(srv.push("orders", &text, "{}").await.status, 401);
+    assert_eq!(
+        call(M::DELETE, "/v1/feeds/orders/tokens/nope", "op-tok", None)
+            .await
+            .status,
+        404
+    );
+    assert_eq!(
+        call(M::DELETE, "/v1/feeds/orders", "op-tok", None)
+            .await
+            .status,
+        403
+    );
+
+    // A tenant's feeds: an operator names the tenant; the tenant's own
+    // principal is confined to it; quotas come with the list.
+    let tenant_feed = json!({"name": "app", "ingest": {"auth": {"tokens": "managed"}}});
+    let made = call(
+        M::POST,
+        "/v1/feeds?tenant=acme",
+        "op-tok",
+        Some(tenant_feed.clone()),
+    )
+    .await;
+    assert_eq!(made.status, 201, "{}", made.body);
+    assert_eq!(
+        made.body["ingest_path"],
+        "/v1/tenants/acme/feeds/app/events"
+    );
+    let theirs = call(M::GET, "/v1/feeds", "acme-tok", None).await;
+    assert_eq!(theirs.status, 200, "{}", theirs.body);
+    assert_eq!(theirs.body["feeds"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        theirs.body["quotas"],
+        json!({
+            "tenant": "acme", "feeds": 1, "max_feeds": 3, "stored_bytes": 0,
+            "max_feed_bytes": 1_000_000, "max_feed_events_per_sec": 50
+        })
+    );
+    assert_eq!(
+        call(M::GET, "/v1/feeds/app", "acme-tok", None).await.status,
+        200
+    );
+    assert_eq!(
+        call(M::GET, "/v1/feeds/orders", "acme-tok", None)
+            .await
+            .status,
+        404
+    );
+    assert_eq!(
+        call(M::GET, "/v1/feeds?tenant=globex", "acme-tok", None)
+            .await
+            .status,
+        404
+    );
+    assert_eq!(
+        call(M::GET, "/v1/feeds/app", "view-tok", None).await.status,
+        404,
+        "a server feed of that name does not exist"
+    );
+    assert_eq!(
+        call(M::GET, "/v1/feeds/app?tenant=acme", "view-tok", None)
+            .await
+            .status,
+        200
+    );
+    let own = call(
+        M::POST,
+        "/v1/feeds/app/tokens",
+        "acme-tok",
+        Some(json!({"name": "portal"})),
+    )
+    .await;
+    assert_eq!(own.status, 201, "{}", own.body);
+
+    // Every change left its entry, with the feed and what was done.
+    let audit = call(M::GET, "/v1/audit?limit=200", "admin-tok", None).await;
+    let entries = audit.body["entries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| audit.body.as_array().cloned().unwrap());
+    let find = |action: &str, result: &str| {
+        entries
+            .iter()
+            .find(|e| e["action"] == action && e["result"] == result)
+            .unwrap_or_else(|| panic!("no {action}/{result} in {entries:?}"))
+            .clone()
+    };
+    for action in [
+        "feed.create",
+        "feed.update",
+        "feed.token_create",
+        "feed.token_revoke",
+        "feed.pause",
+        "feed.resume",
+        "feed.deliver_now",
+        "feed.skip",
+        "feed.replay",
+        "feed.recover",
+        "feed.delivery_set",
+        "feed.delivery_delete",
+        "feed.events_read",
+    ] {
+        find(action, "ok");
+    }
+    let skip = find("feed.skip", "ok");
+    assert_eq!(
+        (&skip["principal"], &skip["target"]),
+        (&json!("alice"), &json!("feed:orders/lake"))
+    );
+    assert_eq!(skip["detail"], "from event 1 to 3; bad rows");
+    assert_eq!(find("feed.pause", "ok")["detail"], "maintenance");
+    assert_eq!(find("feed.events_read", "ok")["detail"], "event 2");
+    assert!(entries.iter().any(|e| {
+        e["action"] == "feed.create"
+            && e["result"] == "error"
+            && e["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("already exists"))
+    }));
+    assert_eq!(find("feed.create", "denied")["principal"], "carol");
+    assert!(entries.iter().any(|e| e["action"] == "feed.create"
+        && e["tenant"] == "acme"
+        && e["target"] == "feed:acme/app"));
+    let all = serde_json::to_string(&entries).unwrap();
+    assert!(
+        !all.contains(&text) && !all.contains("hmac-s3cret"),
+        "a secret reached the audit log"
+    );
+
+    // Deleted: its URL stops accepting, its page is gone.
+    assert_eq!(
+        call(M::DELETE, "/v1/feeds/orders", "admin-tok", None)
+            .await
+            .status,
+        204
+    );
+    assert_eq!(
+        call(M::GET, "/v1/feeds/orders", "view-tok", None)
+            .await
+            .status,
+        404
+    );
+    assert_eq!(
+        call(M::DELETE, "/v1/feeds/orders", "admin-tok", None)
+            .await
+            .status,
+        404
+    );
+}
+
+/// A sealed feed's payload is never returned, and a gated server answers a
+/// change with the change request it made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sealed_payload_is_withheld_and_a_gated_change_answers_202() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::over(config(dir.path(), &["--require-approval", "feed"])).await;
+    // Made before the gate is asked, straight through the service.
+    let (_, token) = srv
+        .feed(json!({"name": "private", "seal": true, "ingest": {"auth": {"tokens": "managed"}}}))
+        .await;
+    assert_eq!(
+        srv.push("private", &token, r#"{"card": "4111"}"#)
+            .await
+            .status,
+        202
+    );
+    let one = srv
+        .send(srv.client.get(srv.url("/v1/feeds/private/events/1")))
+        .await;
+    assert_eq!(one.status, 200, "{}", one.body);
+    assert!(one.body.get("payload").is_none());
+    assert_eq!(one.body["payload_withheld"], "sealed");
+    assert_eq!(one.body["sealed"], true);
+
+    let list = srv.send(srv.client.get(srv.url("/v1/feeds"))).await;
+    assert_eq!(list.body["approval"], "always");
+    let proposed = srv
+        .send(
+            srv.client
+                .post(srv.url("/v1/feeds?reason=new+source"))
+                .json(&json!({"name": "later", "ingest": {"auth": {"tokens": "managed"}}})),
+        )
+        .await;
+    assert_eq!(proposed.status, 202, "{}", proposed.body);
+    assert_eq!(proposed.body["status"], "pending_approval");
+    assert_eq!(proposed.body["change"]["kind"], "feed");
+    assert_eq!(proposed.body["change"]["reason"], "new source");
+    assert_eq!(
+        srv.send(srv.client.get(srv.url("/v1/feeds/later")))
+            .await
+            .status,
+        404
+    );
+    let deleting = srv
+        .send(srv.client.delete(srv.url("/v1/feeds/private")))
+        .await;
+    assert_eq!(deleting.status, 202, "{}", deleting.body);
+    assert_eq!(
+        srv.send(srv.client.get(srv.url("/v1/feeds/private")))
+            .await
+            .status,
+        200
     );
 }

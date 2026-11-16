@@ -6,6 +6,8 @@ pub mod catalog;
 pub mod changes;
 pub mod dlq;
 pub mod doctor;
+#[cfg(feature = "feeds")]
+pub mod feeds;
 pub mod health;
 #[cfg(feature = "catalog")]
 pub mod local_outputs;

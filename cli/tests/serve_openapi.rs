@@ -64,6 +64,10 @@ fn openapi_routes() -> BTreeSet<(String, String)> {
         if path.starts_with("/v1/schedules") {
             continue;
         }
+        #[cfg(not(feature = "feeds"))]
+        if path.starts_with("/v1/feeds") || path.contains("/feeds/") {
+            continue;
+        }
         // …and the `mcp` feature's transport (#420).
         #[cfg(not(feature = "mcp"))]
         if path == "/mcp" {
