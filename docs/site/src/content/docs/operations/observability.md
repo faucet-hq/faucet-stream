@@ -114,7 +114,7 @@ cardinality and never a Prometheus label.
   (`faucet_feed_ingest_requests_total{feed,status}`,
   `faucet_feed_ingest_refused_total{feed,reason}`), what was stored
   (`faucet_feed_events_total`, `faucet_feed_bytes_total`,
-  `faucet_feed_dedupe_hits_total`), the store
+  `faucet_feed_dedupe_hits_total`, `faucet_feed_ingest_replays_total`), the store
   (`faucet_feed_append_duration_seconds`, `faucet_feed_store_errors_total`),
   and delivery health: `faucet_feed_delivery_lag{feed,delivery}`,
   `faucet_feed_oldest_undelivered_seconds{feed,delivery}`,
