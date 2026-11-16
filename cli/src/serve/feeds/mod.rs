@@ -18,6 +18,7 @@
 
 pub mod ingest;
 pub mod metrics;
+pub mod notify;
 pub mod runner;
 pub mod secrets;
 pub mod service;

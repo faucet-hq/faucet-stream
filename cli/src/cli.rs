@@ -1088,7 +1088,7 @@ pub struct NotifyTestArgs {
     /// `run_failure`, `run_success`, `sla_breach`, `circuit_open`,
     /// `contract_abort`, `dlq_threshold`, `scheduler_stuck`, `profile_drift`,
     /// `change_requested`, `budget_exceeded`, `connection_needs_reauth`,
-    /// `log_export_failed`.
+    /// `log_export_failed`, `feed_near_full`, `feed_stalled`.
     #[arg(long, default_value = "run_failure")]
     pub event: String,
     /// Leave the PagerDuty incident a failure-class test event opens. By

@@ -561,11 +561,17 @@ async fn finish(
     let now = Utc::now();
     let (max_events, _) = effective_batch(&w.delivery, w.tenant_limits.as_ref());
     let first = std::sync::atomic::AtomicBool::new(false);
+    let stalled_now = std::sync::atomic::AtomicBool::new(false);
     let stored = w
         .update(state, |s| {
             let already = s.last_run.as_ref().is_some_and(|r| r.claim == live.id);
+            let was = s.health;
             let changed = s.finish(live, outcome, max_events, w.delivery.retries, now);
             first.store(changed && !already, std::sync::atomic::Ordering::Release);
+            stalled_now.store(
+                changed && !already && was != Health::Stalled && s.health == Health::Stalled,
+                std::sync::atomic::Ordering::Release,
+            );
             if changed && !already && matches!(outcome, Outcome::Cancelled) {
                 s.paused = Some(status::Pause {
                     at: now,
@@ -580,6 +586,17 @@ async fn finish(
         })
         .await
         .ok()?;
+    if stalled_now.load(std::sync::atomic::Ordering::Acquire) {
+        super::notify::spawn(
+            state,
+            w.feed.clone(),
+            super::notify::FeedEvent::Stalled {
+                delivery: w.delivery.name.clone(),
+                seq: live.from,
+                error: stored.last_error.clone().unwrap_or_default(),
+            },
+        );
+    }
     if first.load(std::sync::atomic::Ordering::Acquire) {
         let (feed, delivery) = (w.feed.label(), w.delivery.name.as_str());
         metrics::run(&feed, delivery, outcome.as_str());
@@ -780,6 +797,7 @@ impl Scheduler {
         let mut work: Vec<(Work, Step)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut maintain: Vec<(Arc<dyn FeedStore>, Arc<Feed>)> = Vec::new();
+        let mut crossings: Vec<(Arc<Feed>, usize, f64)> = Vec::new();
         for (name, feeds) in by_store {
             let store = match rt.stores().get(name).await {
                 Ok(s) => s,
@@ -804,7 +822,9 @@ impl Scheduler {
                     continue;
                 };
                 maintain.push((store.clone(), (*feed).clone()));
-                self.observe(feed, head);
+                if let Some((crossed, ratio)) = self.observe(feed, head) {
+                    crossings.push(((*feed).clone(), crossed, ratio));
+                }
                 let limits = feed
                     .tenant()
                     .and_then(|t| snapshot.tenant_limits.get(t))
@@ -893,6 +913,9 @@ impl Scheduler {
                 }
             }
         }
+        for (feed, crossed, ratio) in crossings {
+            self.crossed(state, feed, crossed, ratio).await;
+        }
         self.readiness(&rt, &snapshot, report.store_ok);
         if self.maintain_at.is_none_or(|t| t <= Instant::now()) {
             for (store, feed) in maintain {
@@ -903,8 +926,44 @@ impl Scheduler {
         report
     }
 
-    /// Emit a feed's gauges and warn when it nears its undelivered limits.
-    fn observe(&mut self, feed: &Feed, head: &Head) {
+    /// Record a change in how many `warn_at` thresholds a feed is past; the
+    /// server that raises the shared count sends `feed_near_full`. While the
+    /// history cannot be written the change is tried again next tick.
+    async fn crossed(&mut self, state: &ServerState, feed: Arc<Feed>, crossed: usize, ratio: f64) {
+        let label = feed.label();
+        let before = self.warned.get(&label).copied().unwrap_or(0);
+        match super::notify::crossing(&*state.history(), feed.uid.as_str(), crossed).await {
+            Ok(rose) => {
+                self.warned.insert(label.clone(), crossed);
+                if crossed > before {
+                    tracing::warn!(
+                        feed = %label,
+                        event = "feed_near_full",
+                        ratio,
+                        "feed is nearing its undelivered limits; past them it refuses new events"
+                    );
+                }
+                let threshold = crossed
+                    .checked_sub(1)
+                    .and_then(|i| feed.spec.retention.warn_at.get(i).copied());
+                if let (true, Some(threshold)) = (rose, threshold) {
+                    super::notify::spawn(
+                        state,
+                        feed,
+                        super::notify::FeedEvent::NearFull { ratio, threshold },
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(feed = %label, error = %e, "could not record the feed's warning state; retrying")
+            }
+        }
+    }
+
+    /// Emit a feed's gauges; returns how many `warn_at` thresholds it is
+    /// past, with the ratio, when that differs from what this server last
+    /// recorded.
+    fn observe(&mut self, feed: &Feed, head: &Head) -> Option<(usize, f64)> {
         let label = feed.label();
         let mut depth = 0u64;
         let mut oldest = 0f64;
@@ -940,15 +999,8 @@ impl Scheduler {
             .iter()
             .filter(|w| ratio >= **w)
             .count();
-        let before = self.warned.insert(label.clone(), crossed).unwrap_or(0);
-        if crossed > before {
-            tracing::warn!(
-                feed = %label,
-                event = "feed_near_full",
-                ratio,
-                "feed is nearing its undelivered limits; past them it refuses new events"
-            );
-        }
+        let before = self.warned.get(&label).copied().unwrap_or(0);
+        (crossed != before).then_some((crossed, ratio))
     }
 
     fn readiness(&self, rt: &FeedsRuntime, snapshot: &Snapshot, store_ok: bool) {

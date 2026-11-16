@@ -318,7 +318,7 @@ impl DeliveryOutcome {
 }
 
 /// Every kind a PagerDuty trigger can carry, i.e. all but `run_success`.
-const TRIGGER_KINDS: [EventKind; 11] = [
+const TRIGGER_KINDS: [EventKind; 13] = [
     EventKind::RunFailure,
     EventKind::SlaBreach,
     EventKind::CircuitOpen,
@@ -330,6 +330,8 @@ const TRIGGER_KINDS: [EventKind; 11] = [
     EventKind::BudgetExceeded,
     EventKind::ConnectionNeedsReauth,
     EventKind::LogExportFailed,
+    EventKind::FeedNearFull,
+    EventKind::FeedStalled,
 ];
 
 /// Kinds whose incident a successful run closes: the failure class (one shared

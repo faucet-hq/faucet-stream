@@ -386,7 +386,7 @@ pub async fn get(
 }
 
 /// The config a delivery's runs load, for a check or to find its state.
-async fn delivery_config(
+pub(crate) async fn delivery_config(
     state: &ServerState,
     feed: &Feed,
     d: &DeliverySpec,
@@ -1200,6 +1200,7 @@ async fn delete_inner(
         .map_err(store_error)?;
     let names: Vec<String> = feed.deliveries.keys().cloned().collect();
     metrics::forget_feed(&feed.label(), &names);
+    super::notify::forget(&*state.history(), feed.uid.as_str()).await;
     super::ingest::forget_feed(&feed);
     after_change(state).await;
     Ok(())

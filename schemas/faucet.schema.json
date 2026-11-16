@@ -5482,6 +5482,16 @@
           "description": "A run's log export has been failing past `notify_after_secs`, or its\nbuffered log lines were dropped before delivery (#806).",
           "type": "string",
           "const": "log_export_failed"
+        },
+        {
+          "description": "A feed's undelivered events crossed one of its `retention.warn_at`\nthresholds (#1034): past the limits it refuses new events. Emitted\nonce per crossing through each delivery's `notifications:` and, for a\ntenant feed, the tenant's.",
+          "type": "string",
+          "const": "feed_near_full"
+        },
+        {
+          "description": "A feed delivery stalled on one event that keeps failing (#1034): no\nrun starts until an operator skips it, replays or resumes. Emitted\nonce, through the delivery's `notifications:` and, for a tenant feed,\nthe tenant's.",
+          "type": "string",
+          "const": "feed_stalled"
         }
       ]
     },

@@ -81,6 +81,16 @@ pub enum EventKind {
     /// A run's log export has been failing past `notify_after_secs`, or its
     /// buffered log lines were dropped before delivery (#806).
     LogExportFailed,
+    /// A feed's undelivered events crossed one of its `retention.warn_at`
+    /// thresholds (#1034): past the limits it refuses new events. Emitted
+    /// once per crossing through each delivery's `notifications:` and, for a
+    /// tenant feed, the tenant's.
+    FeedNearFull,
+    /// A feed delivery stalled on one event that keeps failing (#1034): no
+    /// run starts until an operator skips it, replays or resumes. Emitted
+    /// once, through the delivery's `notifications:` and, for a tenant feed,
+    /// the tenant's.
+    FeedStalled,
 }
 
 impl EventKind {
@@ -99,6 +109,8 @@ impl EventKind {
             EventKind::BudgetExceeded => "budget_exceeded",
             EventKind::ConnectionNeedsReauth => "connection_needs_reauth",
             EventKind::LogExportFailed => "log_export_failed",
+            EventKind::FeedNearFull => "feed_near_full",
+            EventKind::FeedStalled => "feed_stalled",
         }
     }
 }

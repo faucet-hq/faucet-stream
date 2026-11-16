@@ -2196,3 +2196,119 @@ async fn under_feed_approval_every_change_waits_and_names_its_feed() {
     .await;
     assert!(matches!(unknown, Err(ServeError::NotFound)));
 }
+
+/// A stall and a crossing of a `warn_at` threshold each send one
+/// notification through the delivery template's `notifications:`, however
+/// often the scheduler looks again.
+#[cfg(feature = "notify")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stall_and_a_nearly_full_feed_each_notify_once() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let hook = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&hook)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut srv = Srv::start(root, &[]).await;
+    let body = format!(
+        "version: 1\nkind: pipeline\nname: noisy\nparams:\n  out: {{ type: string, required: true }}\npipeline:\n  source: {{ type: feed }}\n  sink: {{ type: file, config: {{ path: \"${{param.out}}\", format: json_lines, if_exists: append }} }}\n  state: {{ type: file, config: {{ path: \"{}\" }} }}\nnotifications:\n  - name: ops\n    on: [feed_stalled, feed_near_full]\n    channel:\n      type: webhook\n      config:\n        url: \"{}/hook\"\ntests:\n  suite:\n    auto: {{ defaults_baseline: true }}\n",
+        root.join("state").display(),
+        hook.uri()
+    );
+    faucet_cli::templates::register(
+        &srv.state.history(),
+        faucet_cli::templates::store::RegisterRequest {
+            id: Some("noisy".into()),
+            body,
+            format: faucet_cli::serve::load::ConfigFormat::Yaml,
+            description: None,
+            tags: Vec::new(),
+            launch: true,
+            created_by: None,
+        },
+    )
+    .await
+    .unwrap();
+    let blocker = root.join("blocked");
+    std::fs::write(&blocker, "not a directory").unwrap();
+    let mut d = delivery("lake", "noisy", &blocker.join("lake.jsonl"));
+    d["max_batch"] = json!({"events": 2});
+    d["retries"] = json!(1);
+    // Two deliveries share the template: its channel is told once.
+    let mut twin = d.clone();
+    twin["name"] = json!("twin");
+    twin["paused"] = json!(true);
+    let mut spec = feed_spec("orders", json!([d, twin]));
+    spec.retention.undelivered.max_bytes = spec::Size(100);
+    spec.retention.warn_at = vec![0.5];
+    service::create(&srv.state, &admin(), None, spec)
+        .await
+        .unwrap();
+    srv.append("orders", 1..=8).await;
+    srv.until("orders", "lake", true, "stalled", |p| {
+        p.status.health == Health::Stalled
+    })
+    .await;
+    for _ in 0..5 {
+        srv.tick().await;
+    }
+    let events = async || -> Vec<Value> {
+        hook.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    };
+    let mut seen = Vec::new();
+    for _ in 0..100 {
+        seen = events().await;
+        if seen.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    seen = events().await;
+    let kinds: Vec<&str> = seen.iter().map(|e| e["event"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds.iter().filter(|k| **k == "feed_stalled").count(),
+        1,
+        "{kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| **k == "feed_near_full").count(),
+        1,
+        "{kinds:?}"
+    );
+    let stalled = seen.iter().find(|e| e["event"] == "feed_stalled").unwrap();
+    assert_eq!(stalled["pipeline"], "orders");
+    assert_eq!(stalled["row"], "lake");
+    assert_eq!(stalled["details"]["seq"], 1);
+    assert_eq!(stalled["severity"], "error");
+    let full = seen
+        .iter()
+        .find(|e| e["event"] == "feed_near_full")
+        .unwrap();
+    assert_eq!(full["details"]["threshold"], 0.5);
+    assert!(full["details"]["ratio"].as_f64().unwrap() >= 0.5);
+
+    // Another server that sees the same crossing sends nothing; once the
+    // feed drains and fills again, the crossing is told again.
+    let uid = service::find(&srv.state, None, "orders")
+        .await
+        .unwrap()
+        .feed
+        .uid
+        .as_str()
+        .to_string();
+    let history = srv.state.history();
+    use faucet_cli::serve::feeds::notify::crossing;
+    assert!(!crossing(&*history, &uid, 1).await.unwrap());
+    assert!(!crossing(&*history, &uid, 0).await.unwrap());
+    assert!(crossing(&*history, &uid, 1).await.unwrap());
+}

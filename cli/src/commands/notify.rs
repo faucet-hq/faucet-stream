@@ -161,12 +161,19 @@ fn synth_event(kind: &str, pipeline: &str) -> CliResult<NotifyEvent> {
             "synthetic: OTLP log export to the collector failed",
         )
         .with_run(run()),
+        "feed_near_full" => NotifyEvent::feed_near_full(pipeline, 0.82, 0.8),
+        "feed_stalled" => NotifyEvent::feed_stalled(
+            pipeline,
+            TEST_ROW,
+            4211,
+            "synthetic: the sink rejected the record",
+        ),
         other => {
             return Err(CliError::Config(format!(
                 "unknown --event `{other}` (expected one of: run_failure, run_success, \
                  sla_breach, circuit_open, contract_abort, dlq_threshold, scheduler_stuck, \
                  profile_drift, change_requested, budget_exceeded, \
-                 connection_needs_reauth, log_export_failed)"
+                 connection_needs_reauth, log_export_failed, feed_near_full, feed_stalled)"
             )));
         }
     })

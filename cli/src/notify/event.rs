@@ -348,6 +348,48 @@ impl NotifyEvent {
         .with("connection", Value::String(connection.to_string()))
     }
 
+    /// A feed nears its undelivered limits (#1034). `pipeline` is the
+    /// feed's label (`<tenant>/<name>` or the name), `ratio` the larger of
+    /// its undelivered bytes and age as a fraction of their limits.
+    pub fn feed_near_full(feed: &str, ratio: f64, threshold: f64) -> Self {
+        let percent = (ratio * 100.0).round();
+        Self::base(
+            EventKind::FeedNearFull,
+            Severity::Warning,
+            feed.to_string(),
+            "",
+            format!("Feed `{feed}` is at {percent}% of its undelivered limits"),
+            format!(
+                "undelivered events reached {percent}% of the feed's undelivered limits \
+                 (warning threshold {}%); past the limits the feed refuses new events until \
+                 a delivery catches up",
+                (threshold * 100.0).round()
+            ),
+        )
+        .with("feed", Value::String(feed.to_string()))
+        .with("ratio", Value::from(ratio))
+        .with("threshold", Value::from(threshold))
+    }
+
+    /// A feed delivery stalled on event `seq` (#1034). `pipeline` is the
+    /// feed's label and `row` the delivery.
+    pub fn feed_stalled(feed: &str, delivery: &str, seq: u64, error: &str) -> Self {
+        Self::base(
+            EventKind::FeedStalled,
+            Severity::Error,
+            feed.to_string(),
+            delivery.to_string(),
+            format!("Delivery `{delivery}` of feed `{feed}` stalled on event {seq}"),
+            format!(
+                "event {seq} kept failing: {error}. No run starts until an operator fixes \
+                 the cause and resumes the delivery, or skips the event"
+            ),
+        )
+        .with("feed", Value::String(feed.to_string()))
+        .with("delivery", Value::String(delivery.to_string()))
+        .with("seq", Value::from(seq))
+    }
+
     /// A run's logs are not reaching the log service (#806): its export has
     /// been failing, or buffered lines were dropped by a bound.
     pub fn log_export_failed(
