@@ -366,6 +366,8 @@ The page before this build was a designed "soon" placeholder; every capability i
 - 🆕 List: *Needs attention* / *Receiving* / *Delivery paused*, stats (feeds, today, pending, refused share; a tenant sees feeds of its limit and stored bytes), tabs All / Needs attention
 - 🆕 Nothing selected: what needs attention, every delivery most behind first; a tenant's quotas card, whose rate line reads "Rate limits set on its feeds" (the sum of configured limits, not live traffic)
 - 🆕 Overview: ingest URL (copy), sign-in, accepted content, duplicates, last 24 hours with an hourly line, storage against the limits, deliveries
+- ✅ Delivery page, failing: the banner says when the next run starts (`next_run_at`), "Delivered to" shows when the position last moved (`last_delivered_at`) and "Behind" shows the delivery's own waiting bytes (`undelivered_bytes`), as the mock drew
+- ✅ Delete feed / delete delivery: the feed or delivery is gone from the page at once; what it left (events, position, status, state keys) is removed in the background and finished by any server if this one stops
 - ✅ Storage card: "Not delivered yet" is `undelivered_bytes` (counted from the slowest delivery's position) against the limit, and "Delivered, kept for replay" is `retained_bytes` minus it, as the mock drew
 - 🆕 Delivery: position, what it runs (template, version, pool, params; secret params as *sealed*), flush policy, recent runs with their event ranges (`GET /v1/runs?label=feed:…&label=feed_delivery:…`); a switch between a feed's deliveries
 - ✅ The delivery guarantee line ("exactly once" / "at least once" / "effectively once, by key" / "guarantee unknown") comes from `guarantee` on the feed's own page, derived from the delivery's template

@@ -1106,7 +1106,11 @@ paths:
         file feed) and `hourly_24h`, the retained events stored in each of the
         last 24 hours, oldest first. Each delivery carries `guarantee`, the
         delivery guarantee derived from its template as `faucet validate`
-        derives it (`at-least-once`, `effectively-once (…)`, or `unknown`).
+        derives it (`at-least-once`, `effectively-once (…)`, or `unknown`),
+        `undelivered_bytes` (payload bytes from its own position on; absent
+        when the store cannot count them), `last_delivered_at` (when a run
+        last moved its position) and, while it waits out a back-off,
+        `next_run_at` (no run starts before it).
         `changes` merges the definition's change log with what the audit log
         records for its deliveries (pause, resume, deliver now, replay, skip,
         recover; from the most recent audit entries), newest first. Secrets
@@ -1164,7 +1168,10 @@ paths:
       description: >
         Deletes a stored feed with its tokens, events, positions and each
         delivery's state. While a delivery has a run in flight the answer is 409
-        and `error.details.runs` names each delivery and run id. Requires
+        and `error.details.runs` names each delivery and run id. The feed is
+        gone for its users when this answers; a removal that a crash or a
+        store failure interrupts is finished by any server's scheduler, and
+        the name answers 409 to a create until then. Requires
         `FeedAdmin` (admin); audited as `feed.delete`.
       operationId: deleteFeed
       parameters:

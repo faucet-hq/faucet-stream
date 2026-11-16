@@ -467,7 +467,10 @@ limits, its budget and its state namespace.
 
 `--tenant-delivery-min-interval-secs` (default 10) is the shortest gap between
 two runs of a tenant feed's delivery, whatever its `flush.min_interval` says.
-Deleting a tenant deletes its feeds, tokens, events and positions.
+Deleting a tenant deletes its feeds, tokens, events and positions. Each
+feed is marked deleted first, so a tenant delete that fails partway (`503`)
+leaves nothing that takes events or starts runs: repeat the request, or let
+any server's scheduler finish the feeds.
 
 ## Rolling back a delivery run
 

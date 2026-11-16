@@ -274,7 +274,16 @@ on the change request when the server gates the change.
   with the pending change request.
 - Deleting a feed or a delivery while one of its runs is in flight answers
   `409` naming the run. Deleting a feed removes its events, positions and
-  tokens.
+  tokens, each delivery's status and the state keys its runs kept; deleting
+  a delivery removes its position, its status and its state keys. Rows a
+  sink keeps for a delivery (a commit-token row, for example) stay.
+- A delete is recorded in the feed's definition before anything is removed.
+  From that moment the feed is not listed, answers `404` to the API and
+  `401` to senders, and starts no runs; a deleted feed's name can be used
+  again once the removal has finished (`409` until then). If the server
+  stops or a store fails partway, the scheduler of any server finishes the
+  removal on its next pass, so a `204` means "deleted", and the clean-up may
+  still be running for a few seconds.
 - A feed from the `--feeds` file answers `409` to update and delete.
 - `GET /v1/feeds` answers `{feeds, stores, approval, quotas?}`: `stores` are
   the names a new feed may use, `approval` is `always`, `deliveries` or
@@ -332,11 +341,19 @@ slowest delivery has not delivered yet; the undelivered limit, the
 A delivery's byte flush (`flush.max_bytes`) likewise counts the bytes from
 its own position on.
 
+On a feed's own page (`GET /v1/feeds/{name}`) each delivery also carries
+`undelivered_bytes` (the payload bytes from its own position on; absent
+when the store cannot count them), `last_delivered_at` (when a run last
+moved its position) and, while it waits out a back-off after a failed or
+refused run, `next_run_at` (no run starts before it).
+
 **Self-repair.** On every pass the scheduler compares each feed's store rows
 with its definition: a delivery position no definition lists (a change that
 stopped halfway) is deleted unless a run holds it, a defined delivery with no
 position is created, and a changed tenant byte quota is written to the
-tenant's existing feeds.
+tenant's existing feeds. A feed marked deleted, or a delivery dropped from
+its feed, whose removal did not finish is finished here too, on whichever
+server gets to it first.
 
 ## `faucet serve` flags
 
