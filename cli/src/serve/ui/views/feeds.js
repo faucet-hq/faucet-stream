@@ -713,7 +713,8 @@ feeds:
   function historyTab(f) {
     const top = html`${dhead(feedTabs(f), feedActions(f), back())}${feedHead(f)}`;
     const tone = (a) => (/pause/.test(a) ? "warn" : /resume/.test(a) ? "ok" : /skip|delete|revoke/.test(a) ? "bad" : /recover|replay/.test(a) ? "warn" : "muted");
-    const words = (a) => { const s = String(a).replace(/_/g, " "); return s[0].toUpperCase() + s.slice(1); };
+    const MOVES = { pause: "Paused", resume: "Resumed", deliver_now: "Asked to deliver now", replay: "Replayed", skip: "Skipped", recover: "Recovered" };
+    const words = (a) => { const s = String(a).replace(/_/g, " "); return MOVES[a] || s[0].toUpperCase() + s.slice(1); };
     const items = (f.changes || []).map((c) => ({ at: c.at, tone: tone(c.action), text: html`${words(c.action)} by <b>${c.by}</b>${c.detail && c.detail.length ? html` · ${c.detail.join(" · ")}` : ""}` }));
     for (const g of f.gaps || []) items.push({ at: g.at, tone: "bad", text: html`${g.delivery || "Every delivery"} skipped <span class="mono">#${fmtInt(g.from)}${g.to - g.from > 1 ? `–${fmtInt(g.to - 1)}` : ""}</span> by <b>${g.by}</b> · ${plural(g.to - g.from, "event")} · “${g.reason}”` });
     for (const t of f.tokens || []) {
