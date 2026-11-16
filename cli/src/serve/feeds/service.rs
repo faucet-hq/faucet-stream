@@ -1684,7 +1684,7 @@ enum Planned {
     Delete,
 }
 
-fn spec_of<'a>(p: &'a ChangePayload) -> Result<&'a FeedSpec, ServeError> {
+fn spec_of(p: &ChangePayload) -> Result<&FeedSpec, ServeError> {
     let spec = p
         .spec
         .as_ref()

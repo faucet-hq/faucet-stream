@@ -358,6 +358,12 @@ Auth is mandatory: without `--auth-token`/`FAUCET_SERVE_AUTH_TOKEN` **and** with
 | `--feeds-request-timeout-secs <n>` | How long an ingest request may take to send its body (default `30`). |
 | `--feeds-max-concurrent-requests <n>` | Ingest requests handled at once (default `256`); past it senders get `503` with `Retry-After`. |
 
+| `--local-output-retention-days <n>` / `--local-output-in-flight-grace-secs <n>` | Retention GC for the local files a run's sinks wrote (jsonl/csv/parquet): the window (default `7`; `0` disables the sweep) and the mid-write guard (default `60`). Only files faucet recorded as its own sink outputs are ever deleted. Requires the `catalog` feature. |
+| `--preview-local-outputs` | Serve **dataset previews** of those local files — the console reads a tracked output's first N rows back (`FAUCET_SERVE_PREVIEW_LOCAL_OUTPUTS`). **Off by default**: it returns file contents over HTTP, so it is a local-testing convenience. Caps: `--preview-default-rows` (soft, default `500`) and `--preview-max-rows` (hard, default `5000`; a larger `row_count_to_load` — including `all` — is clamped to it). `--preview-max-rows 0` lifts the ceiling so `row_count_to_load=all` reads a whole dataset; the read is still bounded by a response-size budget and a deadline, and a partial answer names the bound that stopped it. |
+| `--body-limit-bytes`, `--shutdown-grace-secs`, `--retain-terminal-runs-secs`, `--idempotency-retention-secs`, `--probe-timeout-secs` | Tuning knobs. |
+
+#### Feeds (`--feeds`)
+
 Senders push events with the feed's own credential, never a serve token: a
 feed token (`Authorization: Bearer fdt_…`, or `?token=` when the feed sets
 `ingest.url_token`), an HMAC signature over the body, or both. One JSON
@@ -391,9 +397,6 @@ a signature secret, secret delivery params or sealed events) and
 `--feed-store NAME=URL`. `faucet schema feed` prints the schema of one feed
 definition, `faucet schema feeds` that of the `--feeds` file
 (`cli/examples/feeds/feeds.yaml`).
-| `--local-output-retention-days <n>` / `--local-output-in-flight-grace-secs <n>` | Retention GC for the local files a run's sinks wrote (jsonl/csv/parquet): the window (default `7`; `0` disables the sweep) and the mid-write guard (default `60`). Only files faucet recorded as its own sink outputs are ever deleted. Requires the `catalog` feature. |
-| `--preview-local-outputs` | Serve **dataset previews** of those local files — the console reads a tracked output's first N rows back (`FAUCET_SERVE_PREVIEW_LOCAL_OUTPUTS`). **Off by default**: it returns file contents over HTTP, so it is a local-testing convenience. Caps: `--preview-default-rows` (soft, default `500`) and `--preview-max-rows` (hard, default `5000`; a larger `row_count_to_load` — including `all` — is clamped to it). `--preview-max-rows 0` lifts the ceiling so `row_count_to_load=all` reads a whole dataset; the read is still bounded by a response-size budget and a deadline, and a partial answer names the bound that stopped it. |
-| `--body-limit-bytes`, `--shutdown-grace-secs`, `--retain-terminal-runs-secs`, `--idempotency-retention-secs`, `--probe-timeout-secs` | Tuning knobs. |
 
 #### Schedules (`--schedules`)
 

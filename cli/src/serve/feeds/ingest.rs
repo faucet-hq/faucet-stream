@@ -1055,7 +1055,7 @@ async fn handle(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    let pieces = split(content_type, &body, spec.max_event_bytes.bytes()).map_err(&refuse)?;
+    let pieces = split(content_type, &body, spec.max_event_bytes.bytes()).map_err(refuse)?;
     let count = pieces.len();
     let uid = feed.uid.as_str();
     if let Some(limit) = &spec.rate_limit {
@@ -1092,7 +1092,7 @@ async fn handle(
             .retry(wait),
         ));
     }
-    let (events, sizes) = build_events(&state, &feed, &headers, pieces).map_err(&refuse)?;
+    let (events, sizes) = build_events(&state, &feed, &headers, pieces).map_err(refuse)?;
     let store = rt.store_for(&feed).await.map_err(|e| {
         refuse(store_refusal(
             &feed,
