@@ -131,8 +131,9 @@ function planDiff(c) {
     const spec = p.spec || {};
     const op = p.action === "delete" ? "-" : "+";
     lines.push([op, `feed: ${p.tenant ? `${p.tenant}/` : ""}${p.name || "?"}`]);
-    for (const d of spec.deliveries || []) lines.push(["+", `delivery ${d.name}: ${d.template ? `${d.template.id} @ ${d.template.version || "stable"}` : d.pipeline || "?"}`]);
+    for (const d of spec.deliveries || []) lines.push(["+", `delivery ${d.name}: ${d.template ? `${d.template.id} @ ${/^\d+$/.test(String(d.template.version)) ? `pin v${d.template.version}` : d.template.version || "stable"}` : d.pipeline || "?"}`]);
     if (p.action === "delete") lines.push([" ", "  its stored events are removed with it"]);
+    return { lines, note: p.action === "delete" ? "" : "Each delivery’s runs go through the same admission, budgets and audit as any other run." };
   }
   for (const r of plan.rows || []) {
     lines.push([" ", `row ${r.row || "?"} · ${r.source || "?"} → ${r.sink || "?"}`]);
