@@ -355,7 +355,7 @@ feeds of a server's `--feeds` file.
 | `skip <feed> <delivery> --reason <text> [--to <n>]` | Move a delivery forward, leaving a gap. |
 | `recover <feed> <delivery>` | Put a held delivery back on a valid position. |
 | `events <feed> [--before <n>] [--from <n>] [--limit <n>]` | List retained events, never their payloads. |
-| `tail <feed> [-n <N>] [-F] [--interval-secs <n>] [--payload]` | Print the newest retained events, oldest first (10 by default, at most 200); `-F` keeps printing new ones. `--payload` prints payloads too, never a sealed event's. |
+| `tail <feed> [-n <N>] [--follow] [--interval-secs <n>] [--payload]` | Print the newest retained events, oldest first (10 by default, at most 200). `--follow` keeps printing new ones, looking every `--interval-secs` (default 2); use it on a PostgreSQL feed store, because nothing else can write to a SQLite store while `tail` holds it. `--payload` prints payloads too, never a sealed event's. |
 | `stats <feed>` | The feed's size, what the last 24 hours brought, and each delivery's backlog. |
 | `cursor <feed> [<delivery>]` | Where each delivery reads next: position, epoch, pending events, live claim and gaps. Read-only. |
 | `push <feed> [<file>] [--content-type <type>] [--dedupe-key <key>]` | Append events from a file or stdin straight to the feed's store, with the checks, dedupe and sealing the ingest route applies. No sender credential, rate limit or tenant quota applies. |
@@ -364,7 +364,9 @@ feeds of a server's `--feeds` file.
 | `token list <feed>` | The feed's tokens, never their text. |
 | `token revoke <feed> <id>` | Revoke a token. |
 
-`send` flags: `-f <file>` (default stdin), `--content-type` (default
+`send` goes through the ingest route, so the feed's credential, limits, rate
+limit and tenant quota all apply; `push` writes to the store directly and
+skips the credential, the rate limit and the tenant quota. `send` flags: `-f <file>` (default stdin), `--content-type` (default
 `application/json`), `--token-env <VAR>` (or `--token`, which other processes
 on the host can see), `--signature-secret-env <VAR>` with
 `--signature-header <name>` and, to match the feed's signature settings,
