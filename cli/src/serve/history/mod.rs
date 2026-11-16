@@ -3267,6 +3267,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn feed_defaults_refuse_writes_and_read_empty() {
+        let h = Bare;
+        let spec: feeds::FeedSpec = serde_json::from_value(serde_json::json!({
+            "name": "orders", "ingest": {"auth": {"tokens": "managed"}}
+        }))
+        .unwrap();
+        let f = feeds::FeedRecord::new(spec, "x", Utc::now());
+        assert!(h.feed_insert(&f).await.is_err());
+        assert!(h.feed_replace(&f, &f).await.is_err());
+        assert!(h.feed_get(&f.key()).await.unwrap().is_none());
+        assert!(h.feed_list().await.unwrap().is_empty());
+        assert_eq!(h.feed_count().await.unwrap(), 0);
+        assert!(!h.feed_delete(&f.key()).await.unwrap());
+        let t = feeds::FeedTokenRecord {
+            id: "t".into(),
+            feed: f.uid.clone(),
+            name: "ci".into(),
+            hash: "00".into(),
+            prefix: "fdt_".into(),
+            created_at: Utc::now(),
+            created_by: "x".into(),
+            expires_at: None,
+            revoked_at: None,
+            revoked_by: None,
+            last_used_at: None,
+        };
+        assert!(h.feed_token_insert(&t).await.is_err());
+        assert!(h.feed_token_replace(&t, &t).await.is_err());
+        assert!(h.feed_token_list(None).await.unwrap().is_empty());
+        #[cfg(feature = "feeds")]
+        assert!(INSTANCE_CAPABILITIES.contains(&CAP_FEEDS));
+    }
+
+    #[tokio::test]
     async fn schedule_and_policy_defaults_refuse_writes_and_read_empty() {
         let h = Bare;
         let spec: schedules::ScheduleSpec = serde_json::from_value(serde_json::json!({

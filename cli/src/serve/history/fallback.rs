@@ -1477,6 +1477,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn feeds_reach_the_primary_and_wait_for_a_degraded_one() {
+        use crate::serve::history::feeds::{FeedRecord, FeedSpec, FeedTokenRecord};
+        let spec: FeedSpec = serde_json::from_value(serde_json::json!({
+            "name": "orders", "tenant": "acme", "ingest": {"auth": {"tokens": "managed"}}
+        }))
+        .unwrap();
+        let now = chrono::Utc::now();
+        let rec = FeedRecord::new(spec, "alice", now);
+        let token = FeedTokenRecord {
+            id: "t1".into(),
+            feed: rec.uid.clone(),
+            name: "ci".into(),
+            hash: "00".into(),
+            prefix: "fdt_".into(),
+            created_at: now,
+            created_by: "alice".into(),
+            expires_at: None,
+            revoked_at: None,
+            revoked_by: None,
+            last_used_at: None,
+        };
+        let healthy = FallbackHistory::healthy(
+            Box::new(MemoryHistory::new(Duration::from_secs(60))),
+            Duration::from_secs(60),
+            "test",
+        );
+        assert!(healthy.feed_insert(&rec).await.unwrap());
+        assert!(!healthy.feed_insert(&rec).await.unwrap());
+        let mut spec = rec.spec.clone();
+        spec.description = Some("d".into());
+        let (next, _) = rec.revised(spec, "bob", now, "updated", vec![]);
+        assert!(healthy.feed_replace(&rec, &next).await.unwrap());
+        assert!(!healthy.feed_replace(&rec, &next).await.unwrap());
+        assert_eq!(
+            healthy
+                .feed_get("acme/orders")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            2
+        );
+        assert_eq!(healthy.feed_list().await.unwrap().len(), 1);
+        assert_eq!(healthy.feed_count().await.unwrap(), 1);
+        assert!(healthy.feed_token_insert(&token).await.unwrap());
+        assert!(!healthy.feed_token_insert(&token).await.unwrap());
+        let mut used = token.clone();
+        used.last_used_at = Some(now);
+        assert!(healthy.feed_token_replace(&token, &used).await.unwrap());
+        assert!(!healthy.feed_token_replace(&token, &used).await.unwrap());
+        assert_eq!(healthy.feed_token_list(None).await.unwrap().len(), 1);
+        assert_eq!(
+            healthy.feed_token_list(Some("other")).await.unwrap().len(),
+            0
+        );
+        // A tenant's feeds and their tokens go with the tenant.
+        healthy.tenant_delete("acme").await.unwrap();
+        assert_eq!(healthy.feed_count().await.unwrap(), 0);
+        assert!(healthy.feed_token_list(None).await.unwrap().is_empty());
+        assert!(healthy.feed_insert(&rec).await.unwrap());
+        assert!(healthy.feed_token_insert(&token).await.unwrap());
+        assert!(healthy.feed_delete("acme/orders").await.unwrap());
+        assert!(!healthy.feed_delete("acme/orders").await.unwrap());
+        assert!(healthy.feed_token_list(None).await.unwrap().is_empty());
+
+        healthy.degraded.store(true, Ordering::Release);
+        assert!(healthy.feed_insert(&rec).await.is_err());
+        assert!(healthy.feed_replace(&rec, &next).await.is_err());
+        assert!(healthy.feed_get("acme/orders").await.is_err());
+        assert!(healthy.feed_list().await.is_err());
+        assert!(healthy.feed_count().await.is_err());
+        assert!(healthy.feed_delete("acme/orders").await.is_err());
+        assert!(healthy.feed_token_insert(&token).await.is_err());
+        assert!(healthy.feed_token_replace(&token, &used).await.is_err());
+        assert!(healthy.feed_token_list(None).await.is_err());
+    }
+
+    #[tokio::test]
     async fn schedules_reach_the_primary_and_wait_for_a_degraded_one() {
         let spec: crate::serve::history::schedules::ScheduleSpec =
             serde_json::from_value(serde_json::json!({

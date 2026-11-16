@@ -953,6 +953,11 @@ async fn a_crash_between_submit_and_the_status_write_is_recovered_by_the_claim_l
     )
     .await
     .unwrap();
+    // Paused, so only this test claims: a pause starts no run but a claim
+    // that exists is still followed to its end.
+    service::pause(&srv.state, &admin(), None, "orders", "lake", None)
+        .await
+        .unwrap();
     srv.append("orders", 1..=2).await;
 
     // The claim and the submit happened; the status write did not.
@@ -1034,6 +1039,9 @@ async fn a_crash_between_submit_and_the_status_write_is_recovered_by_the_claim_l
         orphan.id.as_str()
     );
     // Once it expires the range is claimed again and delivered.
+    service::resume(&srv.state, &admin(), None, "orders", "lake")
+        .await
+        .unwrap();
     srv.delivered("orders", "lake", 4).await;
     assert_eq!(ids(&out), vec![1, 2, 3]);
 
@@ -1401,12 +1409,9 @@ async fn a_tenants_feeds_are_scoped_limited_sealed_and_purged_with_it() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_feed_definition_and_its_tokens_round_trip_through_sqlite() {
+/// The feed methods of a run-history backend.
+async fn history_round_trip(h: Arc<dyn faucet_cli::serve::history::RunHistory>) {
     use faucet_cli::serve::history::feeds::{FeedRecord, FeedTokenRecord};
-    let dir = tempfile::tempdir().unwrap();
-    let srv = Srv::start(dir.path(), &[]).await;
-    let h = srv.state.history();
     let now = chrono::Utc::now();
     assert_eq!(h.feed_count().await.unwrap(), 0);
     let rec = FeedRecord::new(
@@ -1493,6 +1498,13 @@ async fn a_feed_definition_and_its_tokens_round_trip_through_sqlite() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feed_definition_and_its_tokens_round_trip_through_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &[]).await;
+    history_round_trip(srv.state.history()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_servers_on_one_postgres_deliver_each_range_once() {
     use testcontainers::runners::AsyncRunner;
     let pg = testcontainers_modules::postgres::Postgres::default()
@@ -1506,6 +1518,7 @@ async fn two_servers_on_one_postgres_deliver_each_range_once() {
     let cfg = config(root, &url, &[]);
     let mut a = Srv::over(&cfg).await;
     let mut b = Srv::over(&cfg).await;
+    history_round_trip(a.state.history()).await;
     register(&a.state, "orders_lake", &root.join("state")).await;
     let out = root.join("lake.jsonl");
     let mut d = delivery("lake", "orders_lake", &out);

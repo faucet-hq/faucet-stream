@@ -34,6 +34,7 @@ What the database holds:
 | `faucet_usage` | Cost & usage records | Usage reports |
 | `faucet_tenants`, `_tenant_connections`, `_connect_sessions`, `_tenant_runs`, `_tenant_state_refs` | Tenants and their **sealed** connections | Every customer's connection (they would have to reconnect) |
 | `faucet_serve_schedules` | Schedules | Every schedule made in the console or API |
+| `faucet_feeds`, `faucet_feed_tokens` | Feeds | Every feed made through the API with its deliveries, and the hashes of its ingest tokens |
 | `faucet_policy_versions` | Server and tenant policy versions | The policy in force and its history |
 | `faucet_serve_schema` | The schema version (see below) | — |
 
