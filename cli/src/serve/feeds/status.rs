@@ -345,12 +345,21 @@ pub async fn update(
     Err("the delivery's status kept changing".into())
 }
 
-/// Forget a deleted delivery's status.
-pub async fn forget(history: &dyn RunHistory, feed_uid: &str, delivery_uid: &str) {
-    if let Err(e) = history
+/// Clear a deleted delivery's status. `Err`: the history refused the write.
+pub async fn clear(
+    history: &dyn RunHistory,
+    feed_uid: &str,
+    delivery_uid: &str,
+) -> Result<(), String> {
+    history
         .meta_put(&status_key(feed_uid, delivery_uid), "")
         .await
-    {
+        .map_err(|e| e.to_string())
+}
+
+/// Forget a deleted delivery's status.
+pub async fn forget(history: &dyn RunHistory, feed_uid: &str, delivery_uid: &str) {
+    if let Err(e) = clear(history, feed_uid, delivery_uid).await {
         tracing::warn!(feed = feed_uid, delivery = delivery_uid, error = %e, "could not clear a deleted delivery's status");
     }
 }

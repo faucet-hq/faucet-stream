@@ -768,6 +768,30 @@ pub struct FeedRecord {
     /// Newest last, at most [`CHANGE_LOG_RETAIN`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changes: Vec<FeedChange>,
+    /// The feed was deleted and what it left is still being removed: it
+    /// takes no events, starts no runs and is shown nowhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleting: Option<Deleting>,
+    /// Deliveries the spec dropped whose position, status and state keys
+    /// are not removed yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<RemovedDelivery>,
+}
+
+/// When and by whom a feed was deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deleting {
+    pub at: DateTime<Utc>,
+    pub by: String,
+}
+
+/// A delivery dropped from a feed, kept until what it left is removed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemovedDelivery {
+    /// Its id within the feed.
+    pub uid: String,
+    /// Its last definition: where its runs kept their state.
+    pub spec: DeliverySpec,
 }
 
 impl FeedRecord {
@@ -784,6 +808,8 @@ impl FeedRecord {
             revision: 1,
             approved: false,
             changes: Vec::new(),
+            deleting: None,
+            removed: Vec::new(),
         };
         r.sync_deliveries(by, now);
         r.log(now, by, "created", Vec::new());
@@ -869,8 +895,34 @@ impl FeedRecord {
         r.updated_by = by.to_string();
         r.revision += 1;
         let dropped = r.sync_deliveries(by, now);
+        for (name, uid) in &dropped {
+            if let Some(d) = self.spec.delivery(name) {
+                r.removed.push(RemovedDelivery {
+                    uid: uid.clone(),
+                    spec: d.clone(),
+                });
+            }
+        }
         r.log(now, by, action, detail);
         (r, dropped)
+    }
+
+    /// This record marked deleted by `by`.
+    pub fn tombstoned(&self, by: &str, now: DateTime<Utc>) -> Self {
+        let mut r = self.clone();
+        r.updated_at = now;
+        r.updated_by = by.to_string();
+        r.revision += 1;
+        r.deleting = Some(Deleting {
+            at: now,
+            by: by.to_string(),
+        });
+        r
+    }
+
+    /// Whether the feed still exists for its users.
+    pub fn live(&self) -> bool {
+        self.deleting.is_none()
     }
 }
 

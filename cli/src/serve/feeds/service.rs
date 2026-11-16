@@ -6,12 +6,13 @@
 
 use super::status::{self, DeliveryStatus, Health};
 use super::{
-    DeliveryRef, Feed, Source, ensure_in_store, feed_of_record, metrics, secrets, spec, store_calls,
+    DeliveryRef, Feed, Source, StopAfter, ensure_in_store, feed_of_record, metrics, secrets, spec,
+    store_calls,
 };
 use crate::serve::error::ServeError;
 use crate::serve::history::feeds::{
-    DeliverySpec, FeedChange, FeedRecord, FeedSpec, FeedTokenRecord, RunFeedBinding, feed_key,
-    spec_diff,
+    DeliverySpec, FeedChange, FeedRecord, FeedSpec, FeedTokenRecord, RemovedDelivery,
+    RunFeedBinding, feed_key, spec_diff,
 };
 use crate::serve::rbac::{AuthContext, Role};
 use crate::serve::state::ServerState;
@@ -386,6 +387,7 @@ pub async fn find(
         .feed_get(&feed_key(tenant, name))
         .await
         .map_err(ServeError::from)?
+        .filter(FeedRecord::live)
         .ok_or(ServeError::NotFound)?;
     let feed = feed_of_record(state, &record).map_err(ServeError::Internal)?;
     Ok(Found {
@@ -1493,7 +1495,7 @@ async fn build_create(
             .await
             .map_err(ServeError::from)?
             .iter()
-            .filter(|r| r.tenant() == Some(t.as_str()))
+            .filter(|r| r.live() && r.tenant() == Some(t.as_str()))
             .count()
             + rt.file()
                 .feeds
@@ -1557,8 +1559,20 @@ async fn commit_create(
     record.approved = approved;
     let feed = Feed { approved, ..feed };
     let store = state.feeds().store_for(&feed).await.map_err(store_error)?;
-    if !state
-        .history()
+    let history = state.history();
+    if let Some(old) = history
+        .feed_get(&record.key())
+        .await
+        .map_err(ServeError::from)?
+        && !old.live()
+        && let Err(e) = finish_delete(state, &old).await
+    {
+        return Err(ServeError::Conflict(format!(
+            "a deleted feed named '{}' is still being removed ({e}); retry",
+            record.name()
+        )));
+    }
+    if !history
         .feed_insert(&record)
         .await
         .map_err(ServeError::from)?
@@ -1731,10 +1745,8 @@ async fn commit_update(
     ensure_in_store(&*store, &feed, limits.as_ref())
         .await
         .map_err(store_error)?;
-    for (dropped_name, uid) in &dropped {
-        if let Some(gone) = current.spec.delivery(dropped_name) {
-            forget_delivery(state, &*store, &old, gone, uid).await;
-        }
+    if let Err(e) = finish_removed(state, &next).await {
+        tracing::warn!(feed = %feed.label(), error = %e, "the delivery is removed; removing what it left will be retried");
     }
     after_change(state).await;
     view_of(state, &feed).await.map(Some)
@@ -1829,28 +1841,20 @@ pub async fn runs_in_flight(
     Ok(out)
 }
 
-/// Remove a delivery from the store with its status, metric series and
-/// state keys. Rows a sink keeps for it are left behind.
-async fn forget_delivery(
-    state: &ServerState,
-    store: &dyn FeedStore,
-    feed: &Feed,
-    d: &DeliverySpec,
-    uid: &str,
-) {
-    let label = feed.label();
-    if let Some(dref) = feed.delivery(&d.name)
-        && let Err(e) = remove_state(state, feed, d, dref).await
-    {
-        tracing::warn!(feed = %label, delivery = %d.name, error = %e, "could not remove a deleted delivery's state keys");
+/// Why a delivery's state keys could not be located.
+enum StateLookup {
+    /// A dependency is down: the same lookup can succeed later.
+    Retry(String),
+    /// The delivery's config no longer loads.
+    Unknown(String),
+}
+
+impl StateLookup {
+    fn message(self) -> String {
+        match self {
+            Self::Retry(m) | Self::Unknown(m) => m,
+        }
     }
-    if let Ok(duid) = DeliveryUid::new(feed.uid.clone(), uid)
-        && let Err(e) = store.delete_delivery(&store_calls(), &duid).await
-    {
-        tracing::warn!(feed = %label, delivery = %d.name, error = %e, "could not remove a deleted delivery from the feed store");
-    }
-    status::forget(&*state.history(), feed.uid.as_str(), uid).await;
-    metrics::forget_delivery(&label, &d.name);
 }
 
 /// Where a delivery's run keeps its bookmark: the state store and the key.
@@ -1859,10 +1863,13 @@ async fn state_target(
     feed: &Feed,
     d: &DeliverySpec,
     dref: &DeliveryRef,
-) -> Result<Option<(Arc<dyn faucet_core::StateStore>, faucet_core::StateKey)>, String> {
+) -> Result<Option<(Arc<dyn faucet_core::StateStore>, faucet_core::StateKey)>, StateLookup> {
     let loaded = delivery_config(state, feed, d, dref)
         .await
-        .map_err(|e| e.api_error().error.message)?;
+        .map_err(|e| match e {
+            ServeError::Unavailable(m) => StateLookup::Retry(m),
+            other => StateLookup::Unknown(other.api_error().error.message),
+        })?;
     let Some(node) = loaded.nodes.first() else {
         return Ok(None);
     };
@@ -1871,7 +1878,7 @@ async fn state_target(
     };
     let store = crate::state::build_state_store(spec)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| StateLookup::Retry(e.to_string()))?;
     let scope = loaded
         .tenant
         .as_ref()
@@ -1881,6 +1888,9 @@ async fn state_target(
     Ok(Some((store, scope.key(&name).with_row(node.id.as_str()))))
 }
 
+/// Remove the state keys of delivery `d`'s runs. `Err`: try again later.
+/// A delivery whose config no longer loads has no findable keys: logged
+/// and left.
 async fn remove_state(
     state: &ServerState,
     feed: &Feed,
@@ -1888,7 +1898,15 @@ async fn remove_state(
     dref: &DeliveryRef,
 ) -> Result<(), String> {
     use faucet_core::KeySuffix;
-    let Some((store, key)) = state_target(state, feed, d, dref).await? else {
+    let target = match state_target(state, feed, d, dref).await {
+        Ok(t) => t,
+        Err(StateLookup::Retry(e)) => return Err(e),
+        Err(StateLookup::Unknown(e)) => {
+            tracing::warn!(feed = %feed.label(), delivery = %d.name, error = %e, "a removed delivery's config no longer loads; its state keys are left");
+            return Ok(());
+        }
+    };
+    let Some((store, key)) = target else {
         return Ok(());
     };
     let mut keys = vec![key.render()];
@@ -1905,6 +1923,148 @@ async fn remove_state(
         store.delete(&k).await.map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// The feed of `record` for a cleanup: without its signature when the
+/// sealed secret no longer opens.
+fn cleanup_feed(state: &ServerState, record: &FeedRecord) -> Result<Feed, String> {
+    feed_of_record(state, record).or_else(|_| {
+        let mut plain = record.clone();
+        plain.spec.ingest.auth.signature = None;
+        feed_of_record(state, &plain)
+    })
+}
+
+/// `feed` as it was while it still had delivery `gone`.
+fn feed_with(feed: &Feed, gone: &RemovedDelivery) -> Result<(Feed, DeliveryRef), String> {
+    let dref = DeliveryRef {
+        uid: DeliveryUid::new(feed.uid.clone(), gone.uid.clone()).map_err(|e| e.to_string())?,
+        meta: crate::serve::history::feeds::DeliveryMeta {
+            uid: gone.uid.clone(),
+            ..Default::default()
+        },
+    };
+    let mut was = feed.clone();
+    was.spec.deliveries = vec![gone.spec.clone()];
+    was.deliveries = BTreeMap::from([(gone.spec.name.clone(), dref.clone())]);
+    Ok((was, dref))
+}
+
+/// Remove what one dropped delivery left: its runs' state keys, its store
+/// position and its status.
+async fn clear_removed(
+    state: &ServerState,
+    store: &dyn FeedStore,
+    feed: &Feed,
+    gone: &RemovedDelivery,
+) -> Result<(), String> {
+    let rt = state.feeds();
+    let (was, dref) = feed_with(feed, gone)?;
+    remove_state(state, &was, &gone.spec, &dref).await?;
+    rt.stopped(StopAfter::State)?;
+    store
+        .delete_delivery(&store_calls(), &dref.uid)
+        .await
+        .map_err(|e| e.to_string())?;
+    rt.stopped(StopAfter::Store)?;
+    status::clear(&*state.history(), feed.uid.as_str(), &gone.uid).await?;
+    if feed.delivery(&gone.spec.name).is_none() {
+        metrics::forget_delivery(&feed.label(), &gone.spec.name);
+    }
+    Ok(())
+}
+
+/// Finish removing the deliveries `record` dropped, then clear the list.
+/// Safe to repeat and to run on any server.
+pub async fn finish_removed(state: &ServerState, record: &FeedRecord) -> Result<(), String> {
+    if record.removed.is_empty() || !record.live() {
+        return Ok(());
+    }
+    let rt = state.feeds();
+    rt.stopped(StopAfter::Marked)?;
+    let feed = cleanup_feed(state, record)?;
+    let store = rt.store_for(&feed).await?;
+    for gone in &record.removed {
+        clear_removed(state, &*store, &feed, gone).await?;
+    }
+    rt.stopped(StopAfter::Statuses)?;
+    let mut done = record.clone();
+    done.removed.clear();
+    state
+        .history()
+        .feed_replace(record, &done)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Finish deleting a feed marked `deleting`: its runs' state keys, its
+/// events and positions, its statuses and warning count, then the record
+/// with its tokens. Safe to repeat and to run on any server.
+pub async fn finish_delete(state: &ServerState, record: &FeedRecord) -> Result<(), String> {
+    if record.live() {
+        return Ok(());
+    }
+    let rt = state.feeds();
+    let history = state.history();
+    rt.stopped(StopAfter::Marked)?;
+    let feed = cleanup_feed(state, record)?;
+    let store = rt.store_for(&feed).await?;
+    for d in &feed.spec.deliveries {
+        if let Some(dref) = feed.delivery(&d.name) {
+            remove_state(state, &feed, d, dref).await?;
+        }
+    }
+    for gone in &record.removed {
+        let (was, dref) = feed_with(&feed, gone)?;
+        remove_state(state, &was, &gone.spec, &dref).await?;
+    }
+    rt.stopped(StopAfter::State)?;
+    store
+        .purge_feed(&store_calls(), &feed.uid)
+        .await
+        .map_err(|e| e.to_string())?;
+    rt.stopped(StopAfter::Store)?;
+    let uids = record
+        .deliveries
+        .values()
+        .map(|m| m.uid.as_str())
+        .chain(record.removed.iter().map(|g| g.uid.as_str()));
+    for uid in uids {
+        status::clear(&*history, &record.uid, uid).await?;
+    }
+    super::notify::clear(&*history, &record.uid).await?;
+    rt.stopped(StopAfter::Statuses)?;
+    for token in history
+        .feed_token_list(Some(&record.uid))
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        rt.ingest().forget_token(&token.id);
+    }
+    history
+        .feed_remove(record)
+        .await
+        .map_err(|e| e.to_string())?;
+    let names: Vec<String> = feed.deliveries.keys().cloned().collect();
+    metrics::forget_feed(&feed.label(), &names);
+    rt.ingest().forget_feed(feed.uid.as_str());
+    Ok(())
+}
+
+/// Mark `record` deleted. `Ok(None)`: it changed meanwhile.
+async fn mark_deleting(
+    state: &ServerState,
+    record: &FeedRecord,
+    by: &str,
+) -> Result<Option<FeedRecord>, ServeError> {
+    let marked = record.tombstoned(by, Utc::now());
+    Ok(state
+        .history()
+        .feed_replace(record, &marked)
+        .await
+        .map_err(ServeError::from)?
+        .then_some(marked))
 }
 
 async fn delete_inner(
@@ -1928,42 +2088,23 @@ async fn delete_inner(
     for (dname, meta) in &record.deliveries {
         refuse_live_claim(&*store, &feed, dname, &meta.uid).await?;
     }
-    for d in &feed.spec.deliveries {
-        if let Some(meta) = record.deliveries.get(&d.name) {
-            forget_delivery(state, &*store, &feed, d, &meta.uid).await;
-        }
+    let Some(marked) = mark_deleting(state, &record, &actor.principal).await? else {
+        return Err(ServeError::Conflict(format!(
+            "feed '{name}' changed while it was being deleted; retry"
+        )));
+    };
+    if let Err(e) = finish_delete(state, &marked).await {
+        tracing::warn!(feed = %feed.label(), error = %e, "the feed is deleted; removing what it left will be retried");
     }
-    if !state
-        .history()
-        .feed_delete(&record.key())
-        .await
-        .map_err(ServeError::from)?
-    {
-        return Err(ServeError::NotFound);
-    }
-    for token in state
-        .history()
-        .feed_token_list(Some(&record.uid))
-        .await
-        .unwrap_or_default()
-    {
-        state.feeds().ingest().forget_token(&token.id);
-    }
-    store
-        .purge_feed(&store_calls(), &feed.uid)
-        .await
-        .map_err(store_error)?;
-    let names: Vec<String> = feed.deliveries.keys().cloned().collect();
-    metrics::forget_feed(&feed.label(), &names);
-    super::notify::forget(&*state.history(), feed.uid.as_str()).await;
-    state.feeds().ingest().forget_feed(feed.uid.as_str());
     after_change(state).await;
     Ok(())
 }
 
 /// Delete a stored feed: its definition and tokens, its events, cursors and
 /// gaps, and each delivery's status, metric series and state keys. Refused
-/// while a delivery has a run in flight.
+/// while a delivery has a run in flight. The feed is gone for its users
+/// once this returns; a removal that could not finish is finished by the
+/// scheduler of any server.
 pub async fn delete(
     state: &ServerState,
     actor: &AuthContext,
@@ -2066,7 +2207,7 @@ async fn plan_inner(
                 .feed_get(&feed_key(tenant.as_deref(), &p.name))
                 .await
                 .map_err(ServeError::from)?
-                .is_some()
+                .is_some_and(|r| r.live())
             {
                 return Err(ServeError::Conflict(format!(
                     "a feed named '{}' already exists",
@@ -2637,7 +2778,7 @@ pub async fn replay(
 async fn settle_bookmark(state: &ServerState, t: &Target) -> Result<(), ServeError> {
     let Some((states, key)) = state_target(state, &t.feed, &t.delivery, &t.dref)
         .await
-        .map_err(unprocessable)?
+        .map_err(|e| unprocessable(e.message()))?
     else {
         return Ok(());
     };
@@ -3019,39 +3160,39 @@ pub fn rollback_note(
     }
 }
 
-/// Remove a deleted tenant's feeds from their stores, with their statuses
-/// and metric series. The definitions and tokens go with the tenant's
-/// history rows.
+/// Delete every feed of a tenant that is being deleted: each is marked
+/// deleted first, so no server sets it up again, then removed as a deleted
+/// feed is. Returns how many were removed; `Err` leaves the rest marked for
+/// any server's scheduler, and a repeat of the call, to finish.
 pub async fn purge_tenant(state: &ServerState, tenant: &str) -> Result<usize, String> {
-    let records = state
-        .history()
-        .feed_list()
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut purged = 0;
-    for record in records.iter().filter(|r| r.tenant() == Some(tenant)) {
-        let feed = match feed_of_record(state, record) {
-            Ok(f) => f,
-            Err(_) => {
-                let mut plain = record.clone();
-                plain.spec.ingest.auth.signature = None;
-                feed_of_record(state, &plain)?
-            }
-        };
-        let store = state.feeds().store_for(&feed).await?;
-        store
-            .purge_feed(&store_calls(), &feed.uid)
-            .await
-            .map_err(|e| e.to_string())?;
-        for meta in record.deliveries.values() {
-            status::forget(&*state.history(), &record.uid, &meta.uid).await;
+    let history = state.history();
+    let records = history.feed_list().await.map_err(|e| e.to_string())?;
+    let mut marked = Vec::new();
+    for record in records.into_iter().filter(|r| r.tenant() == Some(tenant)) {
+        if !record.live() {
+            marked.push(record);
+            continue;
         }
-        let names: Vec<String> = record.deliveries.keys().cloned().collect();
-        metrics::forget_feed(&feed.label(), &names);
-        purged += 1;
+        let by = format!("tenant:{tenant}:deleted");
+        match mark_deleting(state, &record, &by).await {
+            Ok(Some(m)) => marked.push(m),
+            Ok(None) => return Err(format!("feed '{}' changed; retry", record.name())),
+            Err(e) => return Err(e.api_error().error.message),
+        }
     }
-    if purged > 0 {
-        state.feeds().notify();
+    let mut purged = 0;
+    let mut failed = None;
+    for record in &marked {
+        match finish_delete(state, record).await {
+            Ok(()) => purged += 1,
+            Err(e) => failed = Some(format!("feed '{}': {e}", record.name())),
+        }
     }
-    Ok(purged)
+    if !marked.is_empty() {
+        after_change(state).await;
+    }
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(purged),
+    }
 }

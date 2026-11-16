@@ -1071,6 +1071,9 @@ impl RunHistory for FallbackHistory {
     async fn feed_delete(&self, key: &str) -> Result<bool, HistoryError> {
         strict!(self, p => p.feed_delete(key), f => f.feed_delete(key))
     }
+    async fn feed_remove(&self, expected: &super::feeds::FeedRecord) -> Result<bool, HistoryError> {
+        strict!(self, p => p.feed_remove(expected), f => f.feed_remove(expected))
+    }
     async fn feed_token_insert(
         &self,
         token: &super::feeds::FeedTokenRecord,
@@ -1548,6 +1551,11 @@ mod tests {
         assert!(healthy.feed_delete("acme/orders").await.unwrap());
         assert!(!healthy.feed_delete("acme/orders").await.unwrap());
         assert!(healthy.feed_token_list(None).await.unwrap().is_empty());
+        assert!(healthy.feed_insert(&next).await.unwrap());
+        assert!(healthy.feed_token_insert(&token).await.unwrap());
+        assert!(!healthy.feed_remove(&rec).await.unwrap());
+        assert!(healthy.feed_remove(&next).await.unwrap());
+        assert!(healthy.feed_token_list(None).await.unwrap().is_empty());
 
         healthy.degraded.store(true, Ordering::Release);
         assert!(healthy.feed_insert(&rec).await.is_err());
@@ -1556,6 +1564,7 @@ mod tests {
         assert!(healthy.feed_list().await.is_err());
         assert!(healthy.feed_count().await.is_err());
         assert!(healthy.feed_delete("acme/orders").await.is_err());
+        assert!(healthy.feed_remove(&rec).await.is_err());
         assert!(healthy.feed_token_insert(&token).await.is_err());
         assert!(healthy.feed_token_replace(&token, &used).await.is_err());
         assert!(healthy.feed_token_list(None).await.is_err());

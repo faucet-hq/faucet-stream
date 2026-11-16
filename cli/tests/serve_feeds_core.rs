@@ -1526,6 +1526,15 @@ async fn history_round_trip(h: Arc<dyn faucet_cli::serve::history::RunHistory>) 
     // Deleting a feed takes its tokens; deleting a tenant takes its feeds.
     assert!(h.feed_delete("-/orders").await.unwrap());
     assert!(!h.feed_delete("-/orders").await.unwrap());
+    assert_eq!(h.feed_token_list(None).await.unwrap(), vec![b.clone()]);
+
+    // A compare-and-delete removes only the exact record, with its tokens.
+    assert!(h.feed_insert(&next).await.unwrap());
+    assert!(h.feed_token_insert(&a).await.unwrap());
+    assert!(!h.feed_remove(&rec).await.unwrap(), "the record moved on");
+    assert_eq!(h.feed_token_list(None).await.unwrap().len(), 2);
+    assert!(h.feed_remove(&next).await.unwrap());
+    assert!(!h.feed_remove(&next).await.unwrap());
     assert_eq!(h.feed_token_list(None).await.unwrap(), vec![b]);
     h.tenant_delete("acme").await.unwrap();
     assert_eq!(h.feed_count().await.unwrap(), 0);
@@ -3418,4 +3427,416 @@ async fn a_feeds_page_carries_each_deliverys_guarantee_and_its_moves() {
     assert!(pause.detail.iter().any(|d| d == "maintenance"));
     let listed = service::list(&srv.state, &admin(), None).await.unwrap();
     assert!(listed[0].deliveries[0].guarantee.is_none());
+}
+
+fn files_in(dir: &Path) -> usize {
+    std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0)
+}
+
+async fn meta_set(state: &ServerState, key: &str) -> bool {
+    state
+        .history()
+        .meta_get(key)
+        .await
+        .unwrap()
+        .is_some_and(|v| !v.is_empty())
+}
+
+async fn has_head(store: &Arc<dyn FeedStore>, uid: &FeedUid) -> bool {
+    !store
+        .heads(&store_calls(), std::slice::from_ref(uid))
+        .await
+        .unwrap()
+        .is_empty()
+}
+
+use faucet_cli::serve::feeds::StopAfter;
+
+const STOPS: [StopAfter; 4] = [
+    StopAfter::Marked,
+    StopAfter::State,
+    StopAfter::Store,
+    StopAfter::Statuses,
+];
+
+/// A server whose only scheduler is the test's.
+async fn hand_driven(config: &ServeConfig) -> Srv {
+    let srv = Srv::over(config).await;
+    srv.state
+        .set_feeds(FeedsRuntime::from_config(config).offline());
+    srv
+}
+
+/// Let the removals `srv` stopped be finished: by `other`'s scheduler, or
+/// by `srv`'s own after a restart. Returns how many the pass finished.
+async fn finish(srv: &mut Srv, other: Option<&mut Srv>) -> usize {
+    let finished = match other {
+        Some(o) => o.tick().await.removals,
+        None => {
+            srv.state.feeds().stop_removals_after(None);
+            srv.scheduler = Scheduler::default();
+            srv.tick().await.removals
+        }
+    };
+    srv.state.feeds().stop_removals_after(None);
+    finished
+}
+
+/// Delete feed `orders` on `srv`, stopping after `stop`; check what its
+/// users see meanwhile and what is left once the removal was finished.
+async fn feed_delete_case(
+    srv: &mut Srv,
+    mut other: Option<&mut Srv>,
+    root: &Path,
+    base: &str,
+    case: usize,
+    stop: StopAfter,
+) {
+    use faucet_cli::serve::feeds::notify::{crossing, warned_key};
+    let history = srv.state.history();
+    let states = root.join(format!("state{case}"));
+    let template = format!("lake{case}");
+    register(&srv.state, &template, &states).await;
+    let out = root.join(format!("out{case}.jsonl"));
+    service::create(
+        &srv.state,
+        &admin(),
+        None,
+        feed_spec("orders", json!([delivery("lake", &template, &out)])),
+    )
+    .await
+    .unwrap();
+    let (_, token) = service::token_create(&srv.state, &admin(), None, "orders", "ci", None)
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+    let push = || {
+        client
+            .post(format!("{base}/v1/feeds/orders/events"))
+            .bearer_auth(&token)
+            .header("content-type", "application/json")
+            .body("{\"id\":9}")
+            .send()
+    };
+    assert!(push().await.unwrap().status().is_success());
+    srv.append("orders", 1..=2).await;
+    srv.delivered("orders", "lake", 4).await;
+    let found = service::find(&srv.state, None, "orders").await.unwrap();
+    let (store, uid) = srv.store("orders").await;
+    let status_key =
+        status::status_key(uid.as_str(), found.feed.delivery("lake").unwrap().uid.id());
+    crossing(&*history, uid.as_str(), 1).await.unwrap();
+    assert!(files_in(&states) > 0, "{stop:?}: the run kept its state");
+    assert!(meta_set(&srv.state, &status_key).await);
+    if let Some(o) = other.as_deref_mut() {
+        assert_eq!(o.tick().await.feeds, 1);
+    }
+
+    srv.state.feeds().stop_removals_after(Some(stop));
+    service::delete(&srv.state, &admin(), None, "orders")
+        .await
+        .unwrap();
+    let left = history.feed_get("-/orders").await.unwrap().unwrap();
+    assert!(left.deleting.is_some(), "{stop:?}");
+    assert!(matches!(
+        service::get(&srv.state, &admin(), None, "orders").await,
+        Err(ServeError::NotFound)
+    ));
+    assert!(
+        service::list(&srv.state, &admin(), None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        service::delete(&srv.state, &admin(), None, "orders").await,
+        Err(ServeError::NotFound)
+    ));
+    assert_eq!(push().await.unwrap().status(), 401, "{stop:?}");
+    let purged = matches!(stop, StopAfter::Store | StopAfter::Statuses);
+    assert_eq!(has_head(&store, &uid).await, !purged, "{stop:?}");
+    // The stopped server does not set the feed up again.
+    let report = srv.tick().await;
+    assert_eq!((report.feeds, report.removals), (0, 0), "{stop:?}");
+    assert_eq!(has_head(&store, &uid).await, !purged, "{stop:?}");
+    let again = service::create(&srv.state, &admin(), None, feed_spec("orders", json!([]))).await;
+    assert!(
+        message(again.unwrap_err()).contains("still being removed"),
+        "{stop:?}"
+    );
+
+    assert_eq!(finish(srv, other).await, 1, "{stop:?}");
+    assert!(history.feed_get("-/orders").await.unwrap().is_none());
+    assert!(!has_head(&store, &uid).await, "{stop:?}");
+    assert!(!meta_set(&srv.state, &status_key).await, "{stop:?}");
+    assert!(!meta_set(&srv.state, &warned_key(uid.as_str())).await);
+    assert!(
+        history
+            .feed_token_list(Some(uid.as_str()))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(files_in(&states), 0, "{stop:?}: the state keys are gone");
+    assert_eq!(srv.tick().await.removals, 0);
+}
+
+/// Drop delivery `twin` of feed `orders` on `srv`, stopping after `stop`.
+async fn delivery_removal_case(
+    srv: &mut Srv,
+    other: Option<&mut Srv>,
+    root: &Path,
+    case: usize,
+    stop: StopAfter,
+    sent: u64,
+) {
+    let history = srv.state.history();
+    let (store, uid) = srv.store("orders").await;
+    let states = root.join(format!("twin-state{case}"));
+    let template = format!("twin{case}");
+    register(&srv.state, &template, &states).await;
+    let twin = serde_json::from_value(delivery(
+        "twin",
+        &template,
+        &root.join(format!("twin{case}.jsonl")),
+    ))
+    .unwrap();
+    service::set_delivery(&srv.state, &admin(), None, "orders", twin)
+        .await
+        .unwrap();
+    srv.tick().await;
+    srv.append("orders", sent..=sent).await;
+    srv.delivered("orders", "lake", sent + 1).await;
+    srv.delivered("orders", "twin", sent + 1).await;
+    let found = service::find(&srv.state, None, "orders").await.unwrap();
+    let twin_id = found.feed.delivery("twin").unwrap().uid.id().to_string();
+    let status_key = status::status_key(uid.as_str(), &twin_id);
+    assert!(files_in(&states) > 0, "{stop:?}");
+    assert!(meta_set(&srv.state, &status_key).await);
+
+    srv.state.feeds().stop_removals_after(Some(stop));
+    let view = service::delete_delivery(&srv.state, &admin(), None, "orders", "twin")
+        .await
+        .unwrap();
+    assert_eq!(view.deliveries.len(), 1, "{stop:?}");
+    let left = history.feed_get("-/orders").await.unwrap().unwrap();
+    assert_eq!(left.removed.len(), 1, "{stop:?}");
+    assert_eq!(left.removed[0].uid, twin_id);
+    if stop == StopAfter::Marked {
+        assert!(files_in(&states) > 0, "nothing was removed yet");
+    }
+
+    assert_eq!(finish(srv, other).await, 1, "{stop:?}");
+    let done = history.feed_get("-/orders").await.unwrap().unwrap();
+    assert!(done.removed.is_empty(), "{stop:?}");
+    assert_eq!(done.revision, left.revision, "a clean-up is not an edit");
+    assert!(!delivery_ids(&store, &uid).await.contains(&twin_id));
+    assert!(!meta_set(&srv.state, &status_key).await, "{stop:?}");
+    assert_eq!(files_in(&states), 0, "{stop:?}: the state keys are gone");
+    assert!(files_in(&root.join("kept")) > 0, "{stop:?}");
+    assert_eq!(srv.tick().await.removals, 0);
+}
+
+async fn orders_with_lake(srv: &Srv, root: &Path) {
+    register(&srv.state, "kept", &root.join("kept")).await;
+    service::create(
+        &srv.state,
+        &admin(),
+        None,
+        feed_spec(
+            "orders",
+            json!([delivery("lake", "kept", &root.join("lake.jsonl"))]),
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+/// Delete tenant `tenant` (two feeds) on `srv`, stopping after `stop`.
+async fn tenant_delete_case(srv: &mut Srv, other: Option<&mut Srv>, tenant: &str, stop: StopAfter) {
+    let history = srv.state.history();
+    let now = chrono::Utc::now();
+    let rec = serde_json::from_value(json!({
+        "id": tenant, "limits": {}, "created_at": now, "updated_at": now, "created_by": "alice"
+    }))
+    .unwrap();
+    history.tenant_upsert(&rec).await.unwrap();
+    for name in ["orders", "refunds"] {
+        service::create(
+            &srv.state,
+            &admin(),
+            Some(tenant),
+            feed_spec(name, json!([])),
+        )
+        .await
+        .unwrap();
+    }
+    let snapshot = srv.state.feeds().snapshot();
+    let feed = snapshot.feed(Some(tenant), "orders").unwrap();
+    let store = srv.state.feeds().store_for(&feed).await.unwrap();
+    let event = NewEvent::new("application/json", b"{\"id\":1}".to_vec());
+    store
+        .append(&store_calls(), &feed.uid, vec![event])
+        .await
+        .unwrap();
+
+    srv.state.feeds().stop_removals_after(Some(stop));
+    let refused = faucet_cli::serve::tenants::delete_tenant(&srv.state, tenant).await;
+    assert!(
+        matches!(refused, Err(ServeError::Unavailable(_))),
+        "{stop:?}"
+    );
+    for name in ["orders", "refunds"] {
+        let left = history
+            .feed_get(&format!("{tenant}/{name}"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(left.deleting.is_some(), "{stop:?} {name}");
+    }
+    assert!(
+        service::list(&srv.state, &admin(), Some(tenant))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // The stopped server does not set a purged feed up again.
+    let before = has_head(&store, &feed.uid).await;
+    assert_eq!(before, matches!(stop, StopAfter::Marked | StopAfter::State));
+    assert_eq!(srv.tick().await.removals, 0, "{stop:?}");
+    assert_eq!(has_head(&store, &feed.uid).await, before, "{stop:?}");
+
+    assert_eq!(finish(srv, other).await, 2, "{stop:?}");
+    assert!(!has_head(&store, &feed.uid).await, "{stop:?}");
+    assert!(
+        history
+            .feed_list()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.tenant() != Some(tenant))
+    );
+    let report = faucet_cli::serve::tenants::delete_tenant(&srv.state, tenant)
+        .await
+        .unwrap();
+    assert_eq!(report.feeds, 0, "{stop:?}: already removed");
+    assert!(history.tenant_get(tenant).await.unwrap().is_none());
+}
+
+/// A feed delete that stops after any step (a crash, a store failure) has
+/// already taken the feed away from its users: it is not listed, takes no
+/// events and is not set up again. The scheduler of the restarted server
+/// removes what is left: the events, the delivery's status, the warning
+/// count, the tokens, the run's state keys and the record. Then the name
+/// is free again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feed_delete_that_stops_midway_is_finished_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let history = format!("sqlite:{}", root.join("history.db").display());
+    let mut srv = hand_driven(&config(root, &history, &[])).await;
+    let base = srv.http().await;
+    for (case, stop) in STOPS.into_iter().enumerate() {
+        feed_delete_case(&mut srv, None, root, &base, case, stop).await;
+    }
+    service::create(&srv.state, &admin(), None, feed_spec("orders", json!([])))
+        .await
+        .unwrap();
+}
+
+/// Dropping a delivery records what it left in the feed's definition, so a
+/// removal that stops after any step is finished after a restart: the store
+/// position, the status and the state keys of the dropped delivery go; the
+/// delivery that stays keeps its own and goes on delivering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delivery_removal_that_stops_midway_is_finished_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let history = format!("sqlite:{}", root.join("history.db").display());
+    let mut srv = hand_driven(&config(root, &history, &[])).await;
+    orders_with_lake(&srv, root).await;
+    let mut sent = 0;
+    for (case, stop) in STOPS.into_iter().enumerate() {
+        sent += 1;
+        delivery_removal_case(&mut srv, None, root, case, stop, sent).await;
+    }
+    sent += 1;
+    srv.append("orders", sent..=sent).await;
+    srv.delivered("orders", "lake", sent + 1).await;
+}
+
+/// Deleting a tenant marks each of its feeds deleted before anything is
+/// removed, so a delete that stops midway leaves nothing a server would set
+/// up again; the restarted server finishes the feeds and the repeated
+/// tenant delete goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_delete_that_stops_midway_leaves_its_feeds_to_be_finished() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let history = format!("sqlite:{}", root.join("history.db").display());
+    let mut srv = hand_driven(&config(root, &history, &[])).await;
+    for (case, stop) in STOPS.into_iter().enumerate() {
+        tenant_delete_case(&mut srv, None, &format!("acme{case}"), stop).await;
+    }
+}
+
+/// On a shared history and store, the removals one server stopped in are
+/// finished by the other server's scheduler: a feed delete, a delivery
+/// removal and a tenant delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_server_finishes_the_removals_a_server_stopped_in() {
+    use testcontainers::runners::AsyncRunner;
+    let pg = testcontainers_modules::postgres::Postgres::default()
+        .start()
+        .await
+        .expect("a PostgreSQL container (Docker)");
+    let port = pg.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cfg = config(root, &url, &[]);
+    let mut a = hand_driven(&cfg).await;
+    let mut b = hand_driven(&cfg).await;
+    let base = a.http().await;
+    feed_delete_case(&mut a, Some(&mut b), root, &base, 0, StopAfter::Marked).await;
+    feed_delete_case(&mut a, Some(&mut b), root, &base, 1, StopAfter::Store).await;
+    orders_with_lake(&a, root).await;
+    delivery_removal_case(&mut a, Some(&mut b), root, 0, StopAfter::Marked, 1).await;
+    delivery_removal_case(&mut a, Some(&mut b), root, 1, StopAfter::Store, 2).await;
+    tenant_delete_case(&mut a, Some(&mut b), "acme", StopAfter::State).await;
+}
+
+/// A deleted feed's record goes only while it is still the record that was
+/// marked: a feed made under the same name meanwhile is left alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finished_delete_never_removes_a_feed_made_under_the_same_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &[]).await;
+    let history = srv.state.history();
+    service::create(&srv.state, &admin(), None, feed_spec("orders", json!([])))
+        .await
+        .unwrap();
+    let old = history.feed_get("-/orders").await.unwrap().unwrap();
+    let marked = old.tombstoned("alice", chrono::Utc::now());
+    assert!(history.feed_replace(&old, &marked).await.unwrap());
+    service::finish_delete(&srv.state, &marked).await.unwrap();
+    let made = service::create(&srv.state, &admin(), None, feed_spec("orders", json!([])))
+        .await
+        .unwrap();
+    // A server that still holds the old mark finishes it again.
+    service::finish_delete(&srv.state, &marked).await.unwrap();
+    let kept = history.feed_get("-/orders").await.unwrap().unwrap();
+    assert!(kept.live());
+    assert_eq!(kept.uid, made.uid);
+    let (store, uid) = srv.store("orders").await;
+    assert!(has_head(&store, &uid).await);
+}
+
+/// The in-memory backend's feed methods.
+#[tokio::test]
+async fn a_feed_definition_and_its_tokens_round_trip_through_memory() {
+    history_round_trip(Arc::new(
+        faucet_cli::serve::history::memory::MemoryHistory::new(Duration::from_secs(60)),
+    ))
+    .await;
 }

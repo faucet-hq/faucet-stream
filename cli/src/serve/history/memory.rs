@@ -1940,6 +1940,19 @@ impl RunHistory for MemoryHistory {
         Ok(true)
     }
 
+    async fn feed_remove(&self, expected: &super::feeds::FeedRecord) -> Result<bool, HistoryError> {
+        let key = expected.key();
+        {
+            let mut map = self.feed_map()?;
+            if map.get(&key) != Some(expected) {
+                return Ok(false);
+            }
+            map.remove(&key);
+        }
+        self.feed_token_map()?.retain(|_, t| t.feed != expected.uid);
+        Ok(true)
+    }
+
     async fn feed_token_insert(
         &self,
         token: &super::feeds::FeedTokenRecord,

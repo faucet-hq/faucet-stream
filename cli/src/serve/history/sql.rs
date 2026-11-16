@@ -1066,6 +1066,10 @@ pub struct Stmts {
     /// Params: key.
     pub feed_delete_tokens: String,
     pub feed_delete: String,
+    /// Params: uid.
+    pub feed_remove_tokens: String,
+    /// Params: key, expected body.
+    pub feed_remove: String,
     /// Params: id, feed, updated_at, body.
     pub feed_token_insert: String,
     /// Params: updated_at, body, id, expected body.
@@ -2014,6 +2018,10 @@ impl Stmts {
                 .into(),
             feed_delete: "DELETE FROM faucet_feeds WHERE feed_key=$1"
                 .into(),
+            feed_remove_tokens: "DELETE FROM faucet_feed_tokens WHERE feed=$1"
+                .into(),
+            feed_remove: "DELETE FROM faucet_feeds WHERE feed_key=$1 AND body=$2"
+                .into(),
             feed_token_insert: "INSERT INTO faucet_feed_tokens (id, feed, updated_at, body) VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO NOTHING"
                 .into(),
             feed_token_replace: "UPDATE faucet_feed_tokens SET updated_at=$1, body=$2 WHERE id=$3 AND body=$4"
@@ -2694,6 +2702,10 @@ impl Stmts {
             feed_delete_tokens: "DELETE FROM faucet_feed_tokens WHERE feed IN (SELECT uid FROM faucet_feeds WHERE feed_key=?)"
                 .into(),
             feed_delete: "DELETE FROM faucet_feeds WHERE feed_key=?"
+                .into(),
+            feed_remove_tokens: "DELETE FROM faucet_feed_tokens WHERE feed=?"
+                .into(),
+            feed_remove: "DELETE FROM faucet_feeds WHERE feed_key=? AND body=?"
                 .into(),
             feed_token_insert: "INSERT INTO faucet_feed_tokens (id, feed, updated_at, body) VALUES (?,?,?,?) ON CONFLICT (id) DO NOTHING"
                 .into(),
@@ -6297,6 +6309,31 @@ macro_rules! impl_sql_history {
                     .await
                     .map_err(backend)?
                     .rows_affected();
+                tx.commit().await.map_err(backend)?;
+                Ok(n > 0)
+            }
+
+            async fn feed_remove(
+                &self,
+                expected: &$crate::serve::history::feeds::FeedRecord,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
+                let n = sqlx::query(&self.stmts.feed_remove)
+                    .bind(expected.key())
+                    .bind(sql::encode_json(expected, "feed")?)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?
+                    .rows_affected();
+                if n > 0 {
+                    sqlx::query(&self.stmts.feed_remove_tokens)
+                        .bind(&expected.uid)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(backend)?;
+                }
                 tx.commit().await.map_err(backend)?;
                 Ok(n > 0)
             }

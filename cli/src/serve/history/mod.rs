@@ -2497,6 +2497,14 @@ pub trait RunHistory: Send + Sync {
         Ok(false)
     }
 
+    /// Delete feed `expected` and its tokens only while the stored record is
+    /// still exactly `expected`; returns whether it was deleted. Default:
+    /// `false`.
+    async fn feed_remove(&self, expected: &feeds::FeedRecord) -> Result<bool, HistoryError> {
+        let _ = expected;
+        Ok(false)
+    }
+
     /// Store a new feed token; `false` when its id is taken. Default:
     /// unsupported.
     async fn feed_token_insert(
@@ -3302,6 +3310,7 @@ mod tests {
         assert!(h.feed_list().await.unwrap().is_empty());
         assert_eq!(h.feed_count().await.unwrap(), 0);
         assert!(!h.feed_delete(&f.key()).await.unwrap());
+        assert!(!h.feed_remove(&f).await.unwrap());
         let t = feeds::FeedTokenRecord {
             id: "t".into(),
             feed: f.uid.clone(),

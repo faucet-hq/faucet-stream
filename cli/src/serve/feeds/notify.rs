@@ -56,11 +56,13 @@ pub async fn crossing(
     Err("the feed's warning count kept changing".into())
 }
 
-/// Forget a deleted feed's warning count.
-pub async fn forget(history: &dyn RunHistory, feed_uid: &str) {
-    if let Err(e) = history.meta_put(&warned_key(feed_uid), "").await {
-        tracing::warn!(feed = feed_uid, error = %e, "could not clear a deleted feed's warning count");
-    }
+/// Clear a deleted feed's warning count. `Err`: the history refused the
+/// write.
+pub async fn clear(history: &dyn RunHistory, feed_uid: &str) -> Result<(), String> {
+    history
+        .meta_put(&warned_key(feed_uid), "")
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Send `event` in the background: a slow channel never holds the scheduler.

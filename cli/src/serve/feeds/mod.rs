@@ -38,7 +38,7 @@ use faucet_core::io::CallContext;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,21 @@ pub const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(60);
 pub const REFRESH_NOW_GAP: Duration = Duration::from_secs(1);
 /// How long a store call may take.
 pub const STORE_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A step of removing a deleted feed or delivery. A test stops the removal
+/// after one, as a crash there would.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopAfter {
+    /// The definition says what is to be removed.
+    Marked = 1,
+    /// The runs' state keys are gone.
+    State = 2,
+    /// The store rows are gone.
+    Store = 3,
+    /// The statuses and the warning count are gone.
+    Statuses = 4,
+}
 
 /// Where a feed is defined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -156,6 +171,9 @@ pub struct Snapshot {
     by_uid: HashMap<String, Arc<Feed>>,
     tokens: HashMap<String, FeedTokenRecord>,
     pub tenant_limits: HashMap<String, TenantLimits>,
+    /// Stored feeds with a removal to finish: deleted ones, and ones that
+    /// dropped a delivery.
+    pub unfinished: Vec<FeedRecord>,
     pub loaded_at: Instant,
     loaded: bool,
 }
@@ -183,6 +201,7 @@ impl Snapshot {
             tokens: tokens.into_iter().map(|t| (t.hash.clone(), t)).collect(),
             feeds,
             tenant_limits,
+            unfinished: Vec::new(),
             loaded_at: Instant::now(),
             loaded: true,
         }
@@ -325,6 +344,7 @@ pub struct FeedsRuntime {
     ensured: Mutex<HashSet<String>>,
     started: AtomicBool,
     scheduling: AtomicBool,
+    stop_after: AtomicU8,
     changed: Arc<tokio::sync::Notify>,
     last_refresh: tokio::sync::Mutex<Option<Instant>>,
     readiness: Mutex<Readiness>,
@@ -357,6 +377,7 @@ impl FeedsRuntime {
             ensured: Mutex::new(HashSet::new()),
             started: AtomicBool::new(false),
             scheduling: AtomicBool::new(true),
+            stop_after: AtomicU8::new(0),
             changed: Arc::new(tokio::sync::Notify::new()),
             last_refresh: tokio::sync::Mutex::new(None),
             readiness: Mutex::new(Readiness::default()),
@@ -379,6 +400,21 @@ impl FeedsRuntime {
     pub fn offline(self) -> Self {
         self.scheduling.store(false, Ordering::Release);
         self
+    }
+
+    /// Stop every removal after `step` (`None`: run them through). For
+    /// tests of a server that crashes mid-removal.
+    #[doc(hidden)]
+    pub fn stop_removals_after(&self, step: Option<StopAfter>) {
+        self.stop_after
+            .store(step.map_or(0, |s| s as u8), Ordering::Release);
+    }
+
+    pub(crate) fn stopped(&self, step: StopAfter) -> Result<(), String> {
+        if self.stop_after.load(Ordering::Acquire) == step as u8 {
+            return Err(format!("stopped after {step:?}"));
+        }
+        Ok(())
     }
 
     /// The `--feeds` file's feeds.
@@ -563,7 +599,7 @@ impl FeedsRuntime {
         }
         let snapshot = self.refresh(state).await?;
         *last = Some(Instant::now());
-        if !snapshot.feeds.is_empty() {
+        if !snapshot.feeds.is_empty() || !snapshot.unfinished.is_empty() {
             self.ensure_started(state);
         }
         Ok(snapshot)
@@ -604,7 +640,17 @@ impl FeedsRuntime {
                 }
             }
         }
+        let mut unfinished = Vec::new();
+        let mut deleted: HashSet<String> = HashSet::new();
         for record in stored {
+            if !record.live() {
+                deleted.insert(record.uid.clone());
+                unfinished.push(record);
+                continue;
+            }
+            if !record.removed.is_empty() {
+                unfinished.push(record.clone());
+            }
             if taken.contains(&record.key()) {
                 continue;
             }
@@ -616,8 +662,13 @@ impl FeedsRuntime {
             }
         }
         let now = chrono::Utc::now();
-        let tokens = tokens.into_iter().filter(|t| t.usable(now)).collect();
-        let snapshot = Arc::new(Snapshot::new(feeds, tokens, tenant_limits));
+        let tokens = tokens
+            .into_iter()
+            .filter(|t| t.usable(now) && !deleted.contains(&t.feed))
+            .collect();
+        let mut snapshot = Snapshot::new(feeds, tokens, tenant_limits);
+        snapshot.unfinished = unfinished;
+        let snapshot = Arc::new(snapshot);
         *self
             .snapshot
             .write()

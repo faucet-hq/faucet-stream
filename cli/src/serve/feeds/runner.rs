@@ -425,7 +425,7 @@ async fn defined_ids(state: &ServerState, feed: &Feed) -> Option<HashSet<String>
         }
         Source::Console => {
             let record = history.feed_get(&feed.key()).await.ok()??;
-            if record.uid != feed.uid.as_str() {
+            if record.uid != feed.uid.as_str() || !record.live() {
                 return None;
             }
             record.deliveries.values().map(|m| m.uid.clone()).collect()
@@ -824,7 +824,7 @@ pub struct Scheduler {
     /// Per delivery: the retained bytes below its cursor, as last counted.
     below: HashMap<String, Below>,
     /// Feeds and deliveries this server is creating in the store.
-    setting_up: HashMap<String, Instant>,
+    setting_up: HashSet<String>,
     /// The limits this server last wrote to each feed's store row.
     limits: HashMap<String, StoreLimits>,
 }
@@ -840,10 +840,6 @@ struct Below {
     counted_at: Instant,
 }
 
-/// How long a defined feed may be missing from its store before the
-/// scheduler creates it.
-const FEED_SETUP_GRACE: Duration = Duration::from_secs(10);
-
 /// How long a count of delivered bytes is trusted without a recount.
 const BELOW_MAX_AGE: Duration = Duration::from_secs(60);
 
@@ -855,6 +851,8 @@ pub struct TickReport {
     pub feeds: usize,
     pub claims: usize,
     pub checks: usize,
+    /// Deleted feeds and dropped deliveries whose removal this tick finished.
+    pub removals: usize,
 }
 
 enum Step {
@@ -881,9 +879,10 @@ impl Scheduler {
             report.held = true;
             return report;
         }
+        let mut reloaded = false;
         if self.reload_at.is_none_or(|t| t <= Instant::now()) {
             match rt.refresh(state).await {
-                Ok(_) => {}
+                Ok(_) => reloaded = true,
                 Err(e) => {
                     tracing::warn!(error = %e, "could not reload feeds; keeping the current set");
                     if state.history().degraded() {
@@ -897,6 +896,9 @@ impl Scheduler {
         let snapshot = rt.snapshot();
         report.feeds = snapshot.feeds.len();
         report.store_ok = true;
+        if reloaded {
+            report.removals = finish_removals(state, &snapshot).await;
+        }
         let mut by_store: BTreeMap<&str, Vec<&Arc<Feed>>> = BTreeMap::new();
         for f in snapshot.feeds.iter().filter(|f| f.ensured) {
             by_store.entry(f.spec.store.as_str()).or_default().push(f);
@@ -1064,8 +1066,7 @@ impl Scheduler {
     /// Create what the store lacks of a defined feed: its row, or the
     /// position of delivery `d`. A change that stored the definition and
     /// stopped before the store call leaves this. Nothing is created for a
-    /// definition that is gone by now, and a missing feed row is given
-    /// [`FEED_SETUP_GRACE`] first: a feed being deleted looks the same.
+    /// definition that is gone or marked deleted by now.
     async fn set_up(
         &mut self,
         state: &ServerState,
@@ -1077,20 +1078,11 @@ impl Scheduler {
         let label = feed.label();
         let name = d.map(|d| d.name.as_str()).unwrap_or_default();
         let key = format!("{}/{name}", feed.uid);
-        let first_seen = match self.setting_up.get(&key) {
-            Some(at) => *at,
-            None => {
-                metrics::delivery_setup(&label, name);
-                tracing::warn!(feed = %label, delivery = name, "a defined feed or delivery is missing from the feed store; creating it");
-                let now = Instant::now();
-                self.setting_up.insert(key.clone(), now);
-                now
-            }
-        };
-        let target = d.and_then(|d| feed.delivery(&d.name).map(|r| (d, r)));
-        if target.is_none() && first_seen.elapsed() < FEED_SETUP_GRACE {
-            return;
+        if self.setting_up.insert(key.clone()) {
+            metrics::delivery_setup(&label, name);
+            tracing::warn!(feed = %label, delivery = name, "a defined feed or delivery is missing from the feed store; creating it");
         }
+        let target = d.and_then(|d| feed.delivery(&d.name).map(|r| (d, r)));
         let Some(defined) = defined_ids(state, feed).await else {
             return;
         };
@@ -1298,6 +1290,27 @@ impl Scheduler {
             held,
         });
     }
+}
+
+/// Finish the removals freshly read definitions record: a deleted feed's, a
+/// dropped delivery's. One that fails is tried again after the next reload,
+/// here or on another server. Returns how many finished.
+async fn finish_removals(state: &ServerState, snapshot: &Snapshot) -> usize {
+    let mut finished = 0;
+    for record in &snapshot.unfinished {
+        let done = if record.live() {
+            super::service::finish_removed(state, record).await
+        } else {
+            super::service::finish_delete(state, record).await
+        };
+        match done {
+            Ok(()) => finished += 1,
+            Err(e) => {
+                tracing::warn!(feed = %record.name(), error = %e, "could not finish removing a deleted feed or delivery; retrying")
+            }
+        }
+    }
+    finished
 }
 
 /// Retention for one feed, under its maintenance claim: at most
