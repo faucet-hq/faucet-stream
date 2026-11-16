@@ -1071,7 +1071,7 @@ pub async fn get(
         changes: {
             let mut all = found.record.map(|r| r.changes).unwrap_or_default();
             all.extend(activity(state, feed).await);
-            all.sort_by(|a, b| b.at.cmp(&a.at));
+            all.sort_by_key(|a| std::cmp::Reverse(a.at));
             all
         },
     })

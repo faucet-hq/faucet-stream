@@ -15,7 +15,7 @@ const SEALED = "$sealed";
 const plural = (n, w, ws = `${w}s`) => `${fmtInt(n)} ${n === 1 ? w : ws}`;
 const RUN_TONE = { completed: "ok", failed: "bad", cancelled: "muted", running: "info", sharded: "info", queued: "warn", pending: "warn" };
 const OUTCOME = { delivered: ["ok", "completed"], failed: ["bad", "failed"], refused: ["bad", "refused"], cancelled: ["muted", "cancelled"], claim_lost: ["warn", "claim lost"] };
-const REASON = { unauthorized: "Bad token or signature", rate_limited: "Rate limited", too_large: "Too large", bad_request: "Not valid", unsupported_media_type: "Content not accepted", content_encoding: "Content not accepted", duplicate: "Duplicate", full: "Feed full", held: "Feed held", store: "Store unreachable", timeout: "Timed out", busy: "Busy", draining: "Shutting down", definitions_stale: "Definitions unreadable" };
+const REASON = { unauthorized: "Bad token or signature", rate_limited: "Rate limited", too_large: "Too large", bad_request: "Not valid", malformed: "Not valid", empty: "Empty body", unsupported_media_type: "Content not accepted", content_type: "Content type not accepted", content_encoding: "Encoding not accepted", tenant_rate_limited: "Tenant rate limited", seal: "Could not seal", duplicate: "Duplicate", full: "Feed full", held: "Feed held", store: "Store unreachable", timeout: "Timed out", busy: "Busy", draining: "Shutting down", definitions_stale: "Definitions unreadable" };
 const REASON_TONE = ["var(--bad)", "var(--warn)", "var(--info)", "var(--text-2)", "var(--faint)"];
 const ACCEPT = [["application/json", "JSON"], ["application/x-ndjson", "NDJSON"], ["application/x-www-form-urlencoded", "Form"], ["text/plain", "Text"]];
 const DOCS = "https://faucet-hq.github.io/faucet-stream/cookbook/feeds/";
