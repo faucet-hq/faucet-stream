@@ -665,9 +665,12 @@ pub async fn run_expanded(nodes: Vec<ExpandedNode>, opts: ExecuteOptions) -> Cli
     #[cfg(feature = "source-feed")]
     if let FeedRun::Delivery(execution) = &opts.feed {
         let execution = (**execution).clone();
-        return faucet_common_feed::scope(execution, run_expanded_unredacted(nodes, opts))
-            .await
-            .map(redact_summary);
+        return faucet_common_feed::scope(
+            execution,
+            Box::pin(run_expanded_unredacted(nodes, opts)),
+        )
+        .await
+        .map(redact_summary);
     }
     run_expanded_unredacted(nodes, opts)
         .await
@@ -1298,7 +1301,7 @@ async fn run_expanded_unredacted(
                             state_stores,
                             DLQ_SINKS.scope(
                                 dlq_sinks,
-                                inherit_feed(async move {
+                                inherit_feed(Box::pin(async move {
                                     let _permit =
                                         sem.acquire().await.expect("semaphore not closed");
                                     run_unit(
@@ -1313,7 +1316,7 @@ async fn run_expanded_unredacted(
                                         overwrite_grouped,
                                     )
                                     .await
-                                }),
+                                })),
                             ),
                         )),
                     )
