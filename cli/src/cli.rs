@@ -754,7 +754,7 @@ pub enum FeedCommand {
     /// Post events to a running server's ingest route over HTTP, as a sender
     /// does: with the feed's token, its signature, or both. Needs no
     /// `--store`.
-    Send(FeedSendArgs),
+    Send(Box<FeedSendArgs>),
     /// Issue, list and revoke the feed's ingest tokens.
     #[command(subcommand)]
     Token(FeedTokenCommand),
