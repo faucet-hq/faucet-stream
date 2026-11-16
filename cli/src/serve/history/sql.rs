@@ -725,9 +725,7 @@ pub const DDL: &[&str] = &[
         tenant TEXT,\
         updated_at TEXT NOT NULL,\
         body TEXT NOT NULL)",
-    // Feeds made through the API (#1034) and their ingest tokens (hashed).
-    // `tenant` and `uid` are columns so deleting a tenant drops its feeds and
-    // their tokens. Never purged by run retention.
+    // Feeds and their hashed tokens (#1034); never purged by run retention.
     "CREATE TABLE IF NOT EXISTS faucet_feeds (\
         feed_key TEXT PRIMARY KEY,\
         uid TEXT NOT NULL,\

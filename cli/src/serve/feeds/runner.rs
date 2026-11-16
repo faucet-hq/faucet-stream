@@ -745,8 +745,7 @@ async fn check_step(state: &ServerState, rt: &FeedsRuntime, w: &Work) -> Option<
         None => run_of_claim(state, &w.feed, &live.id).await.ok()?.map(Some),
     };
     let Some(rec) = rec else {
-        // No run was ever submitted for it. A live claim ends by its own
-        // release or its time limit; a recorded one that is gone is cleared.
+        // No run was submitted: a live claim ends on its own, a gone one is cleared.
         if claim_live {
             return Some(stored);
         }

@@ -1049,22 +1049,19 @@ async fn handle(
     };
     let admitted = match look(&snapshot) {
         Some(a) => Some(a),
-        // A feed or a token made on another server a moment ago: look once
-        // more, whatever was missing, so every refusal takes the same steps.
+        // Made on another server a moment ago? Look once more, whatever was missing.
         None => match rt.refresh_now(&state).await {
             Ok(fresh) => {
                 let again = look(&fresh);
                 snapshot = fresh;
                 again
             }
-            // Nothing can be said about a credential the definitions cannot
-            // be read for: a 401 here could make a sender drop its events.
+            // A 401 here could make a sender drop its events.
             Err(_) => return Err(before(stale())),
         },
     };
     let Some(Admitted { feed, token }) = admitted else {
-        // The feed's own page lists the refusal when the feed exists; the
-        // sender is told the same either way.
+        // The sender is told the same whether the feed exists or not.
         return Err((
             snapshot.feed(tenant.as_deref(), &name),
             Refusal::unauthorized(),

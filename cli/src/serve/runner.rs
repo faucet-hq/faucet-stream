@@ -2196,8 +2196,7 @@ async fn execute_run(
     if let Some(n) = &notifier {
         state.log_export().register_notifier(&run_id, n.clone());
     }
-    // A feed delivery reads through the store its binding names, opened here
-    // on the executing server (#1034).
+    // A feed delivery's store is opened on the executing server (#1034).
     let feed = match feed_run(&state, own.feed.as_ref()).await {
         Ok(f) => f,
         Err(reason) => {

@@ -418,9 +418,7 @@ pub fn build_router(
             crate::serve::guard::guard,
         ))
         .with_state(state.clone());
-    // The feed ingest routes (#1034) carry their own limits and
-    // authenticate themselves; with `--feeds-listen` only that listener
-    // serves them.
+    // Ingest routes authenticate themselves; `--feeds-listen` moves them (#1034).
     #[cfg(feature = "feeds")]
     let router = if config.feeds.listen.is_none() {
         router.merge(crate::serve::feeds::ingest::router(state, guard))
@@ -1179,8 +1177,7 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
             "--schedules requires a build with the `schedule` and `templates` features".into(),
         ));
     }
-    // Feeds (#1034): load + validate the file fail-fast, and keep every
-    // SQLite feed store away from submitted configs.
+    // Feeds (#1034): validate the file first and protect every SQLite feed store.
     #[cfg(feature = "feeds")]
     let feeds_file = match &config.feeds.path {
         Some(path) => crate::serve::feeds::spec::load_file(path).await?,
@@ -1529,9 +1526,7 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         crate::serve::schedules::spawn(state.clone(), shutdown.clone())
     };
 
-    // Feeds (#1034): nothing runs until a feed exists. A `--feeds` file with
-    // feeds starts the scheduler now; otherwise the lease tick starts it when
-    // a feed is made, on this server or another.
+    // Feeds (#1034): a `--feeds` file with feeds starts the scheduler now.
     #[cfg(feature = "feeds")]
     {
         let stores = crate::serve::feeds::stores::Stores::from_config(&config);
@@ -1603,8 +1598,7 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
     })
     .await
     .map_err(|e| CliError::Serve(format!("server error: {e}")))?;
-    // Ingest answered 503 while draining; let the requests it had already
-    // admitted get their answer, then close its listener.
+    // Let ingest requests admitted before the drain get their answer.
     #[cfg(feature = "feeds")]
     {
         ingest_stop.cancel();

@@ -882,8 +882,7 @@ pub fn tenant_scope_decision(
         | (&Method::GET, "/v1/connect/providers")
         // Schedules (#1044): the handlers confine a tenant principal to its
         // tenant's schedules (and the fan-outs that include it, read-only).
-        // Feeds (#1034): the service confines a tenant principal to its
-        // tenant's feeds.
+        // Feeds (#1034): the service confines a tenant principal to its tenant's.
         | (_, "/v1/feeds")
         | (_, "/v1/feeds/{name}")
         | (_, "/v1/feeds/{name}/deliveries")

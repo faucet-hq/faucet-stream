@@ -1389,9 +1389,7 @@ pub async fn rollback(
         outcome
     })
     .await??;
-    // A rolled-back delivery run leaves the feed's position alone; the
-    // delivery is paused so nothing else is delivered before the operator
-    // decides (#1034).
+    // A rollback leaves the feed's position alone and pauses the delivery (#1034).
     #[cfg(feature = "feeds")]
     let report = {
         let mut report = report;

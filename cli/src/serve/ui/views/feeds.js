@@ -1,9 +1,4 @@
-// Feeds (#1034): split pane — durable inboxes senders push events into over
-// HTTP. A feed stores every event before it answers, and each of its deliveries
-// runs a registered template over the new events on a flush policy. Console-made
-// feeds live in the run history; `--feeds <file>` ones are read-only here. A
-// tenant principal manages its own tenant's feeds within its quotas.
-// Reads GET /v1/feeds[/{name}[/events|refusals]].
+// Feeds (#1034): split pane over GET /v1/feeds[/{name}[/events|refusals]].
 import { api } from "../api.js";
 import { html, ic, row, ring, sect, tabs, ibtn, stats, empty, skelRows, skelCards, head, card, grid, kv, tbl, pill, chip, tag, code, btn, dhead, dtabs, lnk, alert, field, input, select, check, toggle, diff, join, menu, dotText, spark, bar, legend, meter, cpi, shortId } from "../components.js";
 import { layout, setQuery, patch, poll, errorAlert, hashFor, ago, dialog, toast } from "../page.js";

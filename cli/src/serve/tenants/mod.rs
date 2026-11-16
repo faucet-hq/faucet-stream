@@ -1193,8 +1193,7 @@ pub async fn delete_tenant(state: &ServerState, tenant: &str) -> Result<DeleteRe
         .await
         .map_err(store_err)?;
 
-    // The tenant's feeds leave their stores before the definitions go with
-    // the tenant's rows (#1034).
+    // Feeds leave their stores before their definitions go (#1034).
     #[cfg(feature = "feeds")]
     {
         report.feeds = crate::serve::feeds::service::purge_tenant(state, tenant)

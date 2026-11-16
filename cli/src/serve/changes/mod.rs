@@ -1269,8 +1269,7 @@ pub async fn create(
             .get("tenant")
             .and_then(Value::as_str)
             .map(str::to_string),
-        // A schedule or feed change belongs to the tenant that owns the
-        // object, resolved here from the planned target.
+        // A schedule or feed change belongs to the tenant that owns the object.
         #[cfg(all(feature = "schedule", feature = "templates"))]
         ChangeKind::Schedule => {
             crate::serve::schedules::service::change_tenant(state, actor, &payload).await?
