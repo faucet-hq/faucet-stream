@@ -1555,8 +1555,12 @@ paths:
       description: >
         The ingest requests of this feed that this server refused lately, newest
         first: time, reason, status, sender address and message. Kept in memory
-        per server (at most 200 per feed); payloads and credentials are never
-        kept. Requires `FeedRead` (viewer+).
+        per server (at most 200 per feed) and lost when it restarts: `scope` is
+        always `this_server`, and behind several replicas each answers with the
+        requests it refused itself (the `faucet_feed_ingest_refused_total`
+        metric counts them across replicas). A feed's `refused_recent` is the
+        same per-server count. Payloads and credentials are never kept.
+        Requires `FeedRead` (viewer+).
       operationId: listFeedRefusals
       parameters:
         - { name: name, in: path, required: true, schema: { type: string } }
@@ -1564,10 +1568,24 @@ paths:
         - { name: limit, in: query, required: false, schema: { type: integer } }
       responses:
         "200":
-          description: "The refusals."
+          description: "`{scope, refusals}`."
           content:
             application/json:
-              schema: { type: array, items: { type: object } }
+              schema:
+                type: object
+                required: [scope, refusals]
+                properties:
+                  scope: { type: string, enum: [this_server] }
+                  refusals:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        at: { type: string, format: date-time }
+                        reason: { type: string }
+                        status: { type: integer }
+                        sender: { type: string }
+                        detail: { type: string }
         "401": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }

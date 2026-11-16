@@ -1847,16 +1847,16 @@ async fn the_management_api_serves_feeds_to_each_role_and_audits_every_change() 
 
     // What was refused: reason, status and sender, never a payload.
     let refusals = call(M::GET, "/v1/feeds/orders/refusals", "view-tok", None).await;
-    let reasons: Vec<&str> = refusals
-        .body
+    assert_eq!(refusals.body["scope"], "this_server");
+    let reasons: Vec<&str> = refusals.body["refusals"]
         .as_array()
         .unwrap()
         .iter()
         .map(|r| r["reason"].as_str().unwrap())
         .collect();
     assert_eq!(reasons, vec!["malformed", "unauthorized"]);
-    assert_eq!(refusals.body[0]["status"], 400);
-    assert_eq!(refusals.body[0]["sender"], "127.0.0.1");
+    assert_eq!(refusals.body["refusals"][0]["status"], 400);
+    assert_eq!(refusals.body["refusals"][0]["sender"], "127.0.0.1");
     assert_eq!(
         call(
             M::GET,
@@ -1865,10 +1865,10 @@ async fn the_management_api_serves_feeds_to_each_role_and_audits_every_change() 
             None
         )
         .await
-        .body
-        .as_array()
-        .unwrap()
-        .len(),
+        .body["refusals"]
+            .as_array()
+            .unwrap()
+            .len(),
         1
     );
 

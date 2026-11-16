@@ -31,7 +31,7 @@ use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 /// `?tenant=` names the tenant whose feeds are meant (a tenant principal's
@@ -674,13 +674,24 @@ pub struct RefusalsQuery {
     pub limit: Option<usize>,
 }
 
+/// `GET /v1/feeds/{name}/refusals` answer.
+#[derive(Debug, Serialize)]
+pub struct RefusalsResponse {
+    /// Always `this_server`: each server keeps its own list in memory, so
+    /// another replica holds the requests it refused itself.
+    pub scope: &'static str,
+    pub refusals: Vec<RefusalRecord>,
+}
+
 pub async fn refusals(
     State(state): State<ServerState>,
     Extension(actor): Extension<AuthContext>,
     Path(name): Path<String>,
     Query(q): Query<RefusalsQuery>,
-) -> Result<Json<Vec<RefusalRecord>>, ServeError> {
-    service::refusals(&state, &actor, q.tenant.as_deref(), &name, q.limit)
-        .await
-        .map(Json)
+) -> Result<Json<RefusalsResponse>, ServeError> {
+    let refusals = service::refusals(&state, &actor, q.tenant.as_deref(), &name, q.limit).await?;
+    Ok(Json(RefusalsResponse {
+        scope: "this_server",
+        refusals,
+    }))
 }
