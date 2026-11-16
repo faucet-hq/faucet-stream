@@ -267,9 +267,9 @@ pub fn view(
             Some(DeliveryView {
                 name: d.name.clone(),
                 uid: dref.uid.id().to_string(),
-                status: match (head, dh) {
-                    (Some(_), None) => "setting_up",
-                    _ => status_word(d, &s),
+                status: match (head, dh, status_word(d, &s)) {
+                    (Some(_), None, "ok") => "setting_up",
+                    (_, _, word) => word,
                 }
                 .to_string(),
                 paused_by: s
