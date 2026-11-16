@@ -784,6 +784,106 @@ fn store_refusal(feed: &Feed, what: &str, e: &dyn std::fmt::Display) -> Refusal 
     )
 }
 
+/// The events to append for `pieces`, sealed when the feed says so, each
+/// with its dedupe key and the headers a feed keeps; and each one's size as
+/// it was sent.
+fn build_events(
+    state: &ServerState,
+    feed: &Feed,
+    headers: &HeaderMap,
+    pieces: Vec<Piece>,
+) -> Result<(Vec<NewEvent>, Vec<u64>), Refusal> {
+    let spec = &feed.spec.ingest;
+    let count = pieces.len();
+    let sealed = feed.spec.sealed();
+    let context = sealed.then(|| {
+        let tenant = feed.tenant().and_then(|t| TenantId::new(t).ok());
+        faucet_common_feed::sealing_context(&feed.uid, tenant.as_ref())
+    });
+    let received_at = chrono::Utc::now();
+    let dedupe_header = spec.dedupe.as_ref().and_then(|d| d.header.as_deref());
+    let mut sizes = Vec::with_capacity(count);
+    let mut events = Vec::with_capacity(count);
+    for (i, piece) in pieces.into_iter().enumerate() {
+        let key = spec
+            .dedupe
+            .as_ref()
+            .and_then(|d| dedupe_key(d, headers, &piece, i, count));
+        sizes.push(piece.payload.len() as u64);
+        let payload = match &context {
+            Some(context) => {
+                secrets::seal_payload(state, &piece.payload, context).map_err(|e| {
+                    tracing::error!(feed = %feed.label(), error = %e, "an event could not be sealed");
+                    Refusal::unavailable(
+                        "seal",
+                        format!("the feed's events are sealed and cannot be sealed here: {e}"),
+                        RETRY_FULL_SECS,
+                    )
+                })?
+            }
+            None => piece.payload,
+        };
+        let mut event = NewEvent::new(piece.content_type, payload)
+            .received_at(received_at)
+            .sealed(sealed);
+        for name in KEPT_HEADERS.iter().copied().chain(dedupe_header) {
+            if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
+                event = event.header(name.to_ascii_lowercase(), value);
+            }
+        }
+        if let Some(key) = key {
+            event = event.dedupe_key(key);
+        }
+        events.push(event);
+    }
+    Ok((events, sizes))
+}
+
+/// Append `body` to `feed` as the ingest route would, without a request:
+/// the same split, checks, dedupe keys and sealing, straight to the feed's
+/// store. `dedupe` is the value the feed's dedupe header would carry. For
+/// an operator who holds the store's credentials; no sender credential,
+/// rate limit or tenant quota applies.
+pub async fn push_local(
+    state: &ServerState,
+    feed: &Feed,
+    content_type: &str,
+    body: &[u8],
+    dedupe: Option<&str>,
+) -> Result<AppendAck, Refusal> {
+    let spec = &feed.spec.ingest;
+    if body.len() as u64 > spec.max_request_bytes.bytes() {
+        return Err(Refusal::too_large(format!(
+            "the body is larger than the {} bytes the feed accepts per request",
+            spec.max_request_bytes.bytes()
+        )));
+    }
+    let mut headers = HeaderMap::new();
+    if let (Some(name), Some(value)) = (
+        spec.dedupe.as_ref().and_then(|d| d.header.as_deref()),
+        dedupe,
+    ) && let (Ok(name), Ok(value)) = (
+        header::HeaderName::from_bytes(name.as_bytes()),
+        header::HeaderValue::from_str(value),
+    ) {
+        headers.insert(name, value);
+    }
+    let pieces = split(content_type, body, spec.max_event_bytes.bytes())?;
+    let (events, _) = build_events(state, feed, &headers, pieces)?;
+    let store = state
+        .feeds()
+        .store_for(feed)
+        .await
+        .map_err(|e| store_refusal(feed, "the feed's store could not be opened", &e))?;
+    store
+        .append(&store_calls(), &feed.uid, events)
+        .await
+        .map_err(|e| match full_refusal(&e) {
+            Some(full) => full,
+            None => store_refusal(feed, "appending to the feed's store failed", &e),
+        })
+}
+
 type Refused = (Option<Arc<Feed>>, Refusal);
 
 async fn handle(
@@ -992,45 +1092,7 @@ async fn handle(
             .retry(wait),
         ));
     }
-    let sealed = feed.spec.sealed();
-    let context = sealed.then(|| {
-        let tenant = feed.tenant().and_then(|t| TenantId::new(t).ok());
-        faucet_common_feed::sealing_context(&feed.uid, tenant.as_ref())
-    });
-    let received_at = chrono::Utc::now();
-    let dedupe_header = spec.dedupe.as_ref().and_then(|d| d.header.as_deref());
-    let mut sizes = Vec::with_capacity(count);
-    let mut events = Vec::with_capacity(count);
-    for (i, piece) in pieces.into_iter().enumerate() {
-        let key = spec
-            .dedupe
-            .as_ref()
-            .and_then(|d| dedupe_key(d, &headers, &piece, i, count));
-        sizes.push(piece.payload.len() as u64);
-        let payload = match &context {
-            Some(context) => secrets::seal_payload(&state, &piece.payload, context).map_err(|e| {
-                tracing::error!(feed = %feed.label(), error = %e, "an event could not be sealed");
-                refuse(Refusal::unavailable(
-                    "seal",
-                    "the feed's events are sealed and the server cannot seal right now",
-                    RETRY_FULL_SECS,
-                ))
-            })?,
-            None => piece.payload,
-        };
-        let mut event = NewEvent::new(piece.content_type, payload)
-            .received_at(received_at)
-            .sealed(sealed);
-        for name in KEPT_HEADERS.iter().copied().chain(dedupe_header) {
-            if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
-                event = event.header(name.to_ascii_lowercase(), value);
-            }
-        }
-        if let Some(key) = key {
-            event = event.dedupe_key(key);
-        }
-        events.push(event);
-    }
+    let (events, sizes) = build_events(&state, &feed, &headers, pieces).map_err(&refuse)?;
     let store = rt.store_for(&feed).await.map_err(|e| {
         refuse(store_refusal(
             &feed,

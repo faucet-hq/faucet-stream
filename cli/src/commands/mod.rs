@@ -16,6 +16,9 @@ pub mod discover;
 pub mod dlq;
 pub mod doctor;
 pub mod explain;
+#[cfg(feature = "schedule")]
+#[cfg(feature = "feeds")]
+pub mod feed;
 pub mod fmt;
 #[cfg(feature = "catalog")]
 pub mod history;
@@ -41,7 +44,6 @@ pub mod profiling;
 pub mod replicate;
 pub mod rollback;
 pub mod run;
-#[cfg(feature = "schedule")]
 pub mod schedule;
 pub mod schema;
 pub mod search;

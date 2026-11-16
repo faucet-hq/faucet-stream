@@ -227,6 +227,11 @@ pub enum Command {
     /// store URL and templates registered here are triggerable over HTTP.
     #[cfg(feature = "templates")]
     Template(TemplateArgs),
+    /// Manage feeds (durable event logs senders push into) straight in their
+    /// stores: definitions, deliveries, positions, tokens and events. Point
+    /// `--store` at the run history `faucet serve` uses.
+    #[cfg(feature = "feeds")]
+    Feed(FeedArgs),
     /// Generate a shell tab-completion script (bash / zsh / fish / powershell /
     /// elvish). For registry- and config-aware *dynamic* completion, enable the
     /// `COMPLETE` hook instead, e.g. `source <(COMPLETE=zsh faucet)`.
@@ -594,6 +599,145 @@ pub struct CatalogLineageArgs {
     /// BFS hop bound around --root.
     #[arg(long, default_value_t = 5)]
     pub depth: u32,
+}
+
+/// `faucet feed` arguments (#1034).
+#[cfg(feature = "feeds")]
+#[derive(Debug, Parser)]
+pub struct FeedArgs {
+    #[command(subcommand)]
+    pub command: FeedCommand,
+    /// The run history the server keeps its feeds in: `sqlite:<path>` or
+    /// `postgres://…`. The feed store follows it (a `feeds.db` beside a
+    /// SQLite history, or the same PostgreSQL database).
+    #[arg(
+        long,
+        global = true,
+        value_name = "URL",
+        env = "FAUCET_FEED_STORE",
+        hide_env_values = true
+    )]
+    pub store: Option<String>,
+    /// A named feed store a feed may use: `NAME=sqlite:<path>` or
+    /// `NAME=postgres://…` (repeatable), as given to `faucet serve`.
+    #[arg(long = "feed-store", global = true, value_name = "NAME=URL")]
+    pub feed_store: Vec<String>,
+    /// The server's vault key: needed for a feed with a signature secret,
+    /// secret delivery params or sealed events.
+    #[arg(long, global = true, env = "FAUCET_VAULT_KEY", hide_env_values = true)]
+    pub vault_key: Option<String>,
+    /// The tenant whose feeds are meant.
+    #[arg(long, global = true)]
+    pub tenant: Option<String>,
+    /// Print JSON.
+    #[arg(long, global = true)]
+    pub json: bool,
+}
+
+/// `faucet feed` subcommands.
+#[cfg(feature = "feeds")]
+#[derive(Debug, Subcommand)]
+pub enum FeedCommand {
+    /// List feeds with their status, size and pending events.
+    List,
+    /// Show one feed: deliveries and their positions, gaps, tokens.
+    Show { name: String },
+    /// Create a feed from a definition file (YAML or JSON; `-` = stdin).
+    Create {
+        #[arg(short = 'f', long, value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Create the feed a definition file names, or replace it when it exists.
+    Apply {
+        #[arg(short = 'f', long, value_name = "FILE")]
+        file: PathBuf,
+    },
+    /// Delete a feed with its events, positions and tokens.
+    Delete { name: String },
+    /// Pause a delivery: it keeps its position and starts no runs.
+    Pause {
+        name: String,
+        delivery: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Resume a delivery and clear a stall.
+    Resume { name: String, delivery: String },
+    /// Have a server start the delivery's next run without waiting for its
+    /// flush policy.
+    DeliverNow { name: String, delivery: String },
+    /// Move a delivery back to deliver retained events again.
+    Replay {
+        name: String,
+        delivery: String,
+        /// The event to deliver next.
+        #[arg(long, value_name = "SEQ")]
+        to_seq: Option<u64>,
+        /// The first event stored at or after this time (RFC 3339).
+        #[arg(long, value_name = "TIME")]
+        to_time: Option<String>,
+    },
+    /// Move a delivery forward past events that will not be delivered,
+    /// leaving a gap that names them.
+    Skip {
+        name: String,
+        delivery: String,
+        /// The next event to read (default: one event past the position).
+        #[arg(long, value_name = "SEQ")]
+        to: Option<u64>,
+        /// Why; kept with the gap.
+        #[arg(long)]
+        reason: String,
+    },
+    /// Put a held delivery back on a valid position after its store was
+    /// restored from a backup.
+    Recover { name: String, delivery: String },
+    /// List a feed's retained events (never their payloads), newest first.
+    Events {
+        name: String,
+        #[arg(long)]
+        before: Option<u64>,
+        #[arg(long)]
+        from: Option<u64>,
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+    /// Append events from a file or stdin straight to the feed's store, with
+    /// the checks, dedupe and sealing the ingest route applies. An operator
+    /// tool: no sender credential, rate limit or tenant quota applies.
+    #[command(alias = "send")]
+    Push {
+        name: String,
+        /// The body: one JSON value, a JSON array or NDJSON (`-` or omitted
+        /// = stdin).
+        file: Option<PathBuf>,
+        #[arg(long, default_value = "application/json")]
+        content_type: String,
+        /// The value the feed's dedupe header would carry.
+        #[arg(long)]
+        dedupe_key: Option<String>,
+    },
+    /// Issue, list and revoke the feed's ingest tokens.
+    #[command(subcommand)]
+    Token(FeedTokenCommand),
+}
+
+/// `faucet feed token` subcommands.
+#[cfg(feature = "feeds")]
+#[derive(Debug, Subcommand)]
+pub enum FeedTokenCommand {
+    /// Issue a token; its text is printed once.
+    Create {
+        name: String,
+        token_name: String,
+        /// When it stops working (RFC 3339).
+        #[arg(long, value_name = "TIME")]
+        expires_at: Option<String>,
+    },
+    /// List the feed's tokens (never their text).
+    List { name: String },
+    /// Revoke a token by its id.
+    Revoke { name: String, id: String },
 }
 
 /// `faucet template` arguments (#444).
@@ -3232,6 +3376,13 @@ pub enum SchemaTarget {
     /// templates run on a cron schedule).
     #[cfg(all(feature = "schedule", feature = "templates"))]
     Schedules,
+    /// JSON Schema for one feed definition (`faucet feed create -f`, the
+    /// body of `POST /v1/feeds`).
+    #[cfg(feature = "feeds")]
+    Feed,
+    /// JSON Schema for the `faucet serve --feeds` file.
+    #[cfg(feature = "feeds")]
+    Feeds,
     /// JSON Schema for the `notifications:` (incident-routing) block.
     #[cfg(feature = "notify")]
     Notifications,

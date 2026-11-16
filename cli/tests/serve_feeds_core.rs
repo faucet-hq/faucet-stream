@@ -2287,7 +2287,7 @@ async fn a_stall_and_a_nearly_full_feed_each_notify_once() {
             .map(|r| serde_json::from_slice(&r.body).unwrap())
             .collect()
     };
-    let mut seen = Vec::new();
+    let mut seen;
     for _ in 0..100 {
         seen = events().await;
         if seen.len() >= 2 {
@@ -2646,4 +2646,282 @@ async fn a_feeds_file_pipeline_that_cannot_deliver_fails_the_start() {
     let cfg = config(root, &history, &["--feeds", &feeds_arg]);
     let srv = Srv::over(&cfg).await;
     service::check_file_deliveries(&srv.state).await.unwrap();
+}
+
+/// `faucet feed`: every verb works straight on the stores a server uses,
+/// through the same rules, and starts no delivery itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_feed_verbs_manage_feeds_straight_in_their_stores() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let history = format!("sqlite:{}", root.join("history.db").display());
+    {
+        let srv = Srv::start(root, &[]).await;
+        register(&srv.state, "orders_lake", &root.join("state")).await;
+    }
+    let feed = |args: &[&str]| {
+        let mut argv = vec![
+            "faucet",
+            "feed",
+            "--store",
+            &history,
+            "--vault-key",
+            VAULT_KEY,
+        ];
+        argv.extend_from_slice(args);
+        let cli = faucet_cli::cli::Cli::try_parse_from(argv).unwrap();
+        let faucet_cli::cli::Command::Feed(args) = cli.command else {
+            panic!("not a feed command");
+        };
+        async move {
+            faucet_cli::commands::feed::run(args)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+    let out = root.join("lake.jsonl");
+    let definition = root.join("orders.yaml");
+    let write = |description: &str| {
+        std::fs::write(
+            &definition,
+            format!(
+                "name: orders\ndescription: {description}\ningest:\n  auth:\n    tokens: managed\n    signature: {{ header: X-Sig, secret: cli-hmac }}\n  dedupe: {{ header: X-Event-Id }}\ndeliveries:\n  - name: lake\n    template: {{ id: orders_lake, params: {{ out: \"{}\" }} }}\n    flush: {{ max_events: 1, min_interval: 0s }}\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+    };
+    write("first");
+    let file = definition.display().to_string();
+
+    assert!(feed(&["list"]).await.is_ok());
+    feed(&["create", "-f", &file]).await.unwrap();
+    let again = feed(&["create", "-f", &file]).await.unwrap_err();
+    assert!(again.contains("already exists"), "{again}");
+    write("second");
+    feed(&["apply", "-f", &file, "--json"]).await.unwrap();
+    let json = root.join("more.json");
+    std::fs::write(
+        &json,
+        r#"{"name": "more", "ingest": {"auth": {"tokens": "managed"}}}"#,
+    )
+    .unwrap();
+    feed(&["apply", "-f", &json.display().to_string()])
+        .await
+        .unwrap();
+    feed(&["list", "--json"]).await.unwrap();
+    feed(&["show", "orders"]).await.unwrap();
+    assert!(feed(&["show", "nope"]).await.is_err());
+    let bad = root.join("bad.yaml");
+    std::fs::write(&bad, "name: [").unwrap();
+    assert!(
+        feed(&["create", "-f", &bad.display().to_string()])
+            .await
+            .unwrap_err()
+            .contains("feed definition")
+    );
+
+    // Tokens.
+    feed(&["token", "create", "orders", "shop"]).await.unwrap();
+    feed(&[
+        "token",
+        "create",
+        "orders",
+        "old",
+        "--expires-at",
+        "2099-01-01T00:00:00Z",
+        "--json",
+    ])
+    .await
+    .unwrap();
+    assert!(
+        feed(&["token", "create", "orders", "x", "--expires-at", "soon"])
+            .await
+            .unwrap_err()
+            .contains("--expires-at")
+    );
+    feed(&["token", "list", "orders"]).await.unwrap();
+    let old = {
+        let cfg = config(root, &history, &[]);
+        let h = faucet_cli::serve::history::connect(
+            &cfg.history,
+            cfg.idempotency_retention,
+            cfg.lease_ttl,
+            "test",
+        )
+        .await
+        .unwrap();
+        let tokens = h.feed_token_list(None).await.unwrap();
+        tokens.iter().find(|t| t.name == "old").unwrap().id.clone()
+    };
+    feed(&["token", "revoke", "orders", &old, "--json"])
+        .await
+        .unwrap();
+    feed(&["token", "revoke", "orders", &old]).await.unwrap();
+    assert!(feed(&["token", "revoke", "orders", "nope"]).await.is_err());
+
+    // Events pushed straight to the store, with the route's checks.
+    let events = root.join("events.ndjson");
+    std::fs::write(&events, "{\"id\": 1}\n{\"id\": 2}\n{\"id\": 3}\n").unwrap();
+    let events_arg = events.display().to_string();
+    let push = [
+        "push",
+        "orders",
+        &events_arg,
+        "--content-type",
+        "application/x-ndjson",
+        "--dedupe-key",
+        "batch-1",
+    ];
+    feed(&push).await.unwrap();
+    feed(&[&push[..], &["--json"]].concat()).await.unwrap();
+    std::fs::write(&events, "{").unwrap();
+    assert!(
+        feed(&["send", "orders", &events_arg])
+            .await
+            .unwrap_err()
+            .contains("not JSON")
+    );
+    feed(&["events", "orders", "--limit", "2"]).await.unwrap();
+    feed(&["events", "orders", "--from", "1", "--json"])
+        .await
+        .unwrap();
+
+    // The delivery's moves.
+    feed(&["pause", "orders", "lake", "--reason", "maintenance"])
+        .await
+        .unwrap();
+    feed(&[
+        "skip", "orders", "lake", "--to", "3", "--reason", "bad rows",
+    ])
+    .await
+    .unwrap();
+    assert!(
+        feed(&["skip", "orders", "lake", "--reason", " "])
+            .await
+            .unwrap_err()
+            .contains("needs a reason")
+    );
+    feed(&["replay", "orders", "lake", "--to-seq", "2"])
+        .await
+        .unwrap();
+    feed(&[
+        "replay",
+        "orders",
+        "lake",
+        "--to-time",
+        "2020-01-01T00:00:00Z",
+        "--json",
+    ])
+    .await
+    .unwrap();
+    for bad in [
+        vec!["replay", "orders", "lake"],
+        vec![
+            "replay",
+            "orders",
+            "lake",
+            "--to-seq",
+            "1",
+            "--to-time",
+            "2020-01-01T00:00:00Z",
+        ],
+        vec!["replay", "orders", "lake", "--to-time", "yesterday"],
+    ] {
+        assert!(feed(&bad).await.is_err(), "{bad:?}");
+    }
+    feed(&["recover", "orders", "lake"]).await.unwrap();
+    feed(&["resume", "orders", "lake"]).await.unwrap();
+    feed(&["deliver-now", "orders", "lake", "--json"])
+        .await
+        .unwrap();
+    feed(&["show", "orders", "--json"]).await.unwrap();
+
+    // What a server sees afterwards: the CLI changed the stores and ran
+    // nothing; the server delivers.
+    {
+        let mut srv = Srv::start(root, &[]).await;
+        let detail = service::get(&srv.state, &admin(), None, "orders")
+            .await
+            .unwrap();
+        assert_eq!(detail.feed.spec.description.as_deref(), Some("second"));
+        assert_eq!(
+            detail.feed.watermark,
+            Some(3),
+            "the retried batch was stored once"
+        );
+        assert_eq!(detail.tokens.len(), 2);
+        assert!(
+            detail
+                .gaps
+                .iter()
+                .any(|g| g.reason == "bad rows" && g.by == "cli")
+        );
+        assert_eq!(detail.feed.deliveries[0].position, Some(1));
+        assert!(!out.exists(), "the verbs start no run");
+        let found = service::find(&srv.state, None, "orders").await.unwrap();
+        assert_eq!(
+            found
+                .feed
+                .spec
+                .ingest
+                .auth
+                .signature
+                .as_ref()
+                .unwrap()
+                .secret,
+            "cli-hmac"
+        );
+        srv.delivered("orders", "lake", 4).await;
+        assert_eq!(ids(&out), vec![1, 2, 3]);
+        assert!(detail.tokens.iter().any(|t| t.revoked_at.is_some()));
+    }
+    // That server's scheduler still holds the SQLite feed store: a verb that
+    // needs it says so instead of writing beside it.
+    let held = feed(&["delete", "orders"]).await.unwrap_err();
+    assert!(
+        held.contains("another faucet server is using the feed store"),
+        "{held}"
+    );
+}
+
+/// The verbs that remove things, and the one flag every verb needs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_feed_verbs_delete_feeds_and_need_a_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let history = format!("sqlite:{}", dir.path().join("history.db").display());
+    let feed = |args: &[&str]| {
+        let mut argv = vec!["faucet", "feed", "--store", &history];
+        argv.extend_from_slice(args);
+        let cli = faucet_cli::cli::Cli::try_parse_from(argv).unwrap();
+        let faucet_cli::cli::Command::Feed(args) = cli.command else {
+            panic!("not a feed command");
+        };
+        async move {
+            faucet_cli::commands::feed::run(args)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+    let json = dir.path().join("more.json");
+    std::fs::write(
+        &json,
+        r#"{"name": "more", "ingest": {"auth": {"tokens": "managed"}}}"#,
+    )
+    .unwrap();
+    feed(&["create", "-f", &json.display().to_string()])
+        .await
+        .unwrap();
+    feed(&["delete", "more", "--json"]).await.unwrap();
+    assert!(feed(&["delete", "more"]).await.is_err());
+
+    // Without a store there is nothing to manage.
+    let cli = faucet_cli::cli::Cli::try_parse_from(["faucet", "feed", "list"]).unwrap();
+    let faucet_cli::cli::Command::Feed(args) = cli.command else {
+        panic!("not a feed command");
+    };
+    if args.store.is_none() {
+        let err = faucet_cli::commands::feed::run(args).await.unwrap_err();
+        assert!(err.to_string().contains("pass --store"), "{err}");
+    }
 }

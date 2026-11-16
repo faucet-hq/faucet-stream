@@ -509,6 +509,30 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_shipped_example_loads() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/feeds");
+        let text = std::fs::read_to_string(dir.join("feeds.yaml")).unwrap();
+        // The example names its HMAC secret by reference; give it a value.
+        let resolved = text.replace("${env:ORDERS_HMAC_SECRET}", "example-secret");
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("feeds.yaml"), resolved).unwrap();
+        std::fs::copy(
+            dir.join("orders_to_jsonl.yaml"),
+            tmp.path().join("orders_to_jsonl.yaml"),
+        )
+        .unwrap();
+        let f = load_file(&tmp.path().join("feeds.yaml")).await.unwrap();
+        assert_eq!(f.feeds.len(), 2);
+        assert_eq!(f.feeds[0].deliveries[0].name, "archive");
+        assert!(f.feeds[1].ingest.url_token);
+        let pipeline: serde_json::Value = crate::yaml::from_str(
+            &std::fs::read_to_string(dir.join("orders_to_jsonl.yaml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pipeline["pipeline"]["source"]["type"], "feed");
+    }
+
     #[test]
     fn the_file_schema_is_derivable() {
         let schema = serde_json::to_value(schemars::schema_for!(FeedsFile)).unwrap();

@@ -1,0 +1,43 @@
+# Feeds for `faucet serve --feeds cli/examples/feeds/feeds.yaml`.
+#
+# A feed is a durable log senders push events into over HTTP:
+#   POST /v1/feeds/orders/events        (a feed token, a signature, or both)
+# Each delivery runs a pipeline over the feed with its own position, once
+# its flush policy is met. Feeds in this file are read-only at runtime;
+# feeds made through the API or `faucet feed` live in the run history.
+#
+# Issue a token for a feed (the text is shown once):
+#   faucet feed token create orders shop --store sqlite:./history.db
+# Push a test event without a sender:
+#   echo '{"id": 1}' | faucet feed push orders --store sqlite:./history.db
+version: 1
+feeds:
+  - name: orders
+    description: Order events from the shop
+    ingest:
+      auth:
+        tokens: managed                   # write-only tokens, stored hashed
+        signature:                        # and an HMAC over the body
+          header: X-Signature
+          secret: "${env:ORDERS_HMAC_SECRET}"
+          prefix: "sha256="
+      accept: [application/json, application/x-ndjson]
+      max_event_bytes: 256KiB
+      dedupe: { header: X-Event-Id, window: 24h }   # a retried event is stored once
+      rate_limit: { events_per_sec: 200, burst: 1000 }
+    retention:
+      max_age: 7d                         # how long delivered events stay replayable
+      undelivered: { max_age: 30d, max_bytes: 5GiB }   # past these the feed refuses new events
+      warn_at: [0.5, 0.8]
+    deliveries:
+      - name: archive
+        pipeline: orders_to_jsonl.yaml    # relative to this file; its source is `type: feed`
+        flush: { max_events: 5000, max_bytes: 64MiB, max_age: 60s, min_interval: 10s }
+        max_batch: { events: 10000, bytes: 64MiB }
+        start: earliest
+        retries: 5
+
+  - name: clicks
+    ingest:
+      auth: { tokens: managed }
+      url_token: true                     # for senders that can only be given a URL

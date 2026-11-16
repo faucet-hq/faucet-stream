@@ -269,6 +269,7 @@ pub struct FeedsRuntime {
     file_ids: Mutex<HashMap<String, FileIds>>,
     ensured: Mutex<HashSet<String>>,
     started: AtomicBool,
+    scheduling: AtomicBool,
     changed: Arc<tokio::sync::Notify>,
     last_refresh: tokio::sync::Mutex<Option<Instant>>,
     readiness: Mutex<Readiness>,
@@ -298,6 +299,7 @@ impl FeedsRuntime {
             file_ids: Mutex::new(HashMap::new()),
             ensured: Mutex::new(HashSet::new()),
             started: AtomicBool::new(false),
+            scheduling: AtomicBool::new(true),
             changed: Arc::new(tokio::sync::Notify::new()),
             last_refresh: tokio::sync::Mutex::new(None),
             readiness: Mutex::new(Readiness::default()),
@@ -311,6 +313,13 @@ impl FeedsRuntime {
             spec::LoadedFile::default(),
             stores::Stores::from_config(config),
         )
+    }
+
+    /// A runtime that never starts the scheduler: the `faucet feed` verbs
+    /// change definitions and positions and leave delivering to a server.
+    pub fn offline(self) -> Self {
+        self.scheduling.store(false, Ordering::Release);
+        self
     }
 
     /// The `--feeds` file's feeds.
@@ -396,7 +405,7 @@ impl FeedsRuntime {
     /// Start the scheduler on this server if it is not running: called when
     /// the server first sees a feed.
     pub fn ensure_started(&self, state: &ServerState) {
-        if self.started.swap(true, Ordering::AcqRel) {
+        if !self.scheduling.load(Ordering::Acquire) || self.started.swap(true, Ordering::AcqRel) {
             return;
         }
         tracing::info!("the first feed exists: starting the feed scheduler");

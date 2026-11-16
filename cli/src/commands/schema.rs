@@ -321,6 +321,16 @@ pub async fn run(args: SchemaArgs) -> CliResult<()> {
             let s = faucet_core::schema_for!(crate::serve::schedules::SchedulesFile);
             serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
         }
+        #[cfg(feature = "feeds")]
+        SchemaTarget::Feed => {
+            let s = faucet_core::schema_for!(crate::serve::history::feeds::FeedSpec);
+            serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
+        }
+        #[cfg(feature = "feeds")]
+        SchemaTarget::Feeds => {
+            let s = faucet_core::schema_for!(crate::serve::feeds::spec::FeedsFile);
+            serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
+        }
         SchemaTarget::SourceTemplate => {
             serde_json::to_value(faucet_core::schema_for!(crate::hub::spec::SourceTemplate))
                 .expect("schema serialization")
@@ -503,6 +513,19 @@ mod tests {
         })
         .await;
         assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[cfg(feature = "feeds")]
+    #[tokio::test]
+    async fn schema_prints_a_feed_and_the_feeds_file() {
+        for target in [SchemaTarget::Feed, SchemaTarget::Feeds] {
+            let r = super::run(SchemaArgs {
+                target: Some(target),
+                list: false,
+            })
+            .await;
+            assert!(r.is_ok(), "{r:?}");
+        }
     }
 
     #[cfg(all(feature = "schedule", feature = "templates"))]
