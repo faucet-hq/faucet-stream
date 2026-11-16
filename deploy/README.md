@@ -78,7 +78,16 @@ The chart mounts its PVC there by default (`serve.persistence.enabled: true`,
 Postgres: `serve.history.backend: postgres` with the DSN in a Secret.
 `--history memory` (`serve.history.backend: memory`) keeps nothing across a
 restart. Back the file up with SQLite's online backup — see
-[Backing up the server database](../docs/site/src/content/docs/operations/backup.md). Every `faucet serve` feature (triggers, template sync, policy,
+[Backing up the server database](../docs/site/src/content/docs/operations/backup.md).
+
+A server with [feeds](../docs/site/src/content/docs/cookbook/feeds.md) keeps
+their events in a feed store that follows the history: `feeds.db` in the same
+directory as a SQLite history (so on the same volume), or the history's
+Postgres database. Back it up with the history. The chart's `serve.feeds`
+block adds a feeds file, named stores and an ingest-only port with its own
+Service and Ingress.
+
+Every `faucet serve` feature (triggers, schedules, feeds, template sync, policy,
 tenants and hosted OAuth connect, OTLP export, approvals, MCP) has its own
 values block; [`examples/everything.yaml`](./helm/faucet-stream/examples/everything.yaml)
 turns them all on.
