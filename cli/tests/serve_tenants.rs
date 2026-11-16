@@ -26,7 +26,9 @@ const AUTH_CONFIG: &str = "principals:\n\
     \x20 - { name: alice, token: admin-tok, role: admin }\n\
     \x20 - { name: bob, token: op-tok, role: operator }\n\
     \x20 - { name: carol, token: view-tok, role: viewer }\n\
-    \x20 - { name: acme-app, token: acme-tok, role: operator, tenant: acme }\n";
+    \x20 - { name: acme-app, token: acme-tok, role: operator, tenant: acme }\n\
+    \x20 - { name: acme-admin, token: acme-admin-tok, role: admin, tenant: acme }\n\
+    \x20 - { name: globex-admin, token: globex-admin-tok, role: admin, tenant: globex }\n";
 
 fn serve_args(
     port: u16,
@@ -2562,4 +2564,84 @@ async fn a_connect_callback_from_a_connection_without_a_generation_survives_a_ro
         finish_connect_flow(&api, &st).await,
         "https://app.example/done?connection=crm&status=ok"
     );
+}
+
+/// A change to a tenant's schedule belongs to that tenant, whoever proposed
+/// it: the tenant's admin sees and approves a server admin's edit, another
+/// tenant's cannot see it, and the edit is applied as the requester. A
+/// fan-out schedule's change stays a server-level one.
+#[cfg(feature = "schedule")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schedule_change_belongs_to_the_tenant_that_owns_the_schedule() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = rows_mock().await;
+    let out = dir.path().join("out.jsonl");
+    let db = format!("sqlite:{}", dir.path().join("history.db").display());
+    // Made before the gate: the tenant's own schedule.
+    let open = spawn(dir.path(), Some(db.clone()), &rows.uri()).await;
+    for t in ["acme", "globex"] {
+        let (code, _) = open.post("admin-tok", "/v1/tenants", json!({"id": t})).await;
+        assert_eq!(code, 201);
+    }
+    let (code, reg) = open
+        .post(
+            "admin-tok",
+            "/v1/templates",
+            json!({"config": plain_template(&rows.uri(), &out), "launch": true}),
+        )
+        .await;
+    assert_eq!(code, 201, "{reg}");
+    let nightly = json!({"name": "acme-nightly", "cron": "0 2 * * *", "template": {"id": "plain-sync"}});
+    let (code, made) = open.post("acme-tok", "/v1/schedules", nightly).await;
+    assert_eq!(code, 201, "{made}");
+
+    let gated_dir = dir.path().join("gated");
+    std::fs::create_dir_all(&gated_dir).unwrap();
+    let api = spawn_full(
+        &gated_dir,
+        Some(db),
+        &rows.uri(),
+        None,
+        vec!["schedule".to_string()],
+    )
+    .await;
+    let edit = json!({"name": "acme-nightly", "cron": "0 3 * * *", "template": {"id": "plain-sync"}});
+    let (code, pending) = api
+        .put("admin-tok", "/v1/schedules/acme-nightly", edit)
+        .await;
+    assert_eq!(code, 202, "{pending}");
+    let id = pending["change_id"].as_str().unwrap().to_string();
+    let at = format!("/v1/changes/{id}");
+    let (code, seen) = api.get("acme-admin-tok", &at).await;
+    assert_eq!(code, 200, "{seen}");
+    assert_eq!(seen["tenant"], "acme", "{seen}");
+    assert_eq!(seen["requester"], "alice");
+    let (code, _) = api.get("globex-admin-tok", &at).await;
+    assert_eq!(code, 404);
+    let (code, _) = api
+        .post("globex-admin-tok", &format!("{at}/approve"), json!({}))
+        .await;
+    assert_eq!(code, 404);
+    let (_, listed) = api.get("globex-admin-tok", "/v1/changes").await;
+    assert_eq!(listed, json!([]));
+
+    let (code, done) = api
+        .post("acme-admin-tok", &format!("{at}/approve"), json!({}))
+        .await;
+    assert_eq!(code, 200, "{done}");
+    assert_eq!(done["status"], "executed", "{done}");
+    let (code, s) = api.get("acme-tok", "/v1/schedules/acme-nightly").await;
+    assert_eq!(code, 200, "{s}");
+    assert_eq!(s["schedule"]["cron"], "0 3 * * *", "{s}");
+    assert_eq!(s["schedule"]["updated_by"], "alice", "{s}");
+
+    let fan = json!({"name": "all-nightly", "cron": "0 4 * * *", "template": {"id": "plain-sync"}, "tenants": "all"});
+    let (code, shared) = api.post("op-tok", "/v1/schedules", fan).await;
+    assert_eq!(code, 202, "{shared}");
+    let shared_at = format!("/v1/changes/{}", shared["change_id"].as_str().unwrap());
+    let (code, _) = api.get("acme-admin-tok", &shared_at).await;
+    assert_eq!(code, 404);
+    let (code, server) = api.get("admin-tok", &shared_at).await;
+    assert_eq!(code, 200);
+    assert!(server.get("tenant").is_none(), "{server}");
 }

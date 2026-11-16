@@ -293,9 +293,10 @@ pub struct ChangeRequest {
     /// Why execution failed or the approval was invalidated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// The tenant the proposed run is for (#709): the requester's own tenant
-    /// or the tenant route it was proposed through. Execution runs it as that
-    /// tenant.
+    /// The tenant the change is for (#709): for a run, the requester's own
+    /// tenant or the tenant route it was proposed through; for a schedule,
+    /// feed or tenant policy change, the tenant that owns the object,
+    /// whoever proposed it. Execution runs as the requester for that tenant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
     /// The proposed run's config was written by the server's operator (a
@@ -1263,13 +1264,20 @@ pub async fn create(
     let now = Utc::now();
     // A tenant policy change belongs to the tenant whose policy it changes,
     // whoever proposed it (a server admin through the tenant's route).
-    let tenant = if new.kind == ChangeKind::TenantPolicyUpdate {
-        payload
+    let tenant = match new.kind {
+        ChangeKind::TenantPolicyUpdate => payload
             .get("tenant")
             .and_then(Value::as_str)
-            .map(str::to_string)
-    } else {
-        actor.tenant.clone()
+            .map(str::to_string),
+        // A schedule or feed change belongs to the tenant that owns the
+        // object, resolved here from the planned target.
+        #[cfg(all(feature = "schedule", feature = "templates"))]
+        ChangeKind::Schedule => {
+            crate::serve::schedules::service::change_tenant(state, actor, &payload).await?
+        }
+        #[cfg(feature = "feeds")]
+        ChangeKind::Feed => crate::serve::feeds::service::change_tenant(actor, &payload)?,
+        _ => actor.tenant.clone(),
     };
     let change = ChangeRequest {
         id: uuid::Uuid::now_v7().to_string(),
@@ -1299,7 +1307,7 @@ pub async fn create(
     record_metric(change.kind, "requested");
     crate::serve::audit::write(
         state,
-        actor,
+        &audit_as(actor, &change),
         "change.requested",
         None,
         Some(change.id.clone()),
@@ -1394,7 +1402,7 @@ async fn expire_if_due(
         record_metric(change.kind, "expired");
         crate::serve::audit::write(
             state,
-            &AuthContext::system("expiry"),
+            &audit_as(&AuthContext::system("expiry"), &change),
             "change.expired",
             None,
             Some(change.id.clone()),
@@ -1403,6 +1411,38 @@ async fn expire_if_due(
         .await;
     }
     Ok(change)
+}
+
+/// Whether a change of `kind` belongs to the tenant that owns its object.
+fn owned_by_object(kind: ChangeKind) -> bool {
+    matches!(kind, ChangeKind::Schedule | ChangeKind::Feed)
+}
+
+/// `actor` as the audit log records it for `change`: an unscoped principal
+/// acting on a tenant's schedule or feed is recorded under that tenant.
+fn audit_as(actor: &AuthContext, change: &ChangeRequest) -> AuthContext {
+    let mut as_recorded = actor.clone();
+    if owned_by_object(change.kind) && as_recorded.tenant.is_none() {
+        as_recorded.tenant = change.tenant.clone();
+    }
+    as_recorded
+}
+
+/// Whether `actor` may decide a change that belongs to `change_tenant`: a
+/// server principal any, a tenant principal its own tenant's only.
+pub(crate) fn approver_in_scope(
+    actor: &AuthContext,
+    change_tenant: Option<&str>,
+) -> Result<(), String> {
+    match (&actor.tenant, change_tenant) {
+        (None, _) => Ok(()),
+        (Some(own), Some(t)) if own == t => Ok(()),
+        (Some(own), _) => Err(format!(
+            "'{}' is confined to tenant {own}; only a server admin or an admin of the tenant \
+             the change is for may approve it",
+            actor.principal
+        )),
+    }
 }
 
 /// One request, expiry applied.
@@ -1457,6 +1497,12 @@ pub async fn approve(
             ServeError::Forbidden(reason)
         })?;
     }
+    if owned_by_object(change.kind) {
+        approver_in_scope(actor, change.tenant.as_deref()).map_err(|reason| {
+            record_metric(change.kind, "denied");
+            ServeError::Forbidden(reason)
+        })?;
+    }
     if change
         .approvals
         .iter()
@@ -1501,7 +1547,7 @@ pub async fn approve(
     record_metric(change.kind, "approved");
     crate::serve::audit::write(
         state,
-        actor,
+        &audit_as(actor, &change),
         "change.approved",
         None,
         Some(change.id.clone()),
@@ -1552,6 +1598,9 @@ pub async fn reject(
             policy_update::approver_in_scope(actor, change.tenant.as_deref())
                 .map_err(ServeError::Forbidden)?;
         }
+        if owned_by_object(change.kind) {
+            approver_in_scope(actor, change.tenant.as_deref()).map_err(ServeError::Forbidden)?;
+        }
     }
     change.status = ChangeStatus::Rejected;
     change.rejection = Some(Rejection {
@@ -1564,7 +1613,7 @@ pub async fn reject(
     record_metric(change.kind, "rejected");
     crate::serve::audit::write(
         state,
-        actor,
+        &audit_as(actor, &change),
         "change.rejected",
         None,
         Some(change.id.clone()),
@@ -1831,7 +1880,7 @@ async fn execute(
             record_metric(change.kind, "executed");
             crate::serve::audit::write(
                 state,
-                actor,
+                &audit_as(actor, &change),
                 "change.executed",
                 run_id,
                 Some(change.id.clone()),
@@ -1872,7 +1921,7 @@ async fn finish_invalidated(
     record_metric(change.kind, "invalidated");
     crate::serve::audit::write(
         state,
-        actor,
+        &audit_as(actor, &change),
         "change.invalidated",
         None,
         Some(change.id.clone()),
@@ -1928,7 +1977,7 @@ async fn finish_refused(
     record_metric(change.kind, "deferred");
     crate::serve::audit::write(
         state,
-        actor,
+        &audit_as(actor, &change),
         "change.deferred",
         None,
         Some(change.id.clone()),
@@ -2063,7 +2112,7 @@ async fn finish_failed(
     record_metric(change.kind, "failed");
     crate::serve::audit::write(
         state,
-        actor,
+        &audit_as(actor, &change),
         "change.failed",
         None,
         Some(change.id.clone()),

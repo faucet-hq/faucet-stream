@@ -431,6 +431,10 @@ Under [`--require-approval feed`](/faucet-stream/cookbook/approvals/),
 creating, editing or deleting a feed or one of its deliveries answers `202`
 with a pending change request instead of applying it.
 
+A change to a tenant's feed belongs to that tenant even when a server admin
+proposes it (`?tenant=`): the tenant's principals see the request and its
+approvers may approve it; other tenants cannot see it.
+
 Under `--require-approval run`, a feed change that adds or edits a delivery is
 gated too, because a delivery starts runs. A delivery of an approved feed then
 runs without a per-run approval only while its template versions are pinned to

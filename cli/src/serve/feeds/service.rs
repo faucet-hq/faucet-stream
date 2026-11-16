@@ -1951,6 +1951,16 @@ pub async fn prepare_change(
     serde_json::to_value(&p).map_err(|e| ServeError::Internal(e.to_string()))
 }
 
+/// The tenant that owns the feed a change payload is for: the requester's
+/// own, else the one the payload names (an unscoped principal's route).
+pub fn change_tenant(
+    actor: &AuthContext,
+    payload: &serde_json::Value,
+) -> Result<Option<String>, ServeError> {
+    let named = payload.get("tenant").and_then(serde_json::Value::as_str);
+    scope(actor, named)
+}
+
 /// Apply a change as `actor`. Returns the feed's view after it (`None` for
 /// a delete).
 ///

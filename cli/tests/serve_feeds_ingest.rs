@@ -2503,3 +2503,84 @@ async fn a_sealed_payload_is_withheld_and_a_gated_change_answers_202() {
         200
     );
 }
+
+/// A change to a tenant's feed belongs to that tenant, whoever proposed it:
+/// the tenant's admin sees and approves a server admin's proposal, another
+/// tenant's cannot see it, and the feed is made as the requester.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feed_change_belongs_to_the_tenant_that_owns_the_feed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let auth = root.join("auth.yaml");
+    std::fs::write(
+        &auth,
+        format!(
+            "{AUTH_CONFIG}  - {{ name: acme-admin, token: acme-admin-tok, role: admin, tenant: acme }}\n  - {{ name: globex-admin, token: globex-admin-tok, role: admin, tenant: globex }}\n"
+        ),
+    )
+    .unwrap();
+    let auth_arg = auth.display().to_string();
+    let srv = Srv::over(config_as(
+        root,
+        &["--auth-config", &auth_arg],
+        &["--require-approval", "feed"],
+    ))
+    .await;
+    let now = chrono::Utc::now();
+    for id in ["acme", "globex"] {
+        let rec = serde_json::from_value(json!({
+            "id": id, "limits": {}, "created_at": now, "updated_at": now, "created_by": "alice"
+        }))
+        .unwrap();
+        srv.state.history().tenant_upsert(&rec).await.unwrap();
+    }
+    let call = |method: reqwest::Method, path: &str, token: &str, body: Option<Value>| {
+        let mut req = srv.client.request(method, srv.url(path)).bearer_auth(token);
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        srv.send(req)
+    };
+    use reqwest::Method as M;
+    let feed = json!({"name": "app", "ingest": {"auth": {"tokens": "managed"}}});
+    let proposed = call(M::POST, "/v1/feeds?tenant=acme", "admin-tok", Some(feed)).await;
+    assert_eq!(proposed.status, 202, "{}", proposed.body);
+    let change = &proposed.body["change"];
+    assert_eq!(change["tenant"], "acme", "{change}");
+    assert_eq!(change["requester"], "alice");
+    assert_eq!(change["requester_role"], "admin");
+    let id = change["id"].as_str().unwrap().to_string();
+    let at = format!("/v1/changes/{id}");
+
+    assert_eq!(call(M::GET, &at, "globex-admin-tok", None).await.status, 404);
+    let approve = format!("{at}/approve");
+    assert_eq!(
+        call(M::POST, &approve, "globex-admin-tok", Some(json!({})))
+            .await
+            .status,
+        404
+    );
+    let listed = call(M::GET, "/v1/changes", "globex-admin-tok", None).await;
+    assert_eq!(listed.body, json!([]));
+    let theirs = call(M::GET, "/v1/changes", "acme-admin-tok", None).await;
+    assert_eq!(theirs.body[0]["id"], id.as_str(), "{}", theirs.body);
+    assert_eq!(call(M::GET, &at, "acme-admin-tok", None).await.status, 200);
+
+    let done = call(M::POST, &approve, "acme-admin-tok", Some(json!({}))).await;
+    assert_eq!(done.status, 200, "{}", done.body);
+    assert_eq!(done.body["status"], "executed", "{}", done.body);
+    let made = call(M::GET, "/v1/feeds/app", "acme-admin-tok", None).await;
+    assert_eq!(made.status, 200, "{}", made.body);
+    assert_eq!(made.body["created_by"], "alice");
+    assert_eq!(made.body["tenant"], "acme");
+    let audit = call(M::GET, "/v1/audit?action=change.requested", "admin-tok", None).await;
+    assert_eq!(audit.body["entries"][0]["tenant"], "acme", "{}", audit.body);
+
+    // A server feed's change stays out of every tenant's sight.
+    let server = json!({"name": "ops", "ingest": {"auth": {"tokens": "managed"}}});
+    let own = call(M::POST, "/v1/feeds", "admin-tok", Some(server)).await;
+    assert_eq!(own.status, 202, "{}", own.body);
+    assert!(own.body["change"].get("tenant").is_none());
+    let own_at = format!("/v1/changes/{}", own.body["change"]["id"].as_str().unwrap());
+    assert_eq!(call(M::GET, &own_at, "acme-admin-tok", None).await.status, 404);
+}

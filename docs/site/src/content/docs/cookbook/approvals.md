@@ -59,6 +59,15 @@ approved after another policy change landed is `invalidated` rather than
 overwriting it. (On a server with a single principal — `--auth-token`,
 `--no-auth` — that principal may approve its own request, as for every kind.)
 
+A `schedule` or `feed` change also belongs to the tenant that owns the
+schedule or feed, whoever proposed it. When a server admin proposes a change
+to a tenant's schedule or feed, the request carries that tenant: the tenant's
+principals see it in `GET /v1/changes`, and an approver of that tenant (or a
+server approver) may approve it under the usual approval rules. Another
+tenant's principals get a `404`. The change is still applied as the requester,
+and its audit entries carry the tenant. A fan-out schedule (`tenants:`) is
+owned by no tenant, so its changes stay server-level.
+
 The response is the stored request: `status: pending`, the plan (one
 [`faucet plan`](/faucet-stream/reference/cli/#plan) report per root row — source, sink,
 write mode, delivery guarantee, transforms, the [policy](/faucet-stream/cookbook/policies/)

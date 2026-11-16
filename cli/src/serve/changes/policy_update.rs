@@ -251,15 +251,7 @@ pub async fn execute(
 /// Whether `actor` may act on a policy change for `change_tenant`: a
 /// tenant-scoped principal only on its own tenant's, never the server's.
 pub fn approver_in_scope(actor: &AuthContext, change_tenant: Option<&str>) -> Result<(), String> {
-    match (&actor.tenant, change_tenant) {
-        (None, _) => Ok(()),
-        (Some(own), Some(t)) if own == t => Ok(()),
-        (Some(own), _) => Err(format!(
-            "'{}' is confined to tenant {own}; only a server admin or an admin of the tenant \
-             the change is for may approve it",
-            actor.principal
-        )),
-    }
+    super::approver_in_scope(actor, change_tenant)
 }
 
 #[cfg(test)]

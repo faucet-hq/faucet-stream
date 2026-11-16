@@ -1065,6 +1065,24 @@ pub async fn prepare_change(
     serde_json::to_value(&p).map_err(|e| ServeError::Internal(e.to_string()))
 }
 
+/// The tenant that owns the schedule a change payload is for: the stored
+/// schedule's owner, or for a create the requester's tenant. A fan-out is
+/// owned by no tenant.
+pub async fn change_tenant(
+    state: &ServerState,
+    actor: &AuthContext,
+    payload: &serde_json::Value,
+) -> Result<Option<String>, ServeError> {
+    let name = payload
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    Ok(match find(state, name).await? {
+        Some(found) => found.owner,
+        None => actor.tenant.clone(),
+    })
+}
+
 /// Apply a change as `actor` (already planned / approved, or ungated).
 /// Returns the schedule's view after the change (`None` for a delete).
 ///

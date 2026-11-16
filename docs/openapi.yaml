@@ -4996,7 +4996,7 @@ components:
             executed — the `version` stored.
         status: { type: string, enum: [pending, approved, rejected, executed, expired, invalidated, failed] }
         requester: { type: string }
-        tenant: { type: string, description: "The tenant the proposed run is for (#709)." }
+        tenant: { type: string, description: "The tenant the change is for (#709). A run: the requester's tenant or the tenant route it was proposed through. A `schedule`, `feed` or `tenant_policy_update` change: the tenant that owns the object, whoever proposed it, so that tenant's principals see it and its approvers may approve it; absent for a server-level object (a fan-out schedule included)." }
         requester_role: { type: string, enum: [viewer, operator, admin] }
         reason: { type: string }
         payload: { type: object, description: "The proposed action, verbatim; secrets are never resolved into it." }
