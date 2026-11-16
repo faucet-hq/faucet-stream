@@ -379,6 +379,27 @@ mod broken {
         }
     }
 
+    /// A store that leaves the optional reads to the trait answers "cannot
+    /// say" for each, which is what callers fall back on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_store_without_the_optional_reads_answers_none() {
+        let store = BrokenBackend(SqliteBackend::new())
+            .open()
+            .await
+            .expect("open");
+        let calls = CallContext::default();
+        let feed = FeedUid::generate();
+        assert_eq!(store.bytes_from(&calls, &feed, Seq(1)).await.unwrap(), None);
+        assert_eq!(store.hourly_counts(&calls, &feed, 24).await.unwrap(), None);
+        assert_eq!(
+            store
+                .newest_received(&calls, std::slice::from_ref(&feed))
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[should_panic(expected = "the reader finished")]
     async fn a_watermark_ahead_of_its_events_fails_the_reordering_check() {
