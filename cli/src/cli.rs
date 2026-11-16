@@ -2098,6 +2098,40 @@ impl Default for ServeScheduleArgs {
     }
 }
 
+/// `faucet serve` feeds (#1034).
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone, clap::Args)]
+pub struct ServeFeedArgs {
+    /// Path to a feeds file (YAML/JSON): event feeds senders push into and
+    /// the deliveries that run pipelines over them, read-only at runtime
+    /// (feeds made through the API are stored in the run history). Requires a
+    /// build with the `feeds` feature and a run history that survives a
+    /// restart.
+    #[arg(long, value_name = "PATH")]
+    pub feeds: Option<std::path::PathBuf>,
+    /// Define a named feed store: `NAME=sqlite:<path>` or
+    /// `NAME=postgres://…` (repeatable). The `default` store follows the run
+    /// history: a `feeds.db` beside a SQLite history file, or the history's
+    /// PostgreSQL database.
+    #[arg(long = "feed-store", value_name = "NAME=URL")]
+    pub feed_store: Vec<String>,
+    /// The shortest gap allowed between two runs of a delivery of a tenant's
+    /// feed (seconds), so one tenant cannot flood the server.
+    #[arg(long, default_value_t = 10)]
+    pub tenant_delivery_min_interval_secs: u64,
+}
+
+#[cfg(feature = "serve")]
+impl Default for ServeFeedArgs {
+    fn default() -> Self {
+        Self {
+            feeds: None,
+            feed_store: Vec::new(),
+            tenant_delivery_min_interval_secs: 10,
+        }
+    }
+}
+
 /// `faucet serve` log-shipping buffer bounds (#806).
 #[cfg(feature = "serve")]
 #[derive(Debug, Clone, clap::Args)]
@@ -2488,6 +2522,8 @@ pub struct ServeArgs {
     pub triggers: Option<std::path::PathBuf>,
     #[command(flatten)]
     pub schedules: ServeScheduleArgs,
+    #[command(flatten)]
+    pub feeds: ServeFeedArgs,
     /// Path to a template-sync file (YAML/JSON) listing remote origins to pull
     /// pipeline templates from (GitHub / S3 / GCS / Azure Blob). Pulled on
     /// start, on `POST /v1/templates/sync`, and on each origin's

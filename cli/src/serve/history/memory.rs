@@ -59,6 +59,8 @@ struct TenantState {
 
 /// Schedules made through the API (#1044), by name.
 type ScheduleMap = BTreeMap<String, super::schedules::ScheduleRecord>;
+type FeedMap = BTreeMap<String, super::feeds::FeedRecord>;
+type FeedTokenMap = BTreeMap<String, super::feeds::FeedTokenRecord>;
 
 pub struct MemoryHistory {
     runs: DashMap<String, RunRecord>,
@@ -111,6 +113,8 @@ pub struct MemoryHistory {
     tenants: Mutex<TenantState>,
     /// Schedules made through the API (#1044), by name.
     schedules: Mutex<ScheduleMap>,
+    feeds: Mutex<FeedMap>,
+    feed_tokens: Mutex<FeedTokenMap>,
     /// queue_depth trigger edges: trigger → (last ordinal, armed).
     trigger_edges: Mutex<std::collections::HashMap<String, (u64, bool)>>,
     /// Sealed secret params of clustered runs (#956): run id → sealed text.
@@ -178,6 +182,18 @@ impl MemoryHistory {
             .map_err(|_| HistoryError::Backend("tenants lock poisoned".into()))
     }
 
+    fn feed_map(&self) -> Result<std::sync::MutexGuard<'_, FeedMap>, HistoryError> {
+        self.feeds
+            .lock()
+            .map_err(|_| HistoryError::Backend("feeds lock poisoned".into()))
+    }
+
+    fn feed_token_map(&self) -> Result<std::sync::MutexGuard<'_, FeedTokenMap>, HistoryError> {
+        self.feed_tokens
+            .lock()
+            .map_err(|_| HistoryError::Backend("feed tokens lock poisoned".into()))
+    }
+
     fn schedule_map(&self) -> Result<std::sync::MutexGuard<'_, ScheduleMap>, HistoryError> {
         self.schedules
             .lock()
@@ -207,6 +223,8 @@ impl MemoryHistory {
             changes: Mutex::new(BTreeMap::new()),
             tenants: Mutex::new(TenantState::default()),
             schedules: Mutex::new(BTreeMap::new()),
+            feeds: Mutex::new(BTreeMap::new()),
+            feed_tokens: Mutex::new(BTreeMap::new()),
             trigger_edges: Mutex::new(std::collections::HashMap::new()),
             run_secrets: Mutex::new(std::collections::HashMap::new()),
             policy_versions: Mutex::new(std::collections::HashMap::new()),
@@ -985,6 +1003,16 @@ impl RunHistory for MemoryHistory {
         drop(st);
         self.schedule_map()?
             .retain(|_, r| r.tenant.as_deref() != Some(id));
+        let mut gone = Vec::new();
+        self.feed_map()?.retain(|_, r| {
+            let keep = r.tenant() != Some(id);
+            if !keep {
+                gone.push(r.uid.clone());
+            }
+            keep
+        });
+        self.feed_token_map()?
+            .retain(|_, t| !gone.contains(&t.feed));
         Ok(existed)
     }
 
@@ -1865,6 +1893,90 @@ impl RunHistory for MemoryHistory {
 
     async fn schedule_delete(&self, name: &str) -> Result<bool, HistoryError> {
         Ok(self.schedule_map()?.remove(name).is_some())
+    }
+
+    async fn feed_insert(&self, feed: &super::feeds::FeedRecord) -> Result<bool, HistoryError> {
+        let mut map = self.feed_map()?;
+        let key = feed.key();
+        if map.contains_key(&key) {
+            return Ok(false);
+        }
+        map.insert(key, feed.clone());
+        Ok(true)
+    }
+
+    async fn feed_replace(
+        &self,
+        expected: &super::feeds::FeedRecord,
+        new: &super::feeds::FeedRecord,
+    ) -> Result<bool, HistoryError> {
+        let mut map = self.feed_map()?;
+        match map.get(&expected.key()) {
+            Some(current) if current == expected && new.key() == expected.key() => {
+                map.insert(new.key(), new.clone());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn feed_get(&self, key: &str) -> Result<Option<super::feeds::FeedRecord>, HistoryError> {
+        Ok(self.feed_map()?.get(key).cloned())
+    }
+
+    async fn feed_list(&self) -> Result<Vec<super::feeds::FeedRecord>, HistoryError> {
+        Ok(self.feed_map()?.values().cloned().collect())
+    }
+
+    async fn feed_count(&self) -> Result<u64, HistoryError> {
+        Ok(self.feed_map()?.len() as u64)
+    }
+
+    async fn feed_delete(&self, key: &str) -> Result<bool, HistoryError> {
+        let Some(gone) = self.feed_map()?.remove(key) else {
+            return Ok(false);
+        };
+        self.feed_token_map()?.retain(|_, t| t.feed != gone.uid);
+        Ok(true)
+    }
+
+    async fn feed_token_insert(
+        &self,
+        token: &super::feeds::FeedTokenRecord,
+    ) -> Result<bool, HistoryError> {
+        let mut map = self.feed_token_map()?;
+        if map.contains_key(&token.id) {
+            return Ok(false);
+        }
+        map.insert(token.id.clone(), token.clone());
+        Ok(true)
+    }
+
+    async fn feed_token_replace(
+        &self,
+        expected: &super::feeds::FeedTokenRecord,
+        new: &super::feeds::FeedTokenRecord,
+    ) -> Result<bool, HistoryError> {
+        let mut map = self.feed_token_map()?;
+        match map.get(&expected.id) {
+            Some(current) if current == expected && new.id == expected.id => {
+                map.insert(new.id.clone(), new.clone());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn feed_token_list(
+        &self,
+        feed: Option<&str>,
+    ) -> Result<Vec<super::feeds::FeedTokenRecord>, HistoryError> {
+        Ok(self
+            .feed_token_map()?
+            .values()
+            .filter(|t| feed.is_none_or(|f| t.feed == f))
+            .cloned()
+            .collect())
     }
 
     async fn template_tags(&self, id: &str) -> Result<BTreeMap<String, u32>, HistoryError> {

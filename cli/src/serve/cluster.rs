@@ -426,6 +426,7 @@ mod tests {
             },
             triggers_path: None,
             schedules: Default::default(),
+            feeds: Default::default(),
             templates_sync_path: None,
             policy_path: None,
             policy_store: Default::default(),

@@ -77,6 +77,7 @@ fn serve_args(
         cluster_max_attempts: 3,
         triggers,
         schedules: Default::default(),
+        feeds: Default::default(),
         templates_sync: None,
         policy: None,
         policy_store: Default::default(),

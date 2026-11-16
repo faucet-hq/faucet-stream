@@ -333,6 +333,7 @@ notifications:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                feed: Default::default(),
             },
         )
     };
@@ -474,6 +475,7 @@ notifications:
         catalog: None,
         usage: Default::default(),
         budget: None,
+        feed: Default::default(),
     };
 
     let summary = faucet_cli::executor::run_expanded(nodes, opts)

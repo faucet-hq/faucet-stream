@@ -55,6 +55,7 @@ fn args(port: u16, triggers: Option<PathBuf>) -> faucet_cli::cli::ServeArgs {
         cluster_max_attempts: 3,
         triggers,
         schedules: Default::default(),
+        feeds: Default::default(),
         templates_sync: None,
         policy: None,
         policy_store: Default::default(),

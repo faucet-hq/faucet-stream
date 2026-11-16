@@ -1042,6 +1042,47 @@ impl RunHistory for FallbackHistory {
     async fn schedule_delete(&self, name: &str) -> Result<bool, HistoryError> {
         strict!(self, p => p.schedule_delete(name), f => f.schedule_delete(name))
     }
+    async fn feed_insert(&self, feed: &super::feeds::FeedRecord) -> Result<bool, HistoryError> {
+        strict!(self, p => p.feed_insert(feed), f => f.feed_insert(feed))
+    }
+    async fn feed_replace(
+        &self,
+        expected: &super::feeds::FeedRecord,
+        new: &super::feeds::FeedRecord,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.feed_replace(expected, new), f => f.feed_replace(expected, new))
+    }
+    async fn feed_get(&self, key: &str) -> Result<Option<super::feeds::FeedRecord>, HistoryError> {
+        strict!(self, p => p.feed_get(key), f => f.feed_get(key))
+    }
+    async fn feed_list(&self) -> Result<Vec<super::feeds::FeedRecord>, HistoryError> {
+        strict!(self, p => p.feed_list(), f => f.feed_list())
+    }
+    async fn feed_count(&self) -> Result<u64, HistoryError> {
+        strict!(self, p => p.feed_count(), f => f.feed_count())
+    }
+    async fn feed_delete(&self, key: &str) -> Result<bool, HistoryError> {
+        strict!(self, p => p.feed_delete(key), f => f.feed_delete(key))
+    }
+    async fn feed_token_insert(
+        &self,
+        token: &super::feeds::FeedTokenRecord,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.feed_token_insert(token), f => f.feed_token_insert(token))
+    }
+    async fn feed_token_replace(
+        &self,
+        expected: &super::feeds::FeedTokenRecord,
+        new: &super::feeds::FeedTokenRecord,
+    ) -> Result<bool, HistoryError> {
+        strict!(self, p => p.feed_token_replace(expected, new), f => f.feed_token_replace(expected, new))
+    }
+    async fn feed_token_list(
+        &self,
+        feed: Option<&str>,
+    ) -> Result<Vec<super::feeds::FeedTokenRecord>, HistoryError> {
+        strict!(self, p => p.feed_token_list(feed), f => f.feed_token_list(feed))
+    }
     async fn template_tags(
         &self,
         id: &str,

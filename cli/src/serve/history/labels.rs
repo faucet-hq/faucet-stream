@@ -26,11 +26,19 @@ pub const RESERVED_LABELS: &[&str] = &[
     "schedule",
     "schedule_tick",
     "schedule_manual",
+    // The feed and delivery a run delivers for, and its range claim (#1034).
+    "feed",
+    "feed_delivery",
+    "feed_claim",
 ];
 
 /// The reserved labels a schedule tick stamps (#1044); a trusted caller (the
 /// schedule runner) keeps them through a template trigger.
 pub const SCHEDULE_LABELS: &[&str] = &["schedule", "schedule_tick", "schedule_manual"];
+
+/// The reserved labels the feed scheduler stamps (#1034); kept through a
+/// template trigger like [`SCHEDULE_LABELS`].
+pub const FEED_LABELS: &[&str] = &["feed", "feed_delivery", "feed_claim"];
 
 /// Refuse a caller-supplied label set: a reserved provenance key (unless the
 /// server wrote the request) or a key/value past the limits.

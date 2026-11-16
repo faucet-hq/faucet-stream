@@ -43,6 +43,7 @@ fn opts() -> ExecuteOptions {
         catalog: None,
         usage: Default::default(),
         budget: None,
+        feed: Default::default(),
     }
 }
 

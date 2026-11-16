@@ -105,6 +105,7 @@ pipeline:
             catalog: None,
             usage: Default::default(),
             budget: None,
+            feed: Default::default(),
         },
     )
     .await
@@ -253,6 +254,7 @@ matrix:
             catalog: None,
             usage: Default::default(),
             budget: None,
+            feed: Default::default(),
         },
     )
     .await
@@ -349,5 +351,6 @@ fn plain_options(name: &str) -> ExecuteOptions {
         catalog: None,
         usage: Default::default(),
         budget: None,
+        feed: Default::default(),
     }
 }

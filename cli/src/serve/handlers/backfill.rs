@@ -328,6 +328,8 @@ pub async fn submit_backfill(
             sealed_params: None,
             caller_fields: Default::default(),
             server_key: true,
+            feed: None,
+            pipeline_name_suffix: None,
         };
         let outcome = crate::runtime::server::submit(
             &state,

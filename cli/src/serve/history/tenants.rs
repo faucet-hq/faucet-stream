@@ -78,6 +78,16 @@ pub struct TenantLimits {
     /// Most schedules the tenant may own, paused ones included (#1044).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_schedules: Option<u32>,
+    /// Most feeds the tenant may have (#1034).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_feeds: Option<u32>,
+    /// Most events a second the tenant's feeds accept together, per server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_feed_events_per_sec: Option<u32>,
+    /// Most bytes the tenant's feeds may hold together; past it a feed
+    /// refuses new events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_feed_bytes: Option<u64>,
 }
 
 impl TenantLimits {
@@ -99,6 +109,15 @@ impl TenantLimits {
         }
         if self.max_schedules == Some(0) {
             return zero("max_schedules");
+        }
+        if self.max_feeds == Some(0) {
+            return zero("max_feeds");
+        }
+        if self.max_feed_events_per_sec == Some(0) {
+            return zero("max_feed_events_per_sec");
+        }
+        if self.max_feed_bytes == Some(0) {
+            return zero("max_feed_bytes");
         }
         Ok(())
     }

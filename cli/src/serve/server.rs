@@ -662,6 +662,8 @@ pub async fn maintain_leases(
     if let Err(e) = retry_policy_seed(state).await {
         tracing::error!(error = %e, "seeding the policy store from the --policy file failed; new work waits for it");
     }
+    #[cfg(feature = "feeds")]
+    state.feeds().lease_tick(state).await;
     // Terminal records whose write failed go first: until they land the rows
     // read `running`, and their lease is renewed below so no peer re-runs them.
     crate::serve::runner::retry_pending_finalize(state).await;
@@ -1115,6 +1117,24 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
             "--schedules requires a build with the `schedule` and `templates` features".into(),
         ));
     }
+    // Feeds (#1034): load + validate the file fail-fast, and keep every
+    // SQLite feed store away from submitted configs.
+    #[cfg(feature = "feeds")]
+    let feeds_file = match &config.feeds.path {
+        Some(path) => crate::serve::feeds::spec::load_file(path).await?,
+        None => Default::default(),
+    };
+    #[cfg(feature = "feeds")]
+    for target in crate::serve::feeds::stores::targets(&config.feeds, &config.history)
+        .map_err(CliError::Serve)?
+        .values()
+    {
+        if let crate::serve::feeds::stores::StoreTarget::Sqlite(path) = target {
+            for file in crate::serve::feeds::stores::protected_files(path) {
+                crate::serve::load::protect_file(&file);
+            }
+        }
+    }
     // Template origins (RFC 0006 / #589): load + validate the sync file
     // fail-fast; the pull itself runs after the state exists.
     #[cfg(feature = "templates-sync")]
@@ -1431,6 +1451,20 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         ));
         crate::serve::schedules::spawn(state.clone(), shutdown.clone())
     };
+
+    // Feeds (#1034): nothing runs until a feed exists. A `--feeds` file with
+    // feeds starts the scheduler now; otherwise the lease tick starts it when
+    // a feed is made, on this server or another.
+    #[cfg(feature = "feeds")]
+    {
+        let stores = crate::serve::feeds::stores::Stores::from_config(&config);
+        state.set_feeds(crate::serve::feeds::FeedsRuntime::new(
+            config.feeds.clone(),
+            feeds_file,
+            stores,
+        ));
+        state.feeds().lease_tick(&state).await;
+    }
 
     // The HTTP graceful-shutdown future resolves on signal, then drives the run
     // drain *inside itself* — this is load-bearing: `axum::serve(...).await` does

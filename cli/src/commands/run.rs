@@ -439,6 +439,7 @@ pub(crate) async fn execute(
                 &crate::budget::sink_template_kinds(&cfg),
             )
             .map_err(CliError::Config)?,
+            feed: Default::default(),
         },
     );
     #[cfg(feature = "cli-tui")]
@@ -1013,6 +1014,7 @@ mod tests {
             catalog: None,
             usage: Default::default(),
             budget: None,
+            feed: Default::default(),
         };
         let fut = crate::executor::run_expanded(nodes, opts);
         let exp = std::mem::size_of_val(&fut);

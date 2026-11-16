@@ -65,6 +65,10 @@ struct Inner {
     /// guardrail and the loop's wake-up signal. Replaced once at startup.
     #[cfg(all(feature = "schedule", feature = "templates"))]
     schedules: RwLock<Arc<crate::serve::schedules::SchedulesRuntime>>,
+    /// The feeds runtime (#1034): the `--feeds` file, the stores and the
+    /// definitions snapshot. Replaced once at startup.
+    #[cfg(feature = "feeds")]
+    feeds: RwLock<Arc<crate::serve::feeds::FeedsRuntime>>,
     /// The server-wide data-flow policy (`--policy`, #702), when one was
     /// given, and the content address of its canonical YAML.
     #[cfg(feature = "policy")]
@@ -161,6 +165,10 @@ impl ServerState {
                 schedules: RwLock::new(Arc::new(crate::serve::schedules::SchedulesRuntime::new(
                     Vec::new(),
                     config.schedules.tenant_min_interval,
+                ))),
+                #[cfg(feature = "feeds")]
+                feeds: RwLock::new(Arc::new(crate::serve::feeds::FeedsRuntime::from_config(
+                    config,
                 ))),
                 #[cfg(feature = "policy")]
                 policy: RwLock::new(None),
@@ -624,6 +632,26 @@ impl ServerState {
             .clone()
     }
 
+    /// The feeds runtime (#1034).
+    #[cfg(feature = "feeds")]
+    pub fn feeds(&self) -> Arc<crate::serve::feeds::FeedsRuntime> {
+        self.inner
+            .feeds
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Install the feeds runtime (the loaded `--feeds` file).
+    #[cfg(feature = "feeds")]
+    pub fn set_feeds(&self, runtime: crate::serve::feeds::FeedsRuntime) {
+        *self
+            .inner
+            .feeds
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(runtime);
+    }
+
     /// Install the schedules runtime (the loaded `--schedules` file).
     #[cfg(all(feature = "schedule", feature = "templates"))]
     pub fn set_schedules(&self, runtime: crate::serve::schedules::SchedulesRuntime) {
@@ -670,6 +698,7 @@ mod tests {
             cluster: crate::serve::cluster::ClusterConfig::disabled(),
             triggers_path: None,
             schedules: Default::default(),
+            feeds: Default::default(),
             templates_sync_path: None,
             policy_path: None,
             policy_store: Default::default(),

@@ -125,6 +125,15 @@ pub struct SubmitRequest {
     /// prefix.
     #[serde(skip)]
     pub server_key: bool,
+    /// Set in-process by the feed scheduler, never accepted from a client
+    /// (#1034): the claimed range the run's `feed` source reads.
+    #[serde(skip)]
+    pub feed: Option<crate::serve::history::feeds::RunFeedBinding>,
+    /// Set in-process by the feed scheduler, never accepted from a client:
+    /// appended to the config's pipeline name when it is loaded, so every
+    /// key derived from the name is the delivery's own.
+    #[serde(skip)]
+    pub pipeline_name_suffix: Option<String>,
 }
 
 impl SubmitRequest {
@@ -923,6 +932,7 @@ async fn execute_shard(
             #[cfg(feature = "notify")]
             notifier: None,
             catalog: false,
+            feed: crate::executor::FeedRun::Refused,
         },
     ) {
         Ok(o) => o,
@@ -1347,6 +1357,8 @@ pub(crate) async fn enqueue(
     rec.submitted_by = Some(actor.principal.clone());
     rec.dlq_location = dlq_location(&loaded);
     rec.policy_pin = loaded.policy_pin.clone();
+    rec.feed = req.feed.clone();
+    rec.pipeline_name_suffix = req.pipeline_name_suffix.clone();
     // What a policy change's impact checks this run against (#1051).
     #[cfg(feature = "policy")]
     if state.policy_file().is_none() {
@@ -1580,8 +1592,42 @@ async fn replay_response(
 /// Prefixes of the idempotency keys the server derives itself (tenant
 /// namespaces, trigger fires, schedule ticks, backfill units, approved
 /// changes).
-pub(crate) const RESERVED_IDEMPOTENCY_PREFIXES: &[&str] =
-    &["tenant:", "trig:", "sched:", "backfill:", "change:"];
+pub(crate) const RESERVED_IDEMPOTENCY_PREFIXES: &[&str] = &[
+    "tenant:",
+    "trig:",
+    "sched:",
+    "backfill:",
+    "change:",
+    "feed:",
+];
+
+/// How a run's `feed` source reads: refused in an ordinary run, bound to the
+/// claimed range in a delivery run.
+async fn feed_run(
+    state: &ServerState,
+    binding: Option<&crate::serve::history::feeds::RunFeedBinding>,
+) -> Result<crate::executor::FeedRun, String> {
+    let Some(binding) = binding else {
+        return Ok(crate::executor::FeedRun::Refused);
+    };
+    #[cfg(feature = "feeds")]
+    {
+        let binding = binding
+            .binding()
+            .map_err(|e| format!("feed binding: {e}"))?;
+        let execution = state
+            .feeds()
+            .execution(state, &binding)
+            .await
+            .map_err(|e| format!("feed store: {e}"))?;
+        Ok(crate::executor::FeedRun::Delivery(Box::new(execution)))
+    }
+    #[cfg(not(feature = "feeds"))]
+    {
+        let _ = (state, binding);
+        Err("this run delivers a feed, and this server is built without the `feeds` feature".into())
+    }
+}
 
 /// Refuse a caller's idempotency key in a namespace the server derives keys
 /// in: an unscoped caller could otherwise occupy a tenant's key or a
@@ -2150,6 +2196,26 @@ async fn execute_run(
     if let Some(n) = &notifier {
         state.log_export().register_notifier(&run_id, n.clone());
     }
+    // A feed delivery reads through the store its binding names, opened here
+    // on the executing server (#1034).
+    let feed = match feed_run(&state, own.feed.as_ref()).await {
+        Ok(f) => f,
+        Err(reason) => {
+            finalize(
+                &state,
+                Some(own.clone()),
+                &run_id,
+                started,
+                Terminal::Failed {
+                    reason,
+                    records: 0,
+                    invs: Vec::new(),
+                },
+            )
+            .await;
+            return;
+        }
+    };
     // The governed options (budget, state namespace, resilience, lineage,
     // pricing, catalog); a malformed block finalizes the run as Failed,
     // mirroring the auth/clock failure handling above. Every serve run is
@@ -2168,6 +2234,7 @@ async fn execute_run(
             #[cfg(feature = "notify")]
             notifier,
             catalog: true,
+            feed,
         },
     ) {
         Ok(o) => o,
@@ -3735,6 +3802,7 @@ mod tests {
             cluster: crate::serve::cluster::ClusterConfig::disabled(),
             triggers_path: None,
             schedules: Default::default(),
+            feeds: Default::default(),
             templates_sync_path: None,
             policy_path: None,
             policy_store: Default::default(),
@@ -3791,6 +3859,8 @@ mod tests {
             sealed_params: None,
             caller_fields: Default::default(),
             server_key: false,
+            feed: None,
+            pipeline_name_suffix: None,
         };
 
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
@@ -3860,6 +3930,7 @@ mod tests {
             cluster,
             triggers_path: None,
             schedules: Default::default(),
+            feeds: Default::default(),
             templates_sync_path: None,
             policy_path: None,
             policy_store: Default::default(),
@@ -3909,6 +3980,8 @@ mod tests {
             sealed_params: None,
             caller_fields: Default::default(),
             server_key: false,
+            feed: None,
+            pipeline_name_suffix: None,
         };
         let resp = submit(state.clone(), req, admin_actor()).await.unwrap();
         assert_eq!(resp.status, RunStatus::Pending);
@@ -3957,6 +4030,7 @@ mod tests {
             cluster: crate::serve::cluster::ClusterConfig::disabled(),
             triggers_path: None,
             schedules: Default::default(),
+            feeds: Default::default(),
             templates_sync_path: None,
             policy_path: None,
             policy_store: Default::default(),
@@ -4110,6 +4184,7 @@ mod tests {
             cluster,
             triggers_path: None,
             schedules: Default::default(),
+            feeds: Default::default(),
             templates_sync_path: None,
             policy_path: None,
             policy_store: Default::default(),
@@ -4163,6 +4238,8 @@ mod tests {
             sealed_params: None,
             caller_fields: Default::default(),
             server_key: false,
+            feed: None,
+            pipeline_name_suffix: None,
         };
         let err = submit(state.clone(), req, admin_actor()).await.unwrap_err();
         assert!(
@@ -4238,6 +4315,7 @@ mod tests {
                 cluster,
                 triggers_path: None,
                 schedules: Default::default(),
+                feeds: Default::default(),
                 templates_sync_path: None,
                 policy_path: None,
                 policy_store: Default::default(),

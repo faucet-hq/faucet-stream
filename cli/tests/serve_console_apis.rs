@@ -72,6 +72,7 @@ fn serve_args(port: u16, auth_config: std::path::PathBuf, s: Setup) -> faucet_cl
         cluster_max_attempts: 3,
         triggers: s.triggers,
         schedules: Default::default(),
+        feeds: Default::default(),
         templates_sync: None,
         policy: None,
         policy_store: Default::default(),

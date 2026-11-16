@@ -51,6 +51,7 @@ fn opts(name: &str) -> ExecuteOptions {
         catalog: None,
         usage: Default::default(),
         budget: None,
+        feed: Default::default(),
     }
 }
 

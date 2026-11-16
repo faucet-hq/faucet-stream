@@ -72,6 +72,7 @@ fn args(port: u16, history: &str) -> ServeArgs {
         cluster_max_attempts: 3,
         triggers: None,
         schedules: Default::default(),
+        feeds: Default::default(),
         templates_sync: None,
         policy: None,
         policy_store: Default::default(),

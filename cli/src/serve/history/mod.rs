@@ -7,6 +7,7 @@
 pub mod catalog;
 #[cfg(feature = "serve")]
 pub mod fallback;
+pub mod feeds;
 pub mod labels;
 pub mod memory;
 pub mod overview;
@@ -285,6 +286,15 @@ pub struct RunRecord {
     /// `policy` feature): the newest versions apply (#1051).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_pin: Option<policies::PolicyPin>,
+    /// The feed range a delivery run reads (#1034), set by the feed
+    /// scheduler: a claim, reload or rollback binds the same range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed: Option<feeds::RunFeedBinding>,
+    /// Appended to the config's pipeline name when it is loaded
+    /// (`<name>.<suffix>`), so two deliveries of one template never share a
+    /// state key (#1034). Set by the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_name_suffix: Option<String>,
     /// What a policy change's impact needs of the run's config, and nothing
     /// else (#1051): no connector settings, no masking keys, no values from
     /// secret references. Stored only while the server keeps its policy in
@@ -347,6 +357,8 @@ impl RunRecord {
             submitted_by: None,
             dlq_location: None,
             policy_pin: None,
+            feed: None,
+            pipeline_name_suffix: None,
             policy_projection: None,
         }
     }
@@ -433,12 +445,17 @@ pub const CAP_HOST_CREDENTIALS: &str = "host_credentials";
 /// A member holds a caller's config to the reference kinds added after
 /// `x-faucet-resource: path | url | command` (a listener's address).
 pub const CAP_REFERENCE_KINDS_V2: &str = "reference_kinds_v2";
+/// A member runs feeds (#1034): it knows the `feed` source and binds a
+/// delivery run to its claimed range.
+pub const CAP_FEEDS: &str = "feeds";
 /// What this build advertises in its heartbeat.
 pub const INSTANCE_CAPABILITIES: &[&str] = &[
     CAP_POLICY_PIN,
     CAP_CONNECTION_GENERATION,
     CAP_HOST_CREDENTIALS,
     CAP_REFERENCE_KINDS_V2,
+    #[cfg(feature = "feeds")]
+    CAP_FEEDS,
 ];
 
 /// One live cluster member (for `/readyz` + metrics).
@@ -2411,6 +2428,86 @@ pub trait RunHistory: Send + Sync {
     async fn schedule_delete(&self, name: &str) -> Result<bool, HistoryError> {
         let _ = name;
         Ok(false)
+    }
+
+    /// Store a new feed (#1034); `false` when one with its key (tenant and
+    /// name) already exists. Default: unsupported.
+    async fn feed_insert(&self, feed: &feeds::FeedRecord) -> Result<bool, HistoryError> {
+        let _ = feed;
+        Err(HistoryError::Backend(
+            "this run-history backend does not store feeds".into(),
+        ))
+    }
+
+    /// Replace feed `expected` with `new` only while the stored record is
+    /// still exactly `expected` (so its revision too); returns whether it was
+    /// replaced. Default: unsupported.
+    async fn feed_replace(
+        &self,
+        expected: &feeds::FeedRecord,
+        new: &feeds::FeedRecord,
+    ) -> Result<bool, HistoryError> {
+        let _ = (expected, new);
+        Err(HistoryError::Backend(
+            "this run-history backend does not store feeds".into(),
+        ))
+    }
+
+    /// One feed by its key ([`feeds::feed_key`]). Default: `None`.
+    async fn feed_get(&self, key: &str) -> Result<Option<feeds::FeedRecord>, HistoryError> {
+        let _ = key;
+        Ok(None)
+    }
+
+    /// Every stored feed, ordered by key. Default: empty.
+    async fn feed_list(&self) -> Result<Vec<feeds::FeedRecord>, HistoryError> {
+        Ok(Vec::new())
+    }
+
+    /// How many feeds are stored. Default: 0.
+    async fn feed_count(&self) -> Result<u64, HistoryError> {
+        Ok(0)
+    }
+
+    /// Delete a feed and its tokens; returns whether it existed. Default:
+    /// `false`.
+    async fn feed_delete(&self, key: &str) -> Result<bool, HistoryError> {
+        let _ = key;
+        Ok(false)
+    }
+
+    /// Store a new feed token; `false` when its id is taken. Default:
+    /// unsupported.
+    async fn feed_token_insert(
+        &self,
+        token: &feeds::FeedTokenRecord,
+    ) -> Result<bool, HistoryError> {
+        let _ = token;
+        Err(HistoryError::Backend(
+            "this run-history backend does not store feed tokens".into(),
+        ))
+    }
+
+    /// Replace token `expected` with `new` only while it is unchanged.
+    /// Default: unsupported.
+    async fn feed_token_replace(
+        &self,
+        expected: &feeds::FeedTokenRecord,
+        new: &feeds::FeedTokenRecord,
+    ) -> Result<bool, HistoryError> {
+        let _ = (expected, new);
+        Err(HistoryError::Backend(
+            "this run-history backend does not store feed tokens".into(),
+        ))
+    }
+
+    /// The tokens of the feed with uid `feed`, or every token. Default: empty.
+    async fn feed_token_list(
+        &self,
+        feed: Option<&str>,
+    ) -> Result<Vec<feeds::FeedTokenRecord>, HistoryError> {
+        let _ = feed;
+        Ok(Vec::new())
     }
 
     /// Every stored version of a template, newest first — one read for the

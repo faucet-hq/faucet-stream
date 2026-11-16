@@ -494,6 +494,7 @@ pub async fn run_from_yaml_str_selected(
             usage: usage::UsageOptions::from_spec(cfg.usage.as_ref(), None)
                 .map_err(CliError::Config)?,
             budget: cfg.budget.clone(),
+            feed: Default::default(),
         },
     )
     .await

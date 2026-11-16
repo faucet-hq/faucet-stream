@@ -224,6 +224,9 @@ pub struct ServeConfig {
     pub triggers_path: Option<PathBuf>,
     /// Schedules (#1044): the `--schedules` file and the tenant guardrail.
     pub schedules: ScheduleSettings,
+    /// Feeds (#1034): the `--feeds` file, the named stores and the tenant
+    /// guardrail.
+    pub feeds: FeedSettings,
     /// Path to a `--templates-sync` file. `None` = no remote template origins.
     /// Loaded + validated at startup (gated on the `templates-sync` feature).
     pub templates_sync_path: Option<PathBuf>,
@@ -288,6 +291,70 @@ impl From<&crate::cli::ServeScheduleArgs> for ScheduleSettings {
             path: a.schedules.clone(),
             tenant_min_interval: Duration::from_secs(a.tenant_schedule_min_interval_secs),
         }
+    }
+}
+
+/// The default shortest gap between two runs of a tenant feed's delivery.
+pub const DEFAULT_TENANT_DELIVERY_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Feed settings (#1034): `--feeds`, `--feed-store` and
+/// `--tenant-delivery-min-interval-secs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedSettings {
+    /// The `--feeds` file. `None` = only feeds made through the API.
+    pub path: Option<PathBuf>,
+    /// The named stores beyond `default`: name → `sqlite:<path>` or
+    /// `postgres://…`.
+    pub stores: std::collections::BTreeMap<String, String>,
+    /// The shortest gap between two runs of a tenant feed's delivery.
+    pub tenant_delivery_min_interval: Duration,
+}
+
+impl Default for FeedSettings {
+    fn default() -> Self {
+        Self {
+            path: None,
+            stores: Default::default(),
+            tenant_delivery_min_interval: DEFAULT_TENANT_DELIVERY_MIN_INTERVAL,
+        }
+    }
+}
+
+impl FeedSettings {
+    /// The settings `--feeds`, `--feed-store` and the guardrail flag give.
+    pub fn from_args(a: &crate::cli::ServeFeedArgs) -> CliResult<Self> {
+        let mut stores = std::collections::BTreeMap::new();
+        for entry in &a.feed_store {
+            let Some((name, url)) = entry.split_once('=') else {
+                return Err(CliError::Serve(format!(
+                    "--feed-store '{entry}': use NAME=sqlite:<path> or NAME=postgres://…"
+                )));
+            };
+            let (name, url) = (name.trim(), url.trim());
+            if name.is_empty() || url.is_empty() {
+                return Err(CliError::Serve(format!(
+                    "--feed-store '{entry}': the name and the URL must not be empty"
+                )));
+            }
+            if name == crate::serve::history::feeds::DEFAULT_STORE {
+                return Err(CliError::Serve(
+                    "--feed-store: `default` follows the run history and cannot be redefined; \
+                     pick another name"
+                        .into(),
+                ));
+            }
+            if stores.insert(name.to_string(), url.to_string()).is_some() {
+                return Err(CliError::Serve(format!(
+                    "--feed-store: store '{name}' is defined twice"
+                )));
+            }
+            crate::secrets::registry::register_server(url);
+        }
+        Ok(Self {
+            path: a.feeds.clone(),
+            stores,
+            tenant_delivery_min_interval: Duration::from_secs(a.tenant_delivery_min_interval_secs),
+        })
     }
 }
 
@@ -632,6 +699,16 @@ impl ServeConfig {
             .map(load_otel_config)
             .transpose()?;
         let log_retention = resolve_log_retention(args.log_retention_secs, otel.as_ref());
+        let feeds = FeedSettings::from_args(&args.feeds)?;
+        #[cfg(feature = "feeds")]
+        crate::serve::feeds::stores::check_config(&feeds, &history, cluster.enabled)
+            .map_err(CliError::Serve)?;
+        #[cfg(not(feature = "feeds"))]
+        if feeds.path.is_some() || !feeds.stores.is_empty() {
+            return Err(CliError::Serve(
+                "--feeds and --feed-store require a build with the `feeds` feature".into(),
+            ));
+        }
 
         Ok(Self {
             listen,
@@ -667,6 +744,7 @@ impl ServeConfig {
             cluster,
             triggers_path: args.triggers,
             schedules: ScheduleSettings::from(&args.schedules),
+            feeds,
             templates_sync_path: args.templates_sync,
             policy_path: args.policy,
             policy_store: args.policy_store,
@@ -879,6 +957,7 @@ mod tests {
             cluster_max_attempts: 3,
             triggers: None,
             schedules: Default::default(),
+            feeds: Default::default(),
             templates_sync: None,
             policy: None,
             policy_store: Default::default(),

@@ -45,6 +45,7 @@ fn test_config_with(listen: &str, concurrent: usize, queued: usize) -> ServeConf
         cluster_max_attempts: 3,
         triggers: None,
         schedules: Default::default(),
+        feeds: Default::default(),
         templates_sync: None,
         policy: None,
         policy_store: Default::default(),

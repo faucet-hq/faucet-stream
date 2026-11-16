@@ -64,6 +64,7 @@ fn opts(budget: Option<BudgetSpec>) -> ExecuteOptions {
         catalog: None,
         usage: Default::default(),
         budget,
+        feed: Default::default(),
     }
 }
 
