@@ -11,7 +11,8 @@
 #      every config-level feature that works without external infra:
 #      transforms · quality + DLQ · data contracts · PII masking · SQL transform ·
 #      SQLite round-trip · Parquet round-trip · SLA · file lineage · catalog ·
-#      offline pipeline tests · dlq inspect/replay · doctor · preview · serve smoke.
+#      offline pipeline tests · dlq inspect/replay · doctor · preview · serve smoke ·
+#      a feed with one delivery (seeded when the web console starts).
 #
 # By default it builds a LIGHT feature set (file connectors + governance + the
 # web console + persistent history + lineage + catalog) — pure-Rust, builds in a
@@ -54,7 +55,7 @@ SERVE_PORT=8899
 # console + persistent history + lineage + catalog. Pure-Rust deps only, so it
 # builds in a few minutes with no cmake / DuckDB / librdkafka. `--full` swaps in
 # the everything build (Kafka, gRPC, cloud, DuckDB SQL — needs cmake, ~15-30min).
-LIGHT_FEATURES="source-file,sink-file,file-format-csv,file-format-parquet,source-sqlite,sink-stdout,sink-sqlite,transforms,quality,contract,masking,serve,serve-ui,serve-history-sqlite,lineage,catalog,schedule,triggers,templates,tenants"
+LIGHT_FEATURES="source-file,sink-file,file-format-csv,file-format-parquet,source-sqlite,sink-stdout,sink-sqlite,transforms,quality,contract,masking,serve,serve-ui,serve-history-sqlite,lineage,catalog,schedule,triggers,templates,tenants,feeds"
 BUILD_FEATURES="$LIGHT_FEATURES"
 
 while [ $# -gt 0 ]; do
@@ -207,6 +208,14 @@ launch_ui() {
       echo "${RED}✗ demo template catalog seeding reported failures (see above)${RESET}"
       SEED_FAILED=1
     fi
+    # A feed with one delivery (#1034): a sender token is issued, a few events
+    # are posted as a sender would, and the delivery writes them to
+    # out/feed_orders.jsonl. Idempotent — an existing feed is reused.
+    info "Seeding the demo feed and pushing events through it…"
+    if ! python3 "${REPO_ROOT}/scripts/demo_feed.py" "${base}" "${DEMO_DIR}"; then
+      echo "${RED}✗ the demo feed reported a failure (see above)${RESET}"
+      SEED_FAILED=1
+    fi
   else
     info "python3/curl unavailable — the console will start empty; use the Submit tab."
   fi
@@ -228,6 +237,11 @@ launch_ui() {
   echo "                  ${BOLD}versions page${RESET} where you assign channels (prod, staging, …),"
   echo "                  Launch / Roll back / Deprecate, and trigger a run from a typed"
   echo "                  form generated from the template's params."
+  echo "    • Feeds     — ${BOLD}demo-orders${RESET}: a durable endpoint senders POST events to; its"
+  echo "                  ${BOLD}archive${RESET} delivery writes them to ./out/feed_orders.jsonl. Send more:"
+  echo "                    curl -X POST ${base}/v1/feeds/demo-orders/events \\"
+  echo "                      -H 'Authorization: Bearer <the sender token printed above>' \\"
+  echo "                      -H 'content-type: application/json' -d '{\"order_id\": 42}'"
   echo "    • Tenants   — customers this server runs pipelines for, their limits and"
   echo "                  sealed connections; the top-bar switcher scopes Runs/Usage/Changes"
   echo "    • Submit    — build/paste a new config and run it live"

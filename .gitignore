@@ -61,6 +61,10 @@ docs/superpowers/
 !/scripts/test_integration_coverage.py
 !/scripts/demo_catalog.py
 !/scripts/test_demo_catalog.py
+!/scripts/demo_feed.py
+!/scripts/test_demo_feed.py
+!/scripts/ci_install.py
+!/scripts/test_ci_install.py
 !/scripts/vendor-names.py
 !/scripts/test_vendor_names.py
 !/scripts/connector-deps.py
