@@ -45,16 +45,16 @@ ignore = [
     # Scoped to 0.5.5 by scripts/advisory-scope.py; drop when aws-sigv4 moves to
     # elliptic-curve 0.14.
     { id = "RUSTSEC-2026-0387", reason = "only crypto-bigint 0.5.5 via aws-sigv4 remains; no 0.5.x fix (2026-10-24)" },
-    # 2026-10-07 — quick-xml: faucet's own parsers and calamine are on >= 0.41
-    # (RUSTSEC-2026-0194/0195 fixed). Two older copies remain transitively and
-    # cannot move until their parents do: 0.39 from object_store 0.13 (pinned by
-    # parquet 58) and opendal 0.57 (pinned by iceberg 0.10), which parse only
-    # the configured storage endpoint's list responses and never use NsReader.
-    # cargo-deny cannot scope an advisory ignore to one version, so
-    # scripts/advisory-scope.py (CI) fails on any other affected quick-xml copy;
-    # drop these two ids once object_store/opendal move past 0.41.
-    { id = "RUSTSEC-2026-0194", reason = "only transitive quick-xml 0.39 (object_store/opendal) and 0.31 (azure dev-dep) remain (2026-10-07)" },
-    { id = "RUSTSEC-2026-0195", reason = "only transitive quick-xml 0.39 / 0.31 remain; NsReader unused (2026-10-07)" },
+    # 2026-11-17 — quick-xml: faucet's own parsers, calamine and opendal 0.58
+    # (iceberg 0.11, #1086) are on >= 0.41 (RUSTSEC-2026-0194/0195 fixed). One
+    # older copy remains transitively: 0.39 from object_store 0.13 (pinned by
+    # parquet 58), which parses only the configured storage endpoint's list
+    # responses and never uses NsReader. cargo-deny cannot scope an advisory
+    # ignore to one version, so scripts/advisory-scope.py (CI) fails on any
+    # other affected quick-xml copy; drop these two ids once object_store
+    # moves past 0.41 (#981).
+    { id = "RUSTSEC-2026-0194", reason = "only transitive quick-xml 0.39 (object_store 0.13) remains (2026-11-17)" },
+    { id = "RUSTSEC-2026-0195", reason = "only transitive quick-xml 0.39 (object_store 0.13) remains; NsReader unused (2026-11-17)" },
     # 2026-10-26 — zstd-rs advisories. zstd-sys is on the patched 2.1.2
     # (RUSTSEC-2026-0410) and async-compression (our async .zst reader/writer)
     # on zstd 0.14.3 / zstd-safe 8.2.0. zstd 0.13.3 / zstd-safe 7.3.0 remain

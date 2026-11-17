@@ -42,6 +42,22 @@ fn merge_props(
     merged
 }
 
+/// The GCS endpoint property iceberg-rust reads.
+pub(crate) const GCS_ENDPOINT_PROP: &str = "gcs.service.host";
+/// Its name before iceberg-rust 0.11; still accepted.
+pub(crate) const LEGACY_GCS_ENDPOINT_PROP: &str = "gcs.service.path";
+
+/// `props` with the GCS endpoint under the name iceberg-rust reads: a value
+/// given as `gcs.service.path` moves to `gcs.service.host` unless that is set.
+fn current_names(mut props: HashMap<String, String>) -> HashMap<String, String> {
+    if let Some(endpoint) = props.remove(LEGACY_GCS_ENDPOINT_PROP) {
+        props
+            .entry(GCS_ENDPOINT_PROP.to_string())
+            .or_insert(endpoint);
+    }
+    props
+}
+
 /// The S3 credentials a storage config names (`s3.access-key-id`,
 /// `s3.secret-access-key`, `s3.session-token`) and nothing else: no
 /// environment, profile, web-identity, container or instance credentials, so
@@ -165,7 +181,7 @@ impl OpendalPropInjector {
 #[typetag::serde(name = "faucet-opendal-prop-injector")]
 impl StorageFactory for OpendalPropInjector {
     fn build(&self, config: &StorageConfig) -> iceberg::Result<Arc<dyn Storage>> {
-        let merged = merge_props(&self.props, config.props());
+        let merged = current_names(merge_props(&self.props, config.props()));
         match (guarded(&merged)?, &self.inner) {
             (None, inner) => inner.build(&StorageConfig::from_props(merged)),
             (Some((props, loader)), OpenDalStorageFactory::S3 { .. }) => {
@@ -188,8 +204,9 @@ pub(crate) struct GuardedResolvingFactory;
 #[typetag::serde(name = "faucet-guarded-resolving")]
 impl StorageFactory for GuardedResolvingFactory {
     fn build(&self, config: &StorageConfig) -> iceberg::Result<Arc<dyn Storage>> {
-        match guarded(config.props())? {
-            None => OpenDalResolvingStorageFactory::new().build(config),
+        let props = current_names(config.props().clone());
+        match guarded(&props)? {
+            None => OpenDalResolvingStorageFactory::new().build(&StorageConfig::from_props(props)),
             Some((props, loader)) => OpenDalResolvingStorageFactory::new()
                 .with_s3_credential_loader(loader)
                 .build(&StorageConfig::from_props(props)),
@@ -199,7 +216,7 @@ impl StorageFactory for GuardedResolvingFactory {
 
 /// Build an S3 OpenDAL factory, threading faucet's `catalog.properties`.
 ///
-/// As of `iceberg-storage-opendal` 0.10.0 the `S3` variant accepts any
+/// As of `iceberg-storage-opendal` 0.11.0 the `S3` variant accepts any
 /// S3-family URL (`s3://` / `s3a://` / `s3n://`) internally, so the scheme is
 /// no longer passed in.
 fn cloud_factory_s3(props: &HashMap<String, String>) -> Arc<dyn StorageFactory> {
@@ -254,6 +271,30 @@ pub fn select_storage_factory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_legacy_gcs_endpoint_name_still_reaches_the_storage() {
+        let props = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let moved = current_names(props(&[("gcs.service.path", "http://emulator:4443")]));
+        assert_eq!(
+            moved,
+            props(&[("gcs.service.host", "http://emulator:4443")])
+        );
+
+        let both = current_names(props(&[
+            ("gcs.service.path", "http://old:1"),
+            ("gcs.service.host", "http://new:2"),
+        ]));
+        assert_eq!(both, props(&[("gcs.service.host", "http://new:2")]));
+
+        let untouched = props(&[("gcs.service.host", "http://new:2"), ("s3.region", "eu")]);
+        assert_eq!(current_names(untouched.clone()), untouched);
+    }
 
     #[tokio::test]
     async fn storage_without_named_credentials_is_refused_inside_a_caller_run() {
@@ -414,7 +455,7 @@ mod tests {
 
     #[test]
     fn select_s3_family_selects_s3_factory_and_threads_props() {
-        // iceberg-storage-opendal 0.10.0's `S3` variant accepts any S3-family
+        // iceberg-storage-opendal 0.11.0's `S3` variant accepts any S3-family
         // URL internally (no per-scheme field), so both s3:// and s3a:// map to
         // the same S3 factory; faucet's props are still threaded through.
         let f = select_storage_factory(&inner_with_warehouse(Some("s3://bucket/wh"))).expect("ok");
