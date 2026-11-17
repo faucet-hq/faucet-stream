@@ -208,9 +208,6 @@ launch_ui() {
       echo "${RED}✗ demo template catalog seeding reported failures (see above)${RESET}"
       SEED_FAILED=1
     fi
-    # A feed with one delivery (#1034): a sender token is issued, a few events
-    # are posted as a sender would, and the delivery writes them to
-    # out/feed_orders.jsonl. Idempotent — an existing feed is reused.
     info "Seeding the demo feed and pushing events through it…"
     if ! python3 "${REPO_ROOT}/scripts/demo_feed.py" "${base}" "${DEMO_DIR}"; then
       echo "${RED}✗ the demo feed reported a failure (see above)${RESET}"

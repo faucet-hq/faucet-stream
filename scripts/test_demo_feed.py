@@ -15,13 +15,21 @@ class FakeServer:
         self.existing = existing
         self.event_status = event_status
         self.calls = []
+        self.stable = 1
+        self.tokens = []
 
     def __call__(self, method, path, body=None, token=None):
         self.calls.append((method, path, token))
         if (method, path) == ("GET", "/v1/feeds"):
             return self.feeds_status, {}
+        if method == "GET" and path.endswith("/tokens"):
+            return 200, self.tokens
         if method == "GET":
-            return (200 if self.existing else 404), {}
+            return (200 if self.existing else 404), {"stable": self.stable}
+        if method == "DELETE":
+            return 200, {}
+        if path.endswith("/launch"):
+            return 200, {"version": 1}
         if path == "/v1/templates":
             return 201, {"id": body["id"], "version": 1}
         if path == "/v1/feeds":
@@ -78,6 +86,37 @@ class SeedTest(unittest.TestCase):
             self.assertNotIn("/v1/feeds", posts)
             self.assertEqual(demo_feed.line_count(output), 4)
 
+    def test_an_unlaunched_template_is_launched(self):
+        with tempfile.TemporaryDirectory() as demo_dir:
+            server = FakeServer(demo_dir, existing=True)
+            server.stable = None
+            code, lines = self.seed(server, demo_dir)
+            self.assertEqual(code, 0, lines)
+            self.assertIn(("POST", "/v1/templates/demo-orders-archive/launch", None), server.calls)
+
+    def test_earlier_demo_tokens_are_revoked(self):
+        with tempfile.TemporaryDirectory() as demo_dir:
+            server = FakeServer(demo_dir, existing=True)
+            server.tokens = [
+                {"id": "t1", "name": "try-local-1"},
+                {"id": "t2", "name": "try-local-2", "revoked_at": "2026-01-01T00:00:00Z"},
+                {"id": "t3", "name": "mine"},
+            ]
+            code, lines = self.seed(server, demo_dir)
+            self.assertEqual(code, 0, lines)
+            deletes = [path for method, path, _ in server.calls if method == "DELETE"]
+            self.assertEqual(deletes, ["/v1/feeds/demo-orders/tokens/t1"])
+
+    def test_rows_of_an_earlier_run_do_not_count(self):
+        with tempfile.TemporaryDirectory() as demo_dir:
+            output = os.path.join(demo_dir, demo_feed.OUTPUT)
+            os.makedirs(os.path.dirname(output))
+            with open(output, "w", encoding="utf-8") as handle:
+                handle.write('{"order_id": 1}\n{"order_id": 2}\n{"order_id": 3}\nnot json\n')
+            code, lines = self.seed(FakeServer(demo_dir, deliver=False), demo_dir)
+            self.assertEqual(code, 1)
+            self.assertTrue(any("holds 0 of them" in line for line in lines))
+
     def test_a_build_without_feeds_is_skipped(self):
         with tempfile.TemporaryDirectory() as demo_dir:
             code, lines = self.seed(FakeServer(demo_dir, feeds_status=404), demo_dir)
@@ -99,7 +138,7 @@ class SeedTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as demo_dir:
             code, lines = self.seed(FakeServer(demo_dir, deliver=False), demo_dir)
             self.assertEqual(code, 1)
-            self.assertTrue(any("gained 0 rows" in line for line in lines))
+            self.assertTrue(any("holds 0 of them" in line for line in lines))
 
 
 class HelpersTest(unittest.TestCase):

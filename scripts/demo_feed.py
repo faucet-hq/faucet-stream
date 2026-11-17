@@ -7,8 +7,9 @@ create the feed `demo-orders` with one delivery, issue a sender token, post a
 few events as a sender would, and wait until the delivery has written them to
 `out/feed_orders.jsonl` in the demo workspace.
 
-Idempotent: an existing template or feed is left alone; every start issues a
-new token and sends a new batch of events.
+Idempotent: an existing template or feed is reused (a template left unlaunched
+is launched); every start replaces the previous sender token with a new one
+and sends a new batch of events.
 
 Usage: demo_feed.py [BASE_URL [DEMO_DIR]]   (default http://127.0.0.1:8899)
 """
@@ -22,6 +23,7 @@ import time
 import urllib.error
 import urllib.request
 
+TOKEN_PREFIX = "try-local-"
 TEMPLATE_ID = "demo-orders-archive"
 FEED = "demo-orders"
 DELIVERY = "archive"
@@ -88,9 +90,30 @@ def line_count(path):
         return 0
 
 
+def delivered(path, order_ids):
+    """How many of `order_ids` have a row in the output file."""
+    found = set()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and row.get("order_id") in order_ids:
+                    found.add(row["order_id"])
+    except OSError:
+        return 0
+    return len(found)
+
+
 def ensure_template(call):
-    status, _ = call("GET", f"/v1/templates/{TEMPLATE_ID}")
+    status, body = call("GET", f"/v1/templates/{TEMPLATE_ID}")
     if status == 200:
+        if isinstance(body, dict) and body.get("stable") is None:
+            status, body = call("POST", f"/v1/templates/{TEMPLATE_ID}/launch", {})
+            if status not in (200, 201):
+                return f"launching template {TEMPLATE_ID} answered {status}: {body}"
         return None
     status, body = call(
         "POST",
@@ -112,6 +135,17 @@ def ensure_feed(call):
     return None
 
 
+def revoke_old_tokens(call):
+    status, body = call("GET", f"/v1/feeds/{FEED}/tokens")
+    if status != 200 or not isinstance(body, list):
+        return
+    for token in body:
+        if not isinstance(token, dict) or token.get("revoked_at"):
+            continue
+        if str(token.get("name", "")).startswith(TOKEN_PREFIX) and token.get("id"):
+            call("DELETE", f"/v1/feeds/{FEED}/tokens/{token['id']}")
+
+
 def issue_token(call, name):
     status, body = call("POST", f"/v1/feeds/{FEED}/tokens", {"name": name})
     if status not in (200, 201) or not isinstance(body, dict) or not body.get("token"):
@@ -128,11 +162,11 @@ def send_events(call, token, start, count):
     return None
 
 
-def wait_for_rows(path, expected, wait_secs=WAIT_SECS, sleep=time.sleep, clock=time.monotonic):
+def wait_for_orders(path, order_ids, wait_secs=WAIT_SECS, sleep=time.sleep, clock=time.monotonic):
     deadline = clock() + wait_secs
     while True:
-        have = line_count(path)
-        if have >= expected:
+        have = delivered(path, order_ids)
+        if have >= len(order_ids):
             return have
         if clock() >= deadline:
             return have
@@ -152,26 +186,28 @@ def seed(base, demo_dir, call=None, sleep=time.sleep, clock=time.monotonic, log=
         return 1
     stamp = int(time.time()) if stamp is None else stamp
     output = os.path.join(demo_dir, OUTPUT)
-    before = line_count(output)
     for step in (ensure_template, ensure_feed):
         problem = step(call)
         if problem:
             log(f"  feeds: {problem}")
             return 1
-    token, problem = issue_token(call, f"try-local-{stamp}")
+    revoke_old_tokens(call)
+    token, problem = issue_token(call, f"{TOKEN_PREFIX}{stamp}")
     if not problem:
         problem = send_events(call, token, stamp, EVENTS)
     if problem:
         log(f"  feeds: {problem}")
         return 1
-    have = wait_for_rows(output, before + EVENTS, sleep=sleep, clock=clock)
-    if have < before + EVENTS:
+    sent = set(range(stamp, stamp + EVENTS))
+    have = wait_for_orders(output, sent, sleep=sleep, clock=clock)
+    if have < EVENTS:
         log(
-            f"  feeds: sent {EVENTS} events but {OUTPUT} gained {have - before} rows "
-            f"in {WAIT_SECS}s (see serve.log)"
+            f"  feeds: sent {EVENTS} events but {OUTPUT} holds {have} of them "
+            f"after {WAIT_SECS}s (see serve.log)"
         )
         return 1
-    log(f"  feeds: {EVENTS} events posted to {FEED} and delivered to {OUTPUT} ({have} rows)")
+    rows = line_count(output)
+    log(f"  feeds: {EVENTS} events posted to {FEED} and delivered to {OUTPUT} ({rows} rows)")
     log(f"  feeds: sender token for this session: {token}")
     return 0
 

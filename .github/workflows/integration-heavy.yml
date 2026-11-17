@@ -33,6 +33,7 @@ jobs:
   mssql-cdc:
     name: SQL Server CDC (ignored suites)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -51,6 +52,7 @@ jobs:
   oracle:
     name: Oracle (container suites)
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     env:
       FAUCET_REQUIRE_ORACLE: "1"
     steps:
@@ -103,6 +105,7 @@ jobs:
   secrets:
     name: Secrets managers (Vault + LocalStack)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     services:
       vault:
         image: hashicorp/vault:1.17
@@ -163,6 +166,7 @@ jobs:
   scaffold:
     name: Connector scaffold builds
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -186,6 +190,7 @@ jobs:
     needs: [mssql-cdc, oracle, secrets, scaffold]
     if: ${{ failure() && github.event_name == 'schedule' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       issues: write
     steps:

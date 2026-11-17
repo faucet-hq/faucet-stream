@@ -28,6 +28,7 @@ jobs:
   fresh-resolve:
     name: Fresh resolve (all features)
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     permissions:
       contents: read
       issues: write

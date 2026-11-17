@@ -181,7 +181,10 @@ impl OpendalPropInjector {
 #[typetag::serde(name = "faucet-opendal-prop-injector")]
 impl StorageFactory for OpendalPropInjector {
     fn build(&self, config: &StorageConfig) -> iceberg::Result<Arc<dyn Storage>> {
-        let merged = current_names(merge_props(&self.props, config.props()));
+        let merged = merge_props(
+            &current_names(self.props.clone()),
+            &current_names(config.props().clone()),
+        );
         match (guarded(&merged)?, &self.inner) {
             (None, inner) => inner.build(&StorageConfig::from_props(merged)),
             (Some((props, loader)), OpenDalStorageFactory::S3 { .. }) => {
@@ -294,6 +297,15 @@ mod tests {
 
         let untouched = props(&[("gcs.service.host", "http://new:2"), ("s3.region", "eu")]);
         assert_eq!(current_names(untouched.clone()), untouched);
+
+        let overlay_wins = merge_props(
+            &current_names(props(&[("gcs.service.host", "http://base:1")])),
+            &current_names(props(&[("gcs.service.path", "http://overlay:2")])),
+        );
+        assert_eq!(
+            overlay_wins,
+            props(&[("gcs.service.host", "http://overlay:2")])
+        );
     }
 
     #[tokio::test]

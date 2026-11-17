@@ -75,6 +75,13 @@ def plan(argv, limit=LIMIT_SECS, have_timeout=None):
     raise ValueError(f"unknown mode '{kind}': expected apt, brew or exec")
 
 
+def repair(argv, limit=LIMIT_SECS, have_timeout=None):
+    """The commands run before a retry, to undo an interrupted attempt."""
+    if argv and argv[0] == "apt":
+        return [root_command(["dpkg", "--configure", "-a"], limit, have_timeout)]
+    return []
+
+
 def run_bounded(command, limit):
     """Run one command; return its exit code, or None when it ran out of time."""
     own_group = os.name == "posix"
@@ -88,10 +95,10 @@ def run_bounded(command, limit):
                 os.killpg(process.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
-        process.kill()
         try:
+            process.kill()
             process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
+        except (PermissionError, ProcessLookupError, subprocess.TimeoutExpired):
             pass
         return None
 
@@ -112,7 +119,7 @@ def attempt(commands, limit, run=run_bounded, log=print):
 
 
 def install(commands, limit=LIMIT_SECS, attempts=ATTEMPTS, run=run_bounded,
-            sleep=time.sleep, log=print):
+            sleep=time.sleep, log=print, repairs=()):
     """Try the install up to `attempts` times; return the process exit code."""
     for number in range(1, attempts + 1):
         reason = attempt(commands, limit, run, log)
@@ -121,6 +128,9 @@ def install(commands, limit=LIMIT_SECS, attempts=ATTEMPTS, run=run_bounded,
         if number < attempts:
             log(f"ci_install: attempt {number} of {attempts} failed: {reason}; retrying")
             sleep(PAUSE_SECS)
+            for command in repairs:
+                log(f"ci_install: {' '.join(command)}")
+                run(command, limit)
         else:
             log(f"ci_install: attempt {number} of {attempts} failed: {reason}; giving up")
     return 1
@@ -144,7 +154,7 @@ def main(argv):
     except ValueError as error:
         print(f"ci_install: {error}", file=sys.stderr)
         return 2
-    return install(commands, limit, attempts)
+    return install(commands, limit, attempts, repairs=repair(argv, limit))
 
 
 if __name__ == "__main__":
