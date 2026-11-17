@@ -99,6 +99,19 @@ tab), **Datasets**, **Lineage**, **Templates** (with a versions page you can
 launch and roll back from), **Usage** and **Schemas**. See
 [Web console](/faucet-stream/cookbook/web-console/) for a screenshot tour.
 
+It also sets up a [feed](/faucet-stream/cookbook/feeds/), `demo-orders`, with
+one delivery: it issues a sender token, posts three events as a sender would,
+and waits until the delivery has written them to
+`faucet-local-demo/out/feed_orders.jsonl`. The token is printed, so you can
+post more events yourself and watch them arrive a couple of seconds later:
+
+```bash
+curl -X POST http://127.0.0.1:8899/v1/feeds/demo-orders/events \
+  -H 'Authorization: Bearer <the sender token the script printed>' \
+  -H 'content-type: application/json' -d '{"order_id": 42}'
+tail -n 1 faucet-local-demo/out/feed_orders.jsonl
+```
+
 The run-history database (`faucet-local-demo/faucet-meta.db`) is **not** wiped
 between invocations, so run history accumulates over time. Use `--clean` to
 reset the whole workspace.

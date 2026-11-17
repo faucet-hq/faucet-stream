@@ -28,6 +28,7 @@ jobs:
   fresh-resolve:
     name: Fresh resolve (all features)
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     permissions:
       contents: read
       issues: write
@@ -40,8 +41,7 @@ jobs:
           toolchain: "1.99.1"
       - name: Install librdkafka prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+          python3 scripts/ci_install.py apt libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - name: Resolve dependencies from scratch
         id: resolve
         continue-on-error: true

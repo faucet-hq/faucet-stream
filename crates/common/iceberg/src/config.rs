@@ -205,7 +205,7 @@ pub struct CatalogInner {
     /// Arbitrary catalog properties passed through to the catalog builder
     /// and the warehouse file IO (e.g. S3 region, endpoint, access key).
     /// Keys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,
-    /// `gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,
+    /// `gcs.service.host`, `gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,
     /// `warehouse`) are checked like the typed fields by a host that confines
     /// configs (`faucet serve`).
     #[serde(default)]
@@ -214,6 +214,7 @@ pub struct CatalogInner {
         "*uri": "url",
         "*url": "url",
         "*proxy*": "url",
+        "gcs.service.host": "url",
         "gcs.service.path": "url",
         "*-file": "path",
         "*_file": "path",
@@ -445,6 +446,23 @@ mod tests {
 
     fn cat(v: serde_json::Value) -> CatalogConfig {
         serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn both_gcs_endpoint_names_are_url_resources() {
+        use faucet_core::resolve::{ResourceKind, annotated_resources};
+        let schema = serde_json::to_value(schemars::schema_for!(CatalogInner)).unwrap();
+        for key in ["gcs.service.host", "gcs.service.path"] {
+            let config = serde_json::json!({"properties": {key: "http://10.0.0.8"}});
+            let found: Vec<(String, ResourceKind)> = annotated_resources(&schema, &config)
+                .into_iter()
+                .map(|r| (r.pointer, r.kind))
+                .collect();
+            assert_eq!(
+                found,
+                vec![(format!("/properties/{key}"), ResourceKind::Url)]
+            );
+        }
     }
 
     #[test]

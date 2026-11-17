@@ -16,7 +16,12 @@ use iceberg::io::{
 use serde::{Deserialize, Serialize};
 
 /// Storage properties naming an endpoint the storage connects to.
-const ENDPOINT_PROPS: [&str; 3] = ["s3.endpoint", "gcs.service.path", "adls.endpoint"];
+const ENDPOINT_PROPS: [&str; 4] = [
+    "s3.endpoint",
+    crate::storage_factory::GCS_ENDPOINT_PROP,
+    crate::storage_factory::LEGACY_GCS_ENDPOINT_PROP,
+    "adls.endpoint",
+];
 
 fn refused(what: &str, reason: impl std::fmt::Display) -> iceberg::Error {
     iceberg::Error::new(
@@ -263,5 +268,25 @@ mod tests {
                 .is_err()
         );
         assert!(CheckedStorage::default().read(&inside).await.is_err());
+    }
+
+    #[test]
+    fn every_storage_endpoint_name_is_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let closed = ReferencePolicy::deny_all().with_path_roots(vec![dir.path().to_path_buf()]);
+        let open = policy(dir.path());
+        for key in [
+            "s3.endpoint",
+            "gcs.service.host",
+            "gcs.service.path",
+            "adls.endpoint",
+        ] {
+            let props = HashMap::from([(key.to_string(), "http://10.0.0.8:4443".to_string())]);
+            let refused = check_endpoints(&closed, &props).unwrap_err().to_string();
+            assert!(refused.contains(key), "{key}: {refused}");
+            check_endpoints(&open, &props).unwrap();
+        }
+        let blank = HashMap::from([("gcs.service.host".to_string(), " ".to_string())]);
+        check_endpoints(&closed, &blank).unwrap();
     }
 }

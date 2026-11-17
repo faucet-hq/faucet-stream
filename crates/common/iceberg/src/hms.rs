@@ -538,6 +538,7 @@ fn hive_type(t: &Type) -> String {
             hive_type(&m.key_field.field_type),
             hive_type(&m.value_field.field_type)
         ),
+        Type::Variant(_) => "unknown".into(),
     }
 }
 
@@ -588,7 +589,7 @@ mod tests {
             .build()
             .unwrap()
             .metadata;
-        let location = MetadataLocation::new_with_metadata(metadata.location(), &metadata);
+        let location = MetadataLocation::try_new_with_metadata(&metadata).unwrap();
         let io = FileIOBuilder::new(Arc::new(LocalFsStorageFactory)).build();
         metadata.write_to(&io, &location).await.unwrap();
         Table::builder()
@@ -893,5 +894,19 @@ mod tests {
             Err(other) => panic!("expected a Config error, got {other:?}"),
             Ok(_) => panic!("an empty address must not build a client"),
         }
+    }
+
+    #[test]
+    fn a_variant_column_renders_as_unknown() {
+        assert_eq!(
+            hive_type(&Type::Variant(iceberg::spec::VariantType)),
+            "unknown"
+        );
+        let nested = Type::List(ListType::new(Arc::new(NestedField::required(
+            2,
+            "element",
+            Type::Variant(iceberg::spec::VariantType),
+        ))));
+        assert_eq!(hive_type(&nested), "array<unknown>");
     }
 }

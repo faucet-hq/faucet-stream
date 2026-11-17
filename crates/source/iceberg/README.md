@@ -10,7 +10,7 @@ Reach for it to move lakehouse data *out* of Iceberg — into a warehouse, a ser
 - **Predicate pushdown** — `filter` is typed against the table schema and pushed into the scan as an Iceberg expression, so non-matching data files and row groups are skipped and rows are filtered exactly.
 - **Time travel** — read a pinned `snapshot_id`, or the snapshot that was current at `as_of_timestamp`. Each snapshot is read with its own schema.
 - **Incremental snapshot reads** — `mode: incremental` reads only the data files added by `append` snapshots since the bookmarked snapshot, one bookmark per snapshot. `overwrite` / `delete` snapshots and rolled-back history are detected (`on_rewrite`), expired bookmarks too (`on_expired`).
-- **Row-level deletes are never ignored** — Parquet position and equality delete files are applied during the scan. A delete file iceberg-rust cannot apply (e.g. a v3 deletion vector) makes the source refuse the table rather than return deleted rows.
+- **Row-level deletes are never ignored** — Parquet position and equality delete files are applied during the scan. A delete file the source does not apply yet (a v3 deletion vector) makes it refuse the table rather than return deleted rows.
 - **Columnar fast path** — with the `arrow` feature, an `iceberg → parquet` (or any Arrow-capable sink) chain moves `RecordBatch`es end to end with no per-row `Value`.
 - **Discovery** — `faucet discover` lists every namespace and table with its schema and row count.
 - **Sharding** — clustered runs split a table by data file (hash of the file path).
@@ -54,7 +54,7 @@ filter: "status = 'active' and (amount >= 10.5 or vip is not null) and region in
 
 ## Record shape
 
-Rows come out with every column present (a null is `null`); a `decimal` column keeps every digit as a string, a non-finite float is a `null` counted in the run summary (`non_finite`), a `uuid` column (also inside a struct, list or map) is hyphenated UUID text on both the row and the columnar path, and a binary or `fixed` column is base64. `discover()` reports the same shapes: a decimal column as `{"type": "string", "format": "decimal"}` and a float column as `["number", "string"]`, so a contract or drift baseline built from it accepts real rows.
+Rows come out with every column present (a null is `null`); a `decimal` column keeps every digit as a string, a non-finite float is a `null` counted in the run summary (`non_finite`), a `uuid` column (also inside a struct, list or map) is hyphenated UUID text on both the row and the columnar path, and a binary or `fixed` column is base64. A `variant` column (format v3) is not decoded: it arrives as an object holding the encoded `metadata` and `value` as base64, and `discover()` reports it as `{"type": "object"}`. `discover()` reports the same shapes: a decimal column as `{"type": "string", "format": "decimal"}` and a float column as `["number", "string"]`, so a contract or drift baseline built from it accepts real rows.
 
 ## Incremental reads
 

@@ -42,6 +42,7 @@ takes no settings here. Save this as `orders-archive.yaml`:
 
 ```yaml
 version: 1
+kind: pipeline
 name: orders_archive
 pipeline:
   source:

@@ -13427,7 +13427,7 @@
               "default": null
             },
             "properties": {
-              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
+              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.host`, `gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
               "type": "object",
               "additionalProperties": {
                 "type": "string"
@@ -13438,6 +13438,7 @@
                 "*uri": "url",
                 "*url": "url",
                 "*proxy*": "url",
+                "gcs.service.host": "url",
                 "gcs.service.path": "url",
                 "*-file": "path",
                 "*_file": "path",
@@ -13483,7 +13484,7 @@
               "default": null
             },
             "properties": {
-              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
+              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.host`, `gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
               "type": "object",
               "additionalProperties": {
                 "type": "string"
@@ -13494,6 +13495,7 @@
                 "*uri": "url",
                 "*url": "url",
                 "*proxy*": "url",
+                "gcs.service.host": "url",
                 "gcs.service.path": "url",
                 "*-file": "path",
                 "*_file": "path",
@@ -13539,7 +13541,7 @@
               "default": null
             },
             "properties": {
-              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
+              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.host`, `gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
               "type": "object",
               "additionalProperties": {
                 "type": "string"
@@ -13550,6 +13552,7 @@
                 "*uri": "url",
                 "*url": "url",
                 "*proxy*": "url",
+                "gcs.service.host": "url",
                 "gcs.service.path": "url",
                 "*-file": "path",
                 "*_file": "path",
@@ -13595,7 +13598,7 @@
               "default": null
             },
             "properties": {
-              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
+              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.host`, `gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
               "type": "object",
               "additionalProperties": {
                 "type": "string"
@@ -13606,6 +13609,7 @@
                 "*uri": "url",
                 "*url": "url",
                 "*proxy*": "url",
+                "gcs.service.host": "url",
                 "gcs.service.path": "url",
                 "*-file": "path",
                 "*_file": "path",
@@ -14760,7 +14764,7 @@
               "default": null
             },
             "properties": {
-              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
+              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.host`, `gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
               "type": "object",
               "additionalProperties": {
                 "type": "string"
@@ -14771,6 +14775,7 @@
                 "*uri": "url",
                 "*url": "url",
                 "*proxy*": "url",
+                "gcs.service.host": "url",
                 "gcs.service.path": "url",
                 "*-file": "path",
                 "*_file": "path",
@@ -14816,7 +14821,7 @@
               "default": null
             },
             "properties": {
-              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
+              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.host`, `gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
               "type": "object",
               "additionalProperties": {
                 "type": "string"
@@ -14827,6 +14832,7 @@
                 "*uri": "url",
                 "*url": "url",
                 "*proxy*": "url",
+                "gcs.service.host": "url",
                 "gcs.service.path": "url",
                 "*-file": "path",
                 "*_file": "path",
@@ -14872,7 +14878,7 @@
               "default": null
             },
             "properties": {
-              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
+              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.host`, `gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
               "type": "object",
               "additionalProperties": {
                 "type": "string"
@@ -14883,6 +14889,7 @@
                 "*uri": "url",
                 "*url": "url",
                 "*proxy*": "url",
+                "gcs.service.host": "url",
                 "gcs.service.path": "url",
                 "*-file": "path",
                 "*_file": "path",
@@ -14928,7 +14935,7 @@
               "default": null
             },
             "properties": {
-              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
+              "description": "Arbitrary catalog properties passed through to the catalog builder\nand the warehouse file IO (e.g. S3 region, endpoint, access key).\nKeys that name an endpoint (`*endpoint*`, `*uri`, `*url`, a proxy,\n`gcs.service.host`, `gcs.service.path`) or a local file (`*-file`, `*_file`, `*.file`,\n`warehouse`) are checked like the typed fields by a host that confines\nconfigs (`faucet serve`).",
               "type": "object",
               "additionalProperties": {
                 "type": "string"
@@ -14939,6 +14946,7 @@
                 "*uri": "url",
                 "*url": "url",
                 "*proxy*": "url",
+                "gcs.service.host": "url",
                 "gcs.service.path": "url",
                 "*-file": "path",
                 "*_file": "path",

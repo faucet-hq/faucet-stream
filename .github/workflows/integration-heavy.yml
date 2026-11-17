@@ -33,6 +33,7 @@ jobs:
   mssql-cdc:
     name: SQL Server CDC (ignored suites)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -51,6 +52,7 @@ jobs:
   oracle:
     name: Oracle (container suites)
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     env:
       FAUCET_REQUIRE_ORACLE: "1"
     steps:
@@ -77,7 +79,8 @@ jobs:
               https://download.oracle.com/otn_software/linux/instantclient/2326200/instantclient-basiclite-linux.x64-23.26.2.0.0.zip
           fi
           echo "c5e97765e633ad02597b8274c35efe5c10bd249a3285e34ee58fa7b318243225  $zip" | sha256sum -c -
-          sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
+          CI_INSTALL_ATTEMPTS=1 python3 scripts/ci_install.py apt --no-update libaio1t64 \
+            || python3 scripts/ci_install.py apt --no-update libaio1
           if [ ! -e /usr/lib/x86_64-linux-gnu/libaio.so.1 ] && [ -e /usr/lib/x86_64-linux-gnu/libaio.so.1t64 ]; then
             sudo ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
           fi
@@ -102,6 +105,7 @@ jobs:
   secrets:
     name: Secrets managers (Vault + LocalStack)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     services:
       vault:
         image: hashicorp/vault:1.17
@@ -134,8 +138,7 @@ jobs:
           toolchain: "1.99.1"
       - name: Install librdkafka prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+          python3 scripts/ci_install.py apt libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: false
@@ -163,6 +166,7 @@ jobs:
   scaffold:
     name: Connector scaffold builds
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -172,8 +176,7 @@ jobs:
           toolchain: "1.99.1"
       - name: Install librdkafka prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+          python3 scripts/ci_install.py apt libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: false
@@ -187,6 +190,7 @@ jobs:
     needs: [mssql-cdc, oracle, secrets, scaffold]
     if: ${{ failure() && github.event_name == 'schedule' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       issues: write
     steps:
