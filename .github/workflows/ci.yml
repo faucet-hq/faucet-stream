@@ -44,6 +44,7 @@ jobs:
   changes:
     name: Detect code changes
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       code: ${{ steps.gate.outputs.code }}
       ui: ${{ steps.filter.outputs.ui }}
@@ -119,6 +120,7 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: changes
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
@@ -137,6 +139,7 @@ jobs:
   doc-counts:
     name: Doc counts
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
         with:
@@ -196,6 +199,7 @@ jobs:
   skills:
     name: Skills and examples
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
         with:
@@ -223,6 +227,7 @@ jobs:
   skill-connector-examples:
     name: Skill connector examples
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: changes
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     strategy:
@@ -261,6 +266,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # Required check → job always runs (stays green), but the heavy step is
     # gated so a docs/workflow-only PR reports green without a full build.
     needs: changes
@@ -277,8 +283,7 @@ jobs:
           components: clippy
       - name: Install librdkafka prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+          python3 scripts/ci_install.py apt libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -288,6 +293,7 @@ jobs:
   docs:
     name: Docs
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: changes
     steps:
       - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
@@ -301,8 +307,7 @@ jobs:
           toolchain: "1.99.1"
       - name: Install librdkafka prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+          python3 scripts/ci_install.py apt libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: false
@@ -318,6 +323,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     needs: changes
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     # Drop debug info for this job. The all-features workspace binary plus the
@@ -374,8 +380,7 @@ jobs:
           toolchain: "1.99.1"
       - name: Install librdkafka prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential sqlite3
+          python3 scripts/ci_install.py apt libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential sqlite3
       # The Oracle connectors (ODPI-C) load Instant Client at runtime; without it
       # their integration tests skip and the integration-coverage gate fails.
       - name: Cache Oracle Instant Client
@@ -395,7 +400,8 @@ jobs:
               https://download.oracle.com/otn_software/linux/instantclient/2326200/instantclient-basiclite-linux.x64-23.26.2.0.0.zip
           fi
           echo "c5e97765e633ad02597b8274c35efe5c10bd249a3285e34ee58fa7b318243225  $zip" | sha256sum -c -
-          sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
+          CI_INSTALL_ATTEMPTS=1 python3 scripts/ci_install.py apt --no-update libaio1t64 \
+            || python3 scripts/ci_install.py apt --no-update libaio1
           if [ ! -e /usr/lib/x86_64-linux-gnu/libaio.so.1 ] && [ -e /usr/lib/x86_64-linux-gnu/libaio.so.1t64 ]; then
             sudo ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
           fi
@@ -502,6 +508,7 @@ jobs:
   serve-ui:
     name: Serve UI (assets)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: changes
     if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.ui == 'true' && needs.changes.outputs.code != 'true' }}
     steps:
@@ -516,8 +523,7 @@ jobs:
           toolchain: "1.99.1"
       - name: Install librdkafka prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+          python3 scripts/ci_install.py apt libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: false
@@ -530,6 +536,7 @@ jobs:
   doc-sync:
     name: Docs in sync with code
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: changes
     if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.docsync == 'true' && needs.changes.outputs.code != 'true' }}
     env:
@@ -553,8 +560,7 @@ jobs:
           toolchain: "1.99.1"
       - name: Install librdkafka prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+          python3 scripts/ci_install.py apt libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: false
@@ -569,6 +575,7 @@ jobs:
   helm-lint:
     name: Helm lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: changes
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.deploy == 'true' }}
     steps:
@@ -615,6 +622,7 @@ jobs:
   feature-check:
     name: Feature isolation
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     # GitHub has no job priority: started together, these 145 short jobs took
     # every free-plan runner and the required checks queued behind them
     # (Coverage started 52 min late). They start once the coverage shards
@@ -833,12 +841,11 @@ jobs:
       - name: Install librdkafka prerequisites (Ubuntu)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+          python3 scripts/ci_install.py apt libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - name: Install librdkafka prerequisites (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install cmake openssl@3 curl
+          python3 scripts/ci_install.py brew cmake openssl@3 curl
       - name: Check feature in isolation
         run: |
           # Secrets, schedule, serve, catalog, templates, and triggers features
@@ -856,6 +863,7 @@ jobs:
   cli-build:
     name: CLI build
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     needs: changes
     strategy:
       fail-fast: false
@@ -884,8 +892,7 @@ jobs:
       - name: Install librdkafka prerequisites
         if: contains(matrix.features, 'full') || contains(matrix.features, 'kafka')
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+          python3 scripts/ci_install.py apt libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       # Cache keys may not contain commas.
       - id: cache-key
         shell: bash
@@ -922,6 +929,7 @@ jobs:
   windows:
     name: Windows (x86_64-pc-windows-msvc)
     runs-on: windows-2022
+    timeout-minutes: 90
     needs: changes
     # On hold with #565: Windows is not a supported platform yet.
     if: false
@@ -950,7 +958,7 @@ jobs:
       # pinned and choco must verify the package's checksum.
       - name: Install NASM
         run: |
-          choco install nasm --version=3.2.0 --require-checksums --yes --no-progress
+          python scripts/ci_install.py exec -- choco install nasm --version=3.2.0 --require-checksums --yes --no-progress
           echo "C:\\Program Files\\NASM" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -972,6 +980,7 @@ jobs:
     # commit is a real signal (#900). `gungraun-runner` must match the library.
     name: Pipeline instruction budget (+5% vs base)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [test, changes]
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     env:
@@ -993,8 +1002,7 @@ jobs:
           save-if: false
       - name: Install valgrind and gungraun-runner
         run: |
-          sudo apt-get update
-          sudo apt-get install -y valgrind
+          python3 scripts/ci_install.py apt valgrind
           gungraun-runner --version 2>/dev/null | grep -q '0.20.0' \
             || cargo install --version 0.20.0 --locked gungraun-runner
       - name: Count the base commit
@@ -1024,6 +1032,7 @@ jobs:
   kafka-integration:
     name: Kafka integration tests (Docker)
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     needs: changes
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     env:
@@ -1041,8 +1050,7 @@ jobs:
           toolchain: "1.99.1"
       - name: Install librdkafka prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+          python3 scripts/ci_install.py apt libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: false
@@ -1067,6 +1075,7 @@ jobs:
   supply-chain:
     name: Supply chain (cargo-deny)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: changes
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
@@ -1104,6 +1113,7 @@ jobs:
   cargo-vet:
     name: Supply chain (cargo-vet)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: changes
     if: ${{ github.event_name != 'pull_request' || needs.changes.outputs.code == 'true' }}
     steps:
@@ -1137,6 +1147,7 @@ jobs:
   semver-checks:
     name: API stability (cargo-semver-checks)
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     needs: changes
     steps:
       - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
@@ -1164,8 +1175,7 @@ jobs:
       # build script ran for real.
       - name: Install librdkafka prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
+          python3 scripts/ci_install.py apt libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: false
@@ -1268,8 +1278,7 @@ jobs:
           components: llvm-tools-preview
       - name: Install librdkafka prerequisites
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential sqlite3
+          python3 scripts/ci_install.py apt libsasl2-dev libssl-dev libcurl4-openssl-dev cmake build-essential sqlite3
       # The Oracle connectors (ODPI-C) load Instant Client at runtime; without it
       # their integration tests skip and the integration-coverage gate fails.
       - name: Cache Oracle Instant Client
@@ -1289,7 +1298,8 @@ jobs:
               https://download.oracle.com/otn_software/linux/instantclient/2326200/instantclient-basiclite-linux.x64-23.26.2.0.0.zip
           fi
           echo "c5e97765e633ad02597b8274c35efe5c10bd249a3285e34ee58fa7b318243225  $zip" | sha256sum -c -
-          sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
+          CI_INSTALL_ATTEMPTS=1 python3 scripts/ci_install.py apt --no-update libaio1t64 \
+            || python3 scripts/ci_install.py apt --no-update libaio1
           if [ ! -e /usr/lib/x86_64-linux-gnu/libaio.so.1 ] && [ -e /usr/lib/x86_64-linux-gnu/libaio.so.1t64 ]; then
             sudo ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
           fi
