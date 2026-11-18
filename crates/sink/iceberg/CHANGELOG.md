@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.7.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-iceberg-v1.7.2...faucet-sink-iceberg-v1.7.3) - 2026-11-18
+
+### Bug Fixes
+
+- *(deps)* Upgrade Iceberg to 0.11, bound CI installs and job times, add a feed demo to try-local ([#1090](https://github.com/faucet-hq/faucet-stream/pull/1090))
+
+### Documentation
+
+- Switch the docs site to Astro Starlight and remove mdBook ([#1080](https://github.com/faucet-hq/faucet-stream/pull/1080))
+
 ## [1.7.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-iceberg-v1.7.1...faucet-sink-iceberg-v1.7.2) - 2026-11-12
 
 ### Bug Fixes

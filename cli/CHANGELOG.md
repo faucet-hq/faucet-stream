@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.19.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.18.2...faucet-cli-v1.19.0) - 2026-11-18
+
+### Bug Fixes
+
+- *(webhook)* Review follow-ups — declared consumes_destructively capability, per-run paths, page cap ([#1081](https://github.com/faucet-hq/faucet-stream/pull/1081))
+- Webhook answers after commit, numeric schedule versions, self-closing advisory issue, coverage cache budget ([#1074](https://github.com/faucet-hq/faucet-stream/pull/1074))
+
+### Documentation
+
+- Switch the docs site to Astro Starlight and remove mdBook ([#1080](https://github.com/faucet-hq/faucet-stream/pull/1080))
+
+### Features
+
+- Feeds, durable push ingestion for faucet serve ([#1085](https://github.com/faucet-hq/faucet-stream/pull/1085))
+
+### Testing
+
+- *(cli)* Fix a race between the log-capture and env-interpolation tests ([#1084](https://github.com/faucet-hq/faucet-stream/pull/1084))
+
+### Dependencies
+
+- Bumped with: faucet-common-iceberg 1.2.2 → 1.2.3, faucet-core 1.17.0 → 1.18.0, faucet-registry 1.0.2 → 1.1.0, faucet-sink-iceberg 1.7.2 → 1.7.3, faucet-source-iceberg 1.2.2 → 1.2.3, faucet-source-nats 1.2.3 → 1.2.4, faucet-source-pubsub 1.3.2 → 1.3.3, faucet-source-rabbitmq 1.1.3 → 1.1.4, faucet-source-sqs 1.3.2 → 1.3.3, faucet-source-webhook 1.4.2 → 1.5.0
+
 ## [1.18.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.18.0...faucet-cli-v1.18.2) - 2026-11-13
 
 ### Bug Fixes
