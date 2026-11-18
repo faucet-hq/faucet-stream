@@ -1,0 +1,6 @@
+# Advisories accepted for the docs site lockfile (osv-scanner reads the config
+# beside each lockfile). Every entry needs a dated reason.
+
+[[IgnoredVulns]]
+id = "GHSA-fc5q-39xc-vjpf"
+reason = "picomatch ReDoS: no fixed release (4.0.7 is the newest); docs-site build tooling only, globs come from our own config (2026-11-18)"
