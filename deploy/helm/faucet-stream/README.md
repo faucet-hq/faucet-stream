@@ -174,6 +174,17 @@ serve:
   with per-pod history each replica has its own runs and idempotency keys, so
   a `GET`/cancel lands on the wrong pod and a retried keyed submission can run
   twice.
+- **Data dir with several replicas**: a `ReadWriteOnce` disk attaches to one
+  node, so a claim shared by every replica would hold them all on that node
+  and one node failure would stop the whole control plane. With
+  `replicaCount > 1` or `autoscaling.enabled` the chart therefore creates the
+  data-dir claim only when `persistence.accessModes` lists `ReadWriteMany`;
+  otherwise each pod gets its own `emptyDir` and the install notes say so. The
+  history is in postgres, so nothing the server needs is lost; files a
+  pipeline writes under the data dir stay on the pod that ran it and go with
+  that pod. Write durable outputs to object storage or a database, or mount a
+  shared volume with `persistence.existingClaim`. A claim created by an
+  earlier release is kept, not deleted.
 - **Upgrades**: one replica with a volume (`persistence.enabled` or
   `persistence.existingClaim`) upgrades with the `Recreate` strategy: the old
   pod stops before the new one starts, a short outage. With a rolling update
@@ -580,7 +591,7 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `serve.allowedHosts` | `[]` | `--allowed-host`: host names the server answers; a request naming another `Host` is refused |
 | `serve.allowedOrigins` | `[]` | `--allowed-origin`: extra browser origins that may send state-changing requests |
 | `serve.autoscaling.enabled` | `false` | HPA on the Deployment |
-| `serve.persistence.enabled` | `true` | PVC for the data dir (the default SQLite history, bookmarks); `false` = emptyDir |
+| `serve.persistence.enabled` | `true` | PVC for the data dir (the default SQLite history, bookmarks); `false` = emptyDir. With several replicas the claim is created only when `accessModes` lists `ReadWriteMany`; otherwise each pod gets an emptyDir |
 | `serve.strategy` | `{}` | Deployment update strategy; empty = `Recreate` for one replica with a volume, else `RollingUpdate` |
 | `job.enabled` | `false` | one-shot `faucet run` |
 | `cronjob.enabled` | `false` | scheduled `faucet run` |

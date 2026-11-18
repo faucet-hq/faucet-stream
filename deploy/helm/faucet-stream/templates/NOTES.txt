@@ -49,6 +49,14 @@ text and its format; needs jq):
   TOKEN=<that principal's token>
   {{- include "faucet-stream.notesSubmit" (dict "port" .Values.service.port "auth" true) }}
 {{- end }}
+{{- if include "faucet-stream.serveClaimSkipped" . }}
+
+Data dir: several replicas, so each pod has its own emptyDir at
+{{ .Values.serve.persistence.mountPath }} and no shared claim was created (a ReadWriteOnce disk
+would hold every replica on one node). Files a pipeline writes there stay on
+the pod that ran it and go with that pod. For a shared data dir set
+serve.persistence.accessModes=[ReadWriteMany] or serve.persistence.existingClaim.
+{{- end }}
 {{- if include "faucet-stream.serveSingleWithVolume" . }}
 {{- if eq (include "faucet-stream.serveStrategy" . | fromYaml).type "Recreate" }}
 

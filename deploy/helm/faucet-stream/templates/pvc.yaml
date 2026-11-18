@@ -1,4 +1,4 @@
-{{- if and .Values.serve.enabled .Values.serve.persistence.enabled (not .Values.serve.persistence.existingClaim) -}}
+{{- if and .Values.serve.enabled (include "faucet-stream.serveManagedClaim" .) -}}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

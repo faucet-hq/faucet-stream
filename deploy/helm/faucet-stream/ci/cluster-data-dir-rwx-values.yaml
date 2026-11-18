@@ -1,0 +1,14 @@
+# #1095: a ReadWriteMany claim can follow replicas to any node, so it is created and mounted.
+# expect: kind: PersistentVolumeClaim
+# expect: - ReadWriteMany
+# expect: claimName:
+# expect-not: Data dir: several replicas
+serve:
+  replicaCount: 2
+  cluster:
+    enabled: true
+  history:
+    backend: postgres
+    existingSecret: faucet-history
+  persistence:
+    accessModes: [ReadWriteMany]

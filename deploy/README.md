@@ -75,7 +75,9 @@ docker run -v faucet-data:/var/lib/faucet -e FAUCET_SERVE_AUTH_TOKEN=… -p 8080
 
 The chart mounts its PVC there by default (`serve.persistence.enabled: true`,
 `serve.history` unset). For several replicas or `--cluster`, use a shared
-Postgres: `serve.history.backend: postgres` with the DSN in a Secret.
+Postgres: `serve.history.backend: postgres` with the DSN in a Secret; each
+replica then gets its own `emptyDir` data dir unless the claim is
+`ReadWriteMany` (a `ReadWriteOnce` disk would hold every replica on one node).
 `--history memory` (`serve.history.backend: memory`) keeps nothing across a
 restart. Back the file up with SQLite's online backup — see
 [Backing up the server database](../docs/site/src/content/docs/operations/backup.md).
