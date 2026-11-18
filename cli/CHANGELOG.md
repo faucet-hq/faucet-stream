@@ -25,6 +25,10 @@ independently).
 
 - *(cli)* Fix a race between the log-capture and env-interpolation tests ([#1084](https://github.com/faucet-hq/faucet-stream/pull/1084))
 
+### Dependencies
+
+- Bumped with: faucet-common-iceberg 1.2.2 → 1.2.3, faucet-core 1.17.0 → 1.18.0, faucet-registry 1.0.2 → 1.1.0, faucet-sink-iceberg 1.7.2 → 1.7.3, faucet-source-iceberg 1.2.2 → 1.2.3, faucet-source-nats 1.2.3 → 1.2.4, faucet-source-pubsub 1.3.2 → 1.3.3, faucet-source-rabbitmq 1.1.3 → 1.1.4, faucet-source-sqs 1.3.2 → 1.3.3, faucet-source-webhook 1.4.2 → 1.5.0
+
 ## [1.18.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.18.0...faucet-cli-v1.18.2) - 2026-11-13
 
 ### Bug Fixes
