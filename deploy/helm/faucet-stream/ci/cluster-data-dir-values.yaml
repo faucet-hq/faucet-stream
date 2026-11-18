@@ -1,0 +1,12 @@
+# #1095: several replicas never share a ReadWriteOnce claim (it would hold
+# every replica on one node); each pod gets an emptyDir and NOTES say so.
+# expect: Data dir: several replicas
+# expect-not: kind: PersistentVolumeClaim
+# expect-not: claimName:
+serve:
+  replicaCount: 2
+  cluster:
+    enabled: true
+  history:
+    backend: postgres
+    existingSecret: faucet-history

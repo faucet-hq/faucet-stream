@@ -285,8 +285,44 @@ type: Recreate
 {{- end -}}
 {{- end -}}
 
+{{/*
+Several replicas (#1095): one ReadWriteOnce claim cannot follow pods to
+different nodes, so every replica would be held on the node that has the disk.
+*/}}
+{{- define "faucet-stream.serveMultiReplica" -}}
+{{- if or (gt (int .Values.serve.replicaCount) 1) .Values.serve.autoscaling.enabled -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+"true" when the chart creates the data-dir claim: persistence.enabled, no
+existingClaim, and either one replica or a ReadWriteMany access mode.
+*/}}
+{{- define "faucet-stream.serveManagedClaim" -}}
+{{- $p := .Values.serve.persistence -}}
+{{- if and $p.enabled (not $p.existingClaim) (or (not (include "faucet-stream.serveMultiReplica" .)) (has "ReadWriteMany" $p.accessModes)) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* "true" when the data dir is a claim (the chart's or an existing one), not an emptyDir. */}}
+{{- define "faucet-stream.serveDataClaim" -}}
+{{- if or .Values.serve.persistence.existingClaim (include "faucet-stream.serveManagedClaim" .) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* "true" when persistence.enabled was set but several replicas made the data dir a per-pod emptyDir. */}}
+{{- define "faucet-stream.serveClaimSkipped" -}}
+{{- $p := .Values.serve.persistence -}}
+{{- if and .Values.serve.enabled $p.enabled (not $p.existingClaim) (not (include "faucet-stream.serveManagedClaim" .)) -}}
+true
+{{- end -}}
+{{- end -}}
+
 {{- define "faucet-stream.serveSingleWithVolume" -}}
-{{- if and (eq (int .Values.serve.replicaCount) 1) (not .Values.serve.autoscaling.enabled) (or .Values.serve.persistence.enabled .Values.serve.persistence.existingClaim) -}}
+{{- if and (eq (int .Values.serve.replicaCount) 1) (not .Values.serve.autoscaling.enabled) (include "faucet-stream.serveDataClaim" .) -}}
 true
 {{- end -}}
 {{- end -}}
@@ -305,7 +341,7 @@ on a persistent volume (without one the file sits on an emptyDir).
 */}}
 {{- define "faucet-stream.durableHistory" -}}
 {{- $h := include "faucet-stream.historyBackend" . -}}
-{{- if or (eq $h "postgres") (and (eq $h "sqlite") (or .Values.serve.persistence.enabled .Values.serve.persistence.existingClaim)) -}}
+{{- if or (eq $h "postgres") (and (eq $h "sqlite") (include "faucet-stream.serveDataClaim" .)) -}}
 true
 {{- end -}}
 {{- end -}}

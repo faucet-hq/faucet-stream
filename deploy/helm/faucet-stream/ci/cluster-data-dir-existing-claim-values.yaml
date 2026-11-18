@@ -1,0 +1,13 @@
+# #1095: an existing claim is mounted as given, also with several replicas.
+# expect: claimName: shared-data
+# expect-not: kind: PersistentVolumeClaim
+# expect-not: Data dir: several replicas
+serve:
+  replicaCount: 2
+  cluster:
+    enabled: true
+  history:
+    backend: postgres
+    existingSecret: faucet-history
+  persistence:
+    existingClaim: shared-data

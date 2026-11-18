@@ -340,7 +340,7 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
-        {{- if or .Values.serve.persistence.enabled .Values.serve.persistence.existingClaim }}
+        {{- if include "faucet-stream.serveDataClaim" . }}
         - name: scratch
           persistentVolumeClaim:
             claimName: {{ .Values.serve.persistence.existingClaim | default (printf "%s-data" (include "faucet-stream.fullname" .)) }}

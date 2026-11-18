@@ -545,6 +545,10 @@ serve:
   # The data dir (root fs is read-only): the default SQLite run history lives
   # here (#1049), on a PVC by default. `enabled: false` uses an emptyDir
   # instead, which loses the history on every pod restart.
+  # Several replicas (replicaCount > 1 or autoscaling): a ReadWriteOnce claim
+  # would hold every replica on one node, so the chart creates the claim only
+  # when accessModes lists ReadWriteMany; otherwise each pod gets an emptyDir
+  # (the history is in postgres). An existingClaim is always mounted as given.
   persistence:
     enabled: true
     size: 1Gi
