@@ -2217,6 +2217,29 @@ fn check_file_sink_paths(nodes: &[ExpandedNode]) -> CliResult<()> {
             )));
         }
     }
+    let data_dests: HashMap<String, &str> = writers()
+        .filter_map(|n| {
+            crate::registry::sink_shared_destination(&n.sink.kind, &n.sink.config)
+                .map(|d| (d, n.id.as_str()))
+        })
+        .collect();
+    for n in nodes {
+        let Some(dest) = n
+            .dlq
+            .as_ref()
+            .and_then(|d| crate::registry::sink_shared_destination(&d.sink.kind, &d.sink.config))
+        else {
+            continue;
+        };
+        if let Some(writer) = data_dests.get(&dest) {
+            return Err(CliError::Config(format!(
+                "row '{}': its DLQ writes '{dest}', which row '{writer}' also writes as its \
+                 data sink — dead letters and data would overwrite each other; give the DLQ \
+                 its own path",
+                n.id
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -5158,6 +5181,21 @@ pipeline:
             "{err}"
         );
         assert!(run(r#"{ type: stdout, config: {} }"#).is_ok());
+    }
+
+    #[test]
+    fn a_dlq_on_the_data_sinks_remote_object_is_refused() {
+        let yaml = r#"
+version: 1
+pipeline:
+  source: { type: file, config: { path: /tmp/in.jsonl } }
+  sink: { type: s3, config: { bucket: b, path: out.jsonl } }
+  dlq:
+    sink: { type: s3, config: { bucket: b, path: out.jsonl } }
+"#;
+        let cfg = parse_with_extension(yaml, "yaml").unwrap();
+        let e = expand(&cfg).unwrap_err().to_string();
+        assert!(e.contains("DLQ writes 's3://b/out.jsonl'"), "{e}");
     }
 
     #[test]
