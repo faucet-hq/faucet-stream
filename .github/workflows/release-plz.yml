@@ -61,6 +61,9 @@ jobs:
   release-plz-pr:
     name: Open / update release PR
     runs-on: ubuntu-latest
+    # RELEASE_PLZ_TOKEN is an environment secret: `release-pr` (main only,
+    # no approval) here, `release` for the publishing jobs.
+    environment: release-pr
     # Run AFTER release-plz-release so the per-crate tags it creates already
     # exist before this job evaluates. Without this, a release-PR merge fires
     # both jobs in parallel and this one can observe a just-bumped manifest
