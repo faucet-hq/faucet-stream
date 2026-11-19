@@ -22,7 +22,6 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::Duration;
 
 /// One message to publish.
@@ -534,31 +533,21 @@ pub trait MessageConsumer: Send + Sync {
 /// requested (or the stream is polled to its end) — that is, only once the
 /// pipeline has written and flushed them. A run that fails before then
 /// acknowledges nothing it did not write, and the broker redelivers it.
+/// Acknowledgements belong to the stream that read the page: a dropped stream
+/// acknowledges nothing, and another read never acknowledges its pages.
 pub struct MessageSourceDriver<C> {
     consumer: C,
-    pending: Mutex<Vec<AckToken>>,
 }
 
 impl<C: MessageConsumer> MessageSourceDriver<C> {
     /// The source driver over `consumer`.
     pub fn new(consumer: C) -> Self {
-        Self {
-            consumer,
-            pending: Mutex::new(Vec::new()),
-        }
+        Self { consumer }
     }
 
     /// The consumer.
     pub fn consumer(&self) -> &C {
         &self.consumer
-    }
-
-    async fn ack_pending(&self, calls: &CallSlot) -> Result<(), FaucetError> {
-        let tokens = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()));
-        if tokens.is_empty() {
-            return Ok(());
-        }
-        self.consumer.ack(calls, tokens).await
     }
 }
 
@@ -653,9 +642,10 @@ impl<C: MessageConsumer> MessageSourceDriver<C> {
         Box::pin(async_stream::try_stream! {
             let mut consumed = 0usize;
             let mut idle = 0u32;
+            let mut pending: Vec<AckToken> = Vec::new();
             loop {
-                if ack {
-                    self.ack_pending(calls).await?;
+                if !pending.is_empty() {
+                    self.consumer.ack(calls, std::mem::take(&mut pending)).await?;
                 }
                 let room = match limit {
                     Some(max) if consumed >= max => break,
@@ -679,7 +669,7 @@ impl<C: MessageConsumer> MessageSourceDriver<C> {
                 }
                 consumed += records.len();
                 if ack {
-                    *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = tokens;
+                    pending = tokens;
                 }
                 yield StreamPage {
                     records,
