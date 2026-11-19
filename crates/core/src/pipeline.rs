@@ -972,8 +972,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                             state,
                             scope,
                             self.cancel.clone(),
-                            &name,
-                            &row,
+                            (&name, &row, &run_id),
                             crate::dlq::BatchOutcomeSink::new(
                                 &name,
                                 &row,
@@ -1368,8 +1367,10 @@ fn settle_non_finite(
 /// and sink advertise `supports_columnar()` and no `Value`-shaped stage is
 /// configured (feature `arrow`, RFC 0002 / #375).
 ///
-/// Mirrors the checkpoint ordering of the `Value` path exactly —
-/// `write_batch_columnar` → `flush` → persist bookmark ([ADR 0002](https://github.com/faucet-hq/faucet-stream/blob/main/docs/adr/0002-checkpoint-ordering.md)) —
+/// Checkpoints through the same core as the `Value` path —
+/// `write_batch_columnar` → sink flush → DLQ flush → persist bookmark
+/// ([ADR 0002](https://github.com/faucet-hq/faucet-stream/blob/main/docs/adr/0002-checkpoint-ordering.md)),
+/// flushing both sinks on an error exit —
 /// with cooperative, flush-completing cancellation at the page boundary
 /// ([ADR 0011](https://github.com/faucet-hq/faucet-stream/blob/main/docs/adr/0011-cooperative-cancellation.md)).
 /// Emits the source/sink record counters; the richer per-page histograms of the
@@ -1405,7 +1406,15 @@ where
     };
     let src_labels = labels(source.connector_name());
     let sink_labels = labels(sink.connector_name());
-    let _ = run_id; // reserved for span attribution parity with the Value path
+    let ck = crate::checkpoint::Checkpointer::new(
+        sink,
+        dlq.as_ref().map(|d| &d.sink),
+        state
+            .as_ref()
+            .map(|(store, key)| (store.as_ref(), key.as_str())),
+        crate::checkpoint::Hold::None,
+        (pipeline, row, run_id),
+    );
 
     let ctx = std::collections::HashMap::new();
     let mut batches = source.stream_batches(&ctx, DEFAULT_BATCH_SIZE);
@@ -1417,141 +1426,145 @@ where
     // for the run. Rules that re-type by value never reach this loop.
     #[cfg_attr(not(feature = "masking"), allow(unused_mut))]
     let mut widened: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut cancelled = false;
 
-    loop {
-        // Cooperative cancellation: race the next batch against the token so a
-        // cancel stops at the boundary and still flushes (ADR 0011).
-        let page = match &cancel {
-            Some(token) => {
-                tokio::select! {
-                    biased;
-                    _ = token.cancelled() => break,
-                    p = batches.next() => p,
+    let body: Result<(), FaucetError> = async {
+        loop {
+            // Cooperative cancellation: race the next batch against the token so a
+            // cancel stops at the boundary and still flushes (ADR 0011).
+            let page = match &cancel {
+                Some(token) => {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => {
+                            cancelled = true;
+                            break;
+                        }
+                        p = batches.next() => p,
+                    }
                 }
+                None => batches.next().await,
+            };
+            let Some(page) = page else { break };
+            let page = page?;
+            let rows = page.num_rows();
+            counter!("faucet_source_records_total", src_labels.clone()).increment(rows as u64);
+
+            // Governance on the columnar path (#636): the same `apply_governance`
+            // the `Value` loop runs; quarantined rows go to the DLQ, flushed at
+            // each checkpoint.
+            //
+            // The batch is materialized to `Value` only when a policy is actually
+            // configured; with none, the batch goes to the sink untouched and the
+            // run stays pure-columnar end to end.
+            // A quarantine abort (budget exceeded) is raised only after this page's
+            // envelopes are durable and the bookmark has advanced — the same
+            // deferral the `Value` path uses, so quarantined rows are never dropped
+            // on the way out (#146 M4).
+            let mut deferred: Option<FaucetError> = None;
+            let mut account = crate::accounting::PageAccount::new(rows);
+            let clearance = specs.clearance();
+            let batch = if clearance.is_none() && rows > 0 {
+                let records = crate::columnar::record_batch_to_values(&page.batch)?;
+                let schema = page.batch.schema();
+                let gov = apply_governance(records, &specs, &mut gov_state, sink).await?;
+                if let Some(e) = gov.deferred_abort {
+                    if let Some(dlq_cfg) = dlq.as_ref() {
+                        abort_with_envelopes(dlq_cfg, &gov.envelopes, &mut dlq_stats).await?;
+                    }
+                    return Err(e);
+                }
+
+                if !gov.envelopes.is_empty() {
+                    let dlq_cfg = dlq.as_ref().ok_or_else(|| {
+                        // Unreachable: a quarantining policy without a DLQ is
+                        // rejected at run start. Fail loudly rather than drop rows.
+                        FaucetError::Config(
+                            "governance quarantined records but no DLQ sink is configured".into(),
+                        )
+                    })?;
+                    let page_failures = gov.envelopes.len();
+                    // Budgets are shared across the run, exactly as on the `Value`
+                    // path; the overshoot is written rather than dropped, because
+                    // losing the rows is strictly worse than exceeding the budget.
+                    if deferred.is_none()
+                        && let Some(limit) = dlq_cfg.max_failures_per_page
+                        && page_failures > limit
+                    {
+                        deferred = Some(FaucetError::Sink(format!(
+                            "DLQ per-page budget exceeded: {page_failures} > {limit}"
+                        )));
+                    }
+                    let new_total = dlq_stats.records_dlq + page_failures;
+                    if deferred.is_none()
+                        && let Some(limit) = dlq_cfg.max_failures_total
+                        && new_total > limit
+                    {
+                        deferred = Some(FaucetError::Sink(format!(
+                            "DLQ total budget exceeded: {new_total} > {limit}"
+                        )));
+                    }
+                    gate::dlq(dlq_cfg.sink.as_ref(), &gov.envelopes)
+                        .await
+                        .map_err(|e| dlq_write_error("DLQ write failed", e))?;
+                    account.quarantined += page_failures;
+                    dlq_stats.records_dlq += page_failures;
+                    dlq_stats.pages_with_failures += 1;
+                }
+
+                // Re-encode against the *incoming* schema so a pass that only
+                // removes rows cannot silently re-type a column via inference —
+                // except the columns masking rewrote into strings, which are
+                // widened to Utf8.
+                #[cfg(feature = "masking")]
+                if let Some(m) = specs.masking {
+                    widened.extend(crate::columnar::masked_string_columns(
+                        &schema,
+                        gov.records.records(),
+                        |name| m.rewrites_name(name),
+                    ));
+                }
+                let schema = crate::columnar::widen_to_utf8(&schema, &widened);
+                crate::governance::GovernedBatch::encode(&gov.records, schema)?
+            } else {
+                crate::governance::GovernedBatch::passthrough(page.batch, clearance.as_ref())?
+            };
+            let rows = batch.num_rows();
+
+            if rows > 0 {
+                let n = outcomes.observe(gate::columnar(sink, &batch).await)?;
+                records_written += n;
+                account.accepted += n;
+                counter!("faucet_sink_records_total", sink_labels.clone()).increment(n as u64);
+                counter!("faucet_sink_writes_total", sink_labels.clone()).increment(1);
             }
-            None => batches.next().await,
-        };
-        let Some(page) = page else { break };
-        let page = page?;
-        let rows = page.num_rows();
-        counter!("faucet_source_records_total", src_labels.clone()).increment(rows as u64);
+            account.settle(
+                row_accounts.as_deref(),
+                (pipeline, row, sink.connector_name()),
+            )?;
 
-        // Governance on the columnar path (#636). Only reached for policies
-        // that never quarantine (`requires_dlq()` false) — `Pipeline::run`
-        // keeps every quarantining config on the `Value` path, so there are no
-        // envelopes to route and no DLQ machinery to duplicate here. The pass
-        // itself is the *same* `apply_governance` the `Value` loop runs, so the
-        // two cannot drift apart.
-        //
-        // The batch is materialized to `Value` only when a policy is actually
-        // configured; with none, the batch goes to the sink untouched and the
-        // run stays pure-columnar end to end.
-        // A quarantine abort (budget exceeded) is raised only after this page's
-        // envelopes are durable and the bookmark has advanced — the same
-        // deferral the `Value` path uses, so quarantined rows are never dropped
-        // on the way out (#146 M4).
-        let mut deferred: Option<FaucetError> = None;
-        let mut account = crate::accounting::PageAccount::new(rows);
-        let clearance = specs.clearance();
-        let batch = if clearance.is_none() && rows > 0 {
-            let records = crate::columnar::record_batch_to_values(&page.batch)?;
-            let schema = page.batch.schema();
-            let gov = apply_governance(records, &specs, &mut gov_state, sink).await?;
-            if let Some(e) = gov.deferred_abort {
-                if let Some(dlq_cfg) = dlq.as_ref() {
-                    abort_with_envelopes(dlq_cfg, &gov.envelopes, &mut dlq_stats).await?;
-                }
+            // Checkpoint: sink flush, DLQ flush, then the bookmark (ADR 0002) —
+            // the state store is always at or behind both sinks.
+            if let Some(bm) = page.bookmark {
+                ck.page(&bm, crate::checkpoint::Stored::Bare).await?;
+                last_bookmark = Some(bm);
+            }
+
+            // Now the page is fully durable — envelopes written, bookmark advanced
+            // — so a deferred drift/budget abort can stop the run without
+            // stranding anything.
+            if let Some(e) = deferred {
                 return Err(e);
             }
-
-            if !gov.envelopes.is_empty() {
-                let dlq_cfg = dlq.as_ref().ok_or_else(|| {
-                    // Unreachable: a quarantining policy without a DLQ is
-                    // rejected at run start. Fail loudly rather than drop rows.
-                    FaucetError::Config(
-                        "governance quarantined records but no DLQ sink is configured".into(),
-                    )
-                })?;
-                let page_failures = gov.envelopes.len();
-                // Budgets are shared across the run, exactly as on the `Value`
-                // path; the overshoot is written rather than dropped, because
-                // losing the rows is strictly worse than exceeding the budget.
-                if deferred.is_none()
-                    && let Some(limit) = dlq_cfg.max_failures_per_page
-                    && page_failures > limit
-                {
-                    deferred = Some(FaucetError::Sink(format!(
-                        "DLQ per-page budget exceeded: {page_failures} > {limit}"
-                    )));
-                }
-                let new_total = dlq_stats.records_dlq + page_failures;
-                if deferred.is_none()
-                    && let Some(limit) = dlq_cfg.max_failures_total
-                    && new_total > limit
-                {
-                    deferred = Some(FaucetError::Sink(format!(
-                        "DLQ total budget exceeded: {new_total} > {limit}"
-                    )));
-                }
-                gate::dlq(dlq_cfg.sink.as_ref(), &gov.envelopes)
-                    .await
-                    .map_err(|e| dlq_write_error("DLQ write failed", e))?;
-                account.quarantined += page_failures;
-                dlq_stats.records_dlq += page_failures;
-                dlq_stats.pages_with_failures += 1;
-            }
-
-            // Re-encode against the *incoming* schema so a pass that only
-            // removes rows cannot silently re-type a column via inference —
-            // except the columns masking rewrote into strings, which are
-            // widened to Utf8.
-            #[cfg(feature = "masking")]
-            if let Some(m) = specs.masking {
-                widened.extend(crate::columnar::masked_string_columns(
-                    &schema,
-                    gov.records.records(),
-                    |name| m.rewrites_name(name),
-                ));
-            }
-            let schema = crate::columnar::widen_to_utf8(&schema, &widened);
-            crate::governance::GovernedBatch::encode(&gov.records, schema)?
-        } else {
-            crate::governance::GovernedBatch::passthrough(page.batch, clearance.as_ref())?
-        };
-        let rows = batch.num_rows();
-
-        if rows > 0 {
-            let n = outcomes.observe(gate::columnar(sink, &batch).await)?;
-            records_written += n;
-            account.accepted += n;
-            counter!("faucet_sink_records_total", sink_labels.clone()).increment(n as u64);
-            counter!("faucet_sink_writes_total", sink_labels.clone()).increment(1);
         }
-        account.settle(
-            row_accounts.as_deref(),
-            (pipeline, row, sink.connector_name()),
-        )?;
-
-        // Checkpoint: flush then persist the bookmark, never the other way
-        // round (ADR 0002) — the state store is always at or behind the sink.
-        if let Some(bm) = page.bookmark {
-            sink.flush().await?;
-            if let Some((store, key)) = state.as_ref() {
-                store.put(key, &bm).await?;
-            }
-            last_bookmark = Some(bm);
-        }
-
-        // Now the page is fully durable — envelopes written, bookmark advanced
-        // — so a deferred drift/budget abort can stop the run without
-        // stranding anything.
-        if let Some(e) = deferred {
-            return Err(e);
-        }
+        Ok(())
     }
+    .await;
 
-    // Final flush (mirrors the Value path's end-of-stream / on-cancel flush).
-    sink.flush().await?;
+    if let Err(e) = body {
+        return Err(ck.unwind(e).await);
+    }
+    ck.finish(cancelled).await?;
     Ok(PipelineResult {
         records_written,
         bookmark: last_bookmark,
@@ -1593,8 +1606,7 @@ async fn run_stream_native<S, Si>(
     state: Option<(Arc<dyn StateStore>, String)>,
     scope: String,
     cancel: Option<tokio_util::sync::CancellationToken>,
-    pipeline: &str,
-    row: &str,
+    (pipeline, row, run_id): (&str, &str, &str),
     outcomes: crate::dlq::BatchOutcomeSink,
     row_accounts: Option<Arc<crate::accounting::RowAccounts>>,
 ) -> Result<PipelineResult, FaucetError>
@@ -1615,6 +1627,20 @@ where
     let src_labels = labels(source.connector_name());
     let sink_labels = labels(sink.connector_name());
     let overwrite = write_mode == crate::write_mode::WriteMode::Overwrite;
+    let ck = crate::checkpoint::Checkpointer::new(
+        sink,
+        None,
+        state
+            .as_ref()
+            .map(|(store, key)| (store.as_ref(), key.as_str())),
+        if overwrite {
+            crate::checkpoint::Hold::Overwrite
+        } else {
+            crate::checkpoint::Hold::None
+        },
+        (pipeline, row, run_id),
+    )
+    .without_unwind_sink_flush();
 
     tracing::info!(
         pipeline = %pipeline,
@@ -1635,69 +1661,76 @@ where
     let mut cancelled = false;
     let mut warned_unchecked = false;
 
-    loop {
-        let next = match &cancel {
-            Some(token) => {
-                tokio::select! {
-                    biased;
-                    _ = token.cancelled() => { cancelled = true; break },
-                    p = batches.next() => p,
+    let body: Result<(), FaucetError> = async {
+        loop {
+            let next = match &cancel {
+                Some(token) => {
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => { cancelled = true; break },
+                        p = batches.next() => p,
+                    }
                 }
+                None => batches.next().await,
+            };
+            let Some(batch) = next else { break };
+            let batch = batch?;
+            if let Some(n) = batch.records {
+                counter!("faucet_source_records_total", src_labels.clone()).increment(n);
             }
-            None => batches.next().await,
-        };
-        let Some(batch) = next else { break };
-        let batch = batch?;
-        if let Some(n) = batch.records {
-            counter!("faucet_source_records_total", src_labels.clone()).increment(n);
-        }
-        let bookmark = batch.bookmark.clone();
-        let load_ctx = crate::native::NativeLoadContext {
-            write_mode,
-            first_batch,
-        };
-        let offered = batch.records;
-        let batch = crate::governance::GovernedNative::passthrough(batch, &clearance);
-        let n = outcomes.observe(gate::native(sink, batch, &scope, load_ctx).await)?;
-        first_batch = false;
-        // Every batch folds into the run's row accounts like the other paths;
-        // a batch with no source count is credited as offered = loaded.
-        let mut page = crate::accounting::PageAccount::new(offered.map_or(n, |o| o as usize));
-        page.accepted = n;
-        page.settle(
-            row_accounts.as_deref(),
-            (pipeline, row, sink.connector_name()),
-        )?;
-        match offered {
-            Some(_) => {}
-            None if !warned_unchecked => {
-                warned_unchecked = true;
-                tracing::warn!(
-                    pipeline,
-                    row,
-                    connector = sink.connector_name(),
-                    "native load: the source does not report a row count, so rows loaded \
+            let bookmark = batch.bookmark.clone();
+            let load_ctx = crate::native::NativeLoadContext {
+                write_mode,
+                first_batch,
+            };
+            let offered = batch.records;
+            let batch = crate::governance::GovernedNative::passthrough(batch, &clearance);
+            let n = outcomes.observe(gate::native(sink, batch, &scope, load_ctx).await)?;
+            first_batch = false;
+            // Every batch folds into the run's row accounts like the other paths;
+            // a batch with no source count is credited as offered = loaded.
+            let mut page = crate::accounting::PageAccount::new(offered.map_or(n, |o| o as usize));
+            page.accepted = n;
+            page.settle(
+                row_accounts.as_deref(),
+                (pipeline, row, sink.connector_name()),
+            )?;
+            match offered {
+                Some(_) => {}
+                None if !warned_unchecked => {
+                    warned_unchecked = true;
+                    tracing::warn!(
+                        pipeline,
+                        row,
+                        connector = sink.connector_name(),
+                        "native load: the source does not report a row count, so rows loaded \
                      cannot be checked against rows offered on this path"
-                );
-            }
-            None => {}
-        }
-        records_written += n;
-        counter!("faucet_sink_records_total", sink_labels.clone()).increment(n as u64);
-        counter!("faucet_sink_writes_total", sink_labels.clone()).increment(1);
-
-        // Checkpoint: flush then persist the bookmark (ADR 0002).
-        if let Some(bm) = bookmark {
-            if overwrite {
-                pending_bookmark = Some(bm);
-            } else {
-                sink.flush().await?;
-                if let Some((store, key)) = state.as_ref() {
-                    store.put(key, &bm).await?;
+                    );
                 }
-                last_bookmark = Some(bm);
+                None => {}
+            }
+            records_written += n;
+            counter!("faucet_sink_records_total", sink_labels.clone()).increment(n as u64);
+            counter!("faucet_sink_writes_total", sink_labels.clone()).increment(1);
+
+            // Checkpoint: flush then persist the bookmark (ADR 0002).
+            if let Some(bm) = bookmark {
+                if overwrite {
+                    pending_bookmark = Some(bm);
+                } else {
+                    ck.page(&bm, crate::checkpoint::Stored::Bare).await?;
+                    last_bookmark = Some(bm);
+                }
             }
         }
+        Ok(())
+    }
+    .await;
+
+    // An error exit leaves the load session unfinished: it can hold a partly
+    // fed object, and the bookmark has not advanced past it.
+    if let Err(e) = body {
+        return Err(ck.unwind(e).await);
     }
     if cancelled && overwrite {
         // Nothing was finalized — the prior destination is untouched (the
@@ -1712,11 +1745,9 @@ where
     // Terminal flush: end-of-stream (or cancel under append, where committing
     // the partial batch is at-least-once-safe). For overwrite this is the
     // single point where the destination becomes visible.
-    sink.flush().await?;
+    ck.finish(cancelled).await?;
     if let Some(bm) = pending_bookmark {
-        if let Some((store, key)) = state.as_ref() {
-            store.put(key, &bm).await?;
-        }
+        ck.persist(&bm).await?;
         last_bookmark = Some(bm);
     }
 
@@ -2055,6 +2086,29 @@ where
             }
         };
     }
+
+    let ck = crate::checkpoint::Checkpointer::new(
+        sink,
+        dlq.as_ref().map(|d| &d.sink),
+        match (state_store.as_ref(), state_key.as_ref()) {
+            (Some(store), Some(key)) => Some((store.as_ref(), key.as_str())),
+            _ => None,
+        },
+        if defer_bookmarks {
+            crate::checkpoint::Hold::Overwrite
+        } else {
+            crate::checkpoint::Hold::None
+        },
+        (&pipeline_name, &row, &run_id),
+    )
+    .with_retry(
+        retry_policy
+            .as_ref()
+            .map(|policy| crate::checkpoint::Retry {
+                policy,
+                cancel: cancel.as_ref(),
+            }),
+    );
 
     let loop_result: Result<(), FaucetError> = async {
         loop {
@@ -2545,42 +2599,7 @@ where
                         )?;
 
                         if let Some(bookmark) = bookmark {
-                            // Retry-wrap the main-sink flush, the DLQ-sink flush,
-                            // and the state write so a transient failure on any of
-                            // them is retried before aborting — same as the default
-                            // and exactly-once paths. Inert when no policy is set
-                            // (the macro's `None` arm is a bare `.await`).
-                            if !defer_bookmarks {
-                                with_retry!("flush", sink.flush())?;
-                            }
-                            let _dlq_flush_timer = crate::observability::DurationGuard::new(
-                                "faucet_sink_dlq_flush_duration_seconds",
-                                metric_labels.clone(),
-                            );
-                            with_retry!("flush", dlq_cfg.sink.flush()).map_err(|e| {
-                                let mut lbl = metric_labels.clone();
-                                lbl.push(Label::new(
-                                    "kind",
-                                    SharedString::const_str(
-                                        crate::observability::decorator::error_kind(&e),
-                                    ),
-                                ));
-                                counter!("faucet_sink_dlq_errors_total", lbl).increment(1);
-                                FaucetError::Sink(format!("DLQ sink flush failed: {e}"))
-                            })?;
-                            if !defer_bookmarks {
-                                if let (Some(store), Some(key)) =
-                                    (state_store.as_ref(), state_key.as_ref())
-                                {
-                                    with_retry!("state_put", store.put(key, &bookmark))?;
-                                }
-                                let bm_labels = crate::observability::Labels::new(
-                                    &*pipeline_name,
-                                    &*row,
-                                    &*run_id,
-                                );
-                                crate::observability::update_bookmark_lag(&bookmark, &bm_labels);
-                            }
+                            ck.page(&bookmark, crate::checkpoint::Stored::Bare).await?;
                             last_bookmark = Some(bookmark);
                         }
 
@@ -2649,17 +2668,8 @@ where
                                 row_accounts.as_deref(),
                                 (&pipeline_name, &row, sink_name),
                             )?;
-                            with_retry!("flush", sink.flush())?;
-                            if let (Some(store), Some(key)) =
-                                (state_store.as_ref(), state_key.as_ref())
-                            {
-                                let wrapped =
-                                    crate::idempotency::wrap_state(Some(&bookmark), next_seq);
-                                with_retry!("state_put", store.put(key, &wrapped))?;
-                            }
-                            let bm_labels =
-                                crate::observability::Labels::new(&*pipeline_name, &*row, &*run_id);
-                            crate::observability::update_bookmark_lag(&bookmark, &bm_labels);
+                            ck.page(&bookmark, crate::checkpoint::Stored::ExactlyOnce(next_seq))
+                                .await?;
                             last_bookmark = Some(bookmark);
                         } else if !governed.is_empty() {
                             // No bookmark → not individually checkpointed; write
@@ -2724,22 +2734,7 @@ where
                             (&pipeline_name, &row, sink_name),
                         )?;
                         if let Some(bookmark) = bookmark {
-                            if !defer_bookmarks {
-                                with_retry!("flush", sink.flush())?;
-                            }
-                            if !defer_bookmarks {
-                                if let (Some(store), Some(key)) =
-                                    (state_store.as_ref(), state_key.as_ref())
-                                {
-                                    with_retry!("state_put", store.put(key, &bookmark))?;
-                                }
-                                let bm_labels = crate::observability::Labels::new(
-                                    &*pipeline_name,
-                                    &*row,
-                                    &*run_id,
-                                );
-                                crate::observability::update_bookmark_lag(&bookmark, &bm_labels);
-                            }
+                            ck.page(&bookmark, crate::checkpoint::Stored::Bare).await?;
                             last_bookmark = Some(bookmark);
                         }
                     }
@@ -2755,89 +2750,26 @@ where
     }
     .await;
 
-    // Error/early-return unwind: best-effort flush so any buffered output is
-    // made durable, then propagate the ORIGINAL error. Flush errors here are
-    // logged and swallowed — the source/sink error that triggered the unwind
-    // is the meaningful one to surface. DLQ is flushed first (mirroring the
-    // success path below): its records are only ever written here, whereas the
-    // next run re-reads post-bookmark records from the source.
+    // Error/early-return unwind: best-effort flush (DLQ first, then the sink
+    // unless the run holds its output), then propagate the ORIGINAL error.
     if let Err(e) = loop_result {
-        if let Some(ref dlq_cfg) = dlq
-            && let Err(flush_err) = dlq_cfg.sink.flush().await
-        {
-            tracing::warn!(
-                error = %flush_err,
-                "DLQ sink flush failed during error unwind; original error preserved"
-            );
-        }
-        if defer_bookmarks {
-            tracing::info!(
-                "pipeline run failed during overwrite; sink flush skipped so the \
-                 destination is unchanged"
-            );
-        } else if let Err(flush_err) = sink.flush().await {
-            tracing::warn!(
-                error = %flush_err,
-                "sink flush failed during error unwind; original error preserved"
-            );
-        }
-        return Err(e);
+        return Err(ck.unwind(e).await);
     }
 
-    // Flush the DLQ sink BEFORE the main sink so quarantined records are made
-    // durable even if the main sink's final flush fails. The next run will
-    // re-read post-bookmark records from the source and re-route any that
-    // would have fallen out of the main sink's unflushed buffer; DLQ records,
-    // by contrast, are only ever written here and would otherwise be lost.
-    if let Some(ref dlq_cfg) = dlq {
-        let final_metric_labels: Vec<metrics::Label> = vec![
-            metrics::Label::new(
-                "pipeline",
-                metrics::SharedString::from(pipeline_name.clone()),
-            ),
-            metrics::Label::new("row", metrics::SharedString::from(row.clone())),
-            metrics::Label::new(
-                "connector",
-                metrics::SharedString::from(sink_name.to_string()),
-            ),
-            metrics::Label::new(
-                "dlq_connector",
-                metrics::SharedString::from(dlq_sink_name.to_string()),
-            ),
-        ];
-        let _final_dlq_flush_timer = crate::observability::DurationGuard::new(
-            "faucet_sink_dlq_flush_duration_seconds",
-            final_metric_labels.clone(),
-        );
-        dlq_cfg.sink.flush().await.map_err(|e| {
-            let mut lbl = final_metric_labels.clone();
-            lbl.push(metrics::Label::new(
-                "kind",
-                metrics::SharedString::const_str(crate::observability::decorator::error_kind(&e)),
-            ));
-            metrics::counter!("faucet_sink_dlq_errors_total", lbl).increment(1);
-            FaucetError::Sink(format!("DLQ sink flush failed: {e}"))
-        })?;
-    }
-    if cancelled && sink.is_overwrite() {
-        // A cancelled overwrite must NOT finalize: for a direct (non-staged)
-        // overwrite the flush would commit a partial truncate-load as if it
-        // were the full refresh; for a staged one the staging table is
-        // discarded by `abort_overwrite` anyway, so skipping the flush loses
-        // nothing. The prior destination stays untouched either way.
+    // The DLQ is flushed before the main sink, so quarantined records are
+    // durable even if the main sink's final flush fails.
+    ck.finish(cancelled).await?;
+    if cancelled && defer_bookmarks {
         tracing::info!(
             records_written,
             "pipeline run cancelled during overwrite; terminal flush skipped so the \
              destination is unchanged"
         );
-    } else {
-        sink.flush().await?;
-        if cancelled {
-            tracing::info!(
-                records_written,
-                "pipeline run cancelled cooperatively; sink flushed (partial output is durable)"
-            );
-        }
+    } else if cancelled {
+        tracing::info!(
+            records_written,
+            "pipeline run cancelled cooperatively; sink flushed (partial output is durable)"
+        );
     }
 
     tracing::info!(
@@ -8433,6 +8365,8 @@ mod cleanup_tests {
         bookmark_every: bool,
         /// Natural state key, when resumability should be exercised.
         key: Option<&'static str>,
+        /// Fail the stream instead of yielding this batch.
+        fail_at: Option<usize>,
     }
 
     impl NativeCsvSource {
@@ -8441,6 +8375,7 @@ mod cleanup_tests {
                 batches,
                 bookmark_every: false,
                 key: None,
+                fail_at: None,
             }
         }
     }
@@ -8469,8 +8404,13 @@ mod cleanup_tests {
             assert_eq!(format, crate::native::NativeFormat::Csv);
             let n = self.batches;
             let every = self.bookmark_every;
+            let fail_at = self.fail_at;
             Box::pin(async_stream::stream! {
                 for i in 0..n {
+                    if fail_at == Some(i) {
+                        yield Err(FaucetError::Source("connection lost".into()));
+                        return;
+                    }
                     let last = i + 1 == n;
                     let bytes = format!("h\nrow{i}\n").into_bytes();
                     let bm = if every || last { Some(json!({"page": i})) } else { None };
@@ -8823,6 +8763,21 @@ mod cleanup_tests {
         assert_eq!(flush_count(&events), 0, "no flush on cancel: {events:?}");
         assert_eq!(result.records_written, 0);
         assert_eq!(result.bookmark, None);
+    }
+
+    #[tokio::test]
+    async fn a_native_error_never_flushes_the_sink() {
+        for overwrite in [false, true] {
+            let source = NativeCsvSource {
+                fail_at: Some(1),
+                ..NativeCsvSource::new(3)
+            };
+            let sink = NativeRecordingSink::new(overwrite);
+            let events = sink.events.clone();
+            let err = Pipeline::new(&source, &sink).run().await.unwrap_err();
+            assert!(err.to_string().contains("connection lost"), "{err}");
+            assert_eq!(flush_count(&events), 0, "overwrite={overwrite}: {events:?}");
+        }
     }
 
     #[tokio::test]

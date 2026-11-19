@@ -83,10 +83,13 @@ of which preserves the checkpoint-ordering invariant:
 - **Empty, bookmark-less pages are skipped** (`records.is_empty() && bookmark.is_none()`).
 - **A bookmark-less page is written but not checkpointed** — it stays at-least-once
   for that page (rare; CDC sources bookmark every committed transaction).
-- **Every early exit flushes.** The loop runs inside an inner future; a source
-  error, a propagated write/flush/state error, or a cancellation all fall through to
-  a best-effort final flush, so a buffered sink (Parquet footer, S3 multipart)
-  commits what it has rather than orphaning the file.
+- **Every early exit flushes.** The row, Arrow and native loops each run inside an
+  inner future and checkpoint through one core (`checkpoint.rs`); a source error, a
+  propagated write/flush/state error, or a cancellation all fall through to a
+  best-effort final flush (DLQ first, then the main sink), so a buffered sink
+  (Parquet footer, S3 multipart) commits what it has rather than orphaning the
+  file. The native byte loop leaves its load session unfinished on an error
+  instead, since it may hold a partly fed object.
 - **Masking runs first, unconditionally**, before any sink, the DLQ, or a lineage
   sample observes the records. See [masking](./masking.md).
 

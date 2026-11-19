@@ -22,6 +22,7 @@ pub mod batching;
 pub mod budget;
 pub mod capabilities;
 pub mod check;
+pub(crate) mod checkpoint;
 pub mod cleanup;
 #[cfg(feature = "arrow")]
 pub mod columnar;
