@@ -99,7 +99,7 @@ async fn types_without_a_native_decode_are_read_as_text() {
     .await
     .expect("source");
     let row = &exact.fetch_all().await.expect("fetch")[0];
-    assert_eq!(row["t"], json!("12:30:00"));
+    assert_eq!(row["t"], json!("12:30:00.000000"));
     let n = row["n"].as_str().expect("numeric is a string");
     assert_eq!(n.parse::<f64>().unwrap(), 1.5, "{n}");
 

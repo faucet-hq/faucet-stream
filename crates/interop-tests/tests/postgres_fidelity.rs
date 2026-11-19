@@ -177,19 +177,18 @@ async fn decimals_money_bytes_and_timestamps_keep_their_canonical_rendering() {
     sink.write_batch(&sent).await.expect("write");
     sink.flush().await.expect("flush");
 
-    // The query source renders `timestamptz` per RFC 3339 (`+00:00`); the
-    // instant is the corpus's, compared on its own below.
+    // The query source and the change stream spell `timestamptz` alike:
+    // RFC 3339 with `Z` and six fraction digits.
     let read = query(&url, "SELECT * FROM typed")
         .await
         .fetch_all()
         .await
         .unwrap();
-    let tol = Tolerance::exact().skipping("at");
-    fidelity::assert_round_trip(&sent, &read, tol.clone());
-    assert_instant(&read[0]["at"]);
+    fidelity::assert_round_trip(&sent, &read, Tolerance::exact());
+    assert_eq!(read[0]["at"], json!("2026-09-18T12:34:56.123456Z"));
     let streamed = cdc_rows(&source).await;
-    fidelity::assert_round_trip(&sent, &streamed, tol);
-    assert_instant(&streamed[0]["at"]);
+    fidelity::assert_round_trip(&sent, &streamed, Tolerance::exact());
+    assert_eq!(streamed[0]["at"], read[0]["at"]);
 
     // A query the text cast cannot wrap (a data-modifying WITH) reads NUMERIC natively.
     let native = query(
@@ -224,15 +223,6 @@ async fn decimals_money_bytes_and_timestamps_keep_their_canonical_rendering() {
         .await;
     assert_eq!(rows, vec![json!({"nan_dec": null, "nan_dbl": null})]);
     assert_eq!(counter.count(), 2);
-}
-
-fn assert_instant(v: &Value) {
-    let at = chrono::DateTime::parse_from_rfc3339(v.as_str().expect("a timestamp string"))
-        .expect("RFC 3339");
-    assert_eq!(
-        at,
-        chrono::DateTime::parse_from_rfc3339("2026-09-18T12:34:56.123456Z").unwrap()
-    );
 }
 
 /// Redshift speaks the PostgreSQL wire protocol and its connectors use
@@ -326,4 +316,33 @@ async fn redshift_sink_and_redshift_source_keep_the_wide_row_and_decimals() {
         let source = faucet_source_redshift::RedshiftSource::new(source).expect("source");
         fidelity::assert_corpus_read(&source, sent, Tolerance::exact()).await;
     }
+
+    // Temporal spellings match the Data API backend's.
+    sql(
+        &url,
+        "CREATE TABLE temporal (at TIMESTAMPTZ, local TIMESTAMP, t TIME);
+         INSERT INTO temporal VALUES
+           ('2026-09-18 12:34:56.5+02', '1969-07-20 20:17:40', '10:00:00.25');",
+    )
+    .await;
+    let source =
+        faucet_source_redshift::RedshiftSource::new(faucet_source_redshift::RedshiftSourceConfig {
+            connection: redshift_connection(&url),
+            query: "SELECT * FROM temporal".into(),
+            params: Vec::new(),
+            max_connections: 1,
+            batch_size: 0,
+            replication: faucet_source_redshift::RedshiftReplication::Full,
+            state_key: None,
+        })
+        .expect("source");
+    let rows = source.fetch_all().await.expect("read");
+    assert_eq!(
+        rows[0],
+        json!({
+            "at": "2026-09-18T10:34:56.500000Z",
+            "local": "1969-07-20T20:17:40.000000",
+            "t": "10:00:00.250000",
+        })
+    );
 }

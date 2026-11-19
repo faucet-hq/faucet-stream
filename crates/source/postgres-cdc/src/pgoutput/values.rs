@@ -200,8 +200,9 @@ fn money_json(text: &str, fraction_digits: Option<u32>) -> Result<Value, FaucetE
 }
 
 /// Re-render a temporal value the way the `postgres` query source does —
-/// `timestamptz` as RFC 3339 in UTC, `timestamp` / `date` / `time` in chrono's
-/// ISO form — so a snapshot and the change stream spell one value one way.
+/// through `faucet_core::fidelity` at microseconds: `timestamptz` as RFC 3339
+/// with `Z`, `timestamp` and `time` with six fraction digits, `date` as
+/// `YYYY-MM-DD` — so a snapshot and the change stream spell one value one way.
 ///
 /// The server renders these in the session's `DateStyle`, which the
 /// replication connection cannot pin. Under any style but `ISO` a date is
@@ -210,13 +211,18 @@ fn money_json(text: &str, fraction_digits: Option<u32>) -> Result<Value, FaucetE
 /// sink would misread (#789 SQL-119). `infinity`, `-infinity` and BC dates
 /// pass through as the server spells them.
 fn temporal_json(type_oid: u32, text: &str) -> Result<Value, FaucetError> {
-    use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat, Utc};
+    use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+    use faucet_core::TimePrecision::Micros;
+    use faucet_core::fidelity;
     if matches!(text, "infinity" | "-infinity") || text.ends_with(" BC") {
         return Ok(Value::String(text.into()));
     }
     if type_oid == OID_TIME {
         return if is_iso_time(text) {
-            Ok(Value::String(text.into()))
+            Ok(NaiveTime::parse_from_str(text, "%H:%M:%S%.f").map_or_else(
+                |_| Value::String(text.into()),
+                |t| fidelity::time(&t, Micros),
+            ))
         } else {
             Err(FaucetError::Source(format!(
                 "pgoutput: time value {text:?} (oid={type_oid}) is not HH:MM:SS[.ffffff]"
@@ -230,23 +236,20 @@ fn temporal_json(type_oid: u32, text: &str) -> Result<Value, FaucetError> {
     let rendered = match type_oid {
         OID_DATE => NaiveDate::parse_from_str(text, "%Y-%m-%d")
             .ok()
-            .map(|d| d.to_string()),
+            .map(|d| fidelity::date(&d)),
         OID_TIMESTAMP => NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
             .ok()
-            .map(|t| t.to_string()),
+            .map(|t| fidelity::timestamp_naive(&t, Micros)),
         _ => DateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f%#z")
             .ok()
-            .map(|t| {
-                t.with_timezone(&Utc)
-                    .to_rfc3339_opts(SecondsFormat::AutoSi, false)
-            }),
+            .map(|t| fidelity::timestamp(&t.with_timezone(&Utc), Micros)),
     };
     // Still ISO but outside these patterns (a seconds offset on a historic
     // timestamptz): keep the server's spelling.
     if rendered.is_none() && year_digits.is_some() {
         return Ok(Value::String(text.into()));
     }
-    rendered.map(Value::String).ok_or_else(|| {
+    rendered.ok_or_else(|| {
         FaucetError::Source(format!(
             "pgoutput: date/time value {text:?} (oid={type_oid}) is not in ISO format — set \
              DateStyle to ISO for the replication role or database \
@@ -603,21 +606,24 @@ mod tests {
     fn temporal_values_are_normalised_or_refused() {
         assert_eq!(
             text_to_json(1184, "2026-03-04 10:00:00.12+05:30").unwrap(),
-            json!("2026-03-04T04:30:00.120+00:00")
+            json!("2026-03-04T04:30:00.120000Z")
         );
         assert_eq!(
             text_to_json(1184, "2026-03-04 10:00:00-03").unwrap(),
-            json!("2026-03-04T13:00:00+00:00")
+            json!("2026-03-04T13:00:00.000000Z")
         );
         assert_eq!(
             text_to_json(1114, "2026-03-04 10:00:00.5").unwrap(),
-            json!("2026-03-04 10:00:00.500")
+            json!("2026-03-04T10:00:00.500000")
         );
         assert_eq!(
             text_to_json(1082, "2026-03-04").unwrap(),
             json!("2026-03-04")
         );
-        assert_eq!(text_to_json(1083, "23:59:59").unwrap(), json!("23:59:59"));
+        assert_eq!(
+            text_to_json(1083, "23:59:59").unwrap(),
+            json!("23:59:59.000000")
+        );
         for raw in ["infinity", "-infinity", "0044-03-15 BC"] {
             assert_eq!(text_to_json(1082, raw).unwrap(), json!(raw));
         }
@@ -637,9 +643,13 @@ mod tests {
     }
 
     #[test]
-    fn time_keeps_the_server_text_and_extended_years_pass_through() {
-        for raw in ["24:00:00", "10:00:00.5", "00:00:00.000001"] {
-            assert_eq!(text_to_json(1083, raw).unwrap(), json!(raw));
+    fn time_renders_six_digits_and_extended_years_pass_through() {
+        for (raw, rendered) in [
+            ("24:00:00", "24:00:00"),
+            ("10:00:00.5", "10:00:00.500000"),
+            ("00:00:00.000001", "00:00:00.000001"),
+        ] {
+            assert_eq!(text_to_json(1083, raw).unwrap(), json!(rendered));
         }
         for raw in ["1:00:00", "10:00", "10:00:00.", "10:00:0x", "ab:cd:ef"] {
             let err = text_to_json(1083, raw).unwrap_err().to_string();
@@ -665,11 +675,11 @@ mod tests {
         // the simple parser splits cleanly.
         assert_eq!(
             text_to_json(1115, r#"{"2026-05-17 12:34:56"}"#).unwrap(),
-            json!(["2026-05-17 12:34:56"])
+            json!(["2026-05-17T12:34:56.000000"])
         );
         assert_eq!(
             text_to_json(1185, r#"{"2026-05-17 12:34:56+00"}"#).unwrap(),
-            json!(["2026-05-17T12:34:56+00:00"])
+            json!(["2026-05-17T12:34:56.000000Z"])
         );
         assert_eq!(
             text_to_json(1182, "{2026-05-17}").unwrap(),
@@ -677,7 +687,7 @@ mod tests {
         );
         assert_eq!(
             text_to_json(1183, "{12:34:56}").unwrap(),
-            json!(["12:34:56"])
+            json!(["12:34:56.000000"])
         );
     }
 

@@ -196,6 +196,8 @@ pipeline:
 | `replication.initial_value` | — *(required)* | Inclusive lower bound for the first run, before a bookmark is stored. Not `null`. |
 | `state_key` | derived | Explicit state-store key. Default `postgres:<host>:<fingerprint of the database URL and query>`; the CLI overrides it with the row's own key. |
 
+**Bookmarks written by an earlier release.** Earlier releases spelled `timestamptz` as `+00:00` with a variable fraction and `timestamp` with a space. A stored incremental bookmark in the old spelling still resumes without loss (it is bound through a cast), but the rows sharing the stored cursor value are read once more on the first run.
+
 **How it reads.** The source wraps the query as `SELECT * FROM (<query>) AS q WHERE q.<column> >= <bookmark> ORDER BY q.<column>`, so the server filters and orders by the cursor (index it). The bookmark is bound as `CAST($n AS <type of column>)`, so a timestamp, numeric or date cursor compares natively. To apply the cursor further inside the query — a CTE, a join, an aggregate the planner cannot push into — write `${bookmark}` there with `>=` (`WHERE o.updated_at >= ${bookmark}`); a `> ${bookmark}` is refused at load time because it would skip rows that share the bookmark value.
 
 **Rows that share a cursor value are never skipped.** A strict `> bookmark` loses a row that commits after a run with the same `updated_at` as the last row read. Instead the bookmark stores the last cursor value **and** a 128-bit fingerprint of every row already emitted at that value — `{"value": "...", "boundary": ["<fingerprint>", ...]}`. The next read re-reads that value with `>=` and drops only the fingerprints it holds, so:
@@ -228,9 +230,10 @@ Columns are converted to JSON values by probing the row's value with each candid
 | `float8` / `double precision` | number (f64); `NaN` / `Infinity` / `-Infinity` as a `null` counted in the run summary (`non_finite`) |
 | `float4` / `real` | number, through the value's shortest decimal form (`0.1`, not `0.10000000149011612`); non-finite values as a counted `null` |
 | `bool` / `boolean` | boolean |
-| `timestamptz` | string (RFC 3339) |
-| `timestamp`, `date` | string (ISO-8601); `infinity` / `-infinity` as those strings (also for `timestamptz`) |
-| `time` | string, the server's own text (`24:00:00` stays `24:00:00`) |
+| `timestamptz` | string, RFC 3339 in UTC with six fraction digits (`2026-09-18T12:34:56.000000Z`) |
+| `timestamp` | string, `YYYY-MM-DDTHH:MM:SS.ffffff` (no offset); `infinity` / `-infinity` as those strings (also for `timestamptz`) |
+| `date` | string, `YYYY-MM-DD` |
+| `time` | string, `HH:MM:SS.ffffff`; `24:00:00` stays `24:00:00` |
 | `uuid` | string (canonical hyphenated) |
 | `numeric`, `decimal` | string, exact at the declared scale (`1.50`); `NaN` / `Infinity` a counted `null` |
 | `money` | string, the exact amount (`"1234.50"`, read through `money::numeric`, not the locale's `$1,234.50`) |

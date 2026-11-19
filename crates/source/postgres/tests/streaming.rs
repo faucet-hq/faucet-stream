@@ -304,9 +304,10 @@ async fn all_column_types_decode_to_expected_json() {
         "timestamptz should render as RFC3339, got {:?}",
         row["tstz"]
     );
-    assert_eq!(row["ts"], "2024-01-02 03:04:05");
+    assert_eq!(row["tstz"], "2024-01-02T03:04:05.000000Z");
+    assert_eq!(row["ts"], "2024-01-02T03:04:05.000000");
     assert_eq!(row["d"], "2024-01-02");
-    assert_eq!(row["tm"], "03:04:05");
+    assert_eq!(row["tm"], "03:04:05.000000");
     assert_eq!(row["u"], "00000000-0000-0000-0000-000000000001");
     // NUMERIC -> string, preserving precision. sqlx's PgNumeric -> BigDecimal
     // conversion pads the scale to a multiple of 4 ("123.4500"), so assert on

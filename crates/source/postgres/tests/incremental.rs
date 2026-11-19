@@ -94,7 +94,7 @@ async fn incremental_reads_resume_without_skipping_boundary_rows() {
         "numeric read as text"
     );
     let done = first.last().unwrap().bookmark.clone().unwrap();
-    assert_eq!(done["value"], json!("2024-01-03T00:00:00+00:00"));
+    assert_eq!(done["value"], json!("2024-01-03T00:00:00.000000Z"));
     assert_eq!(done["boundary"].as_array().unwrap().len(), 4);
 
     // Nothing changed: a resumed run emits nothing and keeps its position.
@@ -116,7 +116,7 @@ async fn incremental_reads_resume_without_skipping_boundary_rows() {
     got.sort_unstable();
     assert_eq!(got, vec![3, 7, 8]);
     let last = third.last().unwrap().bookmark.clone().unwrap();
-    assert_eq!(last["value"], json!("2024-01-04T00:00:00+00:00"));
+    assert_eq!(last["value"], json!("2024-01-04T00:00:00.000000Z"));
 
     // A crash after the first page: resuming from that page's bookmark
     // re-reads only what the lost page held.
@@ -154,7 +154,7 @@ async fn bookmark_token_context_shards_and_digests() {
     assert_eq!(records.len(), 4);
     assert_eq!(
         bookmark.unwrap()["value"],
-        json!("2024-01-03T00:00:00+00:00")
+        json!("2024-01-03T00:00:00.000000Z")
     );
     assert_eq!(source.fetch_all().await.unwrap().len(), 4);
 
@@ -200,4 +200,40 @@ async fn bookmark_token_context_shards_and_digests() {
         matches!(err, faucet_core::FaucetError::Config(_)) && err.to_string().contains("nope"),
         "{err}"
     );
+}
+
+/// A bookmark written by a release that spelled `timestamptz` as
+/// `+00:00` with a variable fraction: the resumed read binds it through a
+/// cast, so no row past it is lost; the boundary rows are re-read once
+/// (their fingerprints carried the old spelling) and the next run reads
+/// nothing new.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bookmark_in_the_previous_spelling_resumes_without_loss() {
+    use faucet_core::replication::cursor::row_fingerprint;
+    let (_c, url) = start_postgres().await;
+    exec(&url, SEED).await;
+    exec(
+        &url,
+        "INSERT INTO items VALUES (7, '2024-01-04T00:00:00Z', 'after', 7.70);",
+    )
+    .await;
+    let query = "SELECT id, updated_at, v FROM items";
+    let old_row =
+        |id: i64, v: &str| json!({"id": id, "updated_at": "2024-01-03T00:00:00+00:00", "v": v});
+    let old = json!({
+        "value": "2024-01-03T00:00:00+00:00",
+        "boundary": [
+            row_fingerprint(&old_row(3, "b")),
+            row_fingerprint(&old_row(4, "c")),
+            row_fingerprint(&old_row(5, "d")),
+            row_fingerprint(&old_row(6, "e")),
+        ],
+    });
+    let upgraded = resumed(config(&url, query, 2), &old).await;
+    let mut got = ids(&upgraded);
+    got.sort_unstable();
+    assert_eq!(got, vec![3, 4, 5, 6, 7], "boundary rows once, nothing lost");
+    let done = upgraded.last().unwrap().bookmark.clone().unwrap();
+    assert_eq!(done["value"], json!("2024-01-04T00:00:00.000000Z"));
+    assert!(ids(&resumed(config(&url, query, 2), &done).await).is_empty());
 }
