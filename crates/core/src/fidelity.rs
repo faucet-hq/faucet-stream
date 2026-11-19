@@ -455,6 +455,54 @@ pub fn timestamp_naive(dt: &NaiveDateTime, precision: TimePrecision) -> Value {
     ))
 }
 
+/// The UTC wall time of an offset-bearing date-time string (RFC 3339, or
+/// ISO 8601 with a space separator, a space before the offset, or no
+/// seconds), for storing an instant in a column without a zone. `None` when
+/// the string carries no offset or is not a date-time.
+pub fn offset_instant_utc(s: &str) -> Option<NaiveDateTime> {
+    const OFFSET_FORMATS: [&str; 4] = [
+        "%Y-%m-%dT%H:%M:%S%.f%#z",
+        "%Y-%m-%d %H:%M:%S%.f%#z",
+        "%Y-%m-%d %H:%M:%S%.f %#z",
+        "%Y-%m-%dT%H:%M%#z",
+    ];
+    let s = s.trim();
+    let dt = DateTime::parse_from_rfc3339(s).ok().or_else(|| {
+        OFFSET_FORMATS
+            .iter()
+            .find_map(|f| DateTime::parse_from_str(s, f).ok())
+    })?;
+    Some(dt.naive_utc())
+}
+
+/// The UTC time of day of an offset-bearing time string (`10:00:00+02:00`),
+/// for a column without a zone. The day the shift crosses into is dropped
+/// (`01:00:00+02:00` → `23:00:00`). `None` when there is no offset.
+pub fn offset_time_utc(s: &str) -> Option<NaiveTime> {
+    let s = s.trim();
+    let split = s
+        .char_indices()
+        .skip(1)
+        .find(|&(_, c)| c == '+' || c == '-' || c == 'Z' || c == 'z')
+        .map(|(i, _)| i)?;
+    let (time, offset) = s.split_at(split);
+    let time = NaiveTime::parse_from_str(time.trim(), "%H:%M:%S%.f")
+        .or_else(|_| NaiveTime::parse_from_str(time.trim(), "%H:%M"))
+        .ok()?;
+    let seconds = if offset.eq_ignore_ascii_case("z") {
+        0
+    } else {
+        DateTime::parse_from_str(
+            &format!("2000-01-01T00:00:00{offset}"),
+            "%Y-%m-%dT%H:%M:%S%#z",
+        )
+        .ok()?
+        .offset()
+        .local_minus_utc()
+    };
+    Some(time - chrono::Duration::seconds(i64::from(seconds)))
+}
+
 /// A date as `YYYY-MM-DD`.
 pub fn date(d: &NaiveDate) -> Value {
     Value::String(d.format("%Y-%m-%d").to_string())
@@ -613,6 +661,44 @@ pub fn unscoped_non_finite() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offset_instants_become_utc_wall_time() {
+        let at = |s| offset_instant_utc(s).map(|d| d.format("%Y-%m-%dT%H:%M:%S%.f").to_string());
+        assert_eq!(
+            at("2026-09-18T12:00:00+02:00").as_deref(),
+            Some("2026-09-18T10:00:00")
+        );
+        assert_eq!(
+            at("2026-09-18T12:00:00.5Z").as_deref(),
+            Some("2026-09-18T12:00:00.500")
+        );
+        assert_eq!(
+            at("2026-09-18 01:00:00-03:30").as_deref(),
+            Some("2026-09-18T04:30:00")
+        );
+        assert_eq!(
+            at("2026-09-18 23:30:00 -0100").as_deref(),
+            Some("2026-09-19T00:30:00")
+        );
+        assert_eq!(
+            at("2026-09-18T12:00+01:00").as_deref(),
+            Some("2026-09-18T11:00:00")
+        );
+        assert_eq!(at("2026-09-18T12:00:00"), None);
+        assert_eq!(at("not a date"), None);
+    }
+
+    #[test]
+    fn offset_times_become_utc_time_of_day() {
+        let at = |s| offset_time_utc(s).map(|t| t.format("%H:%M:%S%.f").to_string());
+        assert_eq!(at("10:00:00+02:00").as_deref(), Some("08:00:00"));
+        assert_eq!(at("01:00:00.25+02:00").as_deref(), Some("23:00:00.250"));
+        assert_eq!(at("23:00:00-02:00").as_deref(), Some("01:00:00"));
+        assert_eq!(at("12:00:00Z").as_deref(), Some("12:00:00"));
+        assert_eq!(at("12:00:00"), None);
+        assert_eq!(at("x+02:00"), None);
+    }
 
     #[test]
     fn exponents_are_written_out_only_up_to_the_digit_bound() {

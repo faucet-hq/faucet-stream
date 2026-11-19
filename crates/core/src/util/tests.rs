@@ -758,3 +758,24 @@ fn redact_strips_common_secret_query_keys() {
         "https://h/?region=us-east-1"
     );
 }
+
+#[test]
+fn check_unique_columns_refuses_the_first_repeated_name() {
+    assert!(super::check_unique_columns("Redshift", ["a", "b", "c"]).is_ok());
+    assert!(super::check_unique_columns("Redshift", Vec::<String>::new()).is_ok());
+    let err = super::check_unique_columns("Redshift", ["id", "x", "id"])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Redshift query returns two columns named \"id\""),
+        "{err}"
+    );
+    assert!(err.contains("a.id AS a_id"), "{err}");
+    let err = super::check_unique_columns("Snowflake", ["", ""])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("an empty name (unaliased expressions)"),
+        "{err}"
+    );
+}
