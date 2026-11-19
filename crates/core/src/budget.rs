@@ -269,7 +269,9 @@ pub struct BudgetState {
     deadline: Option<std::time::SystemTime>,
     max_duration_secs: Option<u64>,
     stop: CancellationToken,
-    ledger: Option<Arc<dyn BudgetLedger>>,
+    // The ledger only hands out allowance; the counters it feeds are behind
+    // their own lock, so a panic inside it leaves nothing half-updated.
+    ledger: std::panic::AssertUnwindSafe<Option<Arc<dyn BudgetLedger>>>,
     closed: std::sync::atomic::AtomicBool,
 }
 
@@ -310,7 +312,7 @@ impl BudgetState {
     /// of counting against the ceilings locally.
     #[must_use]
     pub fn with_ledger(mut self, ledger: Arc<dyn BudgetLedger>) -> Self {
-        self.ledger = Some(ledger);
+        self.ledger = std::panic::AssertUnwindSafe(Some(ledger));
         self
     }
 
@@ -374,7 +376,7 @@ impl BudgetState {
                 let mut c = self.counters();
                 let want_r = c.records + c.reserved_records + records;
                 let want_b = c.records_bytes_total() + bytes;
-                let (limit_r, limit_b) = match &self.ledger {
+                let (limit_r, limit_b) = match &*self.ledger {
                     Some(_) => (
                         spec.max_records.map(|_| c.granted_records),
                         spec.max_bytes.map(|_| c.granted_bytes),
@@ -460,7 +462,7 @@ impl BudgetState {
     /// did not spend. Call once when this process's part of the run ends;
     /// later calls do nothing. Without a ledger it does nothing.
     pub async fn close(&self) {
-        let Some(ledger) = &self.ledger else {
+        let Some(ledger) = &*self.ledger else {
             return;
         };
         if self.closed.swap(true, Ordering::AcqRel) {
