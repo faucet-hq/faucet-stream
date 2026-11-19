@@ -124,6 +124,7 @@ Five more prove a sink behaves as a capability it declares says it does
 | `assert_batch_atomicity_truthful` | a failed write of a batch declared `atomic` lands no row; a `per_row` batch lands exactly its `Ok` rows |
 | `assert_cleanup_scoped` | `cleanup_scope` deletes exactly the rows of its scope the run did not write, and nothing in another scope |
 | `assert_rollback_truthful` | `rollback_run` deletes exactly one run's appended rows; a dry run counts them and changes nothing |
+| `assert_drift_resolves_like_writes` | a field the sink's `column_matching()` rule folds onto an existing column survives `on_drift: ignore` and lands in that column (trivial for an `Exact` sink) |
 | `assert_declared_types_create` | handed a source's [declared column types](/faucet-stream/reference/value-fidelity/#declared-column-types), a run that writes nothing creates the destination with every declared column typed as expected; a page of the types' renderings then lands in it and leaves the column types as they were |
 | `assert_declared_instants_exact` | `assert_declared_types_create`, then every instant read back names the one written in all three renderings (`+00:00`, `Z`, `+05:30`); run with the sink's session in a non-UTC time zone where the backend has one |
 | `assert_declared_overwrite_empty_run` | a zero-row first `write_mode: overwrite` run with a complete declaration succeeds and leaves the empty typed table, whether one instance drives the lifecycle or begin and commit run on other instances than the writer (the CLI) |
@@ -163,6 +164,7 @@ the assertions that prove it:
 | `atomic_batches` | declares `BatchAtomicity::Atomic` for some config | `assert_batch_atomicity_truthful` |
 | `cleanup` | declares `cleanup` | `assert_cleanup_scoped` |
 | `rollback` | declares `rollback` | `assert_rollback_truthful` |
+| `drift_resolution` | overrides `column_matching` | `assert_drift_resolves_like_writes` |
 | `declared_types` | declares `declared_types` | `assert_declared_types_create` or `assert_declared_instants_exact` |
 | `driver_declarations` | is built on a family driver (holds a `DriverSink<`, or implements `SinkDriver`, `SqlDriver`, `MessageDriver` or `HttpDriver`) | `assert_driver_declarations_truthful` |
 | `driver_row_paths` | is built on a family driver | `assert_driver_row_paths_agree` |

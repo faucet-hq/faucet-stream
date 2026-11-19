@@ -371,6 +371,16 @@ impl Matrix {
     }
 }
 
+/// The field written to `column`: the exactly-named one, else the first
+/// equal to it ignoring case ([`faucet_core::ColumnMatching::CaseInsensitive`]).
+fn field_for<'a>(
+    obj: &'a serde_json::Map<String, Value>,
+    column: &str,
+) -> Option<(&'a String, &'a Value)> {
+    obj.get_key_value(column)
+        .or_else(|| obj.iter().find(|(k, _)| k.eq_ignore_ascii_case(column)))
+}
+
 /// Project `records` onto `table` (matched case-insensitively). Keys the table
 /// does not have are reported, never dropped.
 pub fn build_matrix(records: &[Value], table: &[TableColumn]) -> Result<Matrix, FaucetError> {
@@ -417,7 +427,7 @@ pub fn build_matrix(records: &[Value], table: &[TableColumn]) -> Result<Matrix, 
         for r in records {
             let obj = r.as_object().expect("checked above");
             for (c, t) in &nested {
-                if let Some((k, v)) = obj.iter().find(|(k, _)| k.eq_ignore_ascii_case(&c.name)) {
+                if let Some((k, v)) = field_for(obj, &c.name) {
                     unknown_nested_keys(v, t, k, &mut unknown_nested);
                 }
             }
@@ -437,11 +447,7 @@ pub fn build_matrix(records: &[Value], table: &[TableColumn]) -> Result<Matrix, 
             let obj = r.as_object().expect("checked above");
             columns
                 .iter()
-                .map(|c| {
-                    obj.iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(&c.name))
-                        .and_then(|(_, v)| cell_text_for(v, &c.full_type))
-                })
+                .map(|c| field_for(obj, &c.name).and_then(|(_, v)| cell_text_for(v, &c.full_type)))
                 .collect()
         })
         .collect();
@@ -1438,6 +1444,17 @@ mod tests {
         .to_string();
         assert!(err.contains("meta.b, meta.m{}.w, meta.tags[].z"), "{err}");
         assert!(build_matrix(&[json!({"id": 1, "meta": {"a": 1, "tags": null}})], &table).is_ok());
+    }
+
+    #[test]
+    fn matrix_writes_the_exactly_named_twin() {
+        let m = build_matrix(
+            &[json!({"NAME": "upper", "name": "exact", "id": 1})],
+            &cols(),
+        )
+        .unwrap();
+        let name = m.columns.iter().position(|c| c.name == "name").unwrap();
+        assert_eq!(m.rows[0][name].as_deref(), Some("exact"));
     }
 
     #[test]

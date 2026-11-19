@@ -10,6 +10,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::columns::ColumnMatching;
+
 /// One column's drift, expressed in JSON-Schema type-fragment terms
 /// (e.g. `{"type":"integer"}` or `{"type":["string","null"]}`).
 #[derive(Debug, Clone, PartialEq)]
@@ -280,6 +282,49 @@ fn is_numeric_text(s: &str) -> bool {
 /// so they are not drift. A string that is not numeric text keeps the column
 /// `string`.
 pub fn infer_page_schema(destination: &Value, records: &[Value]) -> Value {
+    infer_page_schema_matching(destination, records, ColumnMatching::Exact)
+}
+
+/// [`infer_page_schema`] with fields resolved to the destination's columns
+/// under `matching`, the rule the sink's write path uses
+/// ([`crate::Sink::column_matching`]). A field that lands in a column is
+/// inferred under the column's spelling, a field that addresses no column
+/// under its own name, and a field shadowed by an exactly-named twin (which
+/// the write path skips) not at all.
+pub fn infer_page_schema_matching(
+    destination: &Value,
+    records: &[Value],
+    matching: ColumnMatching,
+) -> Value {
+    let columns = destination_columns(destination);
+    let canonical: Vec<Value>;
+    let records = if matching == ColumnMatching::Exact || columns.is_empty() {
+        records
+    } else {
+        canonical = records
+            .iter()
+            .map(|r| match r {
+                Value::Object(m) => {
+                    Value::Object(crate::columns::canonical_record(m, &columns, matching))
+                }
+                other => other.clone(),
+            })
+            .collect();
+        &canonical
+    };
+    infer_canonical(destination, records)
+}
+
+/// The destination's column names, as `current_schema` reports them.
+pub(crate) fn destination_columns(destination: &Value) -> Vec<String> {
+    destination
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|p| p.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn infer_canonical(destination: &Value, records: &[Value]) -> Value {
     let mut inferred = crate::schema::infer_schema(records);
     let Some(dest_props) = destination.get("properties").and_then(Value::as_object) else {
         return inferred;
@@ -337,6 +382,22 @@ pub fn infer_page_schema(destination: &Value, records: &[Value]) -> Value {
 /// (`{"type":"object","properties":{...}}`). `allow_widening` gates whether a
 /// lossless widening lands in `widenings` (true) or `incompatible` (false).
 pub fn diff_schema(destination: &Value, page: &Value, allow_widening: bool) -> SchemaDiff {
+    diff_schema_matching(destination, page, allow_widening, ColumnMatching::Exact)
+}
+
+/// [`diff_schema`] with each page field resolved to a destination column under
+/// `matching` (the sink's [`crate::Sink::column_matching`]). A field that
+/// differs from a column only in the way the rule ignores is that column, not
+/// an addition; a change is named by the destination's spelling of the
+/// column; a NOT NULL column is missing only when no page field resolves to
+/// it. When two page fields resolve to one column, the exactly-named one is
+/// compared and the other is neither an addition nor a change.
+pub fn diff_schema_matching(
+    destination: &Value,
+    page: &Value,
+    allow_widening: bool,
+    matching: ColumnMatching,
+) -> SchemaDiff {
     let empty = serde_json::Map::new();
     let dest_props = destination
         .get("properties")
@@ -348,21 +409,39 @@ pub fn diff_schema(destination: &Value, page: &Value, allow_widening: bool) -> S
         .unwrap_or(&empty);
 
     let mut diff = SchemaDiff::default();
+    let columns: Vec<String> = dest_props.keys().cloned().collect();
+    let mut resolved: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
-    for (name, page_ty) in page_props {
+    for (field, value, resolution) in crate::columns::resolve_fields(page_props, &columns, matching)
+    {
+        let page_ty = value;
+        let name = match resolution {
+            crate::columns::Resolution::Unmatched => {
+                diff.additions.push(ColumnChange {
+                    name: field.to_owned(),
+                    from: None,
+                    to: page_ty.clone(),
+                });
+                continue;
+            }
+            crate::columns::Resolution::Shadowed(column) => {
+                resolved.insert(column);
+                continue;
+            }
+            crate::columns::Resolution::Column(column) => {
+                resolved.insert(column);
+                column
+            }
+        };
         match dest_props.get(name) {
-            None => diff.additions.push(ColumnChange {
-                name: name.clone(),
-                from: None,
-                to: page_ty.clone(),
-            }),
+            None => {}
             Some(dest_ty) => {
                 if fits(dest_ty, page_ty) {
                     continue; // page values already acceptable — no drift
                 }
                 let page_ty = &without_also_accepted(dest_ty, page_ty);
                 let change = ColumnChange {
-                    name: name.clone(),
+                    name: name.to_owned(),
                     from: Some(dest_ty.clone()),
                     to: page_ty.clone(),
                 };
@@ -377,7 +456,7 @@ pub fn diff_schema(destination: &Value, page: &Value, allow_widening: bool) -> S
 
     // Destination columns absent from the page: drift only if NOT NULL.
     for (name, dest_ty) in dest_props {
-        if !page_props.contains_key(name) {
+        if !resolved.contains(name.as_str()) {
             let (_, nullable) = type_set(dest_ty);
             if !nullable {
                 diff.droppable_required.push(name.clone());
@@ -997,5 +1076,103 @@ mod tests {
         assert!(SchemaDriftPolicy::compile(&evo_q).requires_dlq());
         let warn: SchemaDriftSpec = serde_json::from_str(r#"{"on_drift":"warn"}"#).unwrap();
         assert!(!SchemaDriftPolicy::compile(&warn).requires_dlq());
+    }
+
+    fn page_diff(dest: &Value, records: &[Value], m: ColumnMatching) -> SchemaDiff {
+        let inferred = infer_page_schema_matching(dest, records, m);
+        diff_schema_matching(dest, &inferred, true, m)
+    }
+
+    #[test]
+    fn a_case_variant_of_a_column_is_not_an_addition_under_a_folding_rule() {
+        let dest =
+            schema(json!({"id": {"type": "integer"}, "Email": {"type": ["string", "null"]}}));
+        let records = [json!({"id": 1, "email": "a@x"})];
+        for m in [ColumnMatching::CaseInsensitive, ColumnMatching::FoldUnique] {
+            assert!(page_diff(&dest, &records, m).is_empty(), "{m:?}");
+        }
+        let exact = page_diff(&dest, &records, ColumnMatching::Exact);
+        assert_eq!(exact.additions[0].name, "email");
+        assert_eq!(
+            page_diff(&dest, &records, ColumnMatching::UpperFold).additions[0].name,
+            "email",
+            "UpperFold only folds onto an all-upper-case column"
+        );
+    }
+
+    #[test]
+    fn a_widening_is_named_by_the_destination_spelling() {
+        let dest = schema(json!({"AMOUNT": {"type": "integer"}}));
+        let d = page_diff(&dest, &[json!({"amount": 1.5})], ColumnMatching::UpperFold);
+        assert!(d.additions.is_empty(), "{d:?}");
+        assert_eq!(d.widenings.len(), 1);
+        assert_eq!(d.widenings[0].name, "AMOUNT");
+    }
+
+    #[test]
+    fn a_required_column_is_satisfied_by_a_field_that_resolves_to_it() {
+        let dest = schema(json!({"EMAIL": {"type": "string"}}));
+        let records = [json!({"email": "a@x"})];
+        assert!(page_diff(&dest, &records, ColumnMatching::UpperFold).is_empty());
+        let exact = page_diff(&dest, &records, ColumnMatching::Exact);
+        assert_eq!(exact.droppable_required, vec!["EMAIL".to_owned()]);
+        assert_eq!(exact.additions.len(), 1);
+    }
+
+    #[test]
+    fn an_ambiguous_fold_stays_an_addition() {
+        let dest = schema(
+            json!({"Email": {"type": "string"}, "EMAIL": {"type": "string"}, "id": {"type": "integer"}}),
+        );
+        let d = page_diff(
+            &dest,
+            &[json!({"email": "a", "Email": "b", "EMAIL": "c", "id": 1})],
+            ColumnMatching::FoldUnique,
+        );
+        assert_eq!(d.additions.len(), 1);
+        assert_eq!(d.additions[0].name, "email");
+    }
+
+    #[test]
+    fn a_shadowed_twin_is_neither_an_addition_nor_a_change() {
+        let dest = schema(json!({"email": {"type": "string"}}));
+        let records = [json!({"email": "a@x", "EMAIL": 7})];
+        assert!(page_diff(&dest, &records, ColumnMatching::CaseInsensitive).is_empty());
+        let page = schema(json!({"email": {"type": "string"}, "EMAIL": {"type": "integer"}}));
+        assert!(
+            diff_schema_matching(&dest, &page, true, ColumnMatching::CaseInsensitive).is_empty()
+        );
+    }
+
+    #[test]
+    fn exact_matching_is_the_old_diff() {
+        let cases = [
+            (
+                json!({"id": {"type": "integer"}}),
+                json!([{"id": 1, "x": "y"}]),
+            ),
+            (
+                json!({"id": {"type": "integer"}, "n": {"type": "string"}}),
+                json!([{"id": 1.5}]),
+            ),
+            (
+                json!({"n": {"type": "number"}}),
+                json!([{"n": "12.50"}, {"n": null}]),
+            ),
+            (json!({}), json!([{"a": 1}])),
+        ];
+        for (props, records) in cases {
+            let dest = schema(props);
+            let records = records.as_array().unwrap().clone();
+            let old_inferred = infer_page_schema(&dest, &records);
+            assert_eq!(
+                old_inferred,
+                infer_page_schema_matching(&dest, &records, ColumnMatching::Exact)
+            );
+            assert_eq!(
+                diff_schema(&dest, &old_inferred, true),
+                diff_schema_matching(&dest, &old_inferred, true, ColumnMatching::Exact)
+            );
+        }
     }
 }

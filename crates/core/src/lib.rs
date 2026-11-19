@@ -28,6 +28,7 @@ pub mod cleanup;
 pub mod columnar;
 #[cfg(feature = "arrow")]
 pub mod columnar_transform;
+pub mod columns;
 pub mod compat;
 pub mod config;
 #[cfg(feature = "contract")]
@@ -135,6 +136,7 @@ pub use columnar::{
     ColumnarPage, check_integral, infer_arrow_schema, record_batch_to_values,
     values_to_record_batch, values_to_record_batch_inferred,
 };
+pub use columns::{ColumnMatching, canonical_record, column_for_field, field_for_column};
 pub use create_table::{
     DeclaredFit, PlannedColumn, missing_target_error, plan_columns, plan_columns_declared,
     plan_columns_declared_with, plan_keyed_columns, plan_keyed_columns_declared,

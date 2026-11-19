@@ -395,6 +395,39 @@ pub fn build_transaction_sql(
 
 /// Top-level record fields with no matching column in `columns`, sorted and
 /// deduplicated (SQL-94). Non-object records contribute nothing.
+/// `records` with each top-level field renamed to the spelling of the column
+/// it addresses (the exactly-named field first, else one equal ignoring case,
+/// as BigQuery resolves column names). The typed `JSON_VALUE` / `JSON_QUERY`
+/// extraction reads `$.<column>` case-sensitively, so a field spelled
+/// differently from its column would otherwise be read as `NULL`.
+pub(crate) fn canonical_records<'a>(
+    columns: &[FieldSpec],
+    records: &'a [Value],
+) -> std::borrow::Cow<'a, [Value]> {
+    let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+    let exact: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+    let needs = records.iter().any(|r| {
+        r.as_object()
+            .is_some_and(|o| o.keys().any(|k| !exact.contains(k.as_str())))
+    });
+    if !needs {
+        return std::borrow::Cow::Borrowed(records);
+    }
+    std::borrow::Cow::Owned(
+        records
+            .iter()
+            .map(|r| match r.as_object() {
+                Some(obj) => Value::Object(faucet_core::canonical_record(
+                    obj,
+                    &names,
+                    faucet_core::ColumnMatching::CaseInsensitive,
+                )),
+                None => r.clone(),
+            })
+            .collect(),
+    )
+}
+
 pub(crate) fn unknown_fields(columns: &[FieldSpec], records: &[Value]) -> Vec<String> {
     let known: std::collections::HashSet<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -1113,6 +1146,40 @@ mod tests {
             ]
         );
         assert_eq!(shape_mismatches(&columns, &bad, 2).len(), 2);
+    }
+
+    #[test]
+    fn canonical_records_use_the_column_spelling_the_extraction_reads() {
+        let col = |n: &str| FieldSpec {
+            name: n.into(),
+            ty: BqType::String,
+            repeated: false,
+            fields: vec![],
+        };
+        let columns = vec![col("Id"), col("Email")];
+        let exact = vec![json!({"Id": 1, "Email": "a"})];
+        assert!(matches!(
+            canonical_records(&columns, &exact),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let records = vec![
+            json!({"id": 1, "EMAIL": "a"}),
+            json!({"Id": 2, "email": "shadowed", "Email": "b", "extra": 1}),
+            json!(5),
+        ];
+        let out = canonical_records(&columns, &records);
+        assert_eq!(
+            out.as_ref(),
+            &[
+                json!({"Id": 1, "Email": "a"}),
+                json!({"Id": 2, "Email": "b", "extra": 1}),
+                json!(5),
+            ]
+        );
+        // Every key the typed insert reads (`$.Id`, `$.Email`) is now present.
+        let sql = build_insert_select(&columns, "p", "d", "t");
+        assert!(sql.contains("'$.Id'") && sql.contains("'$.Email'"), "{sql}");
+        assert_eq!(unknown_fields(&columns, &out), vec!["extra"]);
     }
 
     #[test]

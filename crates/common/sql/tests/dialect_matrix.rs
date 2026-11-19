@@ -535,6 +535,83 @@ fn integer_to_fraction_widens_exactly<D: SqlDialect>(d: D) {
     assert_eq!(engine.evolution_steps(&evolution, Some(&existing)).len(), 2);
 }
 
+fn a_case_variant_of_an_existing_column_is_not_added<D: SqlDialect>(d: D) {
+    let name = d.name();
+    let matching = d.column_matching();
+    let engine = SqlSinkEngine::new(d, spec(WriteMode::Append, &[]));
+    let evolution = SchemaEvolution {
+        additions: vec![faucet_core::ColumnChange {
+            name: "userid".into(),
+            from: None,
+            to: json!({"type": "integer"}),
+        }],
+        ..Default::default()
+    };
+    let existing = ["USERID".to_string()].into_iter().collect();
+    let steps = engine.evolution_steps(&evolution, Some(&existing));
+    let folds = matching != ColumnMatching::Exact;
+    assert_eq!(steps.is_empty(), folds, "{name}: {steps:?}");
+}
+
+#[test]
+fn matrix_case_variant_evolution() {
+    every_dialect!(a_case_variant_of_an_existing_column_is_not_added);
+}
+
+/// Every subset (by bitmask) of `names`.
+fn subsets(names: &[&str]) -> Vec<Vec<String>> {
+    (0..1u32 << names.len())
+        .map(|mask| {
+            names
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, n)| (*n).to_owned())
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn core_field_resolution_agrees_with_the_column_index() {
+    let names = ["email", "Email", "EMAIL", "eMail", "id", "ID"];
+    let all = subsets(&names);
+    for matching in [
+        ColumnMatching::Exact,
+        ColumnMatching::CaseInsensitive,
+        ColumnMatching::FoldUnique,
+        ColumnMatching::UpperFold,
+    ] {
+        let core: faucet_core::ColumnMatching = matching.into();
+        for columns in &all {
+            let table: Vec<TableColumn> = columns.iter().map(TableColumn::untyped).collect();
+            for fields in &all {
+                let obj: serde_json::Map<String, Value> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| (f.clone(), json!(i)))
+                    .collect();
+                let unmatched =
+                    faucet_common_sql::mapping::unmatched_fields(&obj, &table, matching);
+                for f in fields {
+                    assert_eq!(
+                        faucet_core::column_for_field(f, columns, core).is_some(),
+                        !unmatched.contains(&f.as_str()),
+                        "{matching:?} columns {columns:?} field {f}"
+                    );
+                }
+                for c in columns {
+                    assert_eq!(
+                        faucet_core::field_for_column(c, columns, &obj, core).map(|(_, v)| v),
+                        faucet_common_sql::mapping::field_for(c, &table, &obj, matching),
+                        "{matching:?} columns {columns:?} fields {fields:?} column {c}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn matrix_widening() {
     every_dialect!(integer_to_fraction_widens_exactly);

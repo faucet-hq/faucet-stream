@@ -20,6 +20,12 @@ used to carry its own copy of.
   unless the record already carries that column or several match) or
   `UpperFold` (a field reaches an all-upper-case column through its
   upper-case form). Union column sets and present-column groups.
+  `mapping::column_for_field` delegates to `faucet_core::column_for_field`
+  (`From<ColumnMatching> for faucet_core::ColumnMatching`), and
+  `SqlSinkDriver` reports the dialect's rule as the sink's
+  `column_matching()`, so schema drift resolves fields the way the engine
+  writes them. `evolution_steps` skips an addition that already resolves to an
+  existing column under that rule.
 - **`SqlSinkEngine<D>`** — the planning, run over a backend's `SqlExecutor`:
   mapping (a record matching no column is an error), union-column appends
   (a missing column binds NULL), one upsert per set of carried columns (an

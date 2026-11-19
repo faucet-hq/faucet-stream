@@ -168,6 +168,14 @@ pub const REQUIREMENTS: &[Requirement] = &[
         summary: "a cancelled run flushes, so buffered output is not lost",
     },
     Requirement {
+        id: "drift_resolution",
+        role: Role::Sink,
+        triggers: &[Trigger::Overrides("column_matching")],
+        assertions: &["assert_drift_resolves_like_writes"],
+        summary: "a field the sink's column-matching rule folds onto a column lands there, \
+                  and schema drift resolves it the same way",
+    },
+    Requirement {
         id: "partial_outcomes",
         role: Role::Sink,
         triggers: &[Trigger::Overrides("write_batch_partial")],

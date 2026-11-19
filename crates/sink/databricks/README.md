@@ -192,7 +192,10 @@ columns are not supported on the exactly-once append path.
 ## Schema drift
 
 `current_schema()` reads `information_schema.columns` (`full_data_type`,
-`is_nullable`). `evolve_schema` is idempotent (existing columns are skipped):
+`is_nullable`). Fields match columns ignoring case (`column_matching()` is
+`CaseInsensitive`): every write path builds the same matrix, writing the
+exactly-named field when a record carries several spellings, and drift
+resolves fields the same way. `evolve_schema` is idempotent (existing columns are skipped):
 
 | Change | DDL |
 |---|---|

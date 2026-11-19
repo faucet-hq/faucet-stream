@@ -7340,7 +7340,16 @@ mod tests {
         // page_indices offset by 10 to prove the envelope carries the TRUE page
         // index, not the survivor-relative one (#321 L6).
         let page_indices = vec![10, 11, 12, 13];
-        let (kept, env) = quarantine_drift_rows(&diff, records, &page_indices, "sink", "pl", "");
+        let (kept, env) = quarantine_drift_rows(
+            &diff,
+            &json!({}),
+            crate::ColumnMatching::Exact,
+            records,
+            &page_indices,
+            "sink",
+            "pl",
+            "",
+        );
         assert_eq!(
             kept,
             vec![

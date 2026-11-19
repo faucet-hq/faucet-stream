@@ -125,6 +125,7 @@ pub const SINK_HOOKS: &[&str] = &[
     "dedups_by_key",
     "supported_write_modes",
     "current_schema",
+    "column_matching",
     "supports_schema_evolution",
     "evolve_schema",
     "supports_cleanup",
@@ -331,6 +332,10 @@ impl Sink for HookSink {
         self.hit("current_schema");
         Ok(Some(json!({"type": "object"})))
     }
+    fn column_matching(&self) -> faucet_core::ColumnMatching {
+        self.hit("column_matching");
+        faucet_core::ColumnMatching::UpperFold
+    }
     fn supports_schema_evolution(&self) -> bool {
         self.hit("supports_schema_evolution");
         true
@@ -518,6 +523,11 @@ pub async fn assert_sink_forwards_every_hook(sink: &dyn Sink, probe: &HookSink, 
         &mut wrong,
         "current_schema",
         matches!(sink.current_schema().await, Ok(Some(_))),
+    );
+    answer(
+        &mut wrong,
+        "column_matching",
+        sink.column_matching() == faucet_core::ColumnMatching::UpperFold,
     );
     answer(
         &mut wrong,

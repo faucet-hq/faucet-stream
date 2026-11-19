@@ -502,6 +502,15 @@ let out = governance.govern(records, &sink).await?;   // masking → quality →
 sink.write_governed(&out.page).await?;
 ```
 
+The drift pass matches page fields to the destination's columns with the
+sink's own rule, `Sink::column_matching()` (`ColumnMatching::Exact`,
+`CaseInsensitive`, `FoldUnique`, `UpperFold`; default `Exact`), so a field that
+differs from a column only by case under a folding rule is not drift.
+`faucet_core::columns` holds the one lookup (`column_for_field`,
+`field_for_column`, `canonical_record`); `drift::diff_schema_matching` /
+`infer_page_schema_matching` are the matching-aware forms of `diff_schema` /
+`infer_page_schema`.
+
 ## Family drivers (RFC 0014)
 
 `faucet_core::driver` holds the small, I/O-only traits a connector implements

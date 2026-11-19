@@ -558,8 +558,9 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
     }
 
     /// The DDL steps of a schema evolution. `existing` (the live column
-    /// names) skips additions already present, for dialects without `ADD
-    /// COLUMN IF NOT EXISTS`.
+    /// names) skips additions already present — under the dialect's column
+    /// matching, so a case variant of an existing column is never added as a
+    /// twin — for dialects without `ADD COLUMN IF NOT EXISTS`.
     pub fn evolution_steps(
         &self,
         evolution: &faucet_core::SchemaEvolution,
@@ -567,8 +568,13 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
     ) -> Vec<EvolutionStep> {
         let base = |v: &Value| faucet_core::json_schema_base_type(v).unwrap_or(SqlBaseType::Text);
         let mut steps = Vec::new();
+        let existing: Option<Vec<String>> = existing.map(|e| e.iter().cloned().collect());
+        let matching = self.dialect.column_matching();
         for c in &evolution.additions {
-            if existing.is_some_and(|e| e.contains(&c.name)) {
+            if existing
+                .as_deref()
+                .is_some_and(|e| crate::mapping::column_for_field(&c.name, e, matching).is_some())
+            {
                 continue;
             }
             steps.push(EvolutionStep::Add {
