@@ -59,8 +59,9 @@ pub struct BigQuerySourceConfig {
     pub max_results_per_page: i32,
     /// Positional bind parameters for the query, sent as
     /// [`POSITIONAL`](https://cloud.google.com/bigquery/docs/parameterized-queries)
-    /// query parameters in declaration order before any context-derived
-    /// values. Each value is typed from its JSON form: an integer as
+    /// query parameters, each bound to the next `?` the query holds; a
+    /// `{token}` from a parent record binds at its own position in the
+    /// text. Each value is typed from its JSON form: an integer as
     /// `INT64`, any other number as `FLOAT64`, a boolean as `BOOL`, and
     /// everything else (strings, arrays, objects, null) as `STRING`.
     #[serde(default)]

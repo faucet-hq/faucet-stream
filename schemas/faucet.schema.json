@@ -30513,7 +30513,7 @@
                       "default": 1000
                     },
                     "params": {
-                      "description": "Positional bind parameters for the query, sent as\n[`POSITIONAL`](https://cloud.google.com/bigquery/docs/parameterized-queries)\nquery parameters in declaration order before any context-derived\nvalues. Each value is typed from its JSON form: an integer as\n`INT64`, any other number as `FLOAT64`, a boolean as `BOOL`, and\neverything else (strings, arrays, objects, null) as `STRING`.",
+                      "description": "Positional bind parameters for the query, sent as\n[`POSITIONAL`](https://cloud.google.com/bigquery/docs/parameterized-queries)\nquery parameters, each bound to the next `?` the query holds; a\n`{token}` from a parent record binds at its own position in the\ntext. Each value is typed from its JSON form: an integer as\n`INT64`, any other number as `FLOAT64`, a boolean as `BOOL`, and\neverything else (strings, arrays, objects, null) as `STRING`.",
                       "type": "array",
                       "items": true,
                       "default": []

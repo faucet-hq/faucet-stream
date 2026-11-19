@@ -14,7 +14,7 @@ use faucet_common_snowflake::{
     CancelOnDrop, SnowflakeAuth, authorization_header, cancel_statement, credential_to_auth,
     http_client, snowflake_token_type,
 };
-use faucet_core::util::substitute_context_bind_params;
+use faucet_core::util::{CONTEXT_MARK, substitute_context_bind_params};
 use faucet_core::{AuthSpec, FaucetError, SharedAuthProvider, Stream, StreamPage};
 use reqwest::Client;
 use serde::Deserialize;
@@ -92,6 +92,7 @@ impl SnowflakeSource {
     pub fn new(config: SnowflakeSourceConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
         faucet_common_snowflake::validate_account(&config.account)?;
+        faucet_core::util::check_no_context_mark("snowflake", &config.query)?;
         Ok(Self {
             config,
             client: http_client()?,
@@ -905,128 +906,19 @@ impl faucet_core::Source for SnowflakeSource {
     }
 }
 
-/// Delimits a context token's index while [`order_bindings`] places it.
-const CONTEXT_MARK: char = '\u{1}';
-
-/// Turn `marked` — the query with each context token replaced by
-/// `CONTEXT_MARK<i>CONTEXT_MARK` — into SQL with `?` markers and the bind
-/// values in the markers' textual order. A `?` inside a string literal, a
-/// quoted identifier, a `$$` string or a comment is not a marker. Params left
-/// over when the query holds fewer `?` than params are appended, so
-/// Snowflake reports the count mismatch rather than this code hiding it.
+/// Snowflake's positional binding order: see
+/// [`order_positional_bindings`](faucet_core::util::order_positional_bindings).
 fn order_bindings(
     marked: &str,
     params: &[Value],
     context_values: Vec<Value>,
 ) -> (String, Vec<Value>) {
-    let mut out = BindOrder {
-        sql: String::with_capacity(marked.len()),
-        bindings: Vec::with_capacity(params.len() + context_values.len()),
+    faucet_core::util::order_positional_bindings(
+        marked,
+        params,
         context_values,
-    };
-    let mut params = params.iter();
-    let mut chars = marked.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            CONTEXT_MARK => out.context(&mut chars),
-            '?' => {
-                out.sql.push('?');
-                if let Some(p) = params.next() {
-                    out.bindings.push(p.clone());
-                }
-            }
-            '\'' => {
-                out.sql.push(c);
-                out.skip(&mut chars, "'", true);
-            }
-            '"' => {
-                out.sql.push(c);
-                out.skip(&mut chars, "\"", false);
-            }
-            '$' if chars.peek() == Some(&'$') => {
-                chars.next();
-                out.sql.push_str("$$");
-                out.skip(&mut chars, "$$", false);
-            }
-            '-' | '/' if chars.peek() == Some(&c) => {
-                chars.next();
-                out.sql.push(c);
-                out.sql.push(c);
-                out.skip(&mut chars, "\n", false);
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                out.sql.push_str("/*");
-                out.skip(&mut chars, "*/", false);
-            }
-            _ => out.sql.push(c),
-        }
-    }
-    out.bindings.extend(params.cloned());
-    (out.sql, out.bindings)
-}
-
-/// The output [`order_bindings`] builds.
-struct BindOrder {
-    sql: String,
-    bindings: Vec<Value>,
-    context_values: Vec<Value>,
-}
-
-impl BindOrder {
-    /// A context mark becomes `?` bound to its value wherever it sits, as the
-    /// token it replaced always did.
-    fn context(&mut self, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-        let index: String = chars.by_ref().take_while(|&d| d != CONTEXT_MARK).collect();
-        let value = index
-            .parse::<usize>()
-            .ok()
-            .and_then(|i| self.context_values.get_mut(i))
-            .map(std::mem::take)
-            .unwrap_or(Value::Null);
-        self.sql.push('?');
-        self.bindings.push(value);
-    }
-
-    /// Copy through the end of a quoted or commented run closed by `close`.
-    /// With `escapes`, a backslash carries the next character; a doubled
-    /// single-character delimiter (`''`, `""`) stays inside the run.
-    fn skip(
-        &mut self,
-        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-        close: &str,
-        escapes: bool,
-    ) {
-        let mut run = String::new();
-        while let Some(d) = chars.next() {
-            if d == CONTEXT_MARK {
-                self.context(chars);
-                run.clear();
-                continue;
-            }
-            self.sql.push(d);
-            if escapes && d == '\\' {
-                if let Some(e) = chars.next() {
-                    self.sql.push(e);
-                }
-                run.clear();
-                continue;
-            }
-            run.push(d);
-            if run.ends_with(close) {
-                let mut delim = close.chars();
-                if let (Some(only), None) = (delim.next(), delim.next())
-                    && chars.peek() == Some(&only)
-                {
-                    chars.next();
-                    self.sql.push(only);
-                    run.clear();
-                    continue;
-                }
-                return;
-            }
-        }
-    }
+        faucet_core::util::SqlLexing::snowflake(),
+    )
 }
 
 #[cfg(test)]
@@ -1043,6 +935,13 @@ mod tests {
             SnowflakeAuth::OAuth { token: "t".into() },
             "SELECT 1",
         )
+    }
+
+    #[test]
+    fn new_rejects_a_query_holding_the_context_mark() {
+        let mut c = cfg();
+        c.query = "SELECT '\u{1}'".into();
+        assert!(SnowflakeSource::new(c).is_err());
     }
 
     #[test]
