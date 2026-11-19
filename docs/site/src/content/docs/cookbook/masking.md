@@ -33,6 +33,22 @@ Masking is value-only and key-preserving: matching fields are rewritten in
 place. It **never fails a run and never quarantines** — so, unlike quarantining
 quality/contract policies, masking does not require a `dlq:` block.
 
+### What masking covers
+
+Masking protects what a run writes: sink writes, the DLQ and lineage samples.
+Error text is not masked. To keep it from carrying data:
+
+- built-in transforms (`cast`, `lookup`, `json_parse`, and the rest) never
+  quote a record **value** in an error. They name the transform, the field and
+  the value's kind (for a string, its length), for example
+  `cast: field 'email' to Int failed: a string of 24 characters is not an integer: invalid digit found in string`.
+  Field names are quoted, so a record keyed by data (a map keyed by e-mail
+  address) can still show a key;
+- error text from sources, backends (an HTTP error body, a database error),
+  the SQL transform's engine and a WASM module is that component's own and may
+  contain data. It is protected only by secret redaction, so keep run logs and
+  run history as private as the data itself.
+
 ## Declaring a masking policy
 
 The `masking:` block is pipeline-level (a sibling of `source` / `sink` /

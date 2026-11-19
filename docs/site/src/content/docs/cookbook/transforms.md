@@ -373,6 +373,11 @@ Failure behaviour is controlled by `on_error`:
 Missing fields are always a no-op — `cast` will never insert a `null` for
 a field that wasn't already on the record.
 
+A failed cast's error names the field, the target type and the value's kind
+(and a string's length), never the value itself, so run logs and run history
+do not carry record data; see
+[what masking covers](/faucet-stream/cookbook/masking/#what-masking-covers).
+
 Casting epoch seconds / millis to a timestamp is out of scope for the
 initial release; file a follow-up issue if you need it.
 
