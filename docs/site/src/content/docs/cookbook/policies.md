@@ -28,7 +28,7 @@ classifications:
   - label: pii
     fields: [email, phone, ssn, date_of_birth]     # full dot-path or leaf key
     field_pattern: "(?i)(^|[._])(first|last|full)_?name$"   # regex over the dot-path
-    value_detector: email                          # email|credit_card|ssn|phone|phone_loose|ipv4
+    value_detector: email                          # email|credit_card|credit_card_loose|ssn|phone|phone_loose|ipv4
   - label: pii
     value_detector: ssn
   - label: finance
@@ -51,7 +51,11 @@ rules:
   dot-path or its leaf key — `ssn` covers `user.ssn`; `field_pattern` is a
   regex over the dot-path) and/or by **value** (`value_detector`, the
   [masking detectors](/faucet-stream/cookbook/masking/)). Name matches are decided before any
-  data moves; value detectors are enforced by the runtime backstop.
+  data moves; value detectors are enforced by the runtime backstop. A value
+  the detector misses is not labelled, so the rule never sees it: classify by
+  name where you can, and use `credit_card_loose` / `phone_loose` when every
+  candidate value must be caught (`credit_card` requires a card network's
+  prefix and length since faucet-core 1.18).
 - A **rule** applies to every column carrying `when.label`, optionally only
   for some `sink_kind`s and only for sinks whose `when.sink` attributes have
   a listed value (a sink that declares no `environment` never matches a rule

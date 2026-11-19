@@ -143,16 +143,17 @@ The `action` block is tagged by `type`:
 
 ### Detectors
 
-All detectors are **conservative** — fully anchored full-string regexes — so
-false positives stay rare. They run on string values; a JSON number is only
-checked by `credit_card` and `phone_loose` (which then write every number as a
-string — see below), and booleans never match. This matters because masking silently rewrites
+All detectors are fully anchored full-string matches. They run on string
+values; a JSON number is only checked by `credit_card`, `credit_card_loose` and
+`phone_loose` (which then write every number as a string — see below), and
+booleans never match. This matters because masking silently rewrites
 data: a false positive is a data-quality bug, not just noise.
 
 | `value_detector` | Matches |
 |------------------|---------|
 | `email` | An RFC-5322-ish email address. |
-| `credit_card` | A 13–19 digit card number (spaces/dashes allowed) that passes the **Luhn** checksum — as a string or a JSON integer. |
+| `credit_card` | A 13–19 digit card number (spaces/dashes allowed) with a card network's prefix and length — Visa, Mastercard, Amex, Discover, JCB, Diners, UnionPay, Maestro, Mir, RuPay, Troy, Verve, UATP — that passes the **Luhn** checksum, as a string or a JSON integer. Epoch-millisecond timestamps never match. An id or order number that begins like a card (with 3, 4, 5, 6 or 8 at a card length) still matches about one time in ten, so match numeric id columns out by name (`fields` / `field_pattern`) where that matters. |
+| `credit_card_loose` | Any 13–19 digit number passing the Luhn checksum, as a string or a JSON integer — the `credit_card` matcher of releases before faucet-core 1.18. Catches cards outside the networks above, but also about one in ten epoch-millisecond timestamps and long ids. |
 | `ssn` | A US SSN `NNN-NN-NNNN`, excluding never-issued ranges (000/666/9xx area, 00 group, 0000 serial). |
 | `phone` | An E.164 number (`+` then 8–15 digits) or a North-American number written with separators (`415-555-2671`, `(415) 555-2671`). A bare run of digits never matches — ids and epoch timestamps look exactly like one. |
 | `ipv4` | An IPv4 dotted-quad address. |
@@ -163,7 +164,15 @@ policy that relied on it to catch bare digit runs or national formats now lets
 them through. A policy with a `phone` rule logs a warning when it compiles; switch
 the rule to `phone_loose` to keep the old coverage.
 
-**Numbers become strings under `credit_card` / `phone_loose`.** These two
+**Upgrading (cards):** faucet-core 1.18 requires a card network's prefix and
+length for `credit_card`, so Luhn-valid numbers outside those networks
+(timestamps, ids — and cards from a network not listed) now pass through. A
+masking rule or a policy classification using `credit_card` logs a warning when
+it compiles; switch it to `credit_card_loose` to keep the old coverage. In a
+policy classification a missed match lets the value through to the sink, so use
+`credit_card_loose` there if every Luhn-valid number must be classified.
+
+**Numbers become strings under `credit_card` / `credit_card_loose` / `phone_loose`.** These two
 detectors can match a JSON number (a card number held as an integer), and a
 masked number is written as a string. If only the matching values were
 rewritten, a column would hold numbers on the pages without a match and strings

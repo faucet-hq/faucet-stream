@@ -250,6 +250,7 @@ fn detector_label(d: Detector) -> &'static str {
         Detector::Phone => "phone",
         Detector::Ipv4 => "ipv4",
         Detector::PhoneLoose => "phone_loose",
+        Detector::CreditCardLoose => "credit_card_loose",
     }
 }
 

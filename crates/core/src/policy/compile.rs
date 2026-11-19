@@ -23,9 +23,17 @@ pub struct CompiledPolicy {
 }
 
 fn uses_narrowed_phone(spec: &PolicySpec) -> bool {
+    uses_detector(spec, Detector::Phone)
+}
+
+fn uses_narrowed_card(spec: &PolicySpec) -> bool {
+    uses_detector(spec, Detector::CreditCard)
+}
+
+fn uses_detector(spec: &PolicySpec, detector: Detector) -> bool {
     spec.classifications
         .iter()
-        .any(|c| c.value_detector == Some(Detector::Phone))
+        .any(|c| c.value_detector == Some(detector))
 }
 
 impl CompiledPolicy {
@@ -34,6 +42,9 @@ impl CompiledPolicy {
         spec.validate()?;
         if uses_narrowed_phone(spec) {
             crate::masking::compile::warn_phone_narrowed();
+        }
+        if uses_narrowed_card(spec) {
+            crate::masking::compile::warn_card_narrowed();
         }
         let classifications = spec
             .classifications
@@ -190,6 +201,21 @@ mod tests {
         assert!(uses_narrowed_phone(&spec("phone")));
         assert!(!uses_narrowed_phone(&spec("phone_loose")));
         assert!(CompiledPolicy::compile(&spec("phone")).is_ok());
+    }
+
+    #[test]
+    fn a_card_classification_triggers_the_narrowed_matcher_warning() {
+        let spec = |d: &str| -> PolicySpec {
+            serde_json::from_value(serde_json::json!({
+                "classifications": [{"label": "pan", "value_detector": d}],
+                "rules": [{"name": "r", "when": {"label": "pan"}, "deny": true}]
+            }))
+            .unwrap()
+        };
+        assert!(uses_narrowed_card(&spec("credit_card")));
+        assert!(!uses_narrowed_card(&spec("credit_card_loose")));
+        assert!(!uses_narrowed_card(&spec("phone")));
+        assert!(CompiledPolicy::compile(&spec("credit_card")).is_ok());
     }
 
     #[test]
