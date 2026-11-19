@@ -136,8 +136,8 @@ pub use cleanup::{
 };
 #[cfg(feature = "arrow")]
 pub use columnar::{
-    ColumnarPage, check_integral, infer_arrow_schema, record_batch_to_values,
-    values_to_record_batch, values_to_record_batch_inferred,
+    ColumnarPage, binary_values_for_arrow_json, check_integral, infer_arrow_schema,
+    record_batch_to_values, values_to_record_batch, values_to_record_batch_inferred,
 };
 pub use columns::{ColumnMatching, canonical_record, column_for_field, field_for_column};
 pub use create_table::{

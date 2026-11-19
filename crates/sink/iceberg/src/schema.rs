@@ -20,7 +20,6 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
-use arrow_json::ReaderBuilder;
 use arrow_json::reader::infer_json_schema_from_iterator;
 use faucet_core::FaucetError;
 use iceberg::spec::{PrimitiveType, Type};
@@ -103,39 +102,18 @@ pub fn infer_arrow_schema(records: &[Value], sample: usize) -> Result<SchemaRef,
 
 /// Decode `records` into an Arrow `RecordBatch` using the provided schema.
 ///
-/// Uses the arrow-json 57 `Decoder` API:
-/// 1. `ReaderBuilder::new(schema).build_decoder()?`
-/// 2. `decoder.serialize(records)?`
-/// 3. `decoder.flush()?.ok_or(...)`
-///
-/// Returns `FaucetError::Sink` on any conversion failure, including a
-/// fractional number bound for an integer column (arrow-json would truncate
-/// it).
+/// Goes through [`faucet_core::values_to_record_batch`], so binary values
+/// arrive as base64 (and a `uuid` column also takes UUID text), and a
+/// fractional number bound for an integer column is refused rather than
+/// truncated. Returns `FaucetError::Sink` on any conversion failure.
 pub fn json_to_record_batch(
     records: &[Value],
     schema: &SchemaRef,
 ) -> Result<RecordBatch, FaucetError> {
-    faucet_core::check_integral(records, schema)
-        .map_err(|e| FaucetError::Sink(format!("iceberg: {e}")))?;
-    let mut decoder = ReaderBuilder::new(schema.clone())
-        .build_decoder()
-        .map_err(|e| FaucetError::Sink(format!("iceberg: failed to build JSON decoder: {e}")))?;
-
-    decoder.serialize(records).map_err(|e| {
-        FaucetError::Sink(format!(
-            "iceberg: failed to serialize records to Arrow: {e}"
-        ))
-    })?;
-
-    decoder
-        .flush()
-        .map_err(|e| FaucetError::Sink(format!("iceberg: Arrow decoder flush failed: {e}")))?
-        .ok_or_else(|| {
-            FaucetError::Sink(
-                "iceberg: Arrow decoder returned no batch after serializing non-empty records"
-                    .to_string(),
-            )
-        })
+    faucet_core::values_to_record_batch(records, schema.clone()).map_err(|e| match e {
+        FaucetError::Transform(m) => FaucetError::Sink(format!("iceberg: {m}")),
+        other => FaucetError::Sink(format!("iceberg: {other}")),
+    })
 }
 
 /// Convert an Arrow `SchemaRef` to an Iceberg `Schema`, auto-assigning field IDs.

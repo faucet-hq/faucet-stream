@@ -296,6 +296,8 @@ When `create_if_missing: true` and the table is new, the Iceberg schema is infer
 
 A fractional number bound for an integer column (`10.5` into a `long`) fails the write naming the column instead of being truncated.
 
+`binary` and `fixed(n)` columns of an existing table take the canonical base64 rendering (`"AAEC/w=="`). A `uuid` column also takes UUID text (`"0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"`) or 32 hex digits. A string that is none of these fails the page naming the column.
+
 ## Config loading & schema
 
 Configs load from YAML/JSON (or env). Inspect the full JSON Schema with:
