@@ -868,7 +868,15 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                             wrapped_source.apply_start_bookmark(bm).await?;
                         }
                     } else {
-                        wrapped_source.apply_start_bookmark(prior).await?;
+                        if crate::idempotency::is_eo_envelope(&prior) {
+                            tracing::info!(
+                                state_key = %key,
+                                "state was written by an exactly-once run; resuming at-least-once from its bookmark"
+                            );
+                        }
+                        if let Some(bm) = crate::idempotency::resume_bookmark(prior) {
+                            wrapped_source.apply_start_bookmark(bm).await?;
+                        }
                     }
                 }
             }
@@ -4401,6 +4409,64 @@ mod tests {
                 .map(|v| crate::state_version::peel_versioned(&v)),
             Some(json!("2026-05-01"))
         );
+    }
+
+    #[tokio::test]
+    async fn an_exactly_once_state_resumes_an_at_least_once_run_from_its_bookmark() {
+        for versioned in [false, true] {
+            let source =
+                StatefulSource::new("eo_then_alo", vec![json!({"id": 2})], json!("2026-05-02"));
+            let eo = crate::idempotency::wrap_state(Some(&json!("2026-05-01")), 7);
+            let stored = if versioned {
+                crate::state_version::wrap_versioned(
+                    source.connector_name(),
+                    source.state_schema(),
+                    &eo,
+                )
+            } else {
+                eo
+            };
+            let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+            store.put("eo_then_alo", &stored).await.unwrap();
+            let sink = MockSink::new();
+            Pipeline::new(&source, &sink)
+                .with_state_store(Arc::clone(&store))
+                .run()
+                .await
+                .unwrap();
+            assert_eq!(source.observed_start(), Some(json!("2026-05-01")));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exactly_once_state_without_a_bookmark_starts_an_at_least_once_run_fresh() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        store
+            .put("eo_empty", &crate::idempotency::wrap_state(None, 3))
+            .await
+            .unwrap();
+        let source = StatefulSource::new("eo_empty", vec![json!({"id": 1})], json!("b"));
+        let sink = MockSink::new();
+        Pipeline::new(&source, &sink)
+            .with_state_store(Arc::clone(&store))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(source.observed_start(), None);
+    }
+
+    #[tokio::test]
+    async fn a_bare_null_bookmark_still_reaches_the_source() {
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        store.put("bare_null", &Value::Null).await.unwrap();
+        let source = StatefulSource::new("bare_null", vec![json!({"id": 1})], json!("b"));
+        let sink = MockSink::new();
+        Pipeline::new(&source, &sink)
+            .with_state_store(Arc::clone(&store))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(source.observed_start(), Some(Value::Null));
     }
 
     #[tokio::test]

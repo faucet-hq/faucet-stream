@@ -478,6 +478,10 @@ process exit, so a crash would silently re-deliver an already-committed page. Us
 
 A DLQ (`dlq:` block) is incompatible with `exactly_once` in this version.
 
+Switching a pipeline back to `delivery: at_least_once` (for example to add a
+`dlq:` block) keeps its position: the next run resumes from the bookmark the
+last exactly-once run stored.
+
 ### Hard gate at config-load time
 
 `delivery: exactly_once` means "require at least effectively-once": the config

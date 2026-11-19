@@ -249,6 +249,17 @@ pub fn unwrap_state(value: &Value) -> (Option<Value>, u64) {
     (bookmark, 0)
 }
 
+/// The bookmark an at-least-once run resumes from, given a stored state value
+/// whose versioned envelope is already peeled. An exactly-once wrapper yields
+/// its inner bookmark (`None` when it has none); any other value, including a
+/// bare `null`, is returned unchanged.
+pub(crate) fn resume_bookmark(stored: Value) -> Option<Value> {
+    if !is_eo_envelope(&stored) {
+        return Some(stored);
+    }
+    unwrap_state(&stored).0
+}
+
 /// Canonical watermark table the SQL sinks UPSERT the commit token into.
 pub const COMMIT_TOKEN_TABLE: &str = "_faucet_commit_token";
 /// Watermark column holding the pipeline state-key (`{name}::{row_id}`).
@@ -496,6 +507,21 @@ pub fn legacy_scope_key(scope: &str, max: usize) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resume_bookmark_peels_only_the_exactly_once_wrapper() {
+        use super::resume_bookmark;
+        use serde_json::json;
+        assert_eq!(
+            resume_bookmark(wrap_state(Some(&json!({"lsn": 9})), 4)),
+            Some(json!({"lsn": 9}))
+        );
+        assert_eq!(resume_bookmark(wrap_state(None, 4)), None);
+        assert_eq!(resume_bookmark(json!("2026")), Some(json!("2026")));
+        assert_eq!(resume_bookmark(Value::Null), Some(Value::Null));
+        let not_eo = json!({"__faucet_eo": 2, "bookmark": 1});
+        assert_eq!(resume_bookmark(not_eo.clone()), Some(not_eo));
+    }
+
     use super::*;
     use serde_json::json;
 
