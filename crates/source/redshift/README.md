@@ -84,6 +84,8 @@ replication:
   initial_value: "2026-01-01T00:00:00Z"
 ```
 
+A query that returns two columns with one name (a join's `id`) is refused with `Redshift query returns two columns named "id"`: a record keeps one value per name, so one column would be lost. Alias them (`SELECT a.id AS a_id, b.id AS b_id …`).
+
 ## Redshift Data API
 
 With `credentials: { type: redshift_data_api }` the query is submitted with

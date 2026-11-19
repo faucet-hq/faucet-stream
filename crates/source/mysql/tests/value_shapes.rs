@@ -87,3 +87,22 @@ async fn big_json_numbers_fail_or_stay_exact() {
     assert_eq!(rows[0]["doc"]["k"], json!(1.5));
     assert_eq!(rows[0]["doc"]["n"], json!("12345678901234567890.123"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_result_with_two_columns_of_one_name_is_refused() {
+    use futures::StreamExt;
+    let (_c, url) = start_mysql().await;
+    let source = MysqlSource::new(MysqlSourceConfig::new(&url, "SELECT 1 AS id, 2 AS id"))
+        .await
+        .expect("source");
+    let err = source.fetch_all().await.expect_err("a column would vanish");
+    assert!(
+        err.to_string()
+            .contains("MySQL query returns two columns named \"id\""),
+        "{err}"
+    );
+    let ctx = std::collections::HashMap::new();
+    let mut pages = source.stream_pages(&ctx, 0);
+    let err = pages.next().await.expect("an item").expect_err("refused");
+    assert!(err.to_string().contains("two columns named"), "{err}");
+}

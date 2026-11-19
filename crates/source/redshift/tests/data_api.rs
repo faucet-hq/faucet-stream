@@ -317,3 +317,15 @@ async fn an_iam_source_reads_with_temporary_cluster_credentials() {
         [json!({"id": 1}), json!({"id": 2})]
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_result_with_two_columns_of_one_name_is_refused() {
+    let env = env(10).await;
+    let s = source(&env, "SELECT 1 AS id, 2 AS id", json!({}));
+    let err = s.fetch_all().await.expect_err("a column would vanish");
+    assert!(
+        err.to_string()
+            .contains("Redshift query returns two columns named \"id\""),
+        "{err}"
+    );
+}

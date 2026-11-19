@@ -89,6 +89,8 @@ let rows = source.fetch_all().await?;
 # }
 ```
 
+A query that returns two columns with one name (a join's `id`) is refused with `Oracle query returns two columns named "id"`: a record keeps one value per name, so one column would be lost. Alias them (`SELECT a.id AS a_id, b.id AS b_id …`).
+
 ## Capabilities
 
 Declares `discover`, and `shardable` when a `shard:` block is set. `faucet list --json` prints the declaration.

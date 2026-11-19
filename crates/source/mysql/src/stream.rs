@@ -696,6 +696,12 @@ fn descriptors_from_catalog(rows: Vec<CatalogRow>) -> Vec<faucet_core::DatasetDe
 
 /// Convert a single `MySqlRow` into a JSON object whose keys are the row's
 /// column names.
+/// A result whose columns repeat a name is refused: `row_to_json` reads each
+/// column by name, so the later one would silently repeat the earlier value.
+fn check_unique_columns(row: &sqlx::mysql::MySqlRow) -> Result<(), FaucetError> {
+    faucet_core::util::check_unique_columns("MySQL", row.columns().iter().map(|c| c.name()))
+}
+
 fn row_to_json(
     row: &sqlx::mysql::MySqlRow,
     text_columns: &std::collections::HashSet<String>,
@@ -776,6 +782,9 @@ impl faucet_core::Source for MysqlSource {
             )
             .await?;
 
+        if let Some(first) = rows.first() {
+            check_unique_columns(first)?;
+        }
         let records: Vec<Value> = rows
             .iter()
             .map(|r| row_to_json(r, &text_columns, &self.json_context()))
@@ -817,11 +826,16 @@ impl faucet_core::Source for MysqlSource {
             let initial_capacity = if batch_size == 0 { 1024 } else { batch_size };
             let mut buffer: Vec<Value> = Vec::with_capacity(initial_capacity);
             let mut total = 0usize;
+            let mut checked = false;
 
             while let Some(row) = steps
                 .call_once("query", bounded_read(self.config.read_timeout_secs, rows.try_next()))
                 .await?
             {
+                if !checked {
+                    check_unique_columns(&row)?;
+                    checked = true;
+                }
                 let record = row_to_json(&row, &text_columns, &self.json_context())?;
                 if tracker.as_mut().is_none_or(|t| t.admit(&record)) {
                     buffer.push(record);

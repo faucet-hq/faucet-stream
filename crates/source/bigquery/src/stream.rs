@@ -770,11 +770,20 @@ fn clamp_timeout_ms(timeout: Duration) -> i32 {
     }
 }
 
-fn schema_fields(qr: &QueryResponse) -> Vec<TableFieldSchema> {
-    qr.schema
-        .as_ref()
-        .and_then(|s| s.fields.clone())
-        .unwrap_or_default()
+fn schema_fields(qr: &QueryResponse) -> Result<Vec<TableFieldSchema>, FaucetError> {
+    unique_fields(
+        qr.schema
+            .as_ref()
+            .and_then(|s| s.fields.clone())
+            .unwrap_or_default(),
+    )
+}
+
+/// A result's fields, refused when two share a name (a record keeps one
+/// value per name).
+fn unique_fields(fields: Vec<TableFieldSchema>) -> Result<Vec<TableFieldSchema>, FaucetError> {
+    faucet_core::util::check_unique_columns("BigQuery", fields.iter().map(|f| &f.name))?;
+    Ok(fields)
 }
 
 fn job_reference(qr: &QueryResponse) -> Result<(String, Option<String>), FaucetError> {
@@ -886,7 +895,7 @@ impl faucet_core::Source for BigQuerySource {
 
         self.signal_bytes_processed(&initial);
 
-        let fields = schema_fields(&initial);
+        let fields = schema_fields(&initial)?;
         let mut all_rows: Vec<Value> = rows_from_response(&initial, &fields);
         let mut page_token = initial.page_token.clone();
         let mut job_complete = initial.job_complete.unwrap_or(false);
@@ -930,7 +939,7 @@ impl faucet_core::Source for BigQuerySource {
                 && let Some(s) = resp.schema.as_ref()
                 && let Some(f) = s.fields.as_ref()
             {
-                fields = f.clone();
+                fields = unique_fields(f.clone())?;
             }
 
             for row in resp.rows.unwrap_or_default() {
@@ -1004,7 +1013,7 @@ impl faucet_core::Source for BigQuerySource {
 
             self.signal_bytes_processed(&initial);
 
-            let mut fields = schema_fields(&initial);
+            let mut fields = schema_fields(&initial)?;
             let mut buffer: Vec<Value> = if batch_size == 0 {
                 Vec::with_capacity(1024)
             } else {
@@ -1059,7 +1068,7 @@ impl faucet_core::Source for BigQuerySource {
                     && let Some(s) = resp.schema.as_ref()
                     && let Some(f) = s.fields.as_ref()
                 {
-                    fields = f.clone();
+                    fields = unique_fields(f.clone())?;
                 }
 
                 for row in resp.rows.unwrap_or_default() {
@@ -1390,6 +1399,17 @@ mod tests {
         let (rewritten, bindings) = resolve_query(&c, &ctx);
         assert_eq!(rewritten, "SELECT * FROM t WHERE id = ?");
         assert_eq!(bindings, vec![json!(7)]);
+    }
+
+    #[test]
+    fn a_result_naming_one_field_twice_is_refused() {
+        let field = |n: &str| TableFieldSchema::new(n, FieldType::Int64);
+        assert!(unique_fields(vec![field("a"), field("b")]).is_ok());
+        let err = unique_fields(vec![field("a"), field("a")]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("BigQuery query returns two columns named \"a\"")
+        );
     }
 
     #[test]

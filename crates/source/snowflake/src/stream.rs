@@ -752,6 +752,7 @@ impl faucet_core::Source for SnowflakeSource {
             );
             return Ok(Vec::new());
         }
+        faucet_core::util::check_unique_columns("Snowflake", columns.iter().map(|c| &c.name))?;
 
         let mut rows: Vec<Value> = initial
             .data
@@ -822,6 +823,7 @@ impl faucet_core::Source for SnowflakeSource {
                 // with no metadata. Either way nothing to emit.
                 return;
             }
+            faucet_core::util::check_unique_columns("Snowflake", columns.iter().map(|c| &c.name))?;
 
             let partition_count = initial
                 .result_set_metadata

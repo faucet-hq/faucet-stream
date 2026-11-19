@@ -289,6 +289,7 @@ This crate has no optional features of its own; enable it in the CLI/umbrella vi
 | `390201` / "no active warehouse" | `warehouse` is misspelled, suspended, or the role lacks `USAGE` on it. Verify the warehouse name and grants. |
 | Account / host not found (DNS or 404) | `account` is wrong. Use the full account identifier including region/cloud (e.g. `xy12345.us-east-1`, or `orgname-accountname`), not the login URL. |
 | A `NUMBER`/`DECIMAL` column arrives as a string | Intentional — a fractional `NUMBER(p,s)` (scale `s > 0`) and a scale-0 value beyond `u64` are decoded as strings to preserve full precision (a JSON number is an `f64`). Cast in a downstream transform if you need a JSON number and can accept the precision loss. |
+| `Snowflake query returns two columns named "id"` | The query selects two columns with one name (a join's `id`). A record keeps one value per name, so the query is refused rather than dropping a column. Alias them: `SELECT a.id AS a_id, b.id AS b_id …`. |
 | Bind parameter compared as text unexpectedly | Each `params` entry is typed from its JSON value. Pass `0.75` (number) not `"0.75"` (string) to bind a `REAL`. |
 | `auth: { ref }` rejected for key-pair | Key-pair JWT can't come from the shared `auth:` catalog — only OAuth (`Bearer`/`Token`) credentials map to a shared provider. Inline the `key_pair` block instead. |
 

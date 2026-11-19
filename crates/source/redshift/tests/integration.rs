@@ -596,3 +596,17 @@ async fn a_fractional_numeric_cursor_keeps_tied_rows() {
         "the resumed run binds the bookmark at its scale: {sent:#?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_result_with_two_columns_of_one_name_is_refused() {
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let source = RedshiftSource::new(full_config(port, "SELECT 1 AS id, 2 AS id", 1000))
+        .expect("source builds");
+    let err = source.fetch_all().await.expect_err("a column would vanish");
+    assert!(
+        err.to_string()
+            .contains("Redshift query returns two columns named \"id\""),
+        "{err}"
+    );
+}

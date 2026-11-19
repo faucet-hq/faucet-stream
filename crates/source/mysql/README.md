@@ -394,6 +394,7 @@ This crate has no optional Cargo features of its own. Enable it in the CLI / umb
 | `FaucetError::Source: MySQL query failed: ...` | SQL syntax error, missing table/column, or insufficient privileges. Run the query directly against MySQL to confirm. |
 | TLS handshake / certificate error | The server requires TLS the client can't negotiate. Adjust the server's TLS settings or supply the right host; `tls-rustls` is built in, so no extra dependency is needed. |
 | A `DECIMAL` or `DATETIME` column arrives as a string | Intentional — `DECIMAL` is stringified to preserve exact precision and temporal types use ISO-8601. Cast downstream if you need a number. |
+| `MySQL query returns two columns named "id"` | The query selects two columns with one name (a join's `id`). A record keeps one value per name, so the query is refused rather than dropping a column. Alias them: `SELECT a.id AS a_id, b.id AS b_id …`. |
 | A column comes back as `null` unexpectedly | The column type isn't in the decode list, or the value is genuinely `NULL`. Wrap the column in `CAST(... AS CHAR)` in the query to force a string. |
 | Run holds many connections open | `max_connections` is high relative to the workload. Lower it; the default of `10` is plenty for a single streaming query. |
 | `${parent.field}` shows up literally in the SQL | The row isn't a matrix child of that parent (no `parent:` set), so the token was never resolved. Check the matrix wiring. |

@@ -274,6 +274,12 @@ impl RedshiftSource {
                     })
                     .await?;
                 let exhausted = fetched.len() < max;
+                if let Some(first) = fetched.first() {
+                    faucet_core::util::check_unique_columns(
+                        "Redshift",
+                        sqlx::Row::columns(first).iter().map(sqlx::Column::name),
+                    )?;
+                }
                 let rows = fetched.iter().map(row_to_json).collect::<Result<_, _>>()?;
                 Ok((rows, exhausted))
             }
@@ -289,6 +295,10 @@ impl RedshiftSource {
                 }
                 let page = api.result_page(calls, id, token.as_deref()).await?;
                 if columns.is_empty() {
+                    faucet_core::util::check_unique_columns(
+                        "Redshift",
+                        page.columns.iter().map(|c| c.name.as_str()),
+                    )?;
                     *columns = page.columns;
                 }
                 let rows = page
