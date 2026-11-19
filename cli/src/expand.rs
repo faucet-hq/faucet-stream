@@ -1769,6 +1769,9 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
     for warning in out.iter().filter_map(rewritten_file_warning) {
         tracing::warn!("{warning}");
     }
+    for warning in out.iter().filter_map(unsettled_name_mode_warning) {
+        tracing::warn!("{warning}");
+    }
     check_truncating_fan_out(&out)?;
     if cfg.reconcile.is_some() {
         check_reconcile_scope(&out)?;
@@ -1961,6 +1964,31 @@ fn check_truncating_fan_out(nodes: &[ExpandedNode]) -> CliResult<()> {
         }
     }
     Ok(())
+}
+
+/// A local file source reading `incremental: {by: name}` with no
+/// `stable_for_secs` can read a file its producer is still writing. The
+/// source never moves its bookmark past a file that changed while it was
+/// read, but a producer pausing between writes is not seen.
+fn unsettled_name_mode_warning(n: &ExpandedNode) -> Option<String> {
+    if n.source.kind != "file" {
+        return None;
+    }
+    let cfg = &n.source.config;
+    let by = cfg.get("incremental")?.get("by")?.as_str()?;
+    let remote = cfg
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|p| p.starts_with("http://") || p.starts_with("https://"));
+    if by != "name" || remote || cfg.get("stable_for_secs").is_some_and(|v| !v.is_null()) {
+        return None;
+    }
+    Some(format!(
+        "row '{}': `incremental: {{by: name}}` without `stable_for_secs` can read a file that \
+         is still being written; set `stable_for_secs` to the producer's write time",
+        n.id
+    ))
 }
 
 /// A local file sink writing one unnumbered file in a format that can only be
@@ -5130,6 +5158,31 @@ pipeline:
             "{err}"
         );
         assert!(run(r#"{ type: stdout, config: {} }"#).is_ok());
+    }
+
+    #[test]
+    fn name_mode_without_a_settle_window_is_warned_about_at_load() {
+        let warn = |source: &str| {
+            let yaml = format!(
+                "version: 1\npipeline:\n  source: {source}\n  sink: {{ type: stdout, config: {{}} }}\n"
+            );
+            let nodes = expand(&parse_with_extension(&yaml, "yaml").unwrap()).unwrap();
+            unsettled_name_mode_warning(&nodes[0])
+        };
+        let w = warn(r#"{ type: file, config: { path: /tmp/in, incremental: { by: name } } }"#)
+            .expect("name mode without stable_for_secs warns");
+        assert!(
+            w.contains("stable_for_secs") && w.contains("by: name"),
+            "{w}"
+        );
+        for quiet in [
+            r#"{ type: file, config: { path: /tmp/in, incremental: { by: name }, stable_for_secs: 60 } }"#,
+            r#"{ type: file, config: { path: /tmp/in, incremental: { by: mtime } } }"#,
+            r#"{ type: file, config: { path: /tmp/in } }"#,
+            r#"{ type: file, config: { path: "https://example.com/a.jsonl", incremental: { by: name } } }"#,
+        ] {
+            assert_eq!(warn(quiet), None, "{quiet}");
+        }
     }
 
     /// #789 FILE-19: a per-page-bookmarking source writing one unnumbered
