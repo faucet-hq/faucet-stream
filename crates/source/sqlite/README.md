@@ -326,6 +326,14 @@ matches `key IS NULL` so nullable keys are never silently dropped. Each shard
 keeps its own state key (`{run}::{shard}`), so a reassigned shard resumes
 where its previous owner left off.
 
+The key must hold only numbers. SQLite compares a text value in a `TEXT`
+column (or a text value stored in any column) with the integer range bounds as
+text, so the ranges would overlap and read rows twice; when the key's largest
+value is text or a blob, planning fails with *shard key "k" holds non-integer
+values*. Shard on an integer column, or select the key as
+`CAST(k AS INTEGER) AS k` in the query. The same check applies to
+`faucet verify` range mode.
+
 Outside the cluster coordinator the `shard` config has **no effect** — a plain
 `faucet run` streams the whole query.
 

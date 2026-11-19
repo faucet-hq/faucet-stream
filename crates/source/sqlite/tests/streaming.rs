@@ -446,3 +446,45 @@ async fn duplicate_column_names_are_refused() {
     let first = stream.next().await.expect("an item");
     assert!(first.is_err(), "stream must fail on duplicate names too");
 }
+
+async fn shard_plan(url: &str, query: &str) -> Result<usize, faucet_core::FaucetError> {
+    let mut config = SqliteSourceConfig::new(url, query);
+    config.shard = Some(faucet_source_sqlite::ShardConfig { key: "k".into() });
+    let source = SqliteSource::new(config).await.expect("source new");
+    source.enumerate_shards(4).await.map(|s| s.len())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shard_key_holding_text_values_is_refused() {
+    let tmp = NamedTempFile::new().expect("tempfile");
+    let url = sqlite_url(tmp.path());
+    let pool = sqlx::SqlitePool::connect(&url).await.expect("pool");
+    sqlx::raw_sql(
+        "CREATE TABLE t (k TEXT, n INTEGER);
+         INSERT INTO t VALUES ('1', 1), ('2', 2), ('10', 10), ('100', 100);
+         CREATE TABLE mixed (k INTEGER);
+         INSERT INTO mixed VALUES (1), (2), ('x');
+         CREATE TABLE empty (k INTEGER);",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+    pool.close().await;
+
+    for query in [
+        "SELECT k FROM t",
+        "SELECT k FROM mixed",
+        "SELECT CAST(n AS TEXT) AS k FROM t",
+    ] {
+        let err = shard_plan(&url, query).await.expect_err(query).to_string();
+        assert!(err.contains("non-integer values"), "{query}: {err}");
+    }
+    assert_eq!(shard_plan(&url, "SELECT n AS k FROM t").await.unwrap(), 4);
+    assert_eq!(
+        shard_plan(&url, "SELECT CAST(k AS INTEGER) AS k FROM t")
+            .await
+            .unwrap(),
+        4
+    );
+    assert_eq!(shard_plan(&url, "SELECT k FROM empty").await.unwrap(), 1);
+}

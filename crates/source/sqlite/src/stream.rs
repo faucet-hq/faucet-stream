@@ -2,9 +2,7 @@
 
 use crate::config::SqliteSourceConfig;
 use async_trait::async_trait;
-use faucet_core::shard::{
-    PkShardBounds, ShardSpec, parse_pk_shard, pk_bounds_query, pk_shards_from_bounds,
-};
+use faucet_core::shard::{PkShardBounds, ShardSpec, parse_pk_shard, pk_shards_from_bounds};
 use faucet_core::{FaucetError, Stream, StreamPage};
 use futures::TryStreamExt;
 use serde_json::Value;
@@ -293,6 +291,34 @@ fn descriptors_from_catalog(rows: Vec<CatalogRow>) -> Vec<faucet_core::DatasetDe
     out
 }
 
+/// The PK-range bounds of `query`'s `quoted_key`, plus the storage class of
+/// its largest value. SQLite orders integer/real < text < blob, so that class
+/// is `text` or `blob` exactly when the key holds a value that is not a
+/// number.
+fn shard_bounds_query(query: &str, quoted_key: &str) -> String {
+    format!(
+        "SELECT CAST(MIN({quoted_key}) AS INTEGER) AS lo, \
+         CAST(MAX({quoted_key}) AS INTEGER) AS hi, \
+         typeof(MAX({quoted_key})) AS hi_type \
+         FROM ({query}) AS _faucet_bounds"
+    )
+}
+
+/// Refuse a shard key holding text or blob values: SQLite compares them with
+/// the integer range literals as text (or above every number), so the ranges
+/// would overlap or miss rows.
+fn check_shard_key_values(key: &str, hi_type: Option<&str>) -> Result<(), FaucetError> {
+    match hi_type {
+        Some("text" | "blob") => Err(FaucetError::Source(format!(
+            "sqlite: shard key {key:?} holds non-integer values (text or blob), which \
+             SQLite does not compare as integers, so integer ranges would overlap; shard \
+             on an integer column, or select it as CAST({key} AS INTEGER) AS {key} in the \
+             query"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Convert a single `SqliteRow` into a JSON object whose keys are the row's
 /// column names. A result with two columns of the same name is refused: a map
 /// keeps only one of them, so the other column's values would vanish.
@@ -531,11 +557,8 @@ impl faucet_core::Source for SqliteSource {
             return Ok(vec![ShardSpec::whole()]);
         };
 
-        let bounds_sql = pk_bounds_query(
-            &self.config.query,
-            &quote_ident_sqlite(&shard_cfg.key),
-            "INTEGER",
-        );
+        let bounds_sql =
+            shard_bounds_query(&self.config.query, &quote_ident_sqlite(&shard_cfg.key));
         let row = self
             .calls
             .call_once("query", async {
@@ -558,6 +581,10 @@ impl faucet_core::Source for SqliteSource {
         let hi: Option<i64> = row
             .try_get("hi")
             .map_err(|e| FaucetError::Source(format!("sqlite: shard bounds decode failed: {e}")))?;
+        let hi_type: Option<String> = row
+            .try_get("hi_type")
+            .map_err(|e| FaucetError::Source(format!("sqlite: shard bounds decode failed: {e}")))?;
+        check_shard_key_values(&shard_cfg.key, hi_type.as_deref())?;
         Ok(pk_shards_from_bounds(&shard_cfg.key, lo, hi, target))
     }
 
@@ -750,6 +777,22 @@ mod tests {
             }
             _ => panic!("expected a batch_size Config error"),
         }
+    }
+
+    #[test]
+    fn a_shard_key_holding_text_or_blob_is_refused() {
+        assert!(check_shard_key_values("id", Some("integer")).is_ok());
+        assert!(check_shard_key_values("id", Some("real")).is_ok());
+        assert!(check_shard_key_values("id", Some("null")).is_ok());
+        assert!(check_shard_key_values("id", None).is_ok());
+        for t in ["text", "blob"] {
+            let err = check_shard_key_values("id", Some(t))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("non-integer values"), "{err}");
+            assert!(err.contains("CAST(id AS INTEGER) AS id"), "{err}");
+        }
+        assert!(shard_bounds_query("SELECT 1", "\"k\"").contains("typeof(MAX(\"k\")) AS hi_type"));
     }
 
     // dataset_uri is a pure-config method — test the logic without needing a
