@@ -183,8 +183,9 @@ pub use governance::{
 };
 pub use idempotency::{
     DeliveryGuarantee, DeliveryMode, EffectivelyOnceMechanism, GuaranteeInputs, ReplayGuarantee,
-    SinkGuarantee, derive_delivery_guarantee, format_token, format_token_with_bookmark,
-    parse_token, parse_token_parts, unwrap_state, wrap_state,
+    SinkGuarantee, WatermarkCheck, check_watermark, derive_delivery_guarantee, format_token,
+    format_token_with_bookmark, parse_token, parse_token_parts, unwrap_state,
+    watermark_ahead_error, wrap_state,
 };
 pub use io::{CallContext, CallExt, CallReader, CallSlot, DEFAULT_CALL_TIMEOUT};
 pub use join::{

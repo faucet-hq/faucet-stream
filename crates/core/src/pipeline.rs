@@ -2659,7 +2659,7 @@ where
                                 // A short report fails the page in `settle`, before its bookmark is persisted (#879).
                                 let report = outcomes.observe(with_retry!(
                                     "sink_write",
-                                    eo_write_once(sink, &governed, &scope, &token, next_seq, &attempt)
+                                    eo_write_once(sink, &governed, &scope, &token, &attempt)
                                 ))?;
                                 records_written += report.accepted;
                                 account.add_report(report);
@@ -2789,14 +2789,14 @@ where
 }
 
 /// One attempt of an exactly-once page write. Every attempt after the first
-/// re-reads the sink's committed token and treats the page as written when the
-/// token already covers `seq`.
+/// re-reads the sink's committed token: the page counts as written only when
+/// the stored token is this page's own; a different token at or past it is
+/// another writer's commit and fails the page.
 async fn eo_write_once<Si: Sink + ?Sized>(
     sink: &Si,
     page: &crate::governance::GovernedPage<'_>,
     scope: &str,
     token: &str,
-    seq: u64,
     attempt: &std::sync::atomic::AtomicU32,
 ) -> Result<crate::accounting::WriteReport, FaucetError> {
     // The engine reads the watermark through `Sink` for every sink until 3b.
@@ -2806,14 +2806,15 @@ async fn eo_write_once<Si: Sink + ?Sized>(
     } else {
         None
     };
-    if committed
-        .as_deref()
-        .and_then(crate::idempotency::parse_token)
-        .is_some_and(|c| c >= seq)
-    {
-        return Ok(crate::accounting::WriteReport::accepted(page.len()));
+    match crate::idempotency::check_watermark(committed.as_deref(), token) {
+        crate::idempotency::WatermarkCheck::Committed => {
+            Ok(crate::accounting::WriteReport::accepted(page.len()))
+        }
+        crate::idempotency::WatermarkCheck::Ahead => {
+            Err(crate::idempotency::watermark_ahead_error(scope, token))
+        }
+        _ => gate::idempotent(sink, page, scope, token).await,
     }
-    gate::idempotent(sink, page, scope, token).await
 }
 
 /// Emit the adaptive controller's current state + any adjustment as metrics.
