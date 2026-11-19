@@ -1495,11 +1495,7 @@ mod tests {
             ))
             .with_policy(PolicyGovernance::new(
                 Arc::new(crate::policy::CompiledPolicy::compile(&policy).unwrap()),
-                crate::policy::SinkFacts {
-                    id: "w".into(),
-                    kind: "stdout".into(),
-                    attributes: Default::default(),
-                },
+                crate::policy::SinkFacts::new("w", "stdout", Default::default()),
                 crate::policy::PolicyScope {
                     pipeline: "p".into(),
                     row: "w".into(),

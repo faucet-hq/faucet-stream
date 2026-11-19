@@ -464,6 +464,13 @@ writes the bare value instead — for a mixed-version cluster.
 
 ## Governance (RFC 0013)
 
+The data-flow policy (`policy` feature) judges each destination through a
+`SinkFacts` (`SinkFacts::new(id, kind, attributes)`). Facts built
+`.unattested()` (attributes the policy owner did not write, such as a config
+a caller submitted to a server) never satisfy a `require` rule — the violation
+is `MissingAttribute { attribute, unattested: true }` — and every rule scoped
+by `when.sink` attributes applies to them.
+
 `faucet_core::Governance` carries every guarantee a run is held to — masking,
 quality, contract, schema drift, the data-flow policy, budget, profiling,
 metadata columns, metering, resilience, cancellation and the DLQ — and

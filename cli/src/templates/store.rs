@@ -1661,17 +1661,27 @@ async fn materialize_pair_selected(
     });
     let mut composition = crate::hub::compose(&source, &sink)?;
     let (mut overlay_id, mut overlay_version) = (None, None);
+    let mut inline_overlay = false;
     if let Some(choice) = overlay {
         let (t, oid, over) = resolve_overlay(store, choice).await?;
         composition = composition.apply_overlay_within(&t, &all_streams)?;
         overlay_id = Some(oid);
         overlay_version = over;
+        inline_overlay = matches!(choice, OverlayChoice::Inline(_));
     }
     let overlay_contributes = std::mem::take(&mut composition.overlay_contributes);
     let warnings = std::mem::take(&mut composition.warnings);
+    let caller_dlqs = if inline_overlay {
+        inline_overlay_dlqs(&composition.document, &overlay_contributes)
+    } else {
+        Vec::new()
+    };
     let items = expanded.composed_fields(&composition.document);
-    let (body, bound) =
+    let (body, mut bound) =
         bind_document_for_run(composition.document, supplied, env_overrides, mode, &items)?;
+    for pointer in caller_dlqs {
+        bound.fields.insert(pointer, "overlay");
+    }
     Ok(MaterializedConfig {
         template_id: src_rec.id.clone(),
         version: src_rec.version,
@@ -1692,6 +1702,27 @@ async fn materialize_pair_selected(
         untested: None,
         caller_fields: bound.fields,
     })
+}
+
+/// The JSON pointers of the DLQ blocks a caller's inline deployment overlay
+/// contributed (`pipeline.dlq`, `matrix.<stream>.dlq`): the caller chose those
+/// destinations, so their `attributes` are not trusted for policy.
+fn inline_overlay_dlqs(doc: &Value, contributes: &[String]) -> Vec<String> {
+    use crate::params::caller::child;
+    let rows = doc.get("matrix").and_then(Value::as_array);
+    contributes
+        .iter()
+        .filter_map(|c| {
+            if c == "pipeline.dlq" {
+                return Some("/pipeline/dlq".to_owned());
+            }
+            let stream = c.strip_prefix("matrix.")?.strip_suffix(".dlq")?;
+            let i = rows?
+                .iter()
+                .position(|r| r.get("id").and_then(Value::as_str) == Some(stream))?;
+            Some(child(&child("/matrix", &i.to_string()), "dlq"))
+        })
+        .collect()
 }
 
 async fn fetch_version(store: &TemplateStore, id: &str, version: u32) -> CliResult<TemplateRecord> {

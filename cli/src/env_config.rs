@@ -381,6 +381,7 @@ pub fn build_pipeline_config(env: &HashMap<String, String>) -> CliResult<Pipelin
         // still tracked (the default) under the runtime's own retention window.
         #[cfg(feature = "catalog")]
         local_outputs: None,
+        attribute_trust: Default::default(),
         partition: None,
         #[cfg(feature = "schedule")]
         schedule: None,

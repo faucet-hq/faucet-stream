@@ -141,11 +141,7 @@ pub(crate) async fn governance_for(req: GovernanceRequest<'_>) -> CliResult<Gove
         classifier = Some(Arc::clone(&compiled));
         let mut p = faucet_core::PolicyGovernance::new(
             compiled,
-            faucet_core::SinkFacts {
-                id: node.sink_ref.clone(),
-                kind: node.sink.kind.clone(),
-                attributes: node.sink.attributes.clone(),
-            },
+            crate::policy::sink_facts(node),
             faucet_core::PolicyScope {
                 pipeline: pipeline.to_string(),
                 row: row.to_string(),
@@ -219,6 +215,8 @@ pub(crate) fn dlq_governance(
             masking: node.masking.as_ref(),
             #[cfg(feature = "policy")]
             policy: node.policy.is_some(),
+            #[cfg(feature = "policy")]
+            attested: node.dlq_attested,
             main_ids: &[node.sink_ref.as_str(), node.sink.kind.as_str()],
         },
         dlq,
@@ -233,6 +231,9 @@ pub(crate) struct DlqTarget<'a> {
     pub masking: Option<&'a faucet_core::MaskingSpec>,
     #[cfg(feature = "policy")]
     pub policy: bool,
+    /// Whether the policy owner trusts the DLQ's `attributes`.
+    #[cfg(feature = "policy")]
+    pub attested: bool,
     pub main_ids: &'a [&'a str],
 }
 
@@ -246,7 +247,7 @@ pub(crate) fn dlq_governance_for(
     let mut d = DlqGovernance::new(config);
     #[cfg(feature = "policy")]
     if target.policy {
-        d = d.with_facts(crate::policy::dlq_facts(dlq));
+        d = d.with_facts(crate::policy::dlq_facts(dlq, target.attested));
     }
     #[cfg(feature = "masking")]
     if let Some(spec) = target.masking
@@ -341,11 +342,8 @@ pub(crate) fn topology_sink_governance(req: TopologySinkRequest<'_>) -> CliResul
         #[allow(unused_mut)]
         let mut p = faucet_core::PolicyGovernance::new(
             compiled,
-            faucet_core::SinkFacts {
-                id: req.node_id.to_string(),
-                kind: req.kind.to_string(),
-                attributes: req.attributes.clone(),
-            },
+            faucet_core::SinkFacts::new(req.node_id, req.kind, req.attributes.clone())
+                .with_attested(cfg.topology_destination_trust(req.node_id, req.template).0),
             faucet_core::PolicyScope {
                 pipeline: cfg.name.clone().unwrap_or_default(),
                 row: req.node_id.to_string(),
@@ -390,6 +388,8 @@ pub(crate) fn topology_dlq(
             masking: cfg.pipeline.masking.as_ref(),
             #[cfg(feature = "policy")]
             policy: cfg.policy.is_some(),
+            #[cfg(feature = "policy")]
+            attested: cfg.attribute_trust.attests(&["/pipeline/dlq".to_owned()]),
             main_ids,
         },
         dlq,

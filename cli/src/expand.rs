@@ -91,6 +91,11 @@ pub struct ExpandedNode {
     /// for the legacy singular `pipeline.sink`). Used to scope masking
     /// `applies_to` rules per destination.
     pub sink_ref: String,
+    /// Whether the policy owner trusts this node's sink `attributes`
+    /// ([`crate::config::AttributeTrust`]); `true` outside `faucet serve`.
+    pub sink_attested: bool,
+    /// The same for the DLQ's `attributes`.
+    pub dlq_attested: bool,
     /// Compiled schema-drift policy spec (pipeline-level; same for every node).
     pub schema: Option<faucet_core::SchemaDriftSpec>,
     /// Delivery guarantee for this row. Resolved from the row's override or
@@ -800,6 +805,8 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             )?;
             out.push(ExpandedNode {
                 opt_outs: Vec::new(),
+                sink_attested: true,
+                dlq_attested: true,
                 id: ids[i].clone(),
                 row_index: i,
                 // A discovery row enumerates a value set rather than moving
@@ -872,6 +879,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             .as_ref()
             .and_then(|s| s.r#ref.clone())
             .unwrap_or_else(|| "default".to_string());
+        let (sink_attested, dlq_attested) = destination_trust(cfg, i, &sink_ref, row.dlq.is_some());
         let role = if !row.for_each.is_empty() {
             // Discovery-driven fan-out (#501): runs once per cartesian-product
             // tuple of the named dimensions (also mirrored into `depends_on`).
@@ -1362,11 +1370,12 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             && cfg.policy.as_ref().is_some_and(|p| {
                 crate::policy::quarantines_at(
                     p,
-                    &faucet_core::SinkFacts {
-                        id: sink_ref.clone(),
-                        kind: merged_sink.kind.clone(),
-                        attributes: merged_sink.attributes.clone(),
-                    },
+                    &faucet_core::SinkFacts::new(
+                        sink_ref.clone(),
+                        merged_sink.kind.clone(),
+                        merged_sink.attributes.clone(),
+                    )
+                    .with_attested(sink_attested),
                 )
             })
         {
@@ -1683,6 +1692,8 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
 
         let base = ExpandedNode {
             opt_outs: Vec::new(),
+            sink_attested,
+            dlq_attested,
             id: ids[i].clone(),
             row_index: i,
             weight: row.weight,
@@ -2851,6 +2862,32 @@ where
         Value::Object(m) => m.values().try_for_each(|v| walk_strings(v, f)),
         _ => Ok(()),
     }
+}
+
+/// Whether the policy owner trusts row `row`'s sink and DLQ `attributes`
+/// (`cfg.attribute_trust`): a destination is untrusted when a caller-chosen
+/// value lies under its template block or under the row's override.
+fn destination_trust(
+    cfg: &PipelineConfig,
+    row: usize,
+    sink_ref: &str,
+    row_dlq: bool,
+) -> (bool, bool) {
+    use crate::params::caller::child;
+    let row_base = child("/matrix", &row.to_string());
+    let mut sink = vec![child(&row_base, "sink"), child("/pipeline/sinks", sink_ref)];
+    if sink_ref == "default" {
+        sink.push("/pipeline/sink".to_owned());
+    }
+    let dlq = if row_dlq {
+        vec![child(&row_base, "dlq")]
+    } else {
+        vec!["/pipeline/dlq".to_owned()]
+    };
+    (
+        cfg.attribute_trust.attests(&sink),
+        cfg.attribute_trust.attests(&dlq),
+    )
 }
 
 #[cfg(test)]

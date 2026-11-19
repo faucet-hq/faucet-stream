@@ -867,10 +867,20 @@ pub async fn impact(
         };
         // A run whose config cannot be checked statically is counted, never
         // skipped.
-        let Some(cfg) = cfg else {
+        let Some(mut cfg) = cfg else {
             out.runs_runtime_only += 1;
             continue;
         };
+        // Judge the run with the attribute trust it was admitted under.
+        if !state.references().trusts_caller_attributes() {
+            if rec.caller_config {
+                cfg.attribute_trust = crate::config::AttributeTrust::Untrusted;
+            } else if !rec.caller_params.is_empty() {
+                cfg.attribute_trust = crate::config::AttributeTrust::CallerFields(
+                    rec.caller_params.iter().map(|(p, _)| p.clone()).collect(),
+                );
+            }
+        }
         out.runs_checked += 1;
         compare(
             &mut out,

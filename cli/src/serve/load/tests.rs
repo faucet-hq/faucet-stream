@@ -350,6 +350,106 @@ async fn a_loaded_submission_is_sandboxed_unless_it_came_from_a_server_file() {
     assert_eq!(file.nodes[0].source.config["sandbox"], false);
 }
 
+/// Sink and DLQ attributes in a caller's body are not trusted for policy; a
+/// trusted body is, except a sink whose subtree holds a caller-chosen value;
+/// `--policy-trust-caller-attributes` trusts them all.
+#[tokio::test]
+async fn sink_attributes_are_trusted_only_where_the_operator_wrote_them() {
+    let body = json!({
+        "version": 1,
+        "pipeline": {
+            "source": { "type": "csv", "config": { "path": "in.csv" } },
+            "sinks": {
+                "eu": { "type": "jsonl", "config": { "path": "eu.jsonl" }, "attributes": { "residency": "eu" } },
+                "us": { "type": "jsonl", "config": { "path": "us.jsonl" }, "attributes": { "residency": "us" } }
+            },
+            "dlq": { "sink": { "type": "jsonl", "config": { "path": "dlq.jsonl" } } }
+        },
+        "matrix": [
+            { "id": "a", "sink": { "ref": "eu" } },
+            { "id": "b", "sink": { "ref": "us" } }
+        ]
+    })
+    .to_string();
+    let refs = crate::serve::references::ServeReferencePolicy::default();
+    let caller = BodyOrigin::Caller {
+        allow_subprocess: false,
+    };
+    let loaded = load_submission_with(&body, ConfigFormat::Json, None, None, caller, None, &refs)
+        .await
+        .unwrap();
+    assert_eq!(
+        loaded.cfg.attribute_trust,
+        crate::config::AttributeTrust::Untrusted
+    );
+    assert!(
+        loaded
+            .nodes
+            .iter()
+            .all(|n| !n.sink_attested && !n.dlq_attested)
+    );
+
+    let trusted = load_submission_with(
+        &body,
+        ConfigFormat::Json,
+        None,
+        None,
+        BodyOrigin::Trusted,
+        None,
+        &refs,
+    )
+    .await
+    .unwrap();
+    assert!(
+        trusted
+            .nodes
+            .iter()
+            .all(|n| n.sink_attested && n.dlq_attested)
+    );
+
+    let mut fields = crate::params::CallerFields::default();
+    fields.insert("/pipeline/sinks/us/config/path", "path");
+    let template = load_submission_inputs(
+        &body,
+        ConfigFormat::Json,
+        None,
+        None,
+        BodyOrigin::Trusted,
+        None,
+        &refs,
+        Some(CallerParams {
+            fields: &fields,
+            origin: caller,
+        }),
+    )
+    .await
+    .unwrap();
+    let by_id = |id: &str| template.nodes.iter().find(|n| n.id == id).unwrap();
+    assert!(
+        by_id("a").sink_attested,
+        "the caller chose nothing under `eu`"
+    );
+    assert!(!by_id("b").sink_attested, "the caller chose `us`'s path");
+    assert!(by_id("b").dlq_attested);
+
+    let open =
+        crate::serve::references::ServeReferencePolicy::from_args(&crate::cli::ReferenceArgs {
+            policy_trust_caller_attributes: true,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(open.trusts_caller_attributes());
+    let loaded = load_submission_with(&body, ConfigFormat::Json, None, None, caller, None, &open)
+        .await
+        .unwrap();
+    assert!(
+        loaded
+            .nodes
+            .iter()
+            .all(|n| n.sink_attested && n.dlq_attested)
+    );
+}
+
 #[test]
 fn a_path_that_normalizes_into_proc_is_protected() {
     assert!(file_is_protected("/proc/self/environ"));

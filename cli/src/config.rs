@@ -308,6 +308,71 @@ pub struct PipelineConfig {
     #[cfg(feature = "catalog")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_outputs: Option<crate::local_outputs::LocalOutputsSpec>,
+
+    /// Whether the policy owner trusts the sink `attributes` this config
+    /// carries. Set by `faucet serve` when it loads a body; never read from a
+    /// document. Default: trusted (the local CLI, where the user owns the
+    /// config).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub attribute_trust: AttributeTrust,
+}
+
+/// Who wrote the sink `attributes` of a config `faucet serve` loaded, for
+/// data-flow policy: an attribute written by the caller of a run can neither
+/// satisfy a `require` rule nor take a sink out of a `when.sink` scope.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AttributeTrust {
+    /// The operator wrote every sink: the local CLI, a server file, a
+    /// registered template without caller-chosen sink values.
+    #[default]
+    Trusted,
+    /// The run's caller wrote the config: no sink's attributes are trusted.
+    Untrusted,
+    /// A trusted body holding caller-chosen values at these JSON pointers: a
+    /// sink (or DLQ) with one anywhere in its subtree is not trusted, since
+    /// the caller then chooses where its rows go.
+    CallerFields(Vec<String>),
+}
+
+impl PipelineConfig {
+    /// Whether the policy owner trusts topology sink node `node`'s
+    /// `attributes` (its template `template`) and the pipeline DLQ's.
+    pub fn topology_destination_trust(&self, node: &str, template: &str) -> (bool, bool) {
+        use crate::params::caller::child;
+        let mut sink = vec![
+            child("/pipeline/nodes", node),
+            child("/pipeline/sinks", template),
+        ];
+        if template == "default" {
+            sink.push("/pipeline/sink".to_owned());
+        }
+        (
+            self.attribute_trust.attests(&sink),
+            self.attribute_trust.attests(&["/pipeline/dlq".to_owned()]),
+        )
+    }
+}
+
+impl AttributeTrust {
+    /// Whether a destination declared at any of `bases` (JSON pointers of its
+    /// connector blocks) is trusted.
+    pub fn attests(&self, bases: &[String]) -> bool {
+        match self {
+            AttributeTrust::Trusted => true,
+            AttributeTrust::Untrusted => false,
+            AttributeTrust::CallerFields(pointers) => !pointers.iter().any(|p| {
+                bases.iter().any(|base| {
+                    p == base
+                        || p.strip_prefix(base.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                        || base
+                            .strip_prefix(p.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+            }),
+        }
+    }
 }
 
 /// The base pipeline definition. Each matrix row is resolved against the
@@ -1709,6 +1774,25 @@ pub fn parse_with_extension(text: &str, ext: &str) -> CliResult<PipelineConfig> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn attribute_trust_covers_a_destination_subtree() {
+        let bases = vec!["/pipeline/sinks/s".to_owned(), "/matrix/0/sink".to_owned()];
+        assert!(AttributeTrust::Trusted.attests(&bases));
+        assert!(!AttributeTrust::Untrusted.attests(&bases));
+        let at = |p: &str| AttributeTrust::CallerFields(vec![p.to_owned()]);
+        assert!(!at("/pipeline/sinks/s/config/bucket").attests(&bases));
+        assert!(!at("/pipeline/sinks/s").attests(&bases));
+        assert!(
+            !at("/pipeline/sinks").attests(&bases),
+            "a whole-block value covers it"
+        );
+        assert!(!at("/matrix/0/sink/attributes/residency").attests(&bases));
+        assert!(at("/pipeline/sinks/s2/config/path").attests(&bases));
+        assert!(at("/pipeline/sinks/s2").attests(&bases));
+        assert!(at("/matrix/1/sink").attests(&bases));
+        assert!(at("/pipeline/source/config/path").attests(&bases));
+    }
 
     #[test]
     fn parses_minimal_pipeline_yaml() {

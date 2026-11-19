@@ -241,6 +241,21 @@ pub async fn register_template(
             }
         }
     }
+    #[cfg(feature = "policy")]
+    {
+        let parsed: Option<serde_json::Value> = match record.format {
+            crate::serve::load::ConfigFormat::Yaml => crate::yaml::from_str(&record.body).ok(),
+            crate::serve::load::ConfigFormat::Json => serde_json::from_str(&record.body).ok(),
+        };
+        for warning in parsed
+            .as_ref()
+            .map(crate::policy::caller_chosen_sink_warnings)
+            .unwrap_or_default()
+        {
+            tracing::warn!(template = %record.id, "{warning}");
+            summary.warnings.push(warning);
+        }
+    }
     // Caller params reaching the server identity are refused at trigger time.
     if let Some(warning) = host_identity_warning(&state, &record) {
         tracing::warn!(template = %record.id, "{warning}");

@@ -19,6 +19,42 @@ pub struct SinkFacts {
     pub kind: String,
     /// Declared `attributes` (`residency`, `environment`, `region`, …).
     pub attributes: BTreeMap<String, String>,
+    /// Whether the policy owner trusts the attributes: written by the
+    /// operator (the local CLI, a server file, a registered template), not by
+    /// whoever submitted the run. Unattested attributes never satisfy a
+    /// `require`, and every `when.sink` scope is assumed to match, since the
+    /// attribute that would put the sink out of scope cannot be trusted.
+    pub attested: bool,
+}
+
+impl SinkFacts {
+    /// Facts whose attributes the policy owner trusts.
+    pub fn new(
+        id: impl Into<String>,
+        kind: impl Into<String>,
+        attributes: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            kind: kind.into(),
+            attributes,
+            attested: true,
+        }
+    }
+
+    /// The same facts with untrusted attributes.
+    #[must_use]
+    pub fn unattested(mut self) -> Self {
+        self.attested = false;
+        self
+    }
+
+    /// The same facts with `attested` set as given.
+    #[must_use]
+    pub fn with_attested(mut self, attested: bool) -> Self {
+        self.attested = attested;
+        self
+    }
 }
 
 /// One column as the policy sees it.
@@ -47,8 +83,15 @@ pub struct ColumnFacts {
 pub enum ViolationKind {
     /// The rule denies the label at this sink outright.
     Denied,
-    /// The sink declares no such attribute.
-    MissingAttribute { attribute: String },
+    /// The sink declares no such attribute, or (`unattested`) declares it in
+    /// a config the server does not trust for policy.
+    MissingAttribute {
+        attribute: String,
+        /// The sink's attributes came from a submitted config, so a declared
+        /// value cannot satisfy the rule.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unattested: bool,
+    },
     /// The sink's attribute value is not in the allowed set.
     AttributeNotAllowed {
         attribute: String,
@@ -86,8 +129,20 @@ impl fmt::Display for Violation {
                 "label `{}` may not reach sink `{}` ({})",
                 self.label, self.sink, self.sink_kind
             ),
-            ViolationKind::MissingAttribute { attribute } => format!(
+            ViolationKind::MissingAttribute {
+                attribute,
+                unattested: false,
+            } => format!(
                 "label `{}` requires sink attribute `{attribute}`, which sink `{}` ({}) does not declare",
+                self.label, self.sink, self.sink_kind
+            ),
+            ViolationKind::MissingAttribute {
+                attribute,
+                unattested: true,
+            } => format!(
+                "label `{}` requires sink attribute `{attribute}`; attributes of sink `{}` ({}) \
+                 come from the submitted config, which this server does not trust for policy \
+                 — use a registered sink template, or mask the column",
                 self.label, self.sink, self.sink_kind
             ),
             ViolationKind::AttributeNotAllowed {
@@ -131,13 +186,17 @@ impl fmt::Display for Violation {
     }
 }
 
-/// Whether `rule` governs a column carrying `label` heading into `sink`.
+/// Whether `rule` governs a column carrying `label` heading into `sink`. For
+/// an unattested sink the `when.sink` attributes are assumed to match.
 pub fn rule_applies(rule: &PolicyRule, label: &str, sink: &SinkFacts) -> bool {
     if rule.when.label != label {
         return false;
     }
     if !rule.when.sink_kind.is_empty() && !rule.when.sink_kind.iter().any(|k| k == &sink.kind) {
         return false;
+    }
+    if !sink.attested {
+        return true;
     }
     rule.when.sink.iter().all(|(attr, allowed)| {
         sink.attributes
@@ -203,9 +262,17 @@ pub fn evaluate(
                 continue;
             }
             for (attr, allowed) in &rule.require {
+                if !sink.attested {
+                    out.push(base(ViolationKind::MissingAttribute {
+                        attribute: attr.clone(),
+                        unattested: true,
+                    }));
+                    continue;
+                }
                 match sink.attributes.get(attr) {
                     None => out.push(base(ViolationKind::MissingAttribute {
                         attribute: attr.clone(),
+                        unattested: false,
                     })),
                     Some(v) if !allowed.iter().any(|a| a == v) => {
                         out.push(base(ViolationKind::AttributeNotAllowed {
@@ -244,14 +311,14 @@ mod tests {
     }
 
     fn sink(kind: &str, attrs: &[(&str, &str)]) -> SinkFacts {
-        SinkFacts {
-            id: "default".into(),
-            kind: kind.into(),
-            attributes: attrs
+        SinkFacts::new(
+            "default",
+            kind,
+            attrs
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
-        }
+        )
     }
 
     fn col(name: &str, labels: &[&str], masked: Option<&str>) -> ColumnFacts {
@@ -282,7 +349,7 @@ mod tests {
 
         let v = evaluate(&p, &sink("postgres", &[]), &cols);
         assert!(
-            matches!(&v[0].kind, ViolationKind::MissingAttribute { attribute } if attribute == "residency")
+            matches!(&v[0].kind, ViolationKind::MissingAttribute { attribute, unattested: false } if attribute == "residency")
         );
         assert!(v[0].to_string().contains("does not declare"));
 
@@ -313,6 +380,59 @@ mod tests {
     }
 
     #[test]
+    fn unattested_attributes_never_satisfy_require() {
+        let p = policy();
+        let cols = [col("email", &["pii"], None)];
+        let v = evaluate(
+            &p,
+            &sink("postgres", &[("residency", "eu")]).unattested(),
+            &cols,
+        );
+        assert_eq!(v.len(), 1);
+        assert!(matches!(
+            &v[0].kind,
+            ViolationKind::MissingAttribute { attribute, unattested: true } if attribute == "residency"
+        ));
+        let text = v[0].to_string();
+        assert!(text.contains("does not trust"), "{text}");
+        let j = serde_json::to_value(&v[0]).unwrap();
+        assert_eq!(j["kind"], "missing_attribute");
+        assert_eq!(j["unattested"], true);
+        let attested = evaluate(&p, &sink("postgres", &[]), &cols);
+        assert!(
+            serde_json::to_value(&attested[0])
+                .unwrap()
+                .get("unattested")
+                .is_none()
+        );
+        let masked = [col("email", &["pii"], Some("hash"))];
+        assert!(
+            evaluate(&p, &sink("postgres", &[]).unattested(), &masked).is_empty(),
+            "a listed mask still satisfies the rule"
+        );
+    }
+
+    #[test]
+    fn an_unattested_sink_is_in_scope_of_every_attribute_scoped_rule() {
+        let p = policy();
+        let cols = [col("iban", &["finance"], None)];
+        let v = evaluate(
+            &p,
+            &sink("jsonl", &[("environment", "dev")]).unattested(),
+            &cols,
+        );
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].kind, ViolationKind::Denied);
+        assert!(
+            evaluate(&p, &sink("postgres", &[]).unattested(), &cols).is_empty(),
+            "the sink kind is not an attribute, so `when.sink_kind` still scopes"
+        );
+        assert!(evaluate(&p, &sink("jsonl", &[("environment", "dev")]), &cols).is_empty());
+        assert!(sink("jsonl", &[]).attested);
+        assert!(!sink("jsonl", &[]).with_attested(false).attested);
+    }
+
+    #[test]
     fn conservative_columns_are_flagged_as_such() {
         let p = policy();
         let mut c = col("email", &["pii"], None);
@@ -333,11 +453,7 @@ mod tests {
         }))
         .unwrap();
         let p = CompiledPolicy::compile(&spec).unwrap();
-        let sink = SinkFacts {
-            id: "s".into(),
-            kind: "jsonl".into(),
-            attributes: BTreeMap::new(),
-        };
+        let sink = SinkFacts::new("s", "jsonl", BTreeMap::new());
         let col = |masked: Option<&str>| ColumnFacts {
             name: "salary".into(),
             labels: ["finance".to_string()].into(),

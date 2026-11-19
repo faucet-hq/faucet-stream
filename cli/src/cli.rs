@@ -2563,6 +2563,17 @@ pub struct ReferenceArgs {
         env = "FAUCET_SERVE_ALLOW_LISTEN"
     )]
     pub allow_listen: Vec<String>,
+    /// Trust the sink `attributes` of submitted configs (and of template
+    /// sinks a caller's param values choose) for data-flow policy, as if the
+    /// operator wrote them. Default: untrusted — such attributes never
+    /// satisfy a policy `require` rule, and every `when.sink`-scoped rule
+    /// applies to such a sink. Only for a server whose every caller is the
+    /// policy owner.
+    #[arg(
+        long = "policy-trust-caller-attributes",
+        env = "FAUCET_SERVE_POLICY_TRUST_CALLER_ATTRIBUTES"
+    )]
+    pub policy_trust_caller_attributes: bool,
 }
 
 /// `faucet serve` arguments.

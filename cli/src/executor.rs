@@ -5226,6 +5226,8 @@ mod tests {
         fn node(id: &str, weight: Option<f64>) -> ExpandedNode {
             ExpandedNode {
                 opt_outs: Vec::new(),
+                sink_attested: true,
+                dlq_attested: true,
                 id: id.into(),
                 row_index: 0,
                 weight,
@@ -5589,6 +5591,7 @@ mod tests {
             metadata_columns: None,
             #[cfg(feature = "catalog")]
             local_outputs: None,
+            attribute_trust: Default::default(),
             selection: None,
             observability: None,
             delivery: faucet_core::DeliveryMode::default(),
@@ -7444,6 +7447,8 @@ matrix:
         fn child(id: &str, parent: &str, parent_key: &str, refs: &[(&str, &str)]) -> ExpandedNode {
             ExpandedNode {
                 opt_outs: Vec::new(),
+                sink_attested: true,
+                dlq_attested: true,
                 id: id.into(),
                 row_index: 0,
                 weight: None,
@@ -7536,6 +7541,8 @@ matrix:
         use crate::expand::{DeferredRef, ExpandedNode, NodeRole};
         let c = ExpandedNode {
             opt_outs: Vec::new(),
+            sink_attested: true,
+            dlq_attested: true,
             id: "c".into(),
             row_index: 0,
             weight: None,
@@ -7954,6 +7961,8 @@ matrix:
         use crate::config::ConnectorSpec;
         ExpandedNode {
             opt_outs: Vec::new(),
+            sink_attested: true,
+            dlq_attested: true,
             id: "n".into(),
             row_index: 0,
             weight: None,
@@ -8245,6 +8254,8 @@ matrix:
         use crate::config::ConnectorSpec;
         let orphan = ExpandedNode {
             opt_outs: Vec::new(),
+            sink_attested: true,
+            dlq_attested: true,
             id: "orphan".into(),
             row_index: 0,
             weight: None,

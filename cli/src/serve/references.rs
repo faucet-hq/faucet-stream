@@ -50,6 +50,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 pub struct ServeReferencePolicy {
     caller: ReferencePolicy,
     tenant_root: Option<PathBuf>,
+    trust_caller_attributes: bool,
 }
 
 impl Default for ServeReferencePolicy {
@@ -113,10 +114,24 @@ impl ServeReferencePolicy {
             caller.with_url_hosts(args.allow_url_host.iter().cloned())
         };
         let caller = caller.with_listen(listen_ranges(&args.allow_listen)?);
+        if args.policy_trust_caller_attributes {
+            tracing::warn!(
+                "--policy-trust-caller-attributes: sink attributes in submitted configs are \
+                 trusted for data-flow policy; any caller can satisfy a `require` rule by \
+                 declaring the attribute"
+            );
+        }
         Ok(Self {
             caller,
             tenant_root: args.tenant_path_root.clone(),
+            trust_caller_attributes: args.policy_trust_caller_attributes,
         })
+    }
+
+    /// Whether sink `attributes` a caller wrote are trusted for data-flow
+    /// policy (`--policy-trust-caller-attributes`).
+    pub fn trusts_caller_attributes(&self) -> bool {
+        self.trust_caller_attributes
     }
 
     /// Keep `ports` (the server's own) from every caller listener.
@@ -381,6 +396,7 @@ mod tests {
             allow_unverified_tls: true,
             allow_host_credentials: false,
             allow_listen: vec!["[::]:9000".into(), "[::1]:9100-9199".into()],
+            policy_trust_caller_attributes: false,
         };
         let p = ServeReferencePolicy::from_args(&args).unwrap();
         assert!(p.caller().check_listen("0.0.0.0:9000").is_ok());
