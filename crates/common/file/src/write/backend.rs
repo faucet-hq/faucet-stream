@@ -34,6 +34,19 @@ pub enum Area {
     Swap,
 }
 
+/// What [`StorageBackend::create_side_file`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SideCreate {
+    /// The file was created.
+    Created,
+    /// A file of that name already existed; nothing was written.
+    Exists,
+    /// The backend cannot create a file only when it is absent, so it cannot
+    /// coordinate concurrent writers of one output.
+    Unsupported,
+}
+
 /// Parts of one object uploaded while it is still being written, for a
 /// backend whose store can assemble an object from parts.
 ///
@@ -245,6 +258,43 @@ pub trait StorageBackend: Send + Sync {
         Ok(())
     }
 
+    /// Create the side file `name` with `text`, only when no file of that
+    /// name exists. Side files sit beside the commit ledger
+    /// (`.faucet-overwrite-<tag>.commits/`), which readers of the output
+    /// skip; the writer keeps its output lock and part claims there.
+    /// Default: [`SideCreate::Unsupported`].
+    async fn create_side_file(&self, name: &str, text: &str) -> Result<SideCreate, FaucetError> {
+        let _ = (name, text);
+        Ok(SideCreate::Unsupported)
+    }
+
+    /// The text of side file `name`, or `None` when it is not there.
+    /// Default: `None`.
+    async fn read_side_file(&self, name: &str) -> Result<Option<String>, FaucetError> {
+        let _ = name;
+        Ok(None)
+    }
+
+    /// Replace side file `name` with `text` atomically. Default: nothing
+    /// stored.
+    async fn write_side_file(&self, name: &str, text: &str) -> Result<(), FaucetError> {
+        let _ = (name, text);
+        Ok(())
+    }
+
+    /// Delete side file `name`; a missing file is not an error. Default:
+    /// nothing to delete.
+    async fn delete_side_file(&self, name: &str) -> Result<(), FaucetError> {
+        let _ = name;
+        Ok(())
+    }
+
+    /// The names of the side files that start with `prefix`. Default: none.
+    async fn list_side_files(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
+        let _ = prefix;
+        Ok(Vec::new())
+    }
+
     /// A non-mutating preflight probe of the storage (reachability,
     /// credentials). `None` when the backend has none, so the sink's own
     /// probe answers. Default: `None`.
@@ -420,6 +470,45 @@ macro_rules! delegate_storage_backend {
                 text: &str,
             ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
                 $crate::write::StorageBackend::write_commit_record(&self.$field, text).await
+            }
+            async fn create_side_file(
+                &self,
+                name: &str,
+                text: &str,
+            ) -> ::std::result::Result<$crate::write::SideCreate, $crate::__private::FaucetError>
+            {
+                $crate::write::StorageBackend::create_side_file(&self.$field, name, text).await
+            }
+            async fn read_side_file(
+                &self,
+                name: &str,
+            ) -> ::std::result::Result<
+                ::std::option::Option<::std::string::String>,
+                $crate::__private::FaucetError,
+            > {
+                $crate::write::StorageBackend::read_side_file(&self.$field, name).await
+            }
+            async fn write_side_file(
+                &self,
+                name: &str,
+                text: &str,
+            ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
+                $crate::write::StorageBackend::write_side_file(&self.$field, name, text).await
+            }
+            async fn delete_side_file(
+                &self,
+                name: &str,
+            ) -> ::std::result::Result<(), $crate::__private::FaucetError> {
+                $crate::write::StorageBackend::delete_side_file(&self.$field, name).await
+            }
+            async fn list_side_files(
+                &self,
+                prefix: &str,
+            ) -> ::std::result::Result<
+                ::std::vec::Vec<::std::string::String>,
+                $crate::__private::FaucetError,
+            > {
+                $crate::write::StorageBackend::list_side_files(&self.$field, prefix).await
             }
             async fn check(
                 &self,

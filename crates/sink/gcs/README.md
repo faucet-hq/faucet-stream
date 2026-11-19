@@ -433,6 +433,44 @@ sink:
     parquet: { compression: zstd, row_group_size: 131072 }
 ```
 
+## Concurrent writers of one output
+
+Writers of one output coordinate through small hidden side files in
+`.faucet-overwrite-<name>.commits/` beside it (readers of the output skip
+that directory), so it is safe to run more than one at once:
+
+- **Overwrite commits** take an output lock: a second run that reaches its
+  commit while another is committing waits (an INFO log says so) and then
+  commits; the output always ends as exactly one run's files — the run that
+  committed last — never a mix, and the commit ledger never goes back. A
+  wait longer than an hour fails the commit with nothing moved. A run that
+  crashed while holding the lock delays the next commit by about two
+  minutes. Runs still stage concurrently; only the move into place is one at
+  a time.
+- **`if_exists: append` to a numbered (`{part}`) output** claims each part
+  number before writing it, so two runs never publish the same name (a
+  crashed run can leave a gap in the numbering). Each new part costs one
+  extra small create and one existence check, and one delete when the claim
+  is pruned at the end of a successful run (claims of crashed runs are
+  pruned after seven days) — roughly three times the requests per part for
+  very small parts.
+- **`if_exists: append` to one JSON Lines or raw-text file** adds each
+  flush's new lines to what is stored, under the output lock, so concurrent
+  appenders (including dead-letter queues sharing one file) interleave by
+  flush and lose nothing. A CSV or encrypted file cannot be added to that
+  way: its appender holds the output until it finishes, and a second one
+  waits.
+- **`if_exists: error`** claims the name, so of two runs that both find it
+  absent only one writes it; the other fails. A claim left by a run that
+  died more than an hour ago is taken over.
+
+The lock needs a store that creates an object only when it is absent: S3
+`If-None-Match: *`, GCS `ifGenerationMatch=0`, Azure Blob `If-None-Match`,
+SFTP exclusive open, or a local exclusive create. An S3-compatible store
+that ignores `If-None-Match` cannot coordinate writers; the sink warns once
+when it detects one. Upgrade every writer of an output: an older release
+does not take the lock.
+
 ## Batch atomicity
 
 What a failed write leaves behind (#737): **atomic** without a rollover cap —

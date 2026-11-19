@@ -136,3 +136,22 @@ Connector authors normally depend on the source or sink crate, not this one.
 [dependencies]
 faucet-common-file = "1.0.0"
 ```
+
+### Side files: the output lock and part claims
+
+`StorageBackend` has five defaulted side-file methods (`create_side_file`
+— create only when absent, returning `SideCreate::{Created, Exists,
+Unsupported}` —, `read_side_file`, `write_side_file`, `delete_side_file`,
+`list_side_files(prefix)`) over `.faucet-overwrite-<name>.commits/`, and
+`ObjectClient` has `create_new` / `supports_create_new`. `LocalBackend`
+(exclusive create) and `RemoteBackend` implement them, and
+`delegate_storage_backend!` forwards them. The writer builds two things on
+them: an output lock (`lock-<epoch>`, renewed by its holder, taken over by a
+waiter that sees it unchanged for its lease; the holder stops itself once
+it cannot renew, and every call it makes under the lock is cut off at that
+instant) that serialises overwrite commits and appends to one shared file,
+and part claims (`claim-<file name>`) for numbered appends and
+`if_exists: error`. A backend without them keeps today's behaviour and the
+writer warns once per output that concurrent writers are not coordinated.
+`LocalBackend` builds files in a per-writer scratch directory
+(`scratch_dir()`), removed when the writer goes.

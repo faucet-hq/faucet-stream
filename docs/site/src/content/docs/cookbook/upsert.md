@@ -416,6 +416,13 @@ is `{index}-faucet-ovw-staging-<token>`, and the file sinks (`file`, `s3`, `gcs`
 runs of the same destination at once
 (two schedulers, a manual run during a scheduled one) never drop or share each
 other's staging: each swaps in exactly its own rows, and the last commit wins.
+On the file sinks the moves into place are also serialised by an output lock
+kept beside the destination: a commit that starts while another is moving
+files waits for it (failing after an hour, with nothing moved), so the
+output ends as exactly one run's files, never a mix. A run that crashed
+holding the lock delays the next commit by about two minutes. S3-compatible
+stores must honour `If-None-Match: *` for this; the sink warns once when one
+does not.
 
 Staging a crashed run left behind is cleaned up by a later run of the same
 table, with one rule: a run drops another run's staging only once that run's

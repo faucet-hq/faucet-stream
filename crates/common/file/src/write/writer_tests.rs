@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods)] // tests drive time directly
+
 use super::*;
 use crate::write::LocalBackend;
 use crate::write::remote::tests::{Mem, MemParts};
@@ -20,6 +22,27 @@ fn remote(mem: &Arc<Mem>, path: Option<&str>, s: WriteSettings, uploads: usize) 
         .unwrap()
         .with_upload_concurrency(uploads);
     FileWriter::new(s, t, Arc::new(b)).unwrap()
+}
+
+/// The output's keys, without its side files (lock, claims, ledger).
+fn output_keys(mem: &Mem) -> Vec<String> {
+    mem.keys()
+        .into_iter()
+        .filter(|k| !k.contains(".commits/"))
+        .collect()
+}
+
+/// The entries of `dir`, without the side-file directory and the live
+/// writers' scratch directories.
+fn visible(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.ends_with(".commits") && !n.contains(".scratch-"))
+        .collect();
+    names.sort();
+    names
 }
 
 fn jsonl() -> WriteSettings {
@@ -445,7 +468,7 @@ async fn overwrite_moves_the_swap_area_into_place_and_removes_stale_parts() {
     assert!(mem.keys().contains(&"pre/d/part-00009.jsonl".to_string()));
     w.commit_overwrite().await.unwrap();
     assert_eq!(
-        mem.keys(),
+        output_keys(&mem),
         ["pre/d/part-00001.jsonl", "pre/d/part-00002.jsonl"]
     );
     assert!(!w.swap_area_exists().await.unwrap());
@@ -496,7 +519,7 @@ async fn an_abort_after_the_move_started_finishes_it() {
     *mem.fail_rename_key.lock().unwrap() = None;
     overwrite_remote(&mem).abort_overwrite().await.unwrap();
     assert_eq!(
-        mem.keys(),
+        output_keys(&mem),
         ["pre/d/part-00001.jsonl", "pre/d/part-00002.jsonl"]
     );
     overwrite_remote(&mem).commit_overwrite().await.unwrap_err();
@@ -526,7 +549,7 @@ async fn the_move_into_place_runs_concurrently() {
     w.flush().await.unwrap();
     w.commit_overwrite().await.unwrap();
     assert_eq!(mem.renames.load(SeqCst), 20);
-    assert_eq!(mem.keys().len(), 20);
+    assert_eq!(output_keys(&mem).len(), 20);
 }
 
 #[tokio::test]
@@ -543,13 +566,7 @@ async fn overwrite_on_a_local_directory_leaves_no_swap_area() {
     w.write_rows(&rows(1)).await.unwrap();
     w.flush().await.unwrap();
     w.commit_overwrite().await.unwrap();
-    let mut names: Vec<String> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    assert_eq!(names, ["o-00001.jsonl"]);
+    assert_eq!(visible(dir.path()), ["o-00001.jsonl"]);
 }
 
 #[cfg(feature = "file-format-parquet")]
@@ -752,8 +769,7 @@ async fn the_columnar_byte_cap_counts_each_rows_share() {
     let w = local(dir.path(), "c.parquet", s);
     w.write_batch(&big).await.unwrap();
     w.flush().await.unwrap();
-    let files = std::fs::read_dir(dir.path()).unwrap().count();
-    assert_eq!(files, 3, "400 + 400 + 200 rows");
+    assert_eq!(visible(dir.path()).len(), 3, "400 + 400 + 200 rows");
 }
 
 #[cfg(feature = "file-format-parquet")]
@@ -891,7 +907,12 @@ async fn a_corrupt_csv_body_fails_the_flush() {
     );
     w.write_rows(&[json!({"a": 1})]).await.unwrap();
     w.write_rows(&[json!({"a": 2, "b": 3})]).await.unwrap();
-    let body = dir.path().join("c.csv.faucet-tmp-body");
+    let body = PathBuf::from(format!(
+        "{}-body",
+        w.backend()
+            .scratch_path(Area::Destination, "c.csv")
+            .display()
+    ));
     std::fs::write(&body, [0xff; 64]).unwrap();
     let e = w.flush().await.unwrap_err().to_string();
     assert!(e.contains("file sink: writing"), "{e}");
@@ -932,6 +953,7 @@ mod sealing {
             let w = local(dir.path(), name, plain(&s));
             w.write_rows(&rows(1)).await.unwrap();
             w.flush().await.unwrap();
+            w.complete().await.unwrap();
             let w = local(dir.path(), name, s.clone());
             let e = w.write_rows(&rows(1)).await.unwrap_err().to_string();
             assert!(
@@ -943,6 +965,7 @@ mod sealing {
             let w = local(dir.path(), &other, s.clone());
             w.write_rows(&rows(1)).await.unwrap();
             w.flush().await.unwrap();
+            w.complete().await.unwrap();
             let w = local(dir.path(), &other, plain(&s));
             let e = w.write_rows(&rows(1)).await.unwrap_err().to_string();
             assert!(
@@ -964,7 +987,7 @@ mod sealing {
         s.if_exists = IfExists::Replace;
         let w = local(dir.path(), "x.jsonl.gz", s);
         w.write_rows(&rows(1)).await.unwrap();
-        let tmp = dir.path().join("x.jsonl.gz.faucet-tmp");
+        let tmp = w.backend().scratch_path(Area::Destination, "x.jsonl.gz");
         let mode = std::fs::metadata(&tmp).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         w.flush().await.unwrap();
@@ -1055,6 +1078,7 @@ mod sealed_line_integrity {
         w.flush().await.unwrap();
         w.write_rows(&rows(1)).await.unwrap();
         w.flush().await.unwrap();
+        w.complete().await.unwrap();
         let again = local(dir.path(), "e.jsonl", sealed_jsonl());
         again.write_rows(&rows(1)).await.unwrap();
         again.flush().await.unwrap();
@@ -1149,6 +1173,7 @@ mod sealed_line_integrity {
             .collect();
         lines.swap(1, 2);
         std::fs::write(dir.path().join("t.jsonl"), lines.concat()).unwrap();
+        w.complete().await.unwrap();
         let w = local(dir.path(), "t.jsonl", sealed_jsonl());
         let e = w.write_rows(&rows(1)).await.unwrap_err().to_string();
         assert!(e.contains("integrity"), "{e}");
@@ -1186,10 +1211,8 @@ mod in_place {
         );
         let text = std::fs::read_to_string(&out).unwrap();
         assert_eq!(text.lines().count(), 5);
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
+        let leftovers: Vec<_> = visible(dir.path())
+            .into_iter()
             .filter(|n| n != "o.jsonl")
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
@@ -1453,14 +1476,13 @@ async fn concurrent_remote_overwrite_runs_keep_their_own_files() {
     // The untokened status probe sees the live runs' areas.
     assert!(overwrite_remote(&mem).swap_area_exists().await.unwrap());
     run(&a).commit_overwrite().await.unwrap();
-    let dest: Vec<String> = mem
-        .keys()
+    let dest: Vec<String> = output_keys(&mem)
         .into_iter()
         .filter(|k| !k.contains(&tag))
         .collect();
     assert_eq!(dest, ["pre/d/part-00001.jsonl", "pre/d/part-00002.jsonl"]);
     run(&b).commit_overwrite().await.unwrap();
-    assert_eq!(mem.keys(), ["pre/d/part-00001.jsonl"]);
+    assert_eq!(output_keys(&mem), ["pre/d/part-00001.jsonl"]);
     assert_eq!(
         mem.objects.lock().unwrap()["pre/d/part-00001.jsonl"],
         b"{\"b\":1}\n".to_vec()
@@ -1555,12 +1577,7 @@ async fn concurrent_local_overwrite_runs_keep_their_own_files() {
         std::fs::read_to_string(out.join("data.jsonl")).unwrap(),
         "{\"b\":1}\n"
     );
-    let left: Vec<_> = std::fs::read_dir(&out)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(left, ["data.jsonl"]);
+    assert_eq!(visible(&out), ["data.jsonl"]);
     assert!(!open().swap_area_exists().await.unwrap());
 }
 
@@ -1741,10 +1758,10 @@ async fn an_owner_finishes_a_commit_another_run_took_over() {
     let owner = open(Some(&a));
     // The move it had listed finds the file already in place.
     owner.promote_own(&names[0]).await.unwrap();
-    owner.move_into_place(5, names.clone()).await.unwrap();
+    owner.move_into_place(5, names.clone(), None).await.unwrap();
     assert!(out.join(&names[0]).exists() && out.join(&names[1]).exists());
     // Every file already moved and the area gone: still no error.
-    owner.move_into_place(5, names).await.unwrap();
+    owner.move_into_place(5, names, None).await.unwrap();
     // A file missing from both places is still an error.
     std::fs::create_dir_all(&area).unwrap();
     std::fs::write(area.join("data-00003.jsonl"), "x\n").unwrap();
@@ -1811,4 +1828,372 @@ async fn a_remote_begin_never_replays_an_older_crashed_commit() {
     let o = mem.objects.lock().unwrap();
     assert_eq!(o["pre/d/part-00001.jsonl"], b"{\"run\":\"c\"}\n".to_vec());
     assert!(!o.keys().any(|k| k.starts_with(&format!("{a_area}/"))));
+}
+
+/// Two overwrite runs committing one output at once end with exactly one
+/// run's files, and the commit ledger never goes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_remote_overwrite_commits_never_blend() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    for _ in 0..5 {
+        let mem = Arc::new(Mem::default());
+        mem.delay_ms.store(5, SeqCst);
+        let staged = |token: String, n: usize, tag: &'static str| {
+            let mem = mem.clone();
+            async move {
+                let w = overwrite_remote(&mem);
+                w.join_overwrite_run(&token).unwrap();
+                w.begin_overwrite().await.unwrap();
+                let rows: Vec<Value> = (0..n).map(|i| json!({ tag: i })).collect();
+                w.write_rows(&rows).await.unwrap();
+                w.flush().await.unwrap();
+                w
+            }
+        };
+        let a = staged(new_overwrite_run_token(), 3, "a").await;
+        let b = staged(new_overwrite_run_token(), 2, "b").await;
+        let ta = tokio::spawn(async move { a.commit_overwrite().await });
+        let tb = tokio::spawn(async move { b.commit_overwrite().await });
+        ta.await.unwrap().unwrap();
+        tb.await.unwrap().unwrap();
+        let dest: Vec<String> = output_keys(&mem)
+            .into_iter()
+            .filter(|k| !k.contains(".faucet-overwrite-"))
+            .collect();
+        let bodies: Vec<String> = dest.iter().map(|k| mem.text(k)).collect();
+        let from_a = bodies.iter().filter(|b| b.contains("\"a\"")).count();
+        let from_b = bodies.iter().filter(|b| b.contains("\"b\"")).count();
+        assert!(
+            (from_a, from_b) == (3, 0) || (from_a, from_b) == (0, 2),
+            "never a blend: {dest:?} {bodies:?}"
+        );
+        let locks: Vec<String> = mem
+            .keys()
+            .into_iter()
+            .filter(|k| k.contains(".commits/lock-"))
+            .collect();
+        assert_eq!(locks.len(), 1, "older lock epochs are deleted: {locks:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_local_overwrite_commits_never_blend() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = jsonl();
+    s.write_mode = FileWriteMode::Overwrite;
+    s.max_records_per_file = Some(1);
+    let path = dir.path().to_path_buf();
+    let staged = |n: usize, tag: &'static str| {
+        let (path, s) = (path.clone(), s.clone());
+        async move {
+            let w = local(&path, "o-{part}.jsonl", s);
+            w.join_overwrite_run(&new_overwrite_run_token()).unwrap();
+            w.begin_overwrite().await.unwrap();
+            let rows: Vec<Value> = (0..n).map(|i| json!({ tag: i })).collect();
+            w.write_rows(&rows).await.unwrap();
+            w.flush().await.unwrap();
+            w
+        }
+    };
+    let a = staged(3, "a").await;
+    let b = staged(2, "b").await;
+    let ta = tokio::spawn(async move { a.commit_overwrite().await });
+    let tb = tokio::spawn(async move { b.commit_overwrite().await });
+    ta.await.unwrap().unwrap();
+    tb.await.unwrap().unwrap();
+    let names = visible(dir.path());
+    let bodies: Vec<String> = names
+        .iter()
+        .map(|n| std::fs::read_to_string(dir.path().join(n)).unwrap())
+        .collect();
+    let a_set = names.len() == 3 && bodies.iter().all(|b| b.contains("\"a\""));
+    let b_set = names.len() == 2 && bodies.iter().all(|b| b.contains("\"b\""));
+    assert!(a_set || b_set, "never a blend: {names:?} {bodies:?}");
+}
+
+/// A commit whose lock cannot be renewed stops before moving more files
+/// and keeps its marker, so a later run finishes or drops the move.
+#[tokio::test]
+async fn a_commit_that_loses_its_lock_stops_and_keeps_its_marker() {
+    let mem = Arc::new(Mem::default());
+    let w = overwrite_remote(&mem);
+    w.begin_overwrite().await.unwrap();
+    w.write_rows(&rows(20)).await.unwrap();
+    w.flush().await.unwrap();
+    mem.delay_ms.store(60, SeqCst);
+    mem.fail_side_writes.store(true, SeqCst);
+    let e = w.commit_overwrite().await.unwrap_err().to_string();
+    assert!(e.contains("lost its hold"), "{e}");
+    mem.delay_ms.store(0, SeqCst);
+    mem.fail_side_writes.store(false, SeqCst);
+    let tag = w.template().swap_dir_name();
+    assert!(
+        mem.keys()
+            .iter()
+            .any(|k| k.ends_with(&format!("{tag}/{COMMIT_MARKER}"))),
+        "the marker is kept for recovery"
+    );
+    w.commit_overwrite().await.unwrap();
+    assert_eq!(
+        output_keys(&mem).len(),
+        20,
+        "a later commit finishes the move"
+    );
+}
+
+/// Two runs appending numbered parts to one output at once get distinct
+/// part numbers, so neither replaces the other's file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_numbered_appends_claim_distinct_parts() {
+    let mem = Arc::new(Mem::default());
+    let mut s = per_flush();
+    s.if_exists = IfExists::Append;
+    s.max_records_per_file = Some(1);
+    let writers: Vec<_> = (0..2)
+        .map(|_| remote(&mem, Some("n/"), s.clone(), 1))
+        .collect();
+    let tasks: Vec<_> = writers
+        .into_iter()
+        .enumerate()
+        .map(|(i, w)| {
+            tokio::spawn(async move {
+                let rows: Vec<Value> = (0..4).map(|j| json!({"w": i, "j": j})).collect();
+                w.write_rows(&rows).await.unwrap();
+                w.flush().await.unwrap();
+                w
+            })
+        })
+        .collect();
+    let mut done = Vec::new();
+    for t in tasks {
+        done.push(t.await.unwrap());
+    }
+    let parts = output_keys(&mem);
+    assert_eq!(parts.len(), 8, "every row its own part: {parts:?}");
+    let claims: Vec<String> = mem
+        .keys()
+        .into_iter()
+        .filter(|k| k.contains(".commits/claim-"))
+        .collect();
+    assert_eq!(claims.len(), 8);
+    let orphan = "pre/n/.faucet-overwrite-part-_part_.jsonl.commits/claim-part-00099.jsonl";
+    mem.objects.lock().unwrap().insert(
+        orphan.into(),
+        format!("owner=x wall={}", unix_secs()).into_bytes(),
+    );
+    let old = "pre/n/.faucet-overwrite-part-_part_.jsonl.commits/claim-part-00098.jsonl";
+    mem.objects
+        .lock()
+        .unwrap()
+        .insert(old.into(), b"owner=x wall=1".to_vec());
+    done[0].complete().await.unwrap();
+    let left: Vec<String> = mem
+        .keys()
+        .into_iter()
+        .filter(|k| k.contains(".commits/claim-"))
+        .collect();
+    assert_eq!(
+        left,
+        [orphan.to_string()],
+        "claims of landed parts and stale claims are pruned; a recent one is kept"
+    );
+    let next = remote(&mem, Some("n/"), s, 1);
+    next.write_rows(&rows(1)).await.unwrap();
+    next.flush().await.unwrap();
+    assert!(
+        !output_keys(&mem).contains(&"pre/n/part-00099.jsonl".to_string()),
+        "a claimed number is skipped"
+    );
+}
+
+/// Two runs appending to one shared line file at once: each flush adds to
+/// what is stored, so no run's lines are lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_appends_to_one_remote_line_file_keep_every_line() {
+    let mem = Arc::new(Mem::default());
+    mem.delay_ms.store(2, SeqCst);
+    mem.objects
+        .lock()
+        .unwrap()
+        .insert("pre/log.jsonl".into(), b"{\"old\":1}\n".to_vec());
+    let mut s = jsonl();
+    s.if_exists = IfExists::Append;
+    let tasks: Vec<_> = (0..3)
+        .map(|i| {
+            let w = remote(&mem, Some("log.jsonl"), s.clone(), 1);
+            tokio::spawn(async move {
+                for j in 0..5 {
+                    w.write_rows(&[json!({"w": i, "j": j})]).await.unwrap();
+                    w.flush().await.unwrap();
+                }
+                w.complete().await.unwrap();
+            })
+        })
+        .collect();
+    for t in tasks {
+        t.await.unwrap();
+    }
+    let text = mem.text("pre/log.jsonl");
+    assert_eq!(text.lines().count(), 16, "{text}");
+    assert!(text.starts_with("{\"old\":1}\n"));
+    for i in 0..3 {
+        for j in 0..5 {
+            assert!(text.contains(&format!("{{\"j\":{j},\"w\":{i}}}")), "{text}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_appends_to_one_local_line_file_keep_every_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = jsonl();
+    s.if_exists = IfExists::Append;
+    for codec in [Compression::None, Compression::Gzip] {
+        let mut s = s.clone();
+        s.codec = codec;
+        let name = if codec == Compression::None {
+            "log.jsonl"
+        } else {
+            "log.jsonl.gz"
+        };
+        let path = dir.path().to_path_buf();
+        let tasks: Vec<_> = (0..3)
+            .map(|i| {
+                let w = local(&path, name, s.clone());
+                tokio::spawn(async move {
+                    for j in 0..5 {
+                        w.write_rows(&[json!({"w": i, "j": j})]).await.unwrap();
+                        w.flush().await.unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let raw = std::fs::read(dir.path().join(name)).unwrap();
+        use std::io::Read as _;
+        let text = if codec == Compression::None {
+            String::from_utf8(raw).unwrap()
+        } else {
+            let mut out = String::new();
+            faucet_core::compression::wrap_sync_reader(&raw[..], codec)
+                .read_to_string(&mut out)
+                .unwrap();
+            out
+        };
+        assert_eq!(text.lines().count(), 15, "{name}: {text}");
+    }
+}
+
+/// A CSV append cannot add to the stored file per flush, so it holds the
+/// output for the writer's life: a second appender waits, then continues
+/// the first one's file.
+#[cfg(feature = "file-format-csv")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_csv_appender_holds_the_output_until_it_is_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = WriteSettings::new(FileFormat::Csv, Compression::None);
+    s.if_exists = IfExists::Append;
+    let first = local(dir.path(), "t.csv", s.clone());
+    first.write_rows(&[json!({"a": 1})]).await.unwrap();
+    first.flush().await.unwrap();
+    let path = dir.path().to_path_buf();
+    let s2 = s.clone();
+    let second = tokio::spawn(async move {
+        let w = local(&path, "t.csv", s2);
+        w.write_rows(&[json!({"a": 2})]).await.unwrap();
+        w.flush().await.unwrap();
+        w.complete().await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    assert!(
+        !second.is_finished(),
+        "waits while the first appender is open"
+    );
+    first.write_rows(&[json!({"a": 3})]).await.unwrap();
+    first.flush().await.unwrap();
+    first.complete().await.unwrap();
+    second.await.unwrap();
+    let text = std::fs::read_to_string(dir.path().join("t.csv")).unwrap();
+    assert_eq!(text, "a\n1\n3\n2\n");
+}
+
+/// Of two `if_exists: error` runs that both find a name absent, only one
+/// writes it.
+#[tokio::test]
+async fn error_mode_claims_the_name_before_writing() {
+    let mem = Arc::new(Mem::default());
+    let mut s = jsonl();
+    s.if_exists = IfExists::Error;
+    let a = remote(&mem, Some("e.jsonl"), s.clone(), 1);
+    let b = remote(&mem, Some("e.jsonl"), s.clone(), 1);
+    a.write_rows(&rows(1)).await.unwrap();
+    let e = b.write_rows(&rows(1)).await.unwrap_err().to_string();
+    assert!(e.contains("being written by another run"), "{e}");
+    a.flush().await.unwrap();
+    a.complete().await.unwrap();
+    let c = remote(&mem, Some("e.jsonl"), s, 1);
+    let e = c.write_rows(&rows(1)).await.unwrap_err().to_string();
+    assert!(e.contains("already exists"), "{e}");
+}
+
+/// A claim left by a run that died long ago does not block the name.
+#[tokio::test]
+async fn an_abandoned_error_mode_claim_is_taken_over() {
+    let mem = Arc::new(Mem::default());
+    mem.objects.lock().unwrap().insert(
+        "pre/.faucet-overwrite-e.jsonl.commits/claim-e.jsonl".into(),
+        b"owner=x wall=1".to_vec(),
+    );
+    let mut s = jsonl();
+    s.if_exists = IfExists::Error;
+    let w = remote(&mem, Some("e.jsonl"), s, 1);
+    w.write_rows(&rows(1)).await.unwrap();
+    w.flush().await.unwrap();
+    assert!(output_keys(&mem).contains(&"pre/e.jsonl".to_string()));
+}
+
+/// Each local writer builds its files in a scratch directory of its own,
+/// so two writers of one name never share or remove each other's scratch;
+/// a writer that is gone has its directory removed.
+#[tokio::test]
+async fn local_writers_keep_their_scratch_apart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = jsonl();
+    s.if_exists = IfExists::Replace;
+    let a = local(dir.path(), "x.jsonl", s.clone());
+    let b = local(dir.path(), "x.jsonl", s.clone());
+    a.write_rows(&rows(1)).await.unwrap();
+    b.write_rows(&rows(2)).await.unwrap();
+    let sa = a.backend().scratch_path(Area::Destination, "x.jsonl");
+    let sb = b.backend().scratch_path(Area::Destination, "x.jsonl");
+    assert_ne!(sa.parent(), sb.parent());
+    assert!(
+        sa.exists() && sb.exists(),
+        "neither removed the other's scratch"
+    );
+    let dead = dir.path().join(".faucet-overwrite-x.jsonl.scratch-dead");
+    std::fs::create_dir(&dead).unwrap();
+    std::fs::write(dead.join(super::super::scratch::OWNER_FILE), b"").unwrap();
+    let c = local(dir.path(), "x.jsonl", s);
+    c.write_rows(&rows(1)).await.unwrap();
+    assert!(!dead.exists(), "a gone writer's scratch is removed");
+    assert!(sa.exists() && sb.exists(), "live writers' scratch is kept");
+    a.flush().await.unwrap();
+    let a_dir = sa.parent().unwrap().to_path_buf();
+    drop(a);
+    assert!(!a_dir.exists(), "a writer's scratch goes with it");
+    let backend = LocalBackend::new(
+        dir.path().to_str().unwrap(),
+        &NameTemplate {
+            name: "x.jsonl".into(),
+        },
+        true,
+    );
+    assert!(
+        backend.swap_runs().await.unwrap().is_empty(),
+        "scratch directories are not swap areas"
+    );
 }

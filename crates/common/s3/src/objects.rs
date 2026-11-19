@@ -367,6 +367,32 @@ impl ObjectClient for S3Objects {
         Ok(())
     }
 
+    fn supports_create_new(&self) -> bool {
+        true
+    }
+
+    async fn create_new(&self, key: &str, bytes: &[u8]) -> Result<bool, FaucetError> {
+        self.roundtrips.record("claim");
+        let sent = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .content_type("text/plain")
+            .if_none_match("*")
+            .body(ByteStream::from(bytes.to_vec()))
+            .send()
+            .within(&self.calls, "claim")
+            .await?;
+        match sent {
+            Ok(_) => Ok(true),
+            Err(e) => match e.raw_response().map(|r| r.status().as_u16()) {
+                Some(412 | 409) => Ok(false),
+                _ => Err(self.sdk_err("create object", key, e)),
+            },
+        }
+    }
+
     async fn upload(&self, from: &Path, key: &str) -> Result<(), FaucetError> {
         let len = tokio::fs::metadata(from)
             .await
@@ -671,6 +697,42 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("S3 create local copy error for key 'k'"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn create_new_sends_if_none_match_and_reads_a_conflict_as_exists() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/b/new"))
+            .and(header("if-none-match", "*"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/b/taken"))
+            .and(header("if-none-match", "*"))
+            .respond_with(ResponseTemplate::new(412))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/b/racing"))
+            .respond_with(ResponseTemplate::new(409))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/b/denied"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let o = objects(&server.uri());
+        assert!(o.supports_create_new());
+        assert!(o.create_new("new", b"x").await.unwrap());
+        assert!(!o.create_new("taken", b"x").await.unwrap());
+        assert!(!o.create_new("racing", b"x").await.unwrap());
+        let e = o.create_new("denied", b"x").await.unwrap_err().to_string();
+        assert!(e.contains("create object"), "{e}");
     }
 
     #[test]

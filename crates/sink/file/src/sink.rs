@@ -212,7 +212,17 @@ mod tests {
         s.write_batch(&[json!({"a": 1})]).await.unwrap();
         let fin = d.path().join("x.jsonl");
         assert!(!fin.exists());
-        assert!(d.path().join("x.jsonl.faucet-tmp").exists());
+        let scratch: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".faucet-overwrite-x.jsonl.scratch-")
+            })
+            .map(|e| e.path().join("x.jsonl.faucet-tmp"))
+            .collect();
+        assert!(scratch.len() == 1 && scratch[0].exists(), "{scratch:?}");
         s.flush().await.unwrap();
         assert_eq!(lines(&fin), vec![json!({"a": 1})]);
         s.write_batch(&[json!({"a": 2})]).await.unwrap();
@@ -404,7 +414,8 @@ mod tests {
         if !writable {
             assert_eq!(report.failed_count(), 1);
             let e = s.write_batch(&[json!({})]).await.unwrap_err();
-            assert!(e.to_string().contains("ro/x.jsonl"), "{e}");
+            let e = e.to_string();
+            assert!(e.contains("ro/") && e.contains("x.jsonl"), "{e}");
         }
         std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
