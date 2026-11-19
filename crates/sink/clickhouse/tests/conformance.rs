@@ -131,8 +131,7 @@ async fn conformance_declared_capabilities() {
     faucet_conformance::assert_cancellation_flushes(&sink, count).await;
     faucet_conformance::assert_driver_row_paths_agree(&sink).await;
 
-    // One INSERT per page: a page with a row ClickHouse cannot parse lands
-    // nothing.
+    // Declared best effort even unchunked: the check accepts a torn page.
     let atomic: ClickHouseSinkConfig = serde_json::from_value(serde_json::json!({
         "url": base, "table": "cap", "batch_size": 0
     }))

@@ -560,6 +560,33 @@ fn host_identity(cfg: &Value) -> Vec<String> {
 - A custom connector registered without an answer is refused for caller
   configs unless the operator passes the flag.
 
+### Destination schema and column matching
+
+A sink that returns `Some` from `current_schema()` (a driver's
+`SchemaDriver::current_schema`) reports exactly the columns a record field can
+land in, spelled as the destination stores them, and `column_matching()`
+(`SchemaDriver::column_matching`) returns the rule **every write path of the
+configured sink** uses to map a field onto one of those columns:
+`ColumnMatching::Exact`, `CaseInsensitive`, `FoldUnique` or `UpperFold`. The
+schema-drift pass resolves page fields with the same rule, so a field that
+differs from a column only by case is not reported as a new column.
+
+- When write paths disagree, make them agree or return `Exact`. BigQuery's
+  `insertAll` and load jobs resolve names ignoring case server-side, but its
+  `MERGE` / exactly-once / overwrite paths read `$.<column>` from a JSON
+  payload case-sensitively; the sink renames each record's fields to the
+  column spelling before serialising (`canonical_records`), so every path
+  folds the same way and it can declare `CaseInsensitive`.
+- A sink whose write path does not map fields to the reported columns (a JSON
+  or document column mode) returns `None` from `current_schema()` and declares
+  `SchemaReport::Schemaless` and no `schema_evolution` for that config.
+- Resolve names with `faucet_core::column_for_field` / `field_for_column` (or
+  `canonical_record`), never a private comparison. SQL family sinks get the
+  rule from their dialect (`SqlDialect::column_matching`) through
+  `SqlSinkDriver`.
+- A crate that overrides `column_matching` must call
+  `assert_drift_resolves_like_writes` from `tests/conformance.rs`.
+
 ### Multi-table mirror hooks
 
 A CDC source joins a multi-table `faucet mirror` (`mirror.tables`) through four

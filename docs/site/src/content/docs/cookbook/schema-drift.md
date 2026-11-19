@@ -52,6 +52,28 @@ as strings ([value fidelity](/faucet-stream/reference/value-fidelity/)) — a st
 exact numeric text (`"12.50"`, `"-1.5E-3"`) into a `number` (`NUMERIC` /
 `DECIMAL` / `FLOAT`) column. A string that is not numeric text still is.
 
+### Column names and case
+
+A page field is matched to a destination column by the **sink's own rule**,
+the one its write path uses, so drift and the write agree on where a field
+lands:
+
+| Sink | Rule |
+|------|------|
+| `postgres`, `iceberg`, `elasticsearch`, `clickhouse` | exact name |
+| `mysql`, `sqlite`, `redshift`, `bigquery`, `databricks` | ignoring ASCII case (an exactly-named field wins over a case variant) |
+| `mssql` | ignoring ASCII case when exactly one column matches (SQL Server's default collation) |
+| `oracle` (auto columns) | the field's upper-case form names an all-upper-case column |
+
+So, against a MySQL column `Email`, a field `email` is that column: `ignore`
+keeps it, `evolve` adds nothing, and `quarantine` / `fail` do not react to it.
+A widening is applied to the destination's spelling of the column. When a
+record carries two spellings of one column (`email` and `Email`), the exactly
+named one is written and compared; the other is neither an addition nor a
+change. A field that folds onto several columns (two columns differing only
+by case, under SQL Server's rule) addresses none of them, so it is an
+addition; `evolve` then issues an `ADD COLUMN` the database refuses.
+
 ## The five modes
 
 ### `warn` (default)

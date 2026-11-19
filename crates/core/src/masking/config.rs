@@ -81,8 +81,10 @@ pub struct MatchSpec {
     pub field_pattern: Option<String>,
 
     /// Value-based PII detector run over each *string* field value (and
-    /// integer values, for `credit_card`). Conservative (fully anchored) by
-    /// default to avoid over-masking.
+    /// integer values, for `credit_card`, `credit_card_loose` and
+    /// `phone_loose`). Every detector is fully anchored; numeric detectors can
+    /// still match ids that look like the class, so scope a rule to columns by
+    /// name where ids are numeric.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_detector: Option<Detector>,
 
@@ -92,10 +94,10 @@ pub struct MatchSpec {
     pub fields: Vec<String>,
 }
 
-/// Built-in value detectors. All are conservative (anchored full-string
-/// matches; the card detector additionally requires a valid Luhn checksum) so
-/// false positives stay rare — masking silently rewrites data, so a
-/// false positive is a data-quality bug, not just noise.
+/// Built-in value detectors. All are anchored full-string matches. Masking
+/// silently rewrites data, so a false positive is a data-quality bug, not just
+/// noise: the numeric detectors (`credit_card`, `credit_card_loose`,
+/// `phone_loose`) can still match ids that look like the class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -103,7 +105,10 @@ pub enum Detector {
     /// RFC-5322-ish email address.
     Email,
     /// 13–19 digit card number (spaces/dashes allowed, or a JSON integer)
-    /// passing the Luhn check.
+    /// with a card network's prefix and length (Visa, Mastercard, Amex,
+    /// Discover, JCB, Diners, UnionPay, Maestro, Mir, RuPay, Troy, Verve,
+    /// UATP), passing the Luhn check. Epoch-millisecond timestamps never
+    /// match; ids that begin like a card number match about one time in ten.
     CreditCard,
     /// US Social Security Number `NNN-NN-NNNN`.
     Ssn,
@@ -117,6 +122,11 @@ pub enum Detector {
     /// 1.13. Catches bare and national formats `phone` skips, at the cost of
     /// matching ids and epoch timestamps.
     PhoneLoose,
+    /// Any 13–19 digit number passing the Luhn check, as a string or a JSON
+    /// integer: the `credit_card` matcher of releases before faucet-core 1.18.
+    /// Catches cards outside the known networks, at the cost of matching about
+    /// one in ten long ids and epoch-millisecond timestamps.
+    CreditCardLoose,
 }
 
 impl MaskingSpec {
@@ -149,6 +159,7 @@ impl std::fmt::Display for Detector {
             Detector::Phone => "phone",
             Detector::Ipv4 => "ipv4",
             Detector::PhoneLoose => "phone_loose",
+            Detector::CreditCardLoose => "credit_card_loose",
         })
     }
 }

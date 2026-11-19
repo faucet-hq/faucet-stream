@@ -1786,10 +1786,14 @@ async fn compute_resume(
     }
 
     if delivery != crate::idempotency::DeliveryMode::ExactlyOnce {
-        if stored.iter().any(|(_, v)| v.is_none()) {
+        let resumed: Vec<Option<Value>> = stored
+            .into_iter()
+            .map(|(_, v)| v.and_then(crate::idempotency::resume_bookmark))
+            .collect();
+        if resumed.iter().any(Option::is_none) {
             return Ok(ResumePlan::default());
         }
-        let values: Vec<Value> = stored.into_iter().filter_map(|(_, v)| v).collect();
+        let values: Vec<Value> = resumed.into_iter().flatten().collect();
         return Ok(ResumePlan {
             start: start_bookmark(&values, source_count),
             sinks: HashMap::new(),
@@ -4177,6 +4181,29 @@ mod delivery_and_report_tests {
         // A bare token round-trips through parse_token_parts the same way.
         let t = format_token_with_bookmark(5, Some(&json!({"pos": 5})));
         assert!(t.contains('#'), "token embeds the bookmark: {t}");
+    }
+
+    #[tokio::test]
+    async fn at_least_once_resume_reads_through_exactly_once_envelopes() {
+        let store = Arc::new(MemoryStateStore::new());
+        for k in ["a", "b"] {
+            store
+                .put(&format!("p::{k}"), &wrap_state(Some(&json!({"pos": 3})), 3))
+                .await
+                .unwrap();
+        }
+        let opts = TopologyOptions::new("p").with_state_store(store.clone());
+        let sinks = ["a".to_string(), "b".to_string()];
+        let bm = compute_start_bookmark(&opts, &sinks, 1, DeliveryMode::AtLeastOnce, None)
+            .await
+            .unwrap();
+        assert_eq!(bm, Some(json!({"pos": 3})));
+
+        store.put("p::b", &wrap_state(None, 1)).await.unwrap();
+        let bm = compute_start_bookmark(&opts, &sinks, 1, DeliveryMode::AtLeastOnce, None)
+            .await
+            .unwrap();
+        assert_eq!(bm, None, "a sink with no bookmark replays in full");
     }
 
     /// #658: the class of a node failure travels typed, not as prose.

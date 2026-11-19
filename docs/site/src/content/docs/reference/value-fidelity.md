@@ -72,6 +72,10 @@ counted `null` only where a batch is turned into JSON rows.
   binary double `0.1000000000000000055511151231257827`.
 - A binary column reads base64. The Kafka sink's Avro `bytes_encoding` defaults
   to `base64`; `hex` reads the lowercase hex sources wrote before this model.
+- An existing Iceberg or Delta table's binary columns (`binary`, `fixed(n)`,
+  `uuid`) read base64 too. A 16-byte fixed column (an Iceberg `uuid`) also
+  reads UUID text (`8-4-4-4-12`) or 32 hex digits; neither can be the base64
+  of 16 bytes.
 - A JSON payload is parsed with every number exact: a literal the parsed value
   would not spell again — an integer past `u64`, a decimal longer than a double
   carries — is kept as a string of its digits. A 17-digit rendering of a double

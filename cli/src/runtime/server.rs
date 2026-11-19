@@ -514,6 +514,10 @@ pub struct GovernedRun {
     pub concurrency: Option<usize>,
     /// One shard of a source-sharded run (#230).
     pub shard: Option<faucet_core::ShardSpec>,
+    /// When the run started, for a shard: its budget's records and bytes are
+    /// granted from the run's ledger in the history and its deadline is the
+    /// run's, so every shard on every replica shares one budget.
+    pub run_started: Option<chrono::DateTime<chrono::Utc>>,
     #[cfg(feature = "notify")]
     pub notifier: Option<std::sync::Arc<crate::notify::Notifier>>,
     /// Record the run in the Data Movement Catalog (whole runs only).
@@ -543,6 +547,18 @@ pub fn governed_options(
     let usage = runner::usage_options(cfg).map_err(|e| format!("usage: {e}"))?;
     #[cfg(not(feature = "catalog"))]
     let _ = run.catalog;
+    let budget = run_budget(cfg, tenant);
+    let budget_state = match (&budget, run.shard.is_some(), run.run_started) {
+        (Some(spec), true, Some(started)) if !spec.is_empty() => {
+            Some(crate::serve::budget_ledger::shard_budget_state(
+                state.history(),
+                &run.run_id,
+                spec,
+                started,
+            ))
+        }
+        _ => None,
+    };
     Ok(crate::executor::ExecuteOptions {
         legacy_state_writes: state.cluster().legacy_state_writes(),
         force_lease: false,
@@ -578,8 +594,9 @@ pub fn governed_options(
             annotations: Vec::new(),
             tenant: tenant.map(|t| t.values.id.clone()),
         }),
+        budget_state,
         usage,
-        budget: run_budget(cfg, tenant),
+        budget,
         feed: run.feed,
     })
 }
@@ -774,6 +791,19 @@ pub async fn submit(
         )
         .await?;
     }
+    // A budgeted sharded run waits until every member counts its shards
+    // against one run ledger: an older member would give each shard the
+    // whole budget.
+    if admitted.budget.as_ref().is_some_and(|b| !b.is_empty())
+        && admitted.loaded.cfg.shard.is_some()
+    {
+        require_member_capability(
+            state,
+            crate::serve::history::CAP_RUN_BUDGET,
+            RUN_BUDGET_REFUSAL,
+        )
+        .await?;
+    }
     req.pool = Some(pool);
     // The stored body (what a cluster peer re-runs) carries the ceilings too.
     req.budget = admitted.budget.clone();
@@ -793,6 +823,11 @@ pub const REFERENCE_KINDS_REFUSAL: &str = "listener unavailable: a cluster membe
 pub const PIN_SERVERS_REFUSAL: &str = "server pinning unavailable: a cluster member does not \
      keep a submitted config's clients on the servers it names; finish the rolling upgrade, \
      then retry";
+
+/// The refusal while a cluster member does not count a sharded run's budget
+/// against the run's ledger.
+pub const RUN_BUDGET_REFUSAL: &str = "run budget unavailable: a cluster member counts a \
+     sharded run's budget per shard; finish the rolling upgrade, then retry";
 
 /// The refusal while a cluster member does not enforce policy pins (#1051).
 pub const POLICY_PIN_REFUSAL: &str = "policy unavailable: a cluster member does not enforce the \

@@ -182,6 +182,9 @@ pub(crate) async fn execute(
     args: RunArgs,
     resolved_config_path: Option<std::path::PathBuf>,
 ) -> CliResult<()> {
+    if let Some(notice) = crate::budget::run_scope_notice(&cfg) {
+        tracing::warn!("{notice}");
+    }
     // A relative `usage.pricing_file` resolves against the config's directory.
     let config_dir = resolved_config_path
         .as_ref()
@@ -439,6 +442,7 @@ pub(crate) async fn execute(
                 &crate::budget::sink_template_kinds(&cfg),
             )
             .map_err(CliError::Config)?,
+            budget_state: None,
             feed: Default::default(),
         },
     );
@@ -1014,6 +1018,7 @@ mod tests {
             catalog: None,
             usage: Default::default(),
             budget: None,
+            budget_state: None,
             feed: Default::default(),
         };
         let fut = crate::executor::run_expanded(nodes, opts);

@@ -91,6 +91,11 @@ pub struct ExpandedNode {
     /// for the legacy singular `pipeline.sink`). Used to scope masking
     /// `applies_to` rules per destination.
     pub sink_ref: String,
+    /// Whether the policy owner trusts this node's sink `attributes`
+    /// ([`crate::config::AttributeTrust`]); `true` outside `faucet serve`.
+    pub sink_attested: bool,
+    /// The same for the DLQ's `attributes`.
+    pub dlq_attested: bool,
     /// Compiled schema-drift policy spec (pipeline-level; same for every node).
     pub schema: Option<faucet_core::SchemaDriftSpec>,
     /// Delivery guarantee for this row. Resolved from the row's override or
@@ -800,6 +805,8 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             )?;
             out.push(ExpandedNode {
                 opt_outs: Vec::new(),
+                sink_attested: true,
+                dlq_attested: true,
                 id: ids[i].clone(),
                 row_index: i,
                 // A discovery row enumerates a value set rather than moving
@@ -872,6 +879,7 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             .as_ref()
             .and_then(|s| s.r#ref.clone())
             .unwrap_or_else(|| "default".to_string());
+        let (sink_attested, dlq_attested) = destination_trust(cfg, i, &sink_ref, row.dlq.is_some());
         let role = if !row.for_each.is_empty() {
             // Discovery-driven fan-out (#501): runs once per cartesian-product
             // tuple of the named dimensions (also mirrored into `depends_on`).
@@ -1362,11 +1370,12 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
             && cfg.policy.as_ref().is_some_and(|p| {
                 crate::policy::quarantines_at(
                     p,
-                    &faucet_core::SinkFacts {
-                        id: sink_ref.clone(),
-                        kind: merged_sink.kind.clone(),
-                        attributes: merged_sink.attributes.clone(),
-                    },
+                    &faucet_core::SinkFacts::new(
+                        sink_ref.clone(),
+                        merged_sink.kind.clone(),
+                        merged_sink.attributes.clone(),
+                    )
+                    .with_attested(sink_attested),
                 )
             })
         {
@@ -1683,6 +1692,8 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
 
         let base = ExpandedNode {
             opt_outs: Vec::new(),
+            sink_attested,
+            dlq_attested,
             id: ids[i].clone(),
             row_index: i,
             weight: row.weight,
@@ -1756,6 +1767,9 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
         );
     }
     for warning in out.iter().filter_map(rewritten_file_warning) {
+        tracing::warn!("{warning}");
+    }
+    for warning in out.iter().filter_map(unsettled_name_mode_warning) {
         tracing::warn!("{warning}");
     }
     check_truncating_fan_out(&out)?;
@@ -1950,6 +1964,31 @@ fn check_truncating_fan_out(nodes: &[ExpandedNode]) -> CliResult<()> {
         }
     }
     Ok(())
+}
+
+/// A local file source reading `incremental: {by: name}` with no
+/// `stable_for_secs` can read a file its producer is still writing. The
+/// source never moves its bookmark past a file that changed while it was
+/// read, but a producer pausing between writes is not seen.
+fn unsettled_name_mode_warning(n: &ExpandedNode) -> Option<String> {
+    if n.source.kind != "file" {
+        return None;
+    }
+    let cfg = &n.source.config;
+    let by = cfg.get("incremental")?.get("by")?.as_str()?;
+    let remote = cfg
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|p| p.starts_with("http://") || p.starts_with("https://"));
+    if by != "name" || remote || cfg.get("stable_for_secs").is_some_and(|v| !v.is_null()) {
+        return None;
+    }
+    Some(format!(
+        "row '{}': `incremental: {{by: name}}` without `stable_for_secs` can read a file that \
+         is still being written; set `stable_for_secs` to the producer's write time",
+        n.id
+    ))
 }
 
 /// A local file sink writing one unnumbered file in a format that can only be
@@ -2172,6 +2211,29 @@ fn check_file_sink_paths(nodes: &[ExpandedNode]) -> CliResult<()> {
         if let Some(writer) = data_paths.get(path) {
             return Err(CliError::Config(format!(
                 "row '{}': its DLQ writes '{path}', which row '{writer}' also writes as its \
+                 data sink — dead letters and data would overwrite each other; give the DLQ \
+                 its own path",
+                n.id
+            )));
+        }
+    }
+    let data_dests: HashMap<String, &str> = writers()
+        .filter_map(|n| {
+            crate::registry::sink_shared_destination(&n.sink.kind, &n.sink.config)
+                .map(|d| (d, n.id.as_str()))
+        })
+        .collect();
+    for n in nodes {
+        let Some(dest) = n
+            .dlq
+            .as_ref()
+            .and_then(|d| crate::registry::sink_shared_destination(&d.sink.kind, &d.sink.config))
+        else {
+            continue;
+        };
+        if let Some(writer) = data_dests.get(&dest) {
+            return Err(CliError::Config(format!(
+                "row '{}': its DLQ writes '{dest}', which row '{writer}' also writes as its \
                  data sink — dead letters and data would overwrite each other; give the DLQ \
                  its own path",
                 n.id
@@ -2851,6 +2913,32 @@ where
         Value::Object(m) => m.values().try_for_each(|v| walk_strings(v, f)),
         _ => Ok(()),
     }
+}
+
+/// Whether the policy owner trusts row `row`'s sink and DLQ `attributes`
+/// (`cfg.attribute_trust`): a destination is untrusted when a caller-chosen
+/// value lies under its template block or under the row's override.
+fn destination_trust(
+    cfg: &PipelineConfig,
+    row: usize,
+    sink_ref: &str,
+    row_dlq: bool,
+) -> (bool, bool) {
+    use crate::params::caller::child;
+    let row_base = child("/matrix", &row.to_string());
+    let mut sink = vec![child(&row_base, "sink"), child("/pipeline/sinks", sink_ref)];
+    if sink_ref == "default" {
+        sink.push("/pipeline/sink".to_owned());
+    }
+    let dlq = if row_dlq {
+        vec![child(&row_base, "dlq")]
+    } else {
+        vec!["/pipeline/dlq".to_owned()]
+    };
+    (
+        cfg.attribute_trust.attests(&sink),
+        cfg.attribute_trust.attests(&dlq),
+    )
 }
 
 #[cfg(test)]
@@ -5093,6 +5181,46 @@ pipeline:
             "{err}"
         );
         assert!(run(r#"{ type: stdout, config: {} }"#).is_ok());
+    }
+
+    #[test]
+    fn a_dlq_on_the_data_sinks_remote_object_is_refused() {
+        let yaml = r#"
+version: 1
+pipeline:
+  source: { type: file, config: { path: /tmp/in.jsonl } }
+  sink: { type: s3, config: { bucket: b, path: out.jsonl } }
+  dlq:
+    sink: { type: s3, config: { bucket: b, path: out.jsonl } }
+"#;
+        let cfg = parse_with_extension(yaml, "yaml").unwrap();
+        let e = expand(&cfg).unwrap_err().to_string();
+        assert!(e.contains("DLQ writes 's3://b/out.jsonl'"), "{e}");
+    }
+
+    #[test]
+    fn name_mode_without_a_settle_window_is_warned_about_at_load() {
+        let warn = |source: &str| {
+            let yaml = format!(
+                "version: 1\npipeline:\n  source: {source}\n  sink: {{ type: stdout, config: {{}} }}\n"
+            );
+            let nodes = expand(&parse_with_extension(&yaml, "yaml").unwrap()).unwrap();
+            unsettled_name_mode_warning(&nodes[0])
+        };
+        let w = warn(r#"{ type: file, config: { path: /tmp/in, incremental: { by: name } } }"#)
+            .expect("name mode without stable_for_secs warns");
+        assert!(
+            w.contains("stable_for_secs") && w.contains("by: name"),
+            "{w}"
+        );
+        for quiet in [
+            r#"{ type: file, config: { path: /tmp/in, incremental: { by: name }, stable_for_secs: 60 } }"#,
+            r#"{ type: file, config: { path: /tmp/in, incremental: { by: mtime } } }"#,
+            r#"{ type: file, config: { path: /tmp/in } }"#,
+            r#"{ type: file, config: { path: "https://example.com/a.jsonl", incremental: { by: name } } }"#,
+        ] {
+            assert_eq!(warn(quiet), None, "{quiet}");
+        }
     }
 
     /// #789 FILE-19: a per-page-bookmarking source writing one unnumbered

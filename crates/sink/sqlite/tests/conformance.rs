@@ -298,6 +298,38 @@ async fn conformance_cleanup_scoped() {
     faucet_conformance::assert_cleanup_scoped(&sink, "tenant", || ids_in(url.clone(), "c")).await;
 }
 
+/// Check 28: a case variant of an existing column survives `on_drift: ignore`
+/// and lands in the column (SQLite matches names ignoring case).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_drift_resolves_like_writes() {
+    let (_dir, url) = table_with("CREATE TABLE d (id INTEGER PRIMARY KEY, Email TEXT)").await;
+    let cfg = SqliteSinkConfig::new(&url, "d").column_mapping(SqliteColumnMapping::AutoMap);
+    let sink = SqliteSink::new(cfg).await.expect("sink");
+    assert_eq!(
+        sink.column_matching(),
+        faucet_core::ColumnMatching::CaseInsensitive
+    );
+    faucet_conformance::assert_drift_resolves_like_writes(&sink, "Email", "email", |id| {
+        let url = url.clone();
+        async move {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .expect("connect");
+            let v: Option<String> = sqlx::query_scalar("SELECT Email FROM d WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&pool)
+                .await
+                .expect("select")
+                .flatten();
+            pool.close().await;
+            v.map(serde_json::Value::from)
+        }
+    })
+    .await;
+}
+
 /// Check 24: rollback deletes exactly the run's rows.
 #[tokio::test(flavor = "multi_thread")]
 async fn conformance_rollback_truthful() {

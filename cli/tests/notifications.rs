@@ -333,6 +333,7 @@ notifications:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )
@@ -475,6 +476,7 @@ notifications:
         catalog: None,
         usage: Default::default(),
         budget: None,
+        budget_state: None,
         feed: Default::default(),
     };
 

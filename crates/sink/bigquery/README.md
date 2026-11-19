@@ -302,6 +302,8 @@ See the [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-
 
 `BigQuerySink` reports its live destination schema via `current_schema()` (a schema-only `tables.get`; a missing table → `None`, so every page column reads as new), so the pipeline-level `schema:` policy can detect drift between an incoming page's top-level shape and the real table. All five `on_drift` modes (`warn` / `ignore` / `quarantine` / `fail` / `evolve`) work against this sink.
 
+Column names match ignoring case (`column_matching()` is `CaseInsensitive`, an exactly-named field winning over a case variant), as BigQuery resolves them. The streaming and load-job paths resolve names server-side; the `MERGE`, effectively-once and overwrite paths read each column from a JSON payload by path, so the sink first renames every record field to its column's spelling. A field `email` for column `Email` therefore lands on every path, and drift does not report it.
+
 Under `on_drift: evolve`, `BigQuerySink::evolve_schema()` applies `ALTER TABLE` DDL, each statement run as its own `jobs.query` job and verified to completion:
 
 - **New columns** → `ADD COLUMN IF NOT EXISTS <col> <type>` (idempotent).

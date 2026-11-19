@@ -897,3 +897,254 @@ async fn a_dlq_before_a_per_row_sink_keeps_rejected_rows_out_of_the_columnar_pat
     assert_eq!(envelopes.len(), 1);
     assert_eq!(envelopes[0]["payload"], json!({"id": 2}));
 }
+
+/// A columnar source yielding one batch per page, optionally failing after
+/// some pages. Its row path errors, so a run that succeeds took the fast path.
+struct PagedColumnarSource {
+    pages: Vec<(Vec<Value>, Option<Value>)>,
+    fail_after: Option<usize>,
+}
+
+#[async_trait]
+impl Source for PagedColumnarSource {
+    async fn fetch_with_context(
+        &self,
+        _context: &HashMap<String, Value>,
+    ) -> Result<Vec<Value>, FaucetError> {
+        Err(FaucetError::Source("value path must not be used".into()))
+    }
+
+    fn state_key(&self) -> Option<String> {
+        Some("columnar-paged".to_string())
+    }
+
+    fn supports_columnar(&self) -> bool {
+        true
+    }
+
+    fn stream_batches<'a>(
+        &'a self,
+        _context: &'a HashMap<String, Value>,
+        _batch_size: usize,
+    ) -> Pin<Box<dyn Stream<Item = Result<ColumnarPage, FaucetError>> + Send + 'a>> {
+        Box::pin(async_stream::stream! {
+            for (i, (rows, bookmark)) in self.pages.iter().enumerate() {
+                let batch = values_to_record_batch_inferred(rows).unwrap();
+                yield Ok(ColumnarPage::new(batch, bookmark.clone()));
+                if self.fail_after == Some(i + 1) {
+                    yield Err(FaucetError::Source("connection lost".into()));
+                    return;
+                }
+            }
+        })
+    }
+}
+
+/// A columnar sink that counts flushes; its row path errors.
+#[derive(Default)]
+struct FlushCountingSink {
+    columnar_calls: AtomicUsize,
+    row_calls: AtomicUsize,
+    flushes: AtomicUsize,
+}
+
+#[async_trait]
+impl Sink for FlushCountingSink {
+    async fn write_batch(&self, _records: &[Value]) -> Result<usize, FaucetError> {
+        self.row_calls.fetch_add(1, Ordering::SeqCst);
+        Err(FaucetError::Sink("value path must not be used".into()))
+    }
+
+    fn supports_columnar(&self) -> bool {
+        true
+    }
+
+    async fn write_batch_columnar(
+        &self,
+        batch: &arrow::array::RecordBatch,
+    ) -> Result<usize, FaucetError> {
+        self.columnar_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(batch.num_rows())
+    }
+
+    async fn flush(&self) -> Result<(), FaucetError> {
+        self.flushes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl FlushCountingSink {
+    fn assert_columnar(&self) {
+        assert!(self.columnar_calls.load(Ordering::SeqCst) > 0);
+        assert_eq!(self.row_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+/// A DLQ that makes envelopes durable only in `flush`, like a file or
+/// object-store sink that publishes its part file there.
+#[derive(Default)]
+struct CommitOnFlushDlq {
+    buffered: std::sync::Mutex<Vec<Value>>,
+    committed: Arc<std::sync::Mutex<Vec<Value>>>,
+    fail_flush: bool,
+}
+
+#[async_trait]
+impl Sink for CommitOnFlushDlq {
+    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        self.buffered.lock().unwrap().extend_from_slice(records);
+        Ok(records.len())
+    }
+
+    async fn flush(&self) -> Result<(), FaucetError> {
+        if self.fail_flush {
+            return Err(FaucetError::Sink("dlq unavailable".into()));
+        }
+        let mut buffered = self.buffered.lock().unwrap();
+        self.committed.lock().unwrap().append(&mut buffered);
+        Ok(())
+    }
+}
+
+/// A state store recording, at each write, how many envelopes the DLQ had
+/// committed.
+struct WatchingStore {
+    committed: Arc<std::sync::Mutex<Vec<Value>>>,
+    puts: std::sync::Mutex<Vec<(Value, usize)>>,
+}
+
+#[async_trait]
+impl faucet_core::StateStore for WatchingStore {
+    async fn get(&self, _key: &str) -> Result<Option<Value>, FaucetError> {
+        Ok(None)
+    }
+    async fn put(&self, _key: &str, value: &Value) -> Result<(), FaucetError> {
+        let committed = self.committed.lock().unwrap().len();
+        let bookmark = faucet_core::state_version::peel_versioned(value);
+        self.puts.lock().unwrap().push((bookmark, committed));
+        Ok(())
+    }
+    async fn delete(&self, _key: &str) -> Result<(), FaucetError> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "quality")]
+fn quarantine_null_email() -> Arc<faucet_core::quality::CompiledQuality> {
+    use faucet_core::quality::{CompiledQuality, OnFailure, QualitySpec, RecordCheck};
+    let spec = QualitySpec {
+        record: vec![RecordCheck::NotNull {
+            field: "email".into(),
+            treat_missing_as_null: true,
+            on_failure: OnFailure::Quarantine,
+        }],
+        batch: vec![],
+    };
+    Arc::new(CompiledQuality::compile(&spec).unwrap())
+}
+
+#[cfg(feature = "quality")]
+#[tokio::test]
+async fn a_quarantining_policy_on_the_columnar_path_flushes_the_dlq_before_the_bookmark() {
+    let source = PagedColumnarSource {
+        pages: vec![
+            (
+                vec![
+                    json!({"id": 1, "email": "a@x"}),
+                    json!({"id": 2, "email": null}),
+                ],
+                Some(json!({"page": 0})),
+            ),
+            (
+                vec![
+                    json!({"id": 3, "email": null}),
+                    json!({"id": 4, "email": "b@x"}),
+                ],
+                Some(json!({"page": 1})),
+            ),
+        ],
+        fail_after: None,
+    };
+    let sink = FlushCountingSink::default();
+    let dlq = Arc::new(CommitOnFlushDlq::default());
+    let store = Arc::new(WatchingStore {
+        committed: Arc::clone(&dlq.committed),
+        puts: std::sync::Mutex::new(Vec::new()),
+    });
+    let result = Pipeline::new(&source, &sink)
+        .with_quality(quarantine_null_email())
+        .with_dlq(faucet_core::dlq::DlqConfig::new(dlq.clone()))
+        .with_state_store(store.clone())
+        .run()
+        .await
+        .unwrap();
+    sink.assert_columnar();
+    assert_eq!(result.records_written, 2);
+    assert_eq!(dlq.committed.lock().unwrap().len(), 2);
+    assert_eq!(
+        *store.puts.lock().unwrap(),
+        vec![(json!({"page": 0}), 1), (json!({"page": 1}), 2)],
+        "each bookmark is written only after its page's envelopes are durable"
+    );
+}
+
+#[cfg(feature = "quality")]
+#[tokio::test]
+async fn a_source_error_on_the_columnar_path_flushes_sink_and_dlq() {
+    let source = PagedColumnarSource {
+        pages: vec![(
+            vec![
+                json!({"id": 1, "email": "a@x"}),
+                json!({"id": 2, "email": null}),
+            ],
+            None,
+        )],
+        fail_after: Some(1),
+    };
+    let sink = FlushCountingSink::default();
+    let dlq = Arc::new(CommitOnFlushDlq::default());
+    let err = Pipeline::new(&source, &sink)
+        .with_quality(quarantine_null_email())
+        .with_dlq(faucet_core::dlq::DlqConfig::new(dlq.clone()))
+        .run()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("connection lost"), "{err}");
+    sink.assert_columnar();
+    assert_eq!(dlq.committed.lock().unwrap().len(), 1);
+    assert_eq!(sink.flushes.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "quality")]
+#[tokio::test]
+async fn a_failed_dlq_flush_on_the_columnar_path_keeps_the_bookmark_back() {
+    let source = PagedColumnarSource {
+        pages: vec![(
+            vec![
+                json!({"id": 1, "email": "a@x"}),
+                json!({"id": 2, "email": null}),
+            ],
+            Some(json!({"page": 0})),
+        )],
+        fail_after: None,
+    };
+    let sink = FlushCountingSink::default();
+    let dlq = Arc::new(CommitOnFlushDlq {
+        fail_flush: true,
+        ..CommitOnFlushDlq::default()
+    });
+    let store = Arc::new(WatchingStore {
+        committed: Arc::clone(&dlq.committed),
+        puts: std::sync::Mutex::new(Vec::new()),
+    });
+    let err = Pipeline::new(&source, &sink)
+        .with_quality(quarantine_null_email())
+        .with_dlq(faucet_core::dlq::DlqConfig::new(dlq.clone()))
+        .with_state_store(store.clone())
+        .run()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("DLQ sink flush failed"), "{err}");
+    sink.assert_columnar();
+    assert!(store.puts.lock().unwrap().is_empty());
+}

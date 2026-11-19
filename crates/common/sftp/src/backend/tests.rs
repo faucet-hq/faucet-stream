@@ -318,3 +318,20 @@ async fn a_refused_main_channel_reconnects_on_the_next_operation() {
     assert!(o.exists("/data").await.unwrap());
     assert!(!Arc::ptr_eq(&old, &o.connection().await.unwrap()));
 }
+
+/// A create-only-when-absent on a live server: the second create of one key
+/// reports "exists" and leaves the first body.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_new_creates_only_when_absent() {
+    let Some((_c, o)) = live_objects().await else {
+        return;
+    };
+    assert!(o.supports_create_new());
+    let key = "/data/side/.faucet-overwrite-x.commits/lock-1";
+    assert!(o.create_new(key, b"first").await.unwrap());
+    assert!(!o.create_new(key, b"second").await.unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let to = dir.path().join("got");
+    o.download(key, &to).await.unwrap();
+    assert_eq!(std::fs::read(&to).unwrap(), b"first");
+}

@@ -85,6 +85,9 @@ function fixText(x) {
   const k = x.kind || "";
   const mask = (x.satisfied_by_mask || []).join(" or ");
   if (k === "denied") return mask ? `mask it with ${mask}` : "drop the column or use another sink";
+  if (k === "missing_attribute" && x.unattested) {
+    return `${mask ? `${mask} it, or ` : ""}run it from a registered template`;
+  }
   if (k === "missing_attribute" || k === "attribute_not_allowed") {
     const allowed = (x.allowed || []).join(", ");
     return `${mask ? `${mask} it, or ` : ""}use a sink with ${x.attribute}${allowed ? ` in [${allowed}]` : ""}`;
@@ -95,6 +98,9 @@ function fixText(x) {
 function whyText(x) {
   const k = x.kind || "";
   if (k === "denied") return `may not reach ${x.sink_kind}`;
+  if (k === "missing_attribute" && x.unattested) {
+    return `${x.attribute} on ${x.sink} is from the submitted config, not trusted`;
+  }
   if (k === "missing_attribute") return `${x.sink} declares no ${x.attribute}`;
   if (k === "attribute_not_allowed") return `${x.attribute} is ${x.value}`;
   if (k === "unmasked") return "reaches the sink unmasked";

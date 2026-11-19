@@ -459,3 +459,175 @@ async fn an_add_action_without_a_size_still_reads() {
         vec![json!({"id": 0}), json!({"id": 1}), json!({"id": 2})]
     );
 }
+
+/// The row path gives an older file the table's shape: a column added after
+/// it was written is `null`, and a narrower physical type reads as the
+/// table's type.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rows_carry_the_table_schema_for_an_evolved_table() {
+    use arrow::array::Int32Array;
+    let dir = tempfile::tempdir().unwrap();
+    let old = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)])),
+        vec![Arc::new(Int32Array::from(vec![1, 2]))],
+    )
+    .unwrap();
+    let new = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("email", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![3])),
+            Arc::new(StringArray::from(vec!["c@x"])),
+        ],
+    )
+    .unwrap();
+    write_parquet(&dir.path().join("old.parquet"), &old, 1_000);
+    write_parquet(&dir.path().join("new.parquet"), &new, 1_000);
+    write_log(
+        dir.path(),
+        json!([
+            {"name": "id", "type": "long", "nullable": true, "metadata": {}},
+            {"name": "email", "type": "string", "nullable": true, "metadata": {}}
+        ]),
+        &[],
+        json!({}),
+        &[
+            ("old.parquet".into(), json!({})),
+            ("new.parquet".into(), json!({})),
+        ],
+        plain_protocol(),
+    );
+    let mut rows = DeltaSource::new(source(dir.path()))
+        .await
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap();
+    rows.sort_by_key(|r| r["id"].as_i64());
+    assert_eq!(
+        rows,
+        vec![
+            json!({"id": 1, "email": null}),
+            json!({"id": 2, "email": null}),
+            json!({"id": 3, "email": "c@x"}),
+        ]
+    );
+}
+
+/// A file that stores a timestamp without a zone reads as the table's UTC
+/// `timestamp` on the row path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_naive_timestamp_file_reads_as_the_table_timestamp() {
+    use arrow::array::TimestampMicrosecondArray;
+    use arrow::datatypes::TimeUnit;
+    let dir = tempfile::tempdir().unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )])),
+        vec![Arc::new(TimestampMicrosecondArray::from(vec![
+            1_767_225_600_000_000i64,
+        ]))],
+    )
+    .unwrap();
+    write_parquet(&dir.path().join("a.parquet"), &batch, 1_000);
+    write_log(
+        dir.path(),
+        json!([{"name": "ts", "type": "timestamp", "nullable": true, "metadata": {}}]),
+        &[],
+        json!({}),
+        &[("a.parquet".into(), json!({}))],
+        plain_protocol(),
+    );
+    let rows = DeltaSource::new(source(dir.path()))
+        .await
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![json!({"ts": "2026-01-01T00:00:00.000000Z"})]);
+}
+
+/// A partition value its column type cannot hold fails the read instead of
+/// passing through as text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partition_value_its_type_cannot_hold_fails_the_read() {
+    let dir = tempfile::tempdir().unwrap();
+    write_parquet(&dir.path().join("a.parquet"), &ids(1), 1_000);
+    write_log(
+        dir.path(),
+        json!([
+            {"name": "id", "type": "long", "nullable": true, "metadata": {}},
+            {"name": "n", "type": "integer", "nullable": true, "metadata": {}}
+        ]),
+        &["n"],
+        json!({}),
+        &[("a.parquet".into(), json!({"n": "not-a-number"}))],
+        plain_protocol(),
+    );
+    let err = DeltaSource::new(source(dir.path()))
+        .await
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("n"), "{err}");
+}
+
+/// The row path and the columnar path render the same rows for a table
+/// partitioned by every type a partition value is decoded as.
+#[cfg(feature = "arrow")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn row_and_columnar_paths_render_every_partition_type_alike() {
+    let dir = tempfile::tempdir().unwrap();
+    write_parquet(&dir.path().join("a.parquet"), &ids(2), 1_000);
+    write_parquet(&dir.path().join("b.parquet"), &ids(1), 1_000);
+    write_log(
+        dir.path(),
+        json!([
+            {"name": "id", "type": "long", "nullable": true, "metadata": {}},
+            {"name": "s", "type": "string", "nullable": true, "metadata": {}},
+            {"name": "i", "type": "integer", "nullable": true, "metadata": {}},
+            {"name": "l", "type": "long", "nullable": true, "metadata": {}},
+            {"name": "f", "type": "double", "nullable": true, "metadata": {}},
+            {"name": "b", "type": "boolean", "nullable": true, "metadata": {}},
+            {"name": "d", "type": "date", "nullable": true, "metadata": {}},
+            {"name": "ts", "type": "timestamp", "nullable": true, "metadata": {}},
+            {"name": "amount", "type": "decimal(10,2)", "nullable": true, "metadata": {}},
+            {"name": "tag", "type": "binary", "nullable": true, "metadata": {}}
+        ]),
+        &["s", "i", "l", "f", "b", "d", "ts", "amount", "tag"],
+        json!({}),
+        &[
+            (
+                "a.parquet".into(),
+                json!({"s": "eu", "i": "7", "l": "9000000000", "f": "1.5", "b": "true",
+                       "d": "2026-01-02", "ts": "2026-01-01 10:00:00", "amount": "1.50",
+                       "tag": "\u{1}\u{2}"}),
+            ),
+            (
+                "b.parquet".into(),
+                json!({"s": null, "i": null, "l": null, "f": null, "b": null,
+                       "d": null, "ts": null, "amount": null, "tag": null}),
+            ),
+        ],
+        plain_protocol(),
+    );
+    let src = DeltaSource::new(source(dir.path())).await.unwrap();
+    let rows = src.fetch_all().await.unwrap();
+    let ctx = std::collections::HashMap::new();
+    let mut columnar = Vec::new();
+    let pages: Vec<_> = src.stream_batches(&ctx, 0).collect().await;
+    for page in pages {
+        columnar.extend(faucet_core::record_batch_to_values(&page.unwrap().batch).unwrap());
+    }
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows, columnar);
+    assert_eq!(rows[0]["i"], json!(7));
+    assert_eq!(rows[0]["b"], json!(true));
+    assert_eq!(rows[2]["s"], Value::Null);
+}

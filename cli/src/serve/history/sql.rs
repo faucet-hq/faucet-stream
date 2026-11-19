@@ -59,7 +59,7 @@ pub fn dataset_like(id: &str) -> String {
 /// in `faucet_serve_schema`. A database stamped with a newer version is
 /// refused at startup instead of being written by code that does not know
 /// its columns.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// The oldest binary schema version that can still read a database this
 /// binary writes, kept as the `min_readable` row of `faucet_serve_schema`.
@@ -779,6 +779,15 @@ pub const DDL: &[&str] = &[
         run_id TEXT PRIMARY KEY,\
         stored_at TEXT NOT NULL,\
         sealed TEXT NOT NULL)",
+    // The run-scoped budget ledger of a sharded run (v10): what the run's
+    // shards, on any replica, have been granted against its ceilings.
+    "CREATE TABLE IF NOT EXISTS faucet_serve_run_budgets (\
+        run_id TEXT PRIMARY KEY,\
+        records BIGINT NOT NULL,\
+        bytes BIGINT NOT NULL,\
+        last_records BIGINT NOT NULL,\
+        last_bytes BIGINT NOT NULL,\
+        updated_at TEXT NOT NULL)",
     // Data-flow policy versions (#1043): the server-managed policy and each
     // tenant's, append-only; the newest version of a scope is in force.
     "CREATE TABLE IF NOT EXISTS faucet_policy_versions (\
@@ -1098,6 +1107,20 @@ pub struct Stmts {
     pub run_secrets_put: String,
     pub run_secrets_get: String,
     pub run_secrets_delete: String,
+    /// Create a run's budget ledger row at zero. Params: run_id, updated_at.
+    pub budget_init: String,
+    /// Grant up to the wanted records / bytes, capped at the ceilings, in
+    /// one statement; returns the totals and this grant. Params: run_id,
+    /// want records, max records, want bytes, max bytes, updated_at.
+    pub budget_grant: String,
+    /// Return unspent allowance. Params: run_id, records, bytes, updated_at.
+    pub budget_give_back: String,
+    /// A run's granted totals. Param: run_id.
+    pub budget_spent: String,
+    /// Drop a run's ledger row. Param: run_id.
+    pub budget_delete: String,
+    /// Drop ledger rows whose run is gone.
+    pub purge_orphan_budgets: String,
     /// Store one policy version unless it exists (#1043). Params: scope,
     /// padded version, created_at, body.
     pub policy_version_insert: String,
@@ -2075,6 +2098,28 @@ impl Stmts {
                 .into(),
             run_secrets_get: "SELECT sealed FROM faucet_serve_run_secrets WHERE run_id=$1".into(),
             run_secrets_delete: "DELETE FROM faucet_serve_run_secrets WHERE run_id=$1".into(),
+            budget_init: "INSERT INTO faucet_serve_run_budgets \
+                (run_id, records, bytes, last_records, last_bytes, updated_at) \
+                VALUES ($1,0,0,0,0,$2) ON CONFLICT (run_id) DO NOTHING"
+                .into(),
+            budget_grant: "UPDATE faucet_serve_run_budgets SET \
+                last_records = GREATEST(LEAST($2, $3 - records), 0), \
+                records = GREATEST(LEAST(records + $2, $3), records), \
+                last_bytes = GREATEST(LEAST($4, $5 - bytes), 0), \
+                bytes = GREATEST(LEAST(bytes + $4, $5), bytes), \
+                updated_at = $6 \
+                WHERE run_id=$1 RETURNING records, bytes, last_records, last_bytes"
+                .into(),
+            budget_give_back: "UPDATE faucet_serve_run_budgets SET \
+                records = GREATEST(records - $2, 0), bytes = GREATEST(bytes - $3, 0), \
+                updated_at = $4 WHERE run_id=$1"
+                .into(),
+            budget_spent: "SELECT records, bytes FROM faucet_serve_run_budgets WHERE run_id=$1"
+                .into(),
+            budget_delete: "DELETE FROM faucet_serve_run_budgets WHERE run_id=$1".into(),
+            purge_orphan_budgets: "DELETE FROM faucet_serve_run_budgets WHERE run_id NOT IN \
+                (SELECT run_id FROM faucet_serve_runs)"
+                .into(),
             policy_version_insert: "INSERT INTO faucet_policy_versions \
                 (scope, version, created_at, body) VALUES ($1,$2,$3,$4) \
                 ON CONFLICT (scope, version) DO NOTHING"
@@ -2758,6 +2803,28 @@ impl Stmts {
                 .into(),
             run_secrets_get: "SELECT sealed FROM faucet_serve_run_secrets WHERE run_id=?".into(),
             run_secrets_delete: "DELETE FROM faucet_serve_run_secrets WHERE run_id=?".into(),
+            budget_init: "INSERT INTO faucet_serve_run_budgets \
+                (run_id, records, bytes, last_records, last_bytes, updated_at) \
+                VALUES (?1,0,0,0,0,?2) ON CONFLICT (run_id) DO NOTHING"
+                .into(),
+            budget_grant: "UPDATE faucet_serve_run_budgets SET \
+                last_records = MAX(MIN(?2, ?3 - records), 0), \
+                records = MAX(MIN(records + ?2, ?3), records), \
+                last_bytes = MAX(MIN(?4, ?5 - bytes), 0), \
+                bytes = MAX(MIN(bytes + ?4, ?5), bytes), \
+                updated_at = ?6 \
+                WHERE run_id=?1 RETURNING records, bytes, last_records, last_bytes"
+                .into(),
+            budget_give_back: "UPDATE faucet_serve_run_budgets SET \
+                records = MAX(records - ?2, 0), bytes = MAX(bytes - ?3, 0), \
+                updated_at = ?4 WHERE run_id=?1"
+                .into(),
+            budget_spent: "SELECT records, bytes FROM faucet_serve_run_budgets WHERE run_id=?"
+                .into(),
+            budget_delete: "DELETE FROM faucet_serve_run_budgets WHERE run_id=?".into(),
+            purge_orphan_budgets: "DELETE FROM faucet_serve_run_budgets WHERE run_id NOT IN \
+                (SELECT run_id FROM faucet_serve_runs)"
+                .into(),
             policy_version_insert: "INSERT INTO faucet_policy_versions \
                 (scope, version, created_at, body) VALUES (?,?,?,?) \
                 ON CONFLICT (scope, version) DO NOTHING"
@@ -3968,6 +4035,11 @@ macro_rules! impl_sql_history {
                             .execute(&self.pool)
                             .await
                             .map_err(backend)?;
+                        sqlx::query(&self.stmts.budget_delete)
+                            .bind(id)
+                            .execute(&self.pool)
+                            .await
+                            .map_err(backend)?;
                         Ok(DeleteOutcome::Deleted)
                     }
                 }
@@ -4026,6 +4098,9 @@ macro_rules! impl_sql_history {
                     .execute(&self.pool)
                     .await;
                 let _ = sqlx::query(&self.stmts.purge_orphan_tenant_runs)
+                    .execute(&self.pool)
+                    .await;
+                let _ = sqlx::query(&self.stmts.purge_orphan_budgets)
                     .execute(&self.pool)
                     .await;
                 // Drop audit records older than the run-retention window (#205).
@@ -6645,6 +6720,82 @@ macro_rules! impl_sql_history {
                     .await
                     .map_err(backend)?;
                 Ok(done.rows_affected())
+            }
+
+            async fn budget_grant(
+                &self,
+                run_id: &str,
+                want: (u64, u64),
+                max: (Option<u64>, Option<u64>),
+            ) -> Result<faucet_core::BudgetGrant, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+                let now = $crate::serve::history::sql::fmt_ts(chrono::Utc::now());
+                sqlx::query(&self.stmts.budget_init)
+                    .bind(run_id)
+                    .bind(&now)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let row = sqlx::query(&self.stmts.budget_grant)
+                    .bind(run_id)
+                    .bind(clamp(want.0))
+                    .bind(max.0.map_or(i64::MAX, clamp))
+                    .bind(clamp(want.1))
+                    .bind(max.1.map_or(i64::MAX, clamp))
+                    .bind(&now)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let get = |c: &str| -> Result<u64, $crate::serve::history::HistoryError> {
+                    Ok(row.try_get::<i64, _>(c).map_err(backend)?.max(0) as u64)
+                };
+                Ok(faucet_core::BudgetGrant::new(
+                    get("last_records")?,
+                    get("last_bytes")?,
+                    get("records")?,
+                    get("bytes")?,
+                ))
+            }
+
+            async fn budget_give_back(
+                &self,
+                run_id: &str,
+                records: u64,
+                bytes: u64,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+                sqlx::query(&self.stmts.budget_give_back)
+                    .bind(run_id)
+                    .bind(clamp(records))
+                    .bind(clamp(bytes))
+                    .bind($crate::serve::history::sql::fmt_ts(chrono::Utc::now()))
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
+            }
+
+            async fn budget_spent(
+                &self,
+                run_id: &str,
+            ) -> Result<Option<(u64, u64)>, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let row = sqlx::query(&self.stmts.budget_spent)
+                    .bind(run_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                row.map(|r| {
+                    Ok((
+                        r.try_get::<i64, _>("records").map_err(backend)?.max(0) as u64,
+                        r.try_get::<i64, _>("bytes").map_err(backend)?.max(0) as u64,
+                    ))
+                })
+                .transpose()
             }
 
             async fn run_secrets_delete(

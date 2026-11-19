@@ -771,6 +771,27 @@ impl RunHistory for FallbackHistory {
     async fn run_secrets_delete(&self, run_id: &str) -> Result<(), HistoryError> {
         strict!(self, p => p.run_secrets_delete(run_id), f => f.run_secrets_delete(run_id))
     }
+    // A sharded run's budget is shared across replicas: never grant it from
+    // the empty in-memory fallback.
+    async fn budget_grant(
+        &self,
+        run_id: &str,
+        want: (u64, u64),
+        max: (Option<u64>, Option<u64>),
+    ) -> Result<faucet_core::BudgetGrant, HistoryError> {
+        strict!(self, p => p.budget_grant(run_id, want, max), f => f.budget_grant(run_id, want, max))
+    }
+    async fn budget_give_back(
+        &self,
+        run_id: &str,
+        records: u64,
+        bytes: u64,
+    ) -> Result<(), HistoryError> {
+        strict!(self, p => p.budget_give_back(run_id, records, bytes), f => f.budget_give_back(run_id, records, bytes))
+    }
+    async fn budget_spent(&self, run_id: &str) -> Result<Option<(u64, u64)>, HistoryError> {
+        strict!(self, p => p.budget_spent(run_id), f => f.budget_spent(run_id))
+    }
     // The policy in force is shared state: never read it from, or write it
     // to, the empty in-memory fallback.
     async fn policy_version_insert(

@@ -53,7 +53,7 @@ pub(crate) use page::GovernedBatch;
 pub(crate) use page::{Clearance, GovernedNative};
 pub use page::{GovernedEnvelopes, GovernedPage};
 
-use crate::budget::{BudgetSink, BudgetSpec, BudgetState, BudgetTimer};
+use crate::budget::{BudgetSink, BudgetSpec, BudgetState, BudgetStop, BudgetTimer};
 use crate::dlq::DlqConfig;
 use crate::error::FaucetError;
 use crate::metadata::{CompiledMetadata, MetadataContext, MetadataSink};
@@ -357,9 +357,19 @@ impl Governance {
         self
     }
 
-    /// Budget ceilings. The main sink and the DLQ count against one shared
-    /// state. An empty spec is ignored.
-    pub fn with_budget(mut self, spec: BudgetSpec) -> Self {
+    /// Budget ceilings for a run of its own (its clock starts now). The main
+    /// sink and the DLQ count against one shared state. An empty spec is
+    /// ignored.
+    pub fn with_budget(self, spec: BudgetSpec) -> Self {
+        let state = Arc::new(BudgetState::for_run(&spec, std::time::SystemTime::now()));
+        self.with_budget_state(spec, state)
+    }
+
+    /// Budget ceilings counted against `state`, the budget of the whole run
+    /// this governance is one part of: every part (matrix row, fan-out
+    /// child, topology sink node) shares the ceilings and the run's clock.
+    /// An empty spec is ignored.
+    pub fn with_budget_state(mut self, spec: BudgetSpec, state: Arc<BudgetState>) -> Self {
         if spec.max_records.is_none()
             && spec.max_bytes.is_none()
             && spec.max_duration_secs.is_none()
@@ -368,7 +378,7 @@ impl Governance {
             self.budget_state = None;
         } else {
             self.budget = Some(spec);
-            self.budget_state = Some(Arc::new(BudgetState::default()));
+            self.budget_state = Some(state);
         }
         self
     }
@@ -781,22 +791,26 @@ impl<'g> GovernedSinkBuilder<'g> {
         let mut layers = Vec::new();
         let mut sink = destination;
         let mut timer = None;
+        let mut budget_stop = None;
         for layer in SINK_LAYERS.iter().rev() {
             match layer {
                 SinkLayer::Budget => {
                     if let (Some(spec), Some(state)) = (&gov.budget, &gov.budget_state) {
                         let cancel = gov.cancel.clone().unwrap_or_default();
-                        timer = Some(BudgetTimer::start_for(
-                            spec.max_duration_secs,
+                        let stop = Arc::new(BudgetStop::default());
+                        timer = Some(BudgetTimer::start_run(
                             Arc::clone(state),
                             cancel.clone(),
+                            Arc::clone(&stop),
                         ));
-                        sink = Box::new(BudgetSink::wrap_shared(
+                        sink = Box::new(BudgetSink::with_stop(
                             sink,
                             spec.clone(),
                             Arc::clone(state),
                             cancel,
+                            Arc::clone(&stop),
                         ));
+                        budget_stop = Some(stop);
                         layers.push(*layer);
                     }
                 }
@@ -851,6 +865,7 @@ impl<'g> GovernedSinkBuilder<'g> {
         GovernedSink {
             sink,
             budget: gov.budget_state.clone(),
+            budget_stop,
             _timer: timer,
             layers,
         }
@@ -862,6 +877,7 @@ impl<'g> GovernedSinkBuilder<'g> {
 pub struct GovernedSink {
     sink: Box<dyn Sink>,
     budget: Option<Arc<BudgetState>>,
+    budget_stop: Option<Arc<BudgetStop>>,
     _timer: Option<BudgetTimer>,
     layers: Vec<SinkLayer>,
 }
@@ -877,12 +893,31 @@ impl GovernedSink {
         self.budget.as_ref()
     }
 
-    /// A duration ceiling cancels the run cooperatively, so the pipeline
+    /// The run's budget verdict, when the budget stopped this destination's
+    /// invocation (refused one of its pages, or cancelled it because the run
+    /// spent its budget elsewhere). `None` for an invocation that finished
+    /// before the budget was spent, even when the run's budget is spent now.
+    pub fn budget_stopped(&self) -> Option<crate::budget::BudgetVerdict> {
+        self.budget_handle()?.stopped()
+    }
+
+    /// A handle that outlives this sink (it is usually boxed into the
+    /// pipeline) for [`BudgetHandle::finish`](crate::budget::BudgetHandle::finish).
+    pub fn budget_handle(&self) -> Option<crate::budget::BudgetHandle> {
+        Some(crate::budget::BudgetHandle::new(
+            Arc::clone(self.budget.as_ref()?),
+            Arc::clone(self.budget_stop.as_ref()?),
+        ))
+    }
+
+    /// A budget stop cancels the invocation cooperatively, so the pipeline
     /// returns `Ok` with a partial result; turn that into the budget failure.
+    /// An invocation that finished before the run's budget was spent stays a
+    /// success.
     pub fn finish<T>(&self, result: Result<T, FaucetError>) -> Result<T, FaucetError> {
-        match (&result, self.budget.as_ref().and_then(|s| s.verdict())) {
-            (Ok(_), Some(verdict)) => Err(verdict.error()),
-            _ => result,
+        match self.budget_handle() {
+            Some(h) => h.finish(result),
+            None => result,
         }
     }
 
@@ -1147,6 +1182,51 @@ mod tests {
         assert_eq!(governed.budget_state().unwrap().records(), 1);
         assert!(governed.finish(Ok::<_, FaucetError>(())).is_ok());
         let _ = governed.into_inner();
+    }
+
+    #[tokio::test]
+    async fn invocations_sharing_a_run_budget_fail_only_when_the_budget_stopped_them() {
+        let spec = BudgetSpec {
+            max_records: Some(3),
+            ..Default::default()
+        };
+        let run = Arc::new(BudgetState::for_run(&spec, std::time::SystemTime::now()));
+        let part = |cancel: &CancellationToken| {
+            Governance::new()
+                .with_cancel(cancel.clone())
+                .with_budget_state(spec.clone(), Arc::clone(&run))
+                .sink_builder()
+                .build(Box::new(Dest(Arc::default())))
+        };
+        let (ca, cb, cc) = (
+            CancellationToken::new(),
+            CancellationToken::new(),
+            CancellationToken::new(),
+        );
+        let (a, b, c) = (part(&ca), part(&cb), part(&cc));
+        a.write_batch(&[json!({"i": 1}), json!({"i": 2})])
+            .await
+            .unwrap();
+        assert!(
+            a.finish(Ok::<_, FaucetError>(())).is_ok(),
+            "a finished in budget"
+        );
+        assert!(
+            b.write_batch(&[json!({"i": 3}), json!({"i": 4})])
+                .await
+                .is_err()
+        );
+        assert_eq!(run.records(), 2, "one ledger for the run");
+        tokio::time::timeout(std::time::Duration::from_secs(5), cc.cancelled())
+            .await
+            .unwrap();
+        assert!(c.budget_stopped().is_some());
+        assert!(
+            c.finish(Ok::<_, FaucetError>(())).is_err(),
+            "c was stopped mid-run"
+        );
+        assert!(a.budget_stopped().is_none());
+        assert!(!ca.is_cancelled());
     }
 
     #[tokio::test]
@@ -1495,11 +1575,7 @@ mod tests {
             ))
             .with_policy(PolicyGovernance::new(
                 Arc::new(crate::policy::CompiledPolicy::compile(&policy).unwrap()),
-                crate::policy::SinkFacts {
-                    id: "w".into(),
-                    kind: "stdout".into(),
-                    attributes: Default::default(),
-                },
+                crate::policy::SinkFacts::new("w", "stdout", Default::default()),
                 crate::policy::PolicyScope {
                     pipeline: "p".into(),
                     row: "w".into(),

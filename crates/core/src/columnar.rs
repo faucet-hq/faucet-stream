@@ -224,7 +224,7 @@ pub fn values_to_record_batch(
     schema: SchemaRef,
 ) -> Result<RecordBatch, FaucetError> {
     check_integral(records, &schema)?;
-    let rehexed = base64_binary_to_hex(records, &schema)?;
+    let rehexed = binary_values_for_arrow_json(records, &schema)?;
     let records = rehexed.as_deref().unwrap_or(records);
     let mut decoder = arrow_json::ReaderBuilder::new(schema.clone())
         .build_decoder()
@@ -257,16 +257,43 @@ fn holds_binary(dt: &DataType) -> bool {
     }
 }
 
-/// Binary values travel as base64 (the canonical rendering, [`crate::fidelity`])
-/// but arrow-json reads hex: rewrite the strings bound for binary columns.
-/// `None` when `schema` has none.
-fn base64_binary_to_hex(
+fn uuid_hex(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let hex = |b: &u8| b.is_ascii_hexdigit();
+    match bytes.len() {
+        32 if bytes.iter().all(hex) => Some(s.to_ascii_lowercase()),
+        36 if [8, 13, 18, 23].iter().all(|&i| bytes[i] == b'-')
+            && bytes
+                .iter()
+                .enumerate()
+                .all(|(i, b)| matches!(i, 8 | 13 | 18 | 23) || hex(b)) =>
+        {
+            Some(s.replace('-', "").to_ascii_lowercase())
+        }
+        _ => None,
+    }
+}
+
+/// Rewrite the values `records` bind for binary columns of `schema` into the
+/// hex arrow-json reads.
+///
+/// Binary values travel as standard base64 (the canonical rendering,
+/// [`crate::fidelity`]). For a `FixedSizeBinary(16)` column (a UUID) a dashed
+/// `8-4-4-4-12` UUID or 32 hex digits are also accepted: neither can be the
+/// base64 of 16 bytes. Any other string that is not base64 is an error.
+/// Returns `None` when `schema` has no binary column, so callers can skip
+/// the copy.
+pub fn binary_values_for_arrow_json(
     records: &[Value],
     schema: &Schema,
 ) -> Result<Option<Vec<Value>>, FaucetError> {
     use base64::Engine as _;
     fn rewrite(value: &mut Value, dt: &DataType, path: &str) -> Result<(), FaucetError> {
         match (value, dt) {
+            (Value::String(s), DataType::FixedSizeBinary(16)) if uuid_hex(s).is_some() => {
+                *s = uuid_hex(s).unwrap_or_default();
+                Ok(())
+            }
             (Value::String(s), dt) if !dt.is_nested() && holds_binary(dt) => {
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(s.as_bytes())
@@ -1121,10 +1148,52 @@ mod binary_round_trip_tests {
         ];
         let batch = values_to_record_batch(&rows[..2], schema.clone()).unwrap();
         assert_eq!(record_batch_to_values(&batch).unwrap(), rows[..2].to_vec());
-        assert!(base64_binary_to_hex(&rows, &schema).unwrap().is_some());
+        assert!(
+            binary_values_for_arrow_json(&rows, &schema)
+                .unwrap()
+                .is_some()
+        );
         let err = values_to_record_batch(&[json!({"b": "zz!"})], schema).unwrap_err();
         assert!(err.to_string().contains("not base64"), "{err}");
         let plain = Schema::new(vec![Field::new("n", DataType::Int64, true)]);
-        assert!(base64_binary_to_hex(&rows, &plain).unwrap().is_none());
+        assert!(
+            binary_values_for_arrow_json(&rows, &plain)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn uuid_text_binds_to_a_sixteen_byte_fixed_column() {
+        use base64::Engine as _;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("u", DataType::FixedSizeBinary(16), true),
+            Field::new("f", DataType::FixedSizeBinary(4), true),
+        ]));
+        let bytes: Vec<u8> = (0u8..16).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let rows = vec![
+            json!({"u": "00010203-0405-0607-0809-0A0B0C0D0E0F"}),
+            json!({"u": "000102030405060708090a0b0c0d0e0f"}),
+            json!({"u": b64, "f": "AAECAw=="}),
+        ];
+        let batch = values_to_record_batch(&rows, schema.clone()).unwrap();
+        let back = record_batch_to_values(&batch).unwrap();
+        for row in &back {
+            assert_eq!(row["u"], json!(b64));
+        }
+        assert_eq!(back[2]["f"], json!("AAECAw=="));
+        let err = values_to_record_batch(
+            &[json!({"u": "not-a-uuid-and-not-base64!"})],
+            schema.clone(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not base64"), "{err}");
+        let err = values_to_record_batch(
+            &[json!({"f": "00010203-0405-0607-0809-0A0B0C0D0E0F"})],
+            schema,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not base64"), "{err}");
     }
 }

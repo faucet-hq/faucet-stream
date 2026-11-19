@@ -23,6 +23,21 @@ pub(crate) fn warn_phone_narrowed() {
     });
 }
 
+/// Once per process: `credit_card` requires a card-network prefix and length
+/// since faucet-core 1.18, so a policy relying on it may now pass a card from
+/// outside the known networks through.
+pub(crate) fn warn_card_narrowed() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "masking/policy: `value_detector: credit_card` matches only Luhn-valid numbers \
+             with a card-network prefix and length; other 13–19 digit numbers pass through. \
+             Use `credit_card_loose` (in a masking rule or a policy classification) to catch \
+             every Luhn-valid number"
+        );
+    });
+}
+
 fn config_err(msg: impl Into<String>) -> FaucetError {
     FaucetError::Config(format!("masking: {}", msg.into()))
 }
@@ -115,6 +130,12 @@ impl CompiledMasking {
             .any(|r| r.value_detector == Some(Detector::Phone))
         {
             warn_phone_narrowed();
+        }
+        if rules
+            .iter()
+            .any(|r| r.value_detector == Some(Detector::CreditCard))
+        {
+            warn_card_narrowed();
         }
         let needs_paths = rules
             .iter()
@@ -241,6 +262,7 @@ mod tests {
         };
         assert!(with("credit_card"));
         assert!(with("phone_loose"));
+        assert!(with("credit_card_loose"));
         for det in ["email", "ssn", "phone", "ipv4"] {
             assert!(!with(det), "{det}");
         }

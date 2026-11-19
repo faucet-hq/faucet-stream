@@ -250,8 +250,12 @@ pub(crate) fn resolved_case_from_node(
     }
 }
 
-fn render_delta(dest: &Value, inferred: &Value) -> SchemaDeltaReport {
-    let diff = faucet_core::drift::diff_schema(dest, inferred, true);
+fn render_delta(
+    dest: &Value,
+    inferred: &Value,
+    matching: faucet_core::ColumnMatching,
+) -> SchemaDeltaReport {
+    let diff = faucet_core::drift::diff_schema_matching(dest, inferred, true, matching);
     SchemaDeltaReport {
         schemaless_sink: false,
         additions: diff.additions.iter().map(|c| c.name.clone()).collect(),
@@ -340,8 +344,13 @@ pub async fn plan_node(
         };
         // Inferred the way the runtime drift pass infers a page: numeric text
         // bound for a numeric column counts as that column's type.
+        let matching = sink
+            .as_ref()
+            .map_or(faucet_core::ColumnMatching::Exact, |s| s.column_matching());
         let inferred = match &sink_schema {
-            Some(dest) => faucet_core::drift::infer_page_schema(dest, &run.written),
+            Some(dest) => {
+                faucet_core::drift::infer_page_schema_matching(dest, &run.written, matching)
+            }
             None => faucet_core::schema::infer_schema(&run.written),
         };
         #[cfg(feature = "catalog")]
@@ -361,7 +370,7 @@ pub async fn plan_node(
             )),
         };
         let schema_delta = match &sink_schema {
-            Some(dest) => render_delta(dest, &inferred),
+            Some(dest) => render_delta(dest, &inferred, matching),
             None => SchemaDeltaReport {
                 schemaless_sink: true,
                 additions: vec![],
@@ -819,6 +828,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn render_delta_resolves_fields_like_the_sink() {
+        let dest = serde_json::json!({"type": "object", "properties": {
+            "id": {"type": "integer"}, "Email": {"type": "string"}
+        }});
+        let inferred = serde_json::json!({"type": "object", "properties": {
+            "id": {"type": "integer"}, "email": {"type": "string"}
+        }});
+        let folded = render_delta(
+            &dest,
+            &inferred,
+            faucet_core::ColumnMatching::CaseInsensitive,
+        );
+        assert!(folded.additions.is_empty() && folded.droppable_required.is_empty());
+        let exact = render_delta(&dest, &inferred, faucet_core::ColumnMatching::Exact);
+        assert_eq!(exact.additions, vec!["email".to_owned()]);
+        assert_eq!(exact.droppable_required, vec!["Email".to_owned()]);
+    }
     #[test]
     fn a_live_pull_bounds_the_source_page_size_by_the_limit() {
         for (configured, expected) in [("0", 10), ("5000", 10), ("3", 3)] {

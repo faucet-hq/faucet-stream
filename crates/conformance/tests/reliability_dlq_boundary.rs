@@ -359,3 +359,163 @@ async fn dlq_all_on_a_best_effort_sink_runs_when_keyed_or_opted_in() {
         assert_eq!(log.records_written(), 6, "{:?}", log.events());
     }
 }
+
+// ── The Arrow fast path checkpoints through the same core ──────────────────
+
+mod columnar {
+    use std::collections::HashMap;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+
+    use faucet_core::columnar::{ColumnarPage, values_to_record_batch_inferred};
+    use faucet_core::dlq::DlqConfig;
+    use faucet_core::quality::{CompiledQuality, OnFailure, QualitySpec, RecordCheck};
+    use faucet_core::{FaucetError, Pipeline, Sink, Source, StateStore, Value, async_trait};
+    use serde_json::json;
+
+    type Log = Arc<Mutex<Vec<&'static str>>>;
+
+    /// Two pages, each with one row the quality check quarantines, then
+    /// optionally a lost connection.
+    struct Pages {
+        fail_at_end: bool,
+    }
+
+    #[async_trait]
+    impl Source for Pages {
+        async fn fetch_with_context(
+            &self,
+            _: &HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            Err(FaucetError::Source("row path must not be used".into()))
+        }
+        fn state_key(&self) -> Option<String> {
+            Some("columnar-dlq".into())
+        }
+        fn supports_columnar(&self) -> bool {
+            true
+        }
+        fn stream_batches<'a>(
+            &'a self,
+            _: &'a HashMap<String, Value>,
+            _: usize,
+        ) -> Pin<Box<dyn futures_core::Stream<Item = Result<ColumnarPage, FaucetError>> + Send + 'a>>
+        {
+            let fail = self.fail_at_end;
+            Box::pin(async_stream::stream! {
+                for p in 0..2 {
+                    let rows = vec![json!({"id": p * 2, "email": "a@x"}), json!({"id": p * 2 + 1, "email": null})];
+                    let batch = values_to_record_batch_inferred(&rows).unwrap();
+                    yield Ok(ColumnarPage::new(batch, Some(json!({"page": p}))));
+                }
+                if fail {
+                    yield Err(FaucetError::Source("connection lost".into()));
+                }
+            })
+        }
+    }
+
+    /// Logs into the shared ordered log; `columnar` is the main sink, which
+    /// refuses the row path.
+    struct Logging {
+        log: Log,
+        columnar: bool,
+    }
+
+    #[async_trait]
+    impl Sink for Logging {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            if self.columnar {
+                return Err(FaucetError::Sink("row path must not be used".into()));
+            }
+            self.log.lock().unwrap().push("dlq write");
+            Ok(records.len())
+        }
+        fn supports_columnar(&self) -> bool {
+            self.columnar
+        }
+        async fn write_batch_columnar(
+            &self,
+            batch: &arrow::array::RecordBatch,
+        ) -> Result<usize, FaucetError> {
+            self.log.lock().unwrap().push("columnar write");
+            Ok(batch.num_rows())
+        }
+        async fn flush(&self) -> Result<(), FaucetError> {
+            let event = if self.columnar { "flush" } else { "dlq flush" };
+            self.log.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    struct Store(Log);
+
+    #[async_trait]
+    impl StateStore for Store {
+        async fn get(&self, _: &str) -> Result<Option<Value>, FaucetError> {
+            Ok(None)
+        }
+        async fn put(&self, _: &str, _: &Value) -> Result<(), FaucetError> {
+            self.0.lock().unwrap().push("put");
+            Ok(())
+        }
+        async fn delete(&self, _: &str) -> Result<(), FaucetError> {
+            Ok(())
+        }
+    }
+
+    async fn run(
+        fail_at_end: bool,
+    ) -> (
+        Result<faucet_core::PipelineResult, FaucetError>,
+        Vec<&'static str>,
+    ) {
+        let log: Log = Arc::default();
+        let sink = Logging {
+            log: log.clone(),
+            columnar: true,
+        };
+        let dlq = Arc::new(Logging {
+            log: log.clone(),
+            columnar: false,
+        });
+        let quality = CompiledQuality::compile(&QualitySpec {
+            record: vec![RecordCheck::NotNull {
+                field: "email".into(),
+                treat_missing_as_null: true,
+                on_failure: OnFailure::Quarantine,
+            }],
+            batch: vec![],
+        })
+        .unwrap();
+        let result = Pipeline::new(&Pages { fail_at_end }, &sink)
+            .with_quality(Arc::new(quality))
+            .with_dlq(DlqConfig::new(dlq))
+            .with_state_store(Arc::new(Store(log.clone())))
+            .run()
+            .await;
+        let events = log.lock().unwrap().clone();
+        (result, events)
+    }
+
+    #[tokio::test]
+    async fn quarantined_rows_are_flushed_to_the_dlq_before_each_bookmark() {
+        let (result, events) = run(false).await;
+        assert_eq!(result.unwrap().records_written, 2);
+        let page = ["dlq write", "columnar write", "flush", "dlq flush", "put"];
+        let mut expected = Vec::new();
+        expected.extend(page);
+        expected.extend(page);
+        expected.extend(["dlq flush", "flush"]);
+        assert_eq!(events, expected);
+    }
+
+    #[tokio::test]
+    async fn an_error_exit_flushes_the_dlq_then_the_sink() {
+        let (result, events) = run(true).await;
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("connection lost"), "{err}");
+        assert_eq!(&events[events.len() - 2..], ["dlq flush", "flush"]);
+        assert_eq!(events.iter().filter(|e| **e == "put").count(), 2);
+    }
+}

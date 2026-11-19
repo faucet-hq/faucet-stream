@@ -22,11 +22,13 @@ pub mod batching;
 pub mod budget;
 pub mod capabilities;
 pub mod check;
+pub(crate) mod checkpoint;
 pub mod cleanup;
 #[cfg(feature = "arrow")]
 pub mod columnar;
 #[cfg(feature = "arrow")]
 pub mod columnar_transform;
+pub mod columns;
 pub mod compat;
 pub mod config;
 #[cfg(feature = "contract")]
@@ -122,7 +124,10 @@ pub use auth::{
     AuthProvider, AuthReference, AuthSpec, Credential, CredentialPlacement, RequestAuth,
     SharedAuthProvider, rejects_credential, send_with_reauth,
 };
-pub use budget::{BudgetKind, BudgetSink, BudgetSpec, BudgetState, BudgetTimer, BudgetVerdict};
+pub use budget::{
+    BudgetGrant, BudgetHandle, BudgetKind, BudgetLedger, BudgetSink, BudgetSpec, BudgetState,
+    BudgetStop, BudgetTimer, BudgetVerdict,
+};
 pub use capabilities::{Capabilities, CapabilitiesBuilder, ConnectorDescriptor, SchemaReport};
 pub use check::{CheckContext, CheckReport, Probe, ProbeStatus};
 pub use cleanup::{
@@ -131,9 +136,10 @@ pub use cleanup::{
 };
 #[cfg(feature = "arrow")]
 pub use columnar::{
-    ColumnarPage, check_integral, infer_arrow_schema, record_batch_to_values,
-    values_to_record_batch, values_to_record_batch_inferred,
+    ColumnarPage, binary_values_for_arrow_json, check_integral, infer_arrow_schema,
+    record_batch_to_values, values_to_record_batch, values_to_record_batch_inferred,
 };
+pub use columns::{ColumnMatching, canonical_record, column_for_field, field_for_column};
 pub use create_table::{
     DeclaredFit, PlannedColumn, missing_target_error, plan_columns, plan_columns_declared,
     plan_columns_declared_with, plan_keyed_columns, plan_keyed_columns_declared,
@@ -177,8 +183,9 @@ pub use governance::{
 };
 pub use idempotency::{
     DeliveryGuarantee, DeliveryMode, EffectivelyOnceMechanism, GuaranteeInputs, ReplayGuarantee,
-    SinkGuarantee, derive_delivery_guarantee, format_token, format_token_with_bookmark,
-    parse_token, parse_token_parts, unwrap_state, wrap_state,
+    SinkGuarantee, WatermarkCheck, check_watermark, derive_delivery_guarantee, format_token,
+    format_token_with_bookmark, parse_token, parse_token_parts, unwrap_state,
+    watermark_ahead_error, wrap_state,
 };
 pub use io::{CallContext, CallExt, CallReader, CallSlot, DEFAULT_CALL_TIMEOUT};
 pub use join::{

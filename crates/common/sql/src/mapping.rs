@@ -30,37 +30,25 @@ pub enum ColumnMatching {
     UpperFold,
 }
 
+impl From<ColumnMatching> for faucet_core::ColumnMatching {
+    fn from(m: ColumnMatching) -> Self {
+        match m {
+            ColumnMatching::Exact => Self::Exact,
+            ColumnMatching::CaseInsensitive => Self::CaseInsensitive,
+            ColumnMatching::FoldUnique => Self::FoldUnique,
+            ColumnMatching::UpperFold => Self::UpperFold,
+        }
+    }
+}
+
 /// The column `field` addresses among `columns` under `matching`, looked up
-/// from the field's side.
+/// from the field's side ([`faucet_core::column_for_field`]).
 pub fn column_for_field<'a>(
     field: &str,
     columns: &'a [String],
     matching: ColumnMatching,
 ) -> Option<&'a str> {
-    if let Some(c) = columns.iter().find(|c| c.as_str() == field) {
-        return Some(c);
-    }
-    match matching {
-        ColumnMatching::Exact => None,
-        ColumnMatching::CaseInsensitive => columns
-            .iter()
-            .find(|c| c.eq_ignore_ascii_case(field))
-            .map(String::as_str),
-        ColumnMatching::FoldUnique => {
-            let mut folded = columns.iter().filter(|c| c.eq_ignore_ascii_case(field));
-            match (folded.next(), folded.next()) {
-                (Some(c), None) => Some(c.as_str()),
-                _ => None,
-            }
-        }
-        ColumnMatching::UpperFold => {
-            let upper = field.to_uppercase();
-            columns
-                .iter()
-                .find(|c| c.as_str() == upper && c.as_str() == c.to_uppercase())
-                .map(String::as_str)
-        }
-    }
+    faucet_core::column_for_field(field, columns, matching.into())
 }
 
 /// One live column of a target table.

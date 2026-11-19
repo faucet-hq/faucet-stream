@@ -230,7 +230,8 @@ async fn policy_refuses_submissions_warns_on_templates_and_audits_runtime_denial
     assert_eq!(denied[0]["result"], "denied");
     assert!(!dir.path().join("out.jsonl").exists());
 
-    // The compliant twin runs.
+    // The twin declaring `residency: eu` is still refused: attributes a
+    // caller writes in a submitted config are not trusted for policy.
     let compliant = csv_to_jsonl(
         "ok",
         &input,
@@ -238,8 +239,70 @@ async fn policy_refuses_submissions_warns_on_templates_and_audits_runtime_denial
         true,
         "    attributes: { residency: eu }\n",
     );
-    let rec = run_config(&base, &client, &compliant).await;
-    assert_eq!(rec["status"], "completed", "{rec}");
+    let resp = client
+        .post(format!("{base}/v1/runs"))
+        .bearer_auth("admin-tok")
+        .json(&json!({ "config": compliant }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 422);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("does not trust"), "{text}");
+    assert!(!dir.path().join("out.jsonl").exists());
+
+    // Registered by an admin, the same config binds its attributes and runs.
+    #[cfg(feature = "templates")]
+    {
+        let resp = client
+            .post(format!("{base}/v1/templates"))
+            .bearer_auth("admin-tok")
+            .json(&json!({ "config": compliant, "id": "compliant" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            201,
+            "{}",
+            resp.text().await.unwrap()
+        );
+        let resp = client
+            .post(format!("{base}/v1/templates/compliant/runs"))
+            .bearer_auth("admin-tok")
+            .json(&json!({ "version": 1, "allow_untested": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            202,
+            "{}",
+            resp.text().await.unwrap()
+        );
+        let run_id = resp.json::<Value>().await.unwrap()["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut status = String::new();
+        for _ in 0..400 {
+            let rec: Value = client
+                .get(format!("{base}/v1/runs/{run_id}"))
+                .bearer_auth("admin-tok")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            status = rec["status"].as_str().unwrap().to_string();
+            if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(status, "completed");
+    }
 
     // Runtime backstop: no contract (nothing known statically), but the
     // `mail` column carries an address the detector catches → the run fails
@@ -263,7 +326,7 @@ async fn policy_refuses_submissions_warns_on_templates_and_audits_runtime_denial
         "{rec}"
     );
     let denied = audit(&base, &client, "policy.denied").await;
-    assert_eq!(denied.len(), 2, "{denied:?}");
+    assert_eq!(denied.len(), 3, "{denied:?}");
     let runtime = denied
         .iter()
         .find(|e| e["principal"] == "runtime")

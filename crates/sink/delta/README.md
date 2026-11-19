@@ -82,6 +82,10 @@ A fractional number bound for an integer column (`10.5` into a `long`) fails the
 
 When the sink creates a table, a column holding integers above `i64::MAX` (unsigned 64-bit ids) is created as `decimal(20,0)`, so every digit is kept. A column mixing such an integer with negative values has no exact type and fails schema inference with an error naming the column; cast it to a string first.
 
+## Binary columns
+
+A `binary` column of an existing table takes the canonical base64 rendering (`"AAEC/w=="`), so a value from any source lands as its bytes. A string that is not base64 fails the page naming the column.
+
 ## Capabilities
 
 Declares `append` only and `schema_report: drops_unknown_fields` (fields the table lacks are warned about and dropped, so `on_drift: fail` is refused), plus columnar (Arrow) input when built with the `arrow` feature. `faucet list --json` prints these declared capabilities.

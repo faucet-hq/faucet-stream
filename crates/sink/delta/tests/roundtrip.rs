@@ -207,3 +207,50 @@ async fn a_commit_after_the_deadline_fails_the_flush() {
         "{err:?}"
     );
 }
+
+/// Base64 binary values land as their bytes in a table with a `binary`
+/// column, including base64 text made only of hex digits.
+#[tokio::test]
+async fn base64_binary_lands_in_a_binary_column() {
+    use deltalake::arrow::array::{Array, BinaryArray};
+    use deltalake::kernel::DataType;
+    use deltalake::operations::create::CreateBuilder;
+    use deltalake::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = table_uri(&dir, "bins");
+    std::fs::create_dir_all(&uri).unwrap();
+    CreateBuilder::new()
+        .with_location(format!("file://{uri}"))
+        .with_column("id", DataType::LONG, false, None)
+        .with_column("b", DataType::BINARY, true, None)
+        .await
+        .expect("create table");
+
+    let sink = DeltaSink::new(DeltaSinkConfig::new(&uri)).await.unwrap();
+    sink.write_batch(&[json!({"id": 1, "b": "ABEi"}), json!({"id": 2, "b": "AAAA"})])
+        .await
+        .expect("write binary values");
+    sink.flush().await.unwrap();
+
+    let mut values = Vec::new();
+    for entry in std::fs::read_dir(&uri).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "parquet") {
+            let reader =
+                ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path).unwrap())
+                    .unwrap()
+                    .build()
+                    .unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let col = batch.column_by_name("b").unwrap();
+                let bin = col.as_any().downcast_ref::<BinaryArray>().unwrap();
+                for i in 0..bin.len() {
+                    values.push(bin.value(i).to_vec());
+                }
+            }
+        }
+    }
+    values.sort();
+    assert_eq!(values, vec![vec![0, 0, 0], vec![0, 0x11, 0x22]]);
+}

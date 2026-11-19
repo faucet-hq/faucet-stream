@@ -157,7 +157,7 @@ that committed before the failure are not repeated.
 
 ## Batch atomicity
 
-What a failed write leaves behind (#737): **atomic** with `batch_size: 0` or a `staging:` block, otherwise **best-effort** — a commit group is one INSERT only when unchunked or staged. `on_batch_error: dlq_all`
+What a failed write leaves behind (#737): **best-effort** for every configuration. ClickHouse commits an INSERT per block and partition, so a page that spans partitions, is larger than `max_insert_block_size`, or loads through `staging:` can keep some parts when it fails. `on_batch_error: dlq_all`
 is refused on a best-effort configuration unless the `dlq:` block sets
 `allow_duplicates_on_dlq_all: true` (a DLQ replay would write the rows that
 already landed a second time). See

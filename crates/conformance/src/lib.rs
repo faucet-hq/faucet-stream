@@ -162,9 +162,10 @@ where
 }
 
 pub use checks::{
-    assert_batch_atomicity_truthful, assert_cleanup_scoped, assert_driver_declarations_truthful,
-    assert_driver_row_paths_agree, assert_overwrite_lifecycle, assert_partial_outcomes_truthful,
-    assert_replay_safe, assert_reported_rows_truthful, assert_rollback_truthful,
+    assert_batch_atomicity_truthful, assert_cleanup_scoped, assert_drift_resolves_like_writes,
+    assert_driver_declarations_truthful, assert_driver_row_paths_agree, assert_overwrite_lifecycle,
+    assert_partial_outcomes_truthful, assert_replay_safe, assert_reported_rows_truthful,
+    assert_rollback_truthful,
 };
 pub use declared::{
     DECLARED_INSTANT, assert_declared_columns_truthful, assert_declared_instants_exact,

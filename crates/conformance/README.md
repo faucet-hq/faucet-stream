@@ -50,6 +50,7 @@ Each proves a sink behaves as a capability it declares says it does:
 | 26 | `assert_declared_types_create` | a sink handed a declaration creates the destination with typed columns, and a write of the renderings (the instant as `+00:00`, `Z` and `+05:30`) never retypes them |
 | 26b | `assert_declared_instants_exact` | check 26, then the instants read back all name the instant written (run with a non-UTC session where the backend has one) |
 | 27 | `assert_declared_overwrite_empty_run` | a zero-row first `write_mode: overwrite` run succeeds and leaves the empty typed table, from one instance or with the lifecycle on other instances |
+| 28 | `assert_drift_resolves_like_writes` | a field the sink's `column_matching()` rule folds onto an existing column survives `on_drift: ignore` and lands in it (required for a crate that overrides `column_matching`) |
 
 Checks 20 and 21 are required for a sink built on a family driver
 (`faucet_core::driver`, `faucet_common_sql::SqlDriver`); they run on any sink.

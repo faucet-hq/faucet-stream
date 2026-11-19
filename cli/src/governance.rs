@@ -77,7 +77,10 @@ pub(crate) async fn governance_for(req: GovernanceRequest<'_>) -> CliResult<Gove
         g = g.with_resilience(r);
     }
     if let Some(spec) = opts.budget.as_ref().filter(|b| !b.is_empty()) {
-        g = g.with_budget(spec.clone());
+        g = match &opts.budget_state {
+            Some(run) => g.with_budget_state(spec.clone(), Arc::clone(run)),
+            None => g.with_budget(spec.clone()),
+        };
     }
     #[cfg(feature = "quality")]
     if let Some(spec) = &node.quality {
@@ -141,11 +144,7 @@ pub(crate) async fn governance_for(req: GovernanceRequest<'_>) -> CliResult<Gove
         classifier = Some(Arc::clone(&compiled));
         let mut p = faucet_core::PolicyGovernance::new(
             compiled,
-            faucet_core::SinkFacts {
-                id: node.sink_ref.clone(),
-                kind: node.sink.kind.clone(),
-                attributes: node.sink.attributes.clone(),
-            },
+            crate::policy::sink_facts(node),
             faucet_core::PolicyScope {
                 pipeline: pipeline.to_string(),
                 row: row.to_string(),
@@ -219,6 +218,8 @@ pub(crate) fn dlq_governance(
             masking: node.masking.as_ref(),
             #[cfg(feature = "policy")]
             policy: node.policy.is_some(),
+            #[cfg(feature = "policy")]
+            attested: node.dlq_attested,
             main_ids: &[node.sink_ref.as_str(), node.sink.kind.as_str()],
         },
         dlq,
@@ -233,6 +234,9 @@ pub(crate) struct DlqTarget<'a> {
     pub masking: Option<&'a faucet_core::MaskingSpec>,
     #[cfg(feature = "policy")]
     pub policy: bool,
+    /// Whether the policy owner trusts the DLQ's `attributes`.
+    #[cfg(feature = "policy")]
+    pub attested: bool,
     pub main_ids: &'a [&'a str],
 }
 
@@ -246,7 +250,7 @@ pub(crate) fn dlq_governance_for(
     let mut d = DlqGovernance::new(config);
     #[cfg(feature = "policy")]
     if target.policy {
-        d = d.with_facts(crate::policy::dlq_facts(dlq));
+        d = d.with_facts(crate::policy::dlq_facts(dlq, target.attested));
     }
     #[cfg(feature = "masking")]
     if let Some(spec) = target.masking
@@ -272,6 +276,8 @@ pub(crate) struct TopologySinkRequest<'a> {
     pub run_id: &'a str,
     pub source_label: String,
     pub budget: Option<&'a faucet_core::BudgetSpec>,
+    /// The graph's run budget, shared by every sink node.
+    pub budget_state: Option<Arc<faucet_core::BudgetState>>,
     pub cancel: CancellationToken,
     pub dry_run: bool,
     pub preview: bool,
@@ -286,7 +292,10 @@ pub(crate) fn topology_sink_governance(req: TopologySinkRequest<'_>) -> CliResul
     let cfg = req.cfg;
     let mut g = Governance::new().with_cancel(req.cancel.clone());
     if let Some(spec) = req.budget.filter(|b| !b.is_empty()) {
-        g = g.with_budget(spec.clone());
+        g = match &req.budget_state {
+            Some(run) => g.with_budget_state(spec.clone(), Arc::clone(run)),
+            None => g.with_budget(spec.clone()),
+        };
         if req.dry_run {
             g = g.without(Pass::Budget, "a --dry-run writes nothing to count");
         }
@@ -341,11 +350,8 @@ pub(crate) fn topology_sink_governance(req: TopologySinkRequest<'_>) -> CliResul
         #[allow(unused_mut)]
         let mut p = faucet_core::PolicyGovernance::new(
             compiled,
-            faucet_core::SinkFacts {
-                id: req.node_id.to_string(),
-                kind: req.kind.to_string(),
-                attributes: req.attributes.clone(),
-            },
+            faucet_core::SinkFacts::new(req.node_id, req.kind, req.attributes.clone())
+                .with_attested(cfg.topology_destination_trust(req.node_id, req.template).0),
             faucet_core::PolicyScope {
                 pipeline: cfg.name.clone().unwrap_or_default(),
                 row: req.node_id.to_string(),
@@ -390,6 +396,8 @@ pub(crate) fn topology_dlq(
             masking: cfg.pipeline.masking.as_ref(),
             #[cfg(feature = "policy")]
             policy: cfg.policy.is_some(),
+            #[cfg(feature = "policy")]
+            attested: cfg.attribute_trust.attests(&["/pipeline/dlq".to_owned()]),
             main_ids,
         },
         dlq,
@@ -658,6 +666,7 @@ mod tests {
             run_id: "r",
             source_label: "rest".into(),
             budget: Some(&budget),
+            budget_state: None,
             cancel: CancellationToken::new(),
             dry_run,
             preview,
@@ -706,6 +715,7 @@ mod tests {
             run_id: "r",
             source_label: "rest".into(),
             budget: None,
+            budget_state: None,
             cancel: CancellationToken::new(),
             dry_run: false,
             preview: false,

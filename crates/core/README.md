@@ -464,6 +464,13 @@ writes the bare value instead — for a mixed-version cluster.
 
 ## Governance (RFC 0013)
 
+The data-flow policy (`policy` feature) judges each destination through a
+`SinkFacts` (`SinkFacts::new(id, kind, attributes)`). Facts built
+`.unattested()` (attributes the policy owner did not write, such as a config
+a caller submitted to a server) never satisfy a `require` rule — the violation
+is `MissingAttribute { attribute, unattested: true }` — and every rule scoped
+by `when.sink` attributes applies to them.
+
 `faucet_core::Governance` carries every guarantee a run is held to — masking,
 quality, contract, schema drift, the data-flow policy, budget, profiling,
 metadata columns, metering, resilience, cancellation and the DLQ — and
@@ -488,6 +495,18 @@ masking rules naming it, the policy with its own attributes, the shared budget
 and metering. A pass that does not apply is turned off with
 `without(pass, reason)`, which is recorded (`opt_outs()`) and logged.
 
+A budget covers a whole run. `with_budget(spec)` starts a run of its own;
+`with_budget_state(spec, state)` counts against a `BudgetState` the caller
+shares between every part of one run (matrix rows, fan-out children,
+topology sink nodes): `BudgetState::for_run(&spec, started)` sets the run's
+deadline, pages reserve their records and bytes under one lock (so
+concurrent parts never overshoot, and a failed write gives its reservation
+back), and a `BudgetLedger` (`with_ledger`) grants allowance in chunks when
+parts run in other processes (`close()` returns what was not spent). Once the
+budget is spent every part still running stops at its next page boundary;
+`GovernedSink::budget_handle()` reports whether the budget stopped *this*
+part, so one that finished earlier stays a success.
+
 ### Governed pages (RFC 0014)
 
 The engine writes only `GovernedPage`s — pages that went through masking →
@@ -501,6 +520,15 @@ not compile. A sink receives one through `Sink::write_governed` (defaulted to
 let out = governance.govern(records, &sink).await?;   // masking → quality → contract → drift
 sink.write_governed(&out.page).await?;
 ```
+
+The drift pass matches page fields to the destination's columns with the
+sink's own rule, `Sink::column_matching()` (`ColumnMatching::Exact`,
+`CaseInsensitive`, `FoldUnique`, `UpperFold`; default `Exact`), so a field that
+differs from a column only by case under a folding rule is not drift.
+`faucet_core::columns` holds the one lookup (`column_for_field`,
+`field_for_column`, `canonical_record`); `drift::diff_schema_matching` /
+`infer_page_schema_matching` are the matching-aware forms of `diff_schema` /
+`infer_page_schema`.
 
 ## Family drivers (RFC 0014)
 
@@ -749,14 +777,18 @@ Machine-readable exports for downstream consumers are plain functions:
 
 The `masking` feature adds a `MaskingSpec` policy that classifies sensitive
 fields — by field-name pattern (regex over the dot-path), by value detector
-(`email` / `credit_card` (Luhn) / `ssn` / `phone` / `phone_loose` / `ipv4`), or by explicit
+(`email` / `credit_card` / `credit_card_loose` / `ssn` / `phone` / `phone_loose` / `ipv4`), or by explicit
 field list — and rewrites them per action: `redact` (fixed mask), `hash`
 (HMAC-SHA256 keyed / SHA-256 unkeyed; deterministic, so masked values stay
 joinable), `tokenize` (short opaque token), or `partial` (reveal only the last N
-chars). Detectors are conservative (anchored; cards require a valid Luhn
-checksum) so silent over-masking is rare. `credit_card` and `phone_loose` can
-match a JSON number, so a policy holding either writes every number as a string,
-keeping each column one type on every page.
+chars). Detectors are anchored full-string matches. `credit_card` requires a
+card network's prefix and length plus a valid Luhn checksum, so epoch
+timestamps and most ids are left alone (ids that begin like a card number still
+match about one time in ten); `credit_card_loose` is the Luhn-only matcher of
+earlier releases. `credit_card`, `credit_card_loose` and `phone_loose` can
+match a JSON number, so a policy holding any of them writes every number as a
+string, keeping each column one type on every page. Transform errors never
+quote a record value; see the masking cookbook for what masking covers.
 
 The masking pass runs **first** — before the quality, contract, and drift passes
 and before every sink write — so PII never reaches a sink, the DLQ, or a lineage
@@ -865,6 +897,7 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `dlq` | `DlqConfig`, `OnBatchError`, `DlqReason`, `DlqStats`, `build_envelope` |
 | `governance` | `Governance`, `GovernedSinkBuilder`, `GovernedSink`, `DlqGovernance`, `PolicyGovernance`, `Pass`, `OptOut`, `SINK_LAYERS` — one builder for every guarantee (#875, #870); `GovernedPage`, `GovernedEnvelopes`, `GovernedOutput` — the governed-page typestate (RFC 0014) |
 | `driver` | `SinkDriver` (+ `StagingDriver`, `CommitTokenDriver`, `CleanupDriver`, `SchemaDriver`, `RollbackDriver`, `ColumnarDriver`), `DriverSink`, `SourceDriver`, `DriverSource`, `MessageDriver`, `MessageSinkDriver`, `MessageConsumer`, `MessageSourceDriver`, `HttpDriver`, `HttpSinkDriver` — family drivers (RFC 0014) |
+| `columnar` | `values_to_record_batch`, `record_batch_to_values`, `check_integral`, `binary_values_for_arrow_json` — JSON ⇄ Arrow (`arrow` feature). Binary columns read base64; a `FixedSizeBinary(16)` (UUID) column also reads a dashed UUID or 32 hex digits, which no base64 of 16 bytes can be |
 | `accounting` | `WriteReport`, `RowAccounts`, `RowAccountsSnapshot` — per-page row accounting (#879) |
 | `fidelity` | Canonical value renderings (#885) — `decimal_text`, `decimal_from_i128`, `decimal_from_pg_numeric`, `integer_*`, `number_text`, `float64` / `float32`, `binary`, `timestamp*`, `date`, `time`, `from_str` / `from_slice` / `parse_json`, `non_integer_text`, `is_exact_decimal_type`, `NonFiniteCounter` |
 | `json_numbers` | `parse_json_exact` / `JsonBigNumbers` — exactness of numbers in JSON text a database stored |

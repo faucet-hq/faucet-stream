@@ -194,13 +194,12 @@ impl ClickHouseSinkConfig {
 }
 
 impl ClickHouseSinkConfig {
-    /// What a failed batch write leaves behind (#737): a commit group is one INSERT only when unchunked or staged.
+    /// What a failed batch write leaves behind (#737): always best effort.
+    /// ClickHouse commits an INSERT per block and partition, so a page that
+    /// spans partitions, exceeds `max_insert_block_size`, or loads through
+    /// staging can keep some parts when it fails.
     pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
-        if self.staging.is_some() || self.batch_size == 0 {
-            faucet_core::BatchAtomicity::Atomic
-        } else {
-            faucet_core::BatchAtomicity::BestEffort
-        }
+        faucet_core::BatchAtomicity::BestEffort
     }
 }
 
@@ -295,6 +294,6 @@ mod tests {
             serde_json::json!({"url": "http://localhost:8123", "table": "events", "batch_size": 0}),
         )
         .unwrap();
-        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::Atomic);
+        assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::BestEffort);
     }
 }

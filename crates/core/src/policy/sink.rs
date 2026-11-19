@@ -515,11 +515,11 @@ mod tests {
 
     fn sink(policy: Arc<CompiledPolicy>, residency: &str) -> (PolicySink, Arc<Capture>) {
         let cap = Arc::new(Capture(Mutex::new(Vec::new())));
-        let facts = SinkFacts {
-            id: "default".into(),
-            kind: "jsonl".into(),
-            attributes: [("residency".to_string(), residency.to_string())].into(),
-        };
+        let facts = SinkFacts::new(
+            "default",
+            "jsonl",
+            [("residency".to_string(), residency.to_string())].into(),
+        );
         (
             PolicySink::new(
                 Box::new(Fwd(Arc::clone(&cap))),
@@ -549,11 +549,11 @@ mod tests {
                 Ok(Vec::new())
             }
         }
-        let facts = SinkFacts {
-            id: "default".into(),
-            kind: "jsonl".into(),
-            attributes: [("residency".to_string(), "us".to_string())].into(),
-        };
+        let facts = SinkFacts::new(
+            "default",
+            "jsonl",
+            [("residency".to_string(), "us".to_string())].into(),
+        );
         let s = PolicySink::new(
             Box::new(Short),
             policy("quarantine"),
@@ -684,10 +684,12 @@ mod tests {
 
     #[tokio::test]
     async fn quarantine_into_a_non_compliant_dlq_fails_instead() {
-        let dlq = |residency: &str| SinkFacts {
-            id: "dlq".into(),
-            kind: "jsonl".into(),
-            attributes: [("residency".to_string(), residency.to_string())].into(),
+        let dlq = |residency: &str| {
+            SinkFacts::new(
+                "dlq",
+                "jsonl",
+                [("residency".to_string(), residency.to_string())].into(),
+            )
         };
         let (s, cap) = sink(policy("quarantine"), "us");
         let s = s.with_dlq_destination(dlq("us"));
@@ -728,11 +730,11 @@ mod tests {
         }))
         .unwrap();
         let (s, cap) = sink(Arc::new(CompiledPolicy::compile(&spec).unwrap()), "eu");
-        let s = s.with_dlq_destination(SinkFacts {
-            id: "dlq".into(),
-            kind: "jsonl".into(),
-            attributes: [("residency".to_string(), "us".to_string())].into(),
-        });
+        let s = s.with_dlq_destination(SinkFacts::new(
+            "dlq",
+            "jsonl",
+            [("residency".to_string(), "us".to_string())].into(),
+        ));
         let err = s
             .write_batch_partial(&[json!({"email": "x@y.com", "ssn": "123-45-6789"})])
             .await
@@ -781,11 +783,11 @@ mod tests {
         let err = s.write_batch(&[json!({"email": "x"})]).await.unwrap_err();
         assert_eq!(fields(&err).0.as_deref(), Some("b.pii"));
         let (s, _) = sink(policy("quarantine"), "us");
-        let s = s.with_dlq_destination(SinkFacts {
-            id: "dlq".into(),
-            kind: "s3".into(),
-            attributes: [("residency".to_string(), "us".to_string())].into(),
-        });
+        let s = s.with_dlq_destination(SinkFacts::new(
+            "dlq",
+            "s3",
+            [("residency".to_string(), "us".to_string())].into(),
+        ));
         let err = s
             .write_batch_partial(&[json!({"email": "a@b.io"})])
             .await
@@ -997,11 +999,7 @@ mod tests {
         let s = PolicySink::new(
             Box::new(probe.clone()),
             policy("fail"),
-            SinkFacts {
-                id: "default".into(),
-                kind: "jsonl".into(),
-                attributes: Default::default(),
-            },
+            SinkFacts::new("default", "jsonl", Default::default()),
             PolicyScope {
                 pipeline: "p".into(),
                 row: "r".into(),

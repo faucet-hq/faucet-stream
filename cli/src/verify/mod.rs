@@ -73,6 +73,9 @@ pub struct VerifyInputs {
 #[derive(Clone, Default)]
 pub struct RunGuards {
     pub budget: Option<faucet_core::BudgetSpec>,
+    /// The run's budget ledger, when the repair runs inside a run: the repair
+    /// counts against the same ceilings and deadline.
+    pub budget_state: Option<std::sync::Arc<faucet_core::BudgetState>>,
     pub cancel: Option<tokio_util::sync::CancellationToken>,
     pub resilience: Option<faucet_core::ResiliencePolicy>,
 }
@@ -87,6 +90,7 @@ impl RunGuards {
                 &crate::budget::sink_template_kinds(cfg),
             )
             .map_err(CliError::Config)?,
+            budget_state: None,
             cancel: None,
             resilience: match &cfg.resilience {
                 Some(spec) => Some(spec.to_policy()?),
@@ -950,6 +954,7 @@ async fn run_repair(
             catalog: None,
             usage: Default::default(),
             budget: guards.budget.clone(),
+            budget_state: guards.budget_state.clone(),
             feed: Default::default(),
         },
     )

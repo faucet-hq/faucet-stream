@@ -3,7 +3,7 @@
 //! blocking pool, so a hung disk never blocks an async worker and dropping
 //! the caller's future stops waiting on it.
 
-use super::backend::{Area, StorageBackend};
+use super::backend::{Area, SideCreate, StorageBackend};
 use super::layout::{NameTemplate, TMP_SUFFIX, io_err, tmp_path};
 use faucet_core::FaucetError;
 use std::path::{Path, PathBuf};
@@ -22,6 +22,54 @@ pub struct LocalBackend {
     run_swap: std::sync::OnceLock<PathBuf>,
     template: NameTemplate,
     create_dirs: bool,
+    /// This writer's own scratch directory, shared by its clones.
+    scratch: std::sync::Arc<OwnedScratch>,
+}
+
+/// The scratch directory one writer builds destination files in, beside the
+/// destination so publishing is a rename. Removed when the last clone of
+/// its backend is dropped.
+#[derive(Debug)]
+struct OwnedScratch {
+    dir: PathBuf,
+    owner: std::sync::Mutex<Option<Option<std::fs::File>>>,
+}
+
+impl Drop for OwnedScratch {
+    fn drop(&mut self) {
+        let made = self.owner.get_mut().map(|o| o.is_some()).unwrap_or(true);
+        if made {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+impl OwnedScratch {
+    /// Create the directory and lock its owner file, once; and remove every
+    /// other writer's scratch directory of this output whose writer is gone.
+    fn make(&self, parent: &Path, template: &NameTemplate) -> Result<(), FaucetError> {
+        let mut owner = self.owner.lock().unwrap_or_else(|p| p.into_inner());
+        if owner.is_some() && self.dir.is_dir() {
+            return Ok(());
+        }
+        super::scratch::sweep_orphaned(parent, &scratch_dir_prefix(template), Some(&self.dir));
+        faucet_core::path_guard::check(&self.dir)?;
+        match std::fs::create_dir(&self.dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(io_err("creating the scratch directory", &self.dir, e)),
+        }
+        refuse_linked_dir(&self.dir)?;
+        let lock = super::scratch::lock_owner(&self.dir)
+            .map_err(|e| io_err("locking the scratch directory", &self.dir, e))?;
+        *owner = Some(lock);
+        Ok(())
+    }
+}
+
+/// The prefix of every writer's scratch directory name for `template`.
+fn scratch_dir_prefix(template: &NameTemplate) -> String {
+    format!("{}.scratch-", template.swap_dir_name())
 }
 
 impl LocalBackend {
@@ -34,13 +82,28 @@ impl LocalBackend {
         } else {
             PathBuf::from(dir)
         };
+        let id = uuid::Uuid::new_v4().simple().to_string();
         Self {
             swap: dir.join(template.swap_dir_name()),
             run_swap: std::sync::OnceLock::new(),
+            scratch: std::sync::Arc::new(OwnedScratch {
+                dir: dir.join(format!("{}{}", scratch_dir_prefix(template), &id[..12])),
+                owner: std::sync::Mutex::new(None),
+            }),
             dir,
             template: template.clone(),
             create_dirs,
         }
+    }
+
+    /// The directory this writer builds destination files in before they
+    /// are renamed into place (`<dir>/.faucet-overwrite-<tag>.scratch-<id>/`).
+    pub fn scratch_dir(&self) -> &Path {
+        &self.scratch.dir
+    }
+
+    fn side_dir(&self) -> PathBuf {
+        self.dir.join(self.template.commit_ledger_dir_name())
     }
 
     /// The destination directory.
@@ -151,13 +214,17 @@ impl StorageBackend for LocalBackend {
     }
 
     fn scratch_path(&self, area: Area, name: &str) -> PathBuf {
-        tmp_path(&self.path(area, name), TMP_SUFFIX)
+        match area {
+            Area::Destination => tmp_path(&self.scratch.dir.join(name), TMP_SUFFIX),
+            Area::Swap => tmp_path(&self.path(area, name), TMP_SUFFIX),
+        }
     }
 
     async fn prepare(&self, area: Area) -> Result<(), FaucetError> {
         let dir = self.area(area).to_path_buf();
         let template = self.template.clone();
         let create = area == Area::Swap || self.create_dirs;
+        let scratch = (area == Area::Destination).then(|| self.scratch.clone());
         fs(move || {
             faucet_core::path_guard::check(&dir)?;
             if area == Area::Swap {
@@ -165,15 +232,18 @@ impl StorageBackend for LocalBackend {
             }
             if dir.is_dir() {
                 remove_stale_scratch(&dir, &template);
-                return Ok(());
-            }
-            if !create {
+            } else if !create {
                 return Err(FaucetError::Sink(format!(
                     "file sink: directory '{}' does not exist and `create_dirs` is off",
                     dir.display()
                 )));
+            } else {
+                std::fs::create_dir_all(&dir).map_err(|e| io_err("creating directory", &dir, e))?;
             }
-            std::fs::create_dir_all(&dir).map_err(|e| io_err("creating directory", &dir, e))
+            if let Some(scratch) = scratch {
+                scratch.make(&dir, &template)?;
+            }
+            Ok(())
         })
         .await
     }
@@ -351,39 +421,113 @@ impl StorageBackend for LocalBackend {
         .await
     }
 
-    async fn read_commit_record(&self) -> Result<Option<String>, FaucetError> {
-        let path = self
-            .dir
-            .join(self.template.commit_ledger_dir_name())
-            .join(super::layout::COMMIT_LEDGER_FILE);
-        fs(move || match std::fs::read_to_string(&path) {
-            Ok(text) => Ok(Some(text)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(io_err("reading the overwrite commit ledger", &path, e)),
+    async fn create_side_file(&self, name: &str, text: &str) -> Result<SideCreate, FaucetError> {
+        let dir = self.side_dir();
+        let text = text.to_string();
+        let name = name.to_string();
+        fs(move || {
+            use std::io::Write as _;
+            faucet_core::path_guard::check(&dir)?;
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| io_err("creating the side-file directory", &dir, e))?;
+            refuse_linked_dir(&dir)?;
+            let path = dir.join(&name);
+            faucet_core::path_guard::check(&path)?;
+            let mut f = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Ok(SideCreate::Exists);
+                }
+                Err(e) => return Err(io_err("creating", &path, e)),
+            };
+            f.write_all(text.as_bytes())
+                .and_then(|()| f.sync_all())
+                .map_err(|e| io_err("writing", &path, e))?;
+            sync_parent(&path);
+            Ok(SideCreate::Created)
         })
         .await
     }
 
-    async fn write_commit_record(&self, text: &str) -> Result<(), FaucetError> {
-        let dir = self.dir.join(self.template.commit_ledger_dir_name());
+    async fn read_side_file(&self, name: &str) -> Result<Option<String>, FaucetError> {
+        let path = self.side_dir().join(name);
+        fs(move || match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io_err("reading", &path, e)),
+        })
+        .await
+    }
+
+    async fn write_side_file(&self, name: &str, text: &str) -> Result<(), FaucetError> {
+        let dir = self.side_dir();
         let text = text.to_string();
+        let name = name.to_string();
         fs(move || {
             faucet_core::path_guard::check(&dir)?;
             std::fs::create_dir_all(&dir)
-                .map_err(|e| io_err("creating the overwrite commit ledger", &dir, e))?;
+                .map_err(|e| io_err("creating the side-file directory", &dir, e))?;
             refuse_linked_dir(&dir)?;
-            let path = dir.join(super::layout::COMMIT_LEDGER_FILE);
-            let tmp = dir.join(format!("{}.tmp", super::layout::COMMIT_LEDGER_FILE));
+            let path = dir.join(&name);
+            let tmp = dir.join(format!(
+                ".{name}.{}.tmp",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            ));
             faucet_core::path_guard::check(&tmp)?;
             faucet_core::path_guard::check(&path)?;
-            write_fresh(&tmp, text.as_bytes())
-                .map_err(|e| io_err("writing the overwrite commit ledger", &tmp, e))?;
-            std::fs::rename(&tmp, &path)
-                .map_err(|e| io_err("writing the overwrite commit ledger", &path, e))?;
+            write_fresh(&tmp, text.as_bytes()).map_err(|e| io_err("writing", &tmp, e))?;
+            if let Err(e) = std::fs::rename(&tmp, &path) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(io_err("writing", &path, e));
+            }
             sync_parent(&path);
             Ok(())
         })
         .await
+    }
+
+    async fn delete_side_file(&self, name: &str) -> Result<(), FaucetError> {
+        let path = self.side_dir().join(name);
+        fs(move || match std::fs::remove_file(&path) {
+            Ok(()) => {
+                sync_parent(&path);
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io_err("removing", &path, e)),
+        })
+        .await
+    }
+
+    async fn list_side_files(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
+        let dir = self.side_dir();
+        let prefix = prefix.to_string();
+        fs(move || {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => return Err(io_err("listing", &dir, e)),
+            };
+            Ok(entries
+                .flatten()
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .filter(|n| n.starts_with(&prefix) && !n.starts_with('.'))
+                .collect())
+        })
+        .await
+    }
+
+    async fn read_commit_record(&self) -> Result<Option<String>, FaucetError> {
+        self.read_side_file(super::layout::COMMIT_LEDGER_FILE).await
+    }
+
+    async fn write_commit_record(&self, text: &str) -> Result<(), FaucetError> {
+        self.write_side_file(super::layout::COMMIT_LEDGER_FILE, text)
+            .await
     }
 
     async fn promote(&self, name: &str) -> Result<(), FaucetError> {
@@ -488,6 +632,7 @@ mod tests {
     async fn publish_fetch_delete_and_promote() {
         let dir = tempfile::tempdir().unwrap();
         let b = backend(dir.path(), true);
+        b.prepare(Area::Destination).await.unwrap();
         let scratch = b.scratch_path(Area::Destination, "f");
         assert!(scratch.ends_with("f.faucet-tmp"));
         std::fs::write(&scratch, b"one").unwrap();
@@ -530,7 +675,10 @@ mod tests {
         b.write_commit_record("7").await.unwrap();
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
         assert_eq!(b.read_commit_record().await.unwrap().as_deref(), Some("7"));
-        assert!(std::fs::symlink_metadata(&tmp).is_err(), "the link is gone");
+        assert!(
+            std::fs::symlink_metadata(&tmp).is_ok(),
+            "the ledger is written through a private temporary name, never the planted one"
+        );
     }
 
     #[cfg(unix)]

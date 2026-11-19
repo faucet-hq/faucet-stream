@@ -28,7 +28,7 @@ classifications:
   - label: pii
     fields: [email, phone, ssn, date_of_birth]     # full dot-path or leaf key
     field_pattern: "(?i)(^|[._])(first|last|full)_?name$"   # regex over the dot-path
-    value_detector: email                          # email|credit_card|ssn|phone|phone_loose|ipv4
+    value_detector: email                          # email|credit_card|credit_card_loose|ssn|phone|phone_loose|ipv4
   - label: pii
     value_detector: ssn
   - label: finance
@@ -51,11 +51,17 @@ rules:
   dot-path or its leaf key — `ssn` covers `user.ssn`; `field_pattern` is a
   regex over the dot-path) and/or by **value** (`value_detector`, the
   [masking detectors](/faucet-stream/cookbook/masking/)). Name matches are decided before any
-  data moves; value detectors are enforced by the runtime backstop.
+  data moves; value detectors are enforced by the runtime backstop. A value
+  the detector misses is not labelled, so the rule never sees it: classify by
+  name where you can, and use `credit_card_loose` / `phone_loose` when every
+  candidate value must be caught (`credit_card` requires a card network's
+  prefix and length since faucet-core 1.18).
 - A **rule** applies to every column carrying `when.label`, optionally only
   for some `sink_kind`s and only for sinks whose `when.sink` attributes have
   a listed value (a sink that declares no `environment` never matches a rule
-  scoped to `environment: prod`). It is satisfied when every `require`
+  scoped to `environment: prod`; under `faucet serve` an attribute the
+  server does not trust cannot take a sink out of scope — see
+  [who may set attributes](#who-may-set-attributes)). It is satisfied when every `require`
   attribute is present with a listed value, or the column reaches the sink
   masked with a listed `mask` action. `deny: true` is never satisfied.
 - `on_runtime` is what the backstop does when a value detector fires on a
@@ -82,6 +88,36 @@ matrix:
 
 A sink template's attributes apply to every row that resolves to it; a
 matrix row's `sink.attributes` adds or overrides keys.
+
+### Who may set attributes
+
+An attribute is a claim about where the rows go, so it only counts when the
+policy owner wrote it. On the local CLI (`faucet run`, `validate`, `plan`,
+`policy`) the user owns the config and every attribute counts. Under
+`faucet serve`:
+
+- a config carried by the request (`POST /v1/runs`, `POST /v1/plan`, an MCP
+  `run_pipeline`, a DLQ replay or backfill of such a run) is **not trusted**:
+  its sink and DLQ attributes never satisfy a `require` rule (the violation
+  reads *"attributes of sink `x` come from the submitted config, which this
+  server does not trust for policy"*, JSON `"unattested": true`), and every
+  rule scoped by `when.sink` applies to its sinks (`when.sink_kind` still
+  scopes by the real kind). A listed `mask` action still satisfies a rule;
+- a registered template, the triggers file, the schedules file and the
+  server's own files are trusted, **except** a sink or DLQ whose config or
+  attributes take a value the caller chose: a free-text template param, a
+  trigger token, an `env` override, or an inline deployment overlay's `dlq`.
+  The caller then chooses the destination, so its attributes are not trusted.
+  Mark such a param `trusted: true` or give it a closed `values:` set to keep
+  them trusted; registering a template whose attributed sink takes a
+  `${param.*}` value warns;
+- a sink that only the `--default-config` base declares is merged into the
+  caller's body, so for a raw submission it is not trusted either.
+
+So bind attributes by registering the pipeline (or the sink template) as a
+template. On a server whose every caller is the policy owner,
+`faucet serve --policy-trust-caller-attributes` trusts caller-written
+attributes (it logs a warning at start).
 
 ## Applying a policy
 

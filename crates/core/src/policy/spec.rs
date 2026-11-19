@@ -58,9 +58,11 @@ pub struct Classification {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field_pattern: Option<String>,
 
-    /// A value detector (`email`, `credit_card`, `ssn`, `phone`, `ipv4`): a
-    /// column whose values look like the class carries the label. Reuses the
-    /// masking detectors, so a masked column no longer matches.
+    /// A value detector (`email`, `credit_card`, `credit_card_loose`, `ssn`,
+    /// `phone`, `phone_loose`, `ipv4`): a column whose values look like the
+    /// class carries the label. Reuses the masking detectors, so a masked
+    /// column no longer matches. A missed match lets a value through, so use
+    /// the `_loose` detectors when every candidate must be classified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_detector: Option<Detector>,
 }

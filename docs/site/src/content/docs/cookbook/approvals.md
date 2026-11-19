@@ -243,7 +243,8 @@ visible to every reviewer.
 The `budget` on a request (`max_records`, `max_bytes`, `max_duration_secs`,
 `allowed_sinks`) is merged into the run with the config's own
 [`budget:`](/faucet-stream/cookbook/usage/#run-budgets) block — the stricter of each ceiling wins —
-so an approved change can never move more than was agreed. The page that
+so an approved change can never move more than was agreed, across every row,
+fan-out child and shard of the run. The page that
 would cross a record or byte ceiling is refused whole (the bookmark stays
 put) and the run fails with `budget_exceeded`; an overwrite aborts cleanly
 rather than leaving a half-written table.

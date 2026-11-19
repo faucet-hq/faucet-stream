@@ -41,6 +41,11 @@ would replace the file (`append: false`, `if_exists: replace`) or a single
 loads, as is a DLQ path that is also a data sink's path. Clear handled dead
 letters with `faucet dlq discard`.
 
+On every write path, including the Arrow fast path, quarantined rows are
+flushed to the DLQ before each bookmark is saved and again at the end of the
+run, so a DLQ that only publishes its file on flush never loses rows the
+bookmark has moved past.
+
 ## The envelope
 
 Each dead-lettered record is wrapped in a fixed-shape envelope — the original

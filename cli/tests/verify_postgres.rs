@@ -105,6 +105,7 @@ pipeline:
             catalog: None,
             usage: Default::default(),
             budget: None,
+            budget_state: None,
             feed: Default::default(),
         },
     )
@@ -254,6 +255,7 @@ matrix:
             catalog: None,
             usage: Default::default(),
             budget: None,
+            budget_state: None,
             feed: Default::default(),
         },
     )
@@ -351,6 +353,7 @@ fn plain_options(name: &str) -> ExecuteOptions {
         catalog: None,
         usage: Default::default(),
         budget: None,
+        budget_state: None,
         feed: Default::default(),
     }
 }
