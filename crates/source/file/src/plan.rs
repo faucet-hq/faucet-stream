@@ -4,6 +4,7 @@
 use crate::config::IncrementalBy;
 use faucet_core::FaucetError;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// One file a run may read.
@@ -16,14 +17,24 @@ pub struct Candidate {
     /// Inode change time (nanoseconds since the epoch) where the platform has
     /// one. A rename or a timestamp-preserving copy moves it but not `mtime`.
     pub ctime_ns: Option<i64>,
+    /// What changes when the content is rewritten, even within one timestamp
+    /// tick: size, inode and change time locally (size alone off unix), a
+    /// strong `ETag` or the length over HTTP. `None` when nothing is known.
+    pub fingerprint: Option<String>,
 }
 
 /// The incremental position: what the previous runs have read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Bookmark {
     /// The newest modification time read, and every path read at exactly that
-    /// time — a later file with the same timestamp is still new.
-    Mtime { mtime_ns: i64, paths: Vec<String> },
+    /// time — a later file with the same timestamp is still new — with the
+    /// fingerprint each of those paths had when read, so a rewrite within the
+    /// same tick is read again.
+    Mtime {
+        mtime_ns: i64,
+        paths: Vec<String>,
+        fingerprints: BTreeMap<String, String>,
+    },
     /// The last path read.
     Name { last: String },
 }
@@ -32,8 +43,16 @@ impl Bookmark {
     /// The JSON the state store keeps.
     pub fn to_value(&self) -> Value {
         match self {
-            Self::Mtime { mtime_ns, paths } => {
-                json!({"by": "mtime", "mtime_ns": mtime_ns, "paths": paths})
+            Self::Mtime {
+                mtime_ns,
+                paths,
+                fingerprints,
+            } => {
+                let mut v = json!({"by": "mtime", "mtime_ns": mtime_ns, "paths": paths});
+                if !fingerprints.is_empty() {
+                    v["fingerprints"] = json!(fingerprints);
+                }
+                v
             }
             Self::Name { last } => json!({"by": "name", "last": last}),
         }
@@ -55,6 +74,18 @@ impl Bookmark {
                     .iter()
                     .map(|p| p.as_str().map(str::to_string).ok_or_else(bad))
                     .collect::<Result<_, _>>()?,
+                fingerprints: match v.get("fingerprints") {
+                    None | Some(Value::Null) => BTreeMap::new(),
+                    Some(Value::Object(map)) => map
+                        .iter()
+                        .map(|(k, f)| {
+                            f.as_str()
+                                .map(|f| (k.clone(), f.to_string()))
+                                .ok_or_else(bad)
+                        })
+                        .collect::<Result<_, _>>()?,
+                    Some(_) => return Err(bad()),
+                },
             }),
             (IncrementalBy::Name, "name") => Ok(Self::Name {
                 last: v
@@ -76,11 +107,27 @@ pub fn is_new(bookmark: Option<&Bookmark>, c: &Candidate) -> Result<bool, Faucet
     Ok(match bookmark {
         None => true,
         Some(Bookmark::Name { last }) => c.path.as_str() > last.as_str(),
-        Some(Bookmark::Mtime { mtime_ns, paths }) => {
+        Some(Bookmark::Mtime {
+            mtime_ns,
+            paths,
+            fingerprints,
+        }) => {
             let m = mtime_of(c)?;
-            m > *mtime_ns || (m == *mtime_ns && !paths.contains(&c.path))
+            m > *mtime_ns
+                || (m == *mtime_ns && (!paths.contains(&c.path) || rewritten(fingerprints, c)))
         }
     })
+}
+
+fn rewritten(fingerprints: &BTreeMap<String, String>, c: &Candidate) -> bool {
+    let changed = matches!(
+        (fingerprints.get(&c.path), &c.fingerprint),
+        (Some(old), Some(new)) if old != new
+    );
+    if changed {
+        tracing::debug!(path = %c.path, "file source: re-reading a file rewritten at the watermark time");
+    }
+    changed
 }
 
 /// A skipped file whose inode changed after the watermark: it landed after
@@ -119,16 +166,30 @@ pub fn advance(
                 Some(Bookmark::Mtime {
                     mtime_ns,
                     mut paths,
+                    mut fingerprints,
                 }) if mtime_ns == m => {
-                    paths.push(c.path.clone());
-                    Bookmark::Mtime { mtime_ns, paths }
+                    if !paths.contains(&c.path) {
+                        paths.push(c.path.clone());
+                    }
+                    match &c.fingerprint {
+                        Some(f) => fingerprints.insert(c.path.clone(), f.clone()),
+                        None => fingerprints.remove(&c.path),
+                    };
+                    Bookmark::Mtime {
+                        mtime_ns,
+                        paths,
+                        fingerprints,
+                    }
                 }
-                Some(Bookmark::Mtime { mtime_ns, paths }) if mtime_ns > m => {
-                    Bookmark::Mtime { mtime_ns, paths }
-                }
+                Some(b @ Bookmark::Mtime { mtime_ns, .. }) if mtime_ns > m => b,
                 _ => Bookmark::Mtime {
                     mtime_ns: m,
                     paths: vec![c.path.clone()],
+                    fingerprints: c
+                        .fingerprint
+                        .iter()
+                        .map(|f| (c.path.clone(), f.clone()))
+                        .collect(),
                 },
             }
         }
@@ -239,6 +300,49 @@ fn ctime_ns(_meta: &std::fs::Metadata) -> Option<i64> {
     None
 }
 
+#[cfg(unix)]
+fn local_fingerprint(meta: &std::fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    Some(format!(
+        "{}:{}:{}",
+        meta.len(),
+        meta.ino(),
+        ctime_ns(meta).unwrap_or_default()
+    ))
+}
+
+#[cfg(not(unix))]
+fn local_fingerprint(meta: &std::fs::Metadata) -> Option<String> {
+    Some(meta.len().to_string())
+}
+
+/// Whether a file stat'ed again after reading (`now`, `None` when the stat
+/// failed) differs from its listing entry: its modification time or its
+/// fingerprint moved, so it changed while it was read.
+pub fn changed_since_listed(listed: &Candidate, now: Option<&Candidate>) -> bool {
+    match now {
+        None => true,
+        Some(now) => now.mtime_ns != listed.mtime_ns || now.fingerprint != listed.fingerprint,
+    }
+}
+
+/// Stat `path` again (following symlinks, as the listing does).
+pub fn restat_local(path: &str) -> Option<Candidate> {
+    std::fs::metadata(path)
+        .ok()
+        .map(|meta| local_candidate(path.to_string(), &meta))
+}
+
+/// The listing entry for a local file, from its metadata.
+pub fn local_candidate(path: String, meta: &std::fs::Metadata) -> Candidate {
+    Candidate {
+        path,
+        mtime_ns: mtime_ns(meta),
+        ctime_ns: ctime_ns(meta),
+        fingerprint: local_fingerprint(meta),
+    }
+}
+
 fn io_err(path: &Path, e: impl std::fmt::Display) -> FaucetError {
     FaucetError::Source(format!("file source: '{}': {e}", path.display()))
 }
@@ -264,11 +368,7 @@ pub fn list_local(path: &str, recursive: bool) -> Result<Vec<Candidate>, FaucetE
             }
             let meta = std::fs::metadata(&p).map_err(|e| io_err(&p, e))?;
             if meta.is_file() {
-                out.push(Candidate {
-                    path: p.to_string_lossy().into_owned(),
-                    mtime_ns: mtime_ns(&meta),
-                    ctime_ns: ctime_ns(&meta),
-                });
+                out.push(local_candidate(p.to_string_lossy().into_owned(), &meta));
             }
         }
         return Ok(out);
@@ -276,11 +376,7 @@ pub fn list_local(path: &str, recursive: bool) -> Result<Vec<Candidate>, FaucetE
     let root = Path::new(path);
     let meta = std::fs::metadata(root).map_err(|e| io_err(root, e))?;
     if meta.is_file() {
-        return Ok(vec![Candidate {
-            path: path.to_string(),
-            mtime_ns: mtime_ns(&meta),
-            ctime_ns: ctime_ns(&meta),
-        }]);
+        return Ok(vec![local_candidate(path.to_string(), &meta)]);
     }
     let mut seen = std::collections::HashSet::new();
     seen.insert(std::fs::canonicalize(root).map_err(|e| io_err(root, e))?);
@@ -336,11 +432,7 @@ fn walk(
                 walk(&p, recursive, seen, links, out)?;
             }
         } else if meta.is_file() {
-            out.push(Candidate {
-                path: p.to_string_lossy().into_owned(),
-                mtime_ns: mtime_ns(&meta),
-                ctime_ns: ctime_ns(&meta),
-            });
+            out.push(local_candidate(p.to_string_lossy().into_owned(), &meta));
         }
     }
     Ok(())
@@ -375,6 +467,7 @@ mod tests {
             path: path.into(),
             mtime_ns: Some(m),
             ctime_ns: Some(m),
+            fingerprint: None,
         }
     }
 
@@ -414,11 +507,13 @@ mod tests {
         let bm = Bookmark::Mtime {
             mtime_ns: 100,
             paths: vec!["new".into()],
+            fingerprints: BTreeMap::new(),
         };
         let copied = Candidate {
             path: "copied".into(),
             mtime_ns: Some(50),
             ctime_ns: Some(200),
+            fingerprint: None,
         };
         assert!(arrived_after_watermark(Some(&bm), &copied));
         assert!(!arrived_after_watermark(Some(&bm), &c("old", 50)));
@@ -457,6 +552,7 @@ mod tests {
                 Bookmark::Mtime {
                     mtime_ns: 5,
                     paths: vec!["a".into()],
+                    fingerprints: BTreeMap::new(),
                 },
                 IncrementalBy::Mtime,
             ),
@@ -498,7 +594,8 @@ mod tests {
             bm,
             Some(Bookmark::Mtime {
                 mtime_ns: 2,
-                paths: vec!["a".into()]
+                paths: vec!["a".into()],
+                fingerprints: BTreeMap::new(),
             })
         );
         let again = select(files, Some(IncrementalBy::Mtime), bm.as_ref(), None, 0).unwrap();
@@ -512,7 +609,8 @@ mod tests {
             tied,
             Bookmark::Mtime {
                 mtime_ns: 2,
-                paths: vec!["a".into(), "b".into()]
+                paths: vec!["a".into(), "b".into()],
+                fingerprints: BTreeMap::new(),
             }
         );
         let older = advance(bm, IncrementalBy::Mtime, &c("q", 1)).unwrap();
@@ -520,7 +618,8 @@ mod tests {
             older,
             Bookmark::Mtime {
                 mtime_ns: 2,
-                paths: vec!["a".into()]
+                paths: vec!["a".into()],
+                fingerprints: BTreeMap::new(),
             }
         );
         assert!(
@@ -531,10 +630,86 @@ mod tests {
                     path: "n".into(),
                     mtime_ns: None,
                     ctime_ns: None,
+                    fingerprint: None,
                 }
             )
             .is_err()
         );
+    }
+
+    fn fp(path: &str, m: i64, f: &str) -> Candidate {
+        Candidate {
+            fingerprint: Some(f.into()),
+            ..c(path, m)
+        }
+    }
+
+    #[test]
+    fn a_tie_rewritten_within_its_tick_is_new_again() {
+        let bm = advance(None, IncrementalBy::Mtime, &fp("a", 2, "10:1:2")).unwrap();
+        assert!(!is_new(Some(&bm), &fp("a", 2, "10:1:2")).unwrap());
+        assert!(is_new(Some(&bm), &fp("a", 2, "20:1:3")).unwrap());
+        assert!(
+            !is_new(Some(&bm), &c("a", 2)).unwrap(),
+            "no fingerprint now: as before"
+        );
+        let reread = advance(Some(bm), IncrementalBy::Mtime, &fp("a", 2, "20:1:3")).unwrap();
+        assert_eq!(
+            reread,
+            Bookmark::Mtime {
+                mtime_ns: 2,
+                paths: vec!["a".into()],
+                fingerprints: BTreeMap::from([("a".into(), "20:1:3".into())]),
+            },
+            "a re-read tie replaces its entry instead of adding one"
+        );
+        let moved = advance(Some(reread), IncrementalBy::Mtime, &fp("b", 3, "1:2:3")).unwrap();
+        assert_eq!(
+            moved,
+            Bookmark::Mtime {
+                mtime_ns: 3,
+                paths: vec!["b".into()],
+                fingerprints: BTreeMap::from([("b".into(), "1:2:3".into())]),
+            },
+            "a forward watermark resets the tie set"
+        );
+    }
+
+    #[test]
+    fn fingerprints_are_optional_in_stored_bookmarks() {
+        let old = json!({"by": "mtime", "mtime_ns": 5, "paths": ["a"]});
+        let b = Bookmark::from_value(&old, IncrementalBy::Mtime).unwrap();
+        assert_eq!(b.to_value(), old, "an old bookmark round-trips unchanged");
+        let new =
+            json!({"by": "mtime", "mtime_ns": 5, "paths": ["a"], "fingerprints": {"a": "1:2:3"}});
+        let b = Bookmark::from_value(&new, IncrementalBy::Mtime).unwrap();
+        assert_eq!(b.to_value(), new);
+        let bad = json!({"by": "mtime", "mtime_ns": 5, "paths": ["a"], "fingerprints": {"a": 1}});
+        assert!(Bookmark::from_value(&bad, IncrementalBy::Mtime).is_err());
+        let bad = json!({"by": "mtime", "mtime_ns": 5, "paths": ["a"], "fingerprints": []});
+        assert!(Bookmark::from_value(&bad, IncrementalBy::Mtime).is_err());
+    }
+
+    #[test]
+    fn a_file_that_changed_since_its_listing_is_detected() {
+        let listed = fp("a", 2, "10:1:2");
+        assert!(!changed_since_listed(&listed, Some(&fp("a", 2, "10:1:2"))));
+        assert!(changed_since_listed(&listed, Some(&fp("a", 3, "10:1:2"))));
+        assert!(changed_since_listed(&listed, Some(&fp("a", 2, "11:1:2"))));
+        assert!(
+            changed_since_listed(&listed, None),
+            "a failed stat counts as changed"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.jsonl");
+        std::fs::write(&p, "{}\n").unwrap();
+        let path = p.to_string_lossy().into_owned();
+        let first = restat_local(&path).unwrap();
+        assert!(first.fingerprint.is_some());
+        assert!(!changed_since_listed(&first, restat_local(&path).as_ref()));
+        std::fs::write(&p, "{}\n{}\n").unwrap();
+        assert!(changed_since_listed(&first, restat_local(&path).as_ref()));
+        assert!(restat_local(&dir.path().join("gone").to_string_lossy()).is_none());
     }
 
     #[test]
@@ -568,6 +743,7 @@ mod tests {
             path: "u".into(),
             mtime_ns: None,
             ctime_ns: None,
+            fingerprint: None,
         };
         assert!(select(vec![none.clone()], None, None, Some(1), now).is_err());
         assert!(select(vec![none], Some(IncrementalBy::Mtime), None, None, now).is_err());

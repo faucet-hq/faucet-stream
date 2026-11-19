@@ -21,6 +21,22 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
 pub struct HttpMeta {
     /// `Last-Modified`, in nanoseconds since the Unix epoch.
     pub last_modified_ns: Option<i64>,
+    /// A strong `ETag` (a weak `W/` one is ignored: servers behind a load
+    /// balancer can send a different one per node).
+    pub etag: Option<String>,
+    /// `Content-Length`.
+    pub content_length: Option<u64>,
+}
+
+impl HttpMeta {
+    /// What changes when the remote file is rewritten: the strong `ETag`,
+    /// else the length.
+    pub fn fingerprint(&self) -> Option<String> {
+        self.etag
+            .as_ref()
+            .map(|e| format!("etag:{e}"))
+            .or_else(|| self.content_length.map(|n| format!("len:{n}")))
+    }
 }
 
 /// A client for one remote file.
@@ -111,12 +127,17 @@ impl HttpFetcher {
         let resp = self
             .send(reqwest::Method::HEAD, url, "head", slot, calls)
             .await?;
+        let header = |name| {
+            resp.headers()
+                .get(name)
+                .and_then(|v: &reqwest::header::HeaderValue| v.to_str().ok())
+        };
         Ok(HttpMeta {
-            last_modified_ns: resp
-                .headers()
-                .get(reqwest::header::LAST_MODIFIED)
-                .and_then(|v| v.to_str().ok())
-                .and_then(parse_http_date),
+            last_modified_ns: header(reqwest::header::LAST_MODIFIED).and_then(parse_http_date),
+            etag: header(reqwest::header::ETAG)
+                .filter(|e| !e.starts_with("W/"))
+                .map(str::to_string),
+            content_length: header(reqwest::header::CONTENT_LENGTH).and_then(|v| v.parse().ok()),
         })
     }
 
@@ -239,6 +260,21 @@ pub fn parse_http_date(v: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fingerprint_prefers_a_strong_etag_then_the_length() {
+        let meta = |etag: Option<&str>, len: Option<u64>| HttpMeta {
+            last_modified_ns: None,
+            etag: etag.map(str::to_string),
+            content_length: len,
+        };
+        assert_eq!(
+            meta(Some("\"a\""), Some(3)).fingerprint().as_deref(),
+            Some("etag:\"a\"")
+        );
+        assert_eq!(meta(None, Some(3)).fingerprint().as_deref(), Some("len:3"));
+        assert_eq!(meta(None, None).fingerprint(), None);
+    }
 
     #[test]
     fn backoff_grows_and_caps() {
