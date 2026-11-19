@@ -64,6 +64,7 @@ fn opts(budget: Option<BudgetSpec>) -> ExecuteOptions {
         catalog: None,
         usage: Default::default(),
         budget,
+        budget_state: None,
         feed: Default::default(),
     }
 }
@@ -180,13 +181,12 @@ async fn allowed_sinks_refuses_the_run_before_it_starts() {
 }
 
 #[tokio::test]
-async fn a_budget_crossing_stops_only_its_own_invocation() {
+async fn a_run_budget_covers_every_row_and_fails_only_the_rows_it_stopped() {
     let dir = tempfile::tempdir().unwrap();
     let big = write_input(dir.path());
     let small = dir.path().join("small.csv");
     std::fs::write(&small, "id,name\n1,zed\n").unwrap();
-    let out_big = dir.path().join("big.jsonl");
-    let out_small = dir.path().join("small.jsonl");
+    let out = |n: &str| dir.path().join(format!("{n}.jsonl")).display().to_string();
     let yaml = format!(
         r#"version: 1
 name: usage_test
@@ -196,28 +196,44 @@ pipeline:
   source: {{ type: csv, config: {{ path: "{big}" }} }}
   sink: {{ type: jsonl, config: {{ path: "{out_big}" }} }}
 matrix:
-  - id: big
   - id: small
     source: {{ config: {{ path: "{small}" }} }}
     sink: {{ config: {{ path: "{out_small}" }} }}
+  - id: big
+  - id: late
+    source: {{ config: {{ path: "{small}" }} }}
+    sink: {{ config: {{ path: "{out_late}" }} }}
 "#,
         big = big.display(),
         small = small.display(),
-        out_big = out_big.display(),
-        out_small = out_small.display(),
+        out_big = out("big"),
+        out_small = out("small"),
+        out_late = out("late"),
     );
     let cfg = PipelineConfig::from_text(&yaml, Path::new("usage.yaml")).unwrap();
     let nodes = expand(&cfg).unwrap();
-    let summary = run_expanded(nodes, opts(cfg.budget.clone())).await.unwrap();
+    let mut o = opts(cfg.budget.clone());
+    o.execution = cfg.execution.clone();
+    let summary = run_expanded(nodes, o).await.unwrap();
     let by_row = |id: &str| summary.invocations.iter().find(|o| o.row_id == id).unwrap();
-    assert_eq!(
-        by_row("big").error_kind,
-        Some(InvocationErrorKind::BudgetExceeded)
-    );
     let small = by_row("small");
     assert!(small.error.is_none(), "{small:?}");
     assert_eq!(
         small.records_written, 1,
-        "a sibling's budget crossing must not cancel this invocation"
+        "a row that finished within the run's budget stays a success"
     );
+    assert_eq!(
+        by_row("big").error_kind,
+        Some(InvocationErrorKind::BudgetExceeded),
+        "5 more rows cross the run's ceiling of 2"
+    );
+    let late = by_row("late");
+    assert_eq!(
+        late.error_kind,
+        Some(InvocationErrorKind::BudgetExceeded),
+        "a row starting after the run spent its budget is stopped: {late:?}"
+    );
+    assert_eq!(late.records_written, 0);
+    let written: usize = summary.invocations.iter().map(|o| o.records_written).sum();
+    assert!(written <= 2, "{written}");
 }

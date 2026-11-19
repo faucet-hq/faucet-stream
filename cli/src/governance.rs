@@ -77,7 +77,10 @@ pub(crate) async fn governance_for(req: GovernanceRequest<'_>) -> CliResult<Gove
         g = g.with_resilience(r);
     }
     if let Some(spec) = opts.budget.as_ref().filter(|b| !b.is_empty()) {
-        g = g.with_budget(spec.clone());
+        g = match &opts.budget_state {
+            Some(run) => g.with_budget_state(spec.clone(), Arc::clone(run)),
+            None => g.with_budget(spec.clone()),
+        };
     }
     #[cfg(feature = "quality")]
     if let Some(spec) = &node.quality {
@@ -273,6 +276,8 @@ pub(crate) struct TopologySinkRequest<'a> {
     pub run_id: &'a str,
     pub source_label: String,
     pub budget: Option<&'a faucet_core::BudgetSpec>,
+    /// The graph's run budget, shared by every sink node.
+    pub budget_state: Option<Arc<faucet_core::BudgetState>>,
     pub cancel: CancellationToken,
     pub dry_run: bool,
     pub preview: bool,
@@ -287,7 +292,10 @@ pub(crate) fn topology_sink_governance(req: TopologySinkRequest<'_>) -> CliResul
     let cfg = req.cfg;
     let mut g = Governance::new().with_cancel(req.cancel.clone());
     if let Some(spec) = req.budget.filter(|b| !b.is_empty()) {
-        g = g.with_budget(spec.clone());
+        g = match &req.budget_state {
+            Some(run) => g.with_budget_state(spec.clone(), Arc::clone(run)),
+            None => g.with_budget(spec.clone()),
+        };
         if req.dry_run {
             g = g.without(Pass::Budget, "a --dry-run writes nothing to count");
         }
@@ -658,6 +666,7 @@ mod tests {
             run_id: "r",
             source_label: "rest".into(),
             budget: Some(&budget),
+            budget_state: None,
             cancel: CancellationToken::new(),
             dry_run,
             preview,
@@ -706,6 +715,7 @@ mod tests {
             run_id: "r",
             source_label: "rest".into(),
             budget: None,
+            budget_state: None,
             cancel: CancellationToken::new(),
             dry_run: false,
             preview: false,

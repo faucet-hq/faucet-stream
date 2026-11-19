@@ -125,9 +125,62 @@ pub fn remaining_budget(
     }
 }
 
+/// A one-release notice for a budgeted config that runs more than one
+/// invocation (several rows, a fan-out, partitions, shards or a topology):
+/// since faucet-cli 1.18 its ceilings and clock cover the whole run rather
+/// than each invocation.
+pub fn run_scope_notice(cfg: &crate::config::PipelineConfig) -> Option<String> {
+    let b = cfg.budget.as_ref()?;
+    if b.max_records.is_none() && b.max_bytes.is_none() && b.max_duration_secs.is_none() {
+        return None;
+    }
+    let many = cfg.matrix.len() > 1
+        || cfg
+            .matrix
+            .iter()
+            .any(|r| r.parent.is_some() || r.partition.is_some() || !r.for_each.is_empty())
+        || cfg.partition.is_some()
+        || cfg.shard.is_some()
+        || crate::topology::is_topology(cfg);
+    many.then(|| {
+        "budget: since faucet-cli 1.18 a budget covers the whole run — every row, fan-out \
+         child, partition, shard and topology sink shares its ceilings and its clock; \
+         raise them to the run's total if they were set per row"
+            .to_string()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_budgeted_config_with_several_invocations_is_told_the_budget_covers_the_run() {
+        let cfg = |extra: &str| {
+            crate::config::PipelineConfig::from_text(
+                &format!(
+                    "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: a.csv }} }}\n  sink: {{ type: jsonl, config: {{ path: o.jsonl }} }}\n{extra}"
+                ),
+                std::path::Path::new("c.yaml"),
+            )
+            .unwrap()
+        };
+        assert!(run_scope_notice(&cfg("budget: { max_records: 5 }\n")).is_none());
+        assert!(
+            run_scope_notice(&cfg(
+                "budget: { max_records: 5 }\nmatrix:\n  - id: a\n  - id: b\n"
+            ))
+            .unwrap()
+            .contains("whole run")
+        );
+        assert!(
+            run_scope_notice(&cfg(
+                "budget: { allowed_sinks: [x] }\nmatrix:\n  - id: a\n  - id: b\n"
+            ))
+            .is_none()
+        );
+        assert!(run_scope_notice(&cfg("matrix:\n  - id: a\n  - id: b\n")).is_none());
+    }
 
     #[test]
     fn a_caller_list_disjoint_from_the_config_denies_every_sink() {

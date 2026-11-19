@@ -41,6 +41,7 @@ fn opts(force: bool) -> ExecuteOptions {
         catalog: None,
         usage: Default::default(),
         budget: None,
+        budget_state: None,
         feed: Default::default(),
     }
 }

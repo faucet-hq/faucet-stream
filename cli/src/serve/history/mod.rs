@@ -469,9 +469,13 @@ pub const CAP_REFERENCE_KINDS_V2: &str = "reference_kinds_v2";
 /// A member runs feeds (#1034): it knows the `feed` source and binds a
 /// delivery run to its claimed range.
 pub const CAP_FEEDS: &str = "feeds";
+/// A member counts a sharded run's budget against the run's ledger in the
+/// history (`faucet_serve_run_budgets`), not per shard.
+pub const CAP_RUN_BUDGET: &str = "run_budget";
 /// What this build advertises in its heartbeat.
 pub const INSTANCE_CAPABILITIES: &[&str] = &[
     CAP_POLICY_PIN,
+    CAP_RUN_BUDGET,
     CAP_CONNECTION_GENERATION,
     CAP_HOST_CREDENTIALS,
     CAP_REFERENCE_KINDS_V2,
@@ -1440,6 +1444,43 @@ pub trait RunHistory: Send + Sync {
     async fn policy_versions_delete(&self, scope: &str) -> Result<u64, HistoryError> {
         let _ = scope;
         Ok(0)
+    }
+
+    /// Grant up to `want` (records, bytes) of `run_id`'s run budget, capped
+    /// at `max` (`None` = no ceiling), atomically across every process that
+    /// shares this history: the ledger of a sharded run's budget. Returns
+    /// this grant and the run's granted totals. Default: unsupported, so a
+    /// sharded budgeted run refuses its pages rather than over-spend.
+    async fn budget_grant(
+        &self,
+        run_id: &str,
+        want: (u64, u64),
+        max: (Option<u64>, Option<u64>),
+    ) -> Result<faucet_core::BudgetGrant, HistoryError> {
+        let _ = (run_id, want, max);
+        Err(HistoryError::Backend(
+            "this run-history backend does not keep run budgets".into(),
+        ))
+    }
+
+    /// Return allowance `run_id`'s budget granted but nobody spent.
+    /// Default: inert.
+    async fn budget_give_back(
+        &self,
+        run_id: &str,
+        records: u64,
+        bytes: u64,
+    ) -> Result<(), HistoryError> {
+        let _ = (run_id, records, bytes);
+        Ok(())
+    }
+
+    /// The (records, bytes) granted against `run_id`'s budget, if it has a
+    /// ledger. Granted, not landed: a shard's unspent allowance counts until
+    /// it is given back. Default: none.
+    async fn budget_spent(&self, run_id: &str) -> Result<Option<(u64, u64)>, HistoryError> {
+        let _ = run_id;
+        Ok(None)
     }
 
     /// The sealed secret params of `run_id`, if still stored. Default: none.

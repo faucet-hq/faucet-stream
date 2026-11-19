@@ -495,6 +495,18 @@ masking rules naming it, the policy with its own attributes, the shared budget
 and metering. A pass that does not apply is turned off with
 `without(pass, reason)`, which is recorded (`opt_outs()`) and logged.
 
+A budget covers a whole run. `with_budget(spec)` starts a run of its own;
+`with_budget_state(spec, state)` counts against a `BudgetState` the caller
+shares between every part of one run (matrix rows, fan-out children,
+topology sink nodes): `BudgetState::for_run(&spec, started)` sets the run's
+deadline, pages reserve their records and bytes under one lock (so
+concurrent parts never overshoot, and a failed write gives its reservation
+back), and a `BudgetLedger` (`with_ledger`) grants allowance in chunks when
+parts run in other processes (`close()` returns what was not spent). Once the
+budget is spent every part still running stops at its next page boundary;
+`GovernedSink::budget_handle()` reports whether the budget stopped *this*
+part, so one that finished earlier stays a success.
+
 ### Governed pages (RFC 0014)
 
 The engine writes only `GovernedPage`s — pages that went through masking →

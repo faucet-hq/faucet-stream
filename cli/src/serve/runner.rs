@@ -914,6 +914,15 @@ async fn execute_shard(
             return (ShardOutcome::Failed, ShardExit::Finished);
         }
     };
+    // A shard's budget is the run's: granted from the run's ledger, measured
+    // from when the run started.
+    let run_started = match state.history().get(run_id).await {
+        Ok(rec) => rec.and_then(|r| r.started_at).unwrap_or(submitted_at),
+        Err(e) => {
+            tracing::warn!(run_id, shard_id, error = %e, "shard: could not read the run's start");
+            submitted_at
+        }
+    };
     // `coop` is the per-shard cancel token registered by `resume_claimed_shard`;
     // a cross-instance cancel (F10), a server shutdown, or a timeout all fire it
     // so the shard's pipeline flushes at its next page boundary. A shard is not
@@ -929,6 +938,7 @@ async fn execute_shard(
             cancel: coop.clone(),
             concurrency,
             shard: Some(shard),
+            run_started: Some(run_started),
             #[cfg(feature = "notify")]
             notifier: None,
             catalog: false,
@@ -942,6 +952,7 @@ async fn execute_shard(
         }
     };
 
+    let budget_state = opts.budget_state.clone();
     let server_shutdown = state.shutdown_token();
     let span = tracing::info_span!(parent: None, "faucet.serve.shard", serve_run_id = %run_id, shard = %shard_id);
     let audit_state = state.clone();
@@ -995,6 +1006,11 @@ async fn execute_shard(
                 .after_interrupt(tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await.ok())
         }
     };
+    // Return the allowance this shard was granted but did not spend, on every
+    // exit; a missed return only stops the run early.
+    if let Some(budget) = &budget_state {
+        budget.close().await;
+    }
     let exit = match terminal {
         Terminal::ShutdownFailed { .. } => ShardExit::Shutdown,
         Terminal::Cancelled { .. } if fenced => ShardExit::Fenced,
@@ -2230,6 +2246,7 @@ async fn execute_run(
             cancel: coop.clone(),
             concurrency,
             shard: None,
+            run_started: None,
             #[cfg(feature = "notify")]
             notifier,
             catalog: true,

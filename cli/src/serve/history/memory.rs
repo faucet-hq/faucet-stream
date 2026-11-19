@@ -62,6 +62,9 @@ type ScheduleMap = BTreeMap<String, super::schedules::ScheduleRecord>;
 type FeedMap = BTreeMap<String, super::feeds::FeedRecord>;
 type FeedTokenMap = BTreeMap<String, super::feeds::FeedTokenRecord>;
 
+/// Run id → (records, bytes) granted against a sharded run's budget.
+type RunBudgets = std::collections::HashMap<String, (u64, u64)>;
+
 pub struct MemoryHistory {
     runs: DashMap<String, RunRecord>,
     idem: DashMap<String, IdemEntry>,
@@ -121,6 +124,8 @@ pub struct MemoryHistory {
     run_secrets: Mutex<RunSecrets>,
     /// Data-flow policy versions (#1043): scope → version → record.
     policy_versions: Mutex<PolicyVersions>,
+    /// Run budget ledgers of sharded runs: run id → granted (records, bytes).
+    run_budgets: Mutex<RunBudgets>,
     /// Retention window for idempotency claims (separate from run retention).
     idem_retention: Duration,
 }
@@ -162,6 +167,12 @@ impl MemoryHistory {
         let e = w.entry(run_id.to_string()).or_insert((through, now));
         *e = (e.0.max(through), now);
         Ok(())
+    }
+
+    fn budgets(&self) -> Result<std::sync::MutexGuard<'_, RunBudgets>, HistoryError> {
+        self.run_budgets
+            .lock()
+            .map_err(|_| HistoryError::Backend("run budgets lock poisoned".into()))
     }
 
     fn secrets(&self) -> Result<std::sync::MutexGuard<'_, RunSecrets>, HistoryError> {
@@ -228,6 +239,7 @@ impl MemoryHistory {
             trigger_edges: Mutex::new(std::collections::HashMap::new()),
             run_secrets: Mutex::new(std::collections::HashMap::new()),
             policy_versions: Mutex::new(std::collections::HashMap::new()),
+            run_budgets: Mutex::new(std::collections::HashMap::new()),
             idem_retention,
         }
     }
@@ -355,6 +367,7 @@ impl RunHistory for MemoryHistory {
             return Ok(DeleteOutcome::StillRunning);
         }
         self.runs.remove(id);
+        self.budgets()?.remove(id);
         // Also drop this run's idempotency claim so a replay of the key starts a
         // fresh run instead of 404-ing on the now-deleted record until the claim
         // self-expires (#146 M8). Only remove it if the claim still points at
@@ -374,6 +387,9 @@ impl RunHistory for MemoryHistory {
                     .map(|f| !is_expired(f, now, retain_for))
                     .unwrap_or(true)
         });
+        if let Ok(mut budgets) = self.run_budgets.lock() {
+            budgets.retain(|id, _| self.runs.contains_key(id));
+        }
         // Also drop stale idempotency claims so the map stays bounded.
         self.idem
             .retain(|_, e| !is_expired(e.claimed_at, now, self.idem_retention));
@@ -1524,6 +1540,41 @@ impl RunHistory for MemoryHistory {
     async fn run_secrets_delete(&self, run_id: &str) -> Result<(), HistoryError> {
         self.secrets()?.remove(run_id);
         Ok(())
+    }
+
+    async fn budget_grant(
+        &self,
+        run_id: &str,
+        want: (u64, u64),
+        max: (Option<u64>, Option<u64>),
+    ) -> Result<faucet_core::BudgetGrant, HistoryError> {
+        let mut budgets = self.budgets()?;
+        let spent = budgets.entry(run_id.to_string()).or_insert((0, 0));
+        let grant = |have: u64, want: u64, max: Option<u64>| {
+            want.min(max.map_or(u64::MAX, |m| m.saturating_sub(have)))
+        };
+        let r = grant(spent.0, want.0, max.0);
+        let b = grant(spent.1, want.1, max.1);
+        spent.0 += r;
+        spent.1 += b;
+        Ok(faucet_core::BudgetGrant::new(r, b, spent.0, spent.1))
+    }
+
+    async fn budget_give_back(
+        &self,
+        run_id: &str,
+        records: u64,
+        bytes: u64,
+    ) -> Result<(), HistoryError> {
+        if let Some(spent) = self.budgets()?.get_mut(run_id) {
+            spent.0 = spent.0.saturating_sub(records);
+            spent.1 = spent.1.saturating_sub(bytes);
+        }
+        Ok(())
+    }
+
+    async fn budget_spent(&self, run_id: &str) -> Result<Option<(u64, u64)>, HistoryError> {
+        Ok(self.budgets()?.get(run_id).copied())
     }
 
     async fn run_secrets_purge_terminal(&self) -> Result<usize, HistoryError> {

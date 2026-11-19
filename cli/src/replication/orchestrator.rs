@@ -129,6 +129,7 @@ pub(crate) fn make_opts(
         catalog: opts.catalog.clone(),
         usage: opts.usage.clone(),
         budget: opts.budget.clone(),
+        budget_state: None,
         feed: Default::default(),
     }
 }

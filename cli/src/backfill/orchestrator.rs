@@ -318,6 +318,7 @@ fn make_opts(
         // A backfill is bounded by its window, not a budget; the ceilings a
         // `budget:` block sets describe the forward sync.
         budget: None,
+        budget_state: None,
         feed: Default::default(),
     }
 }

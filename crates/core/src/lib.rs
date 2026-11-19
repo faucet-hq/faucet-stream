@@ -124,7 +124,10 @@ pub use auth::{
     AuthProvider, AuthReference, AuthSpec, Credential, CredentialPlacement, RequestAuth,
     SharedAuthProvider, rejects_credential, send_with_reauth,
 };
-pub use budget::{BudgetKind, BudgetSink, BudgetSpec, BudgetState, BudgetTimer, BudgetVerdict};
+pub use budget::{
+    BudgetGrant, BudgetHandle, BudgetKind, BudgetLedger, BudgetSink, BudgetSpec, BudgetState,
+    BudgetStop, BudgetTimer, BudgetVerdict,
+};
 pub use capabilities::{Capabilities, CapabilitiesBuilder, ConnectorDescriptor, SchemaReport};
 pub use check::{CheckContext, CheckReport, Probe, ProbeStatus};
 pub use cleanup::{

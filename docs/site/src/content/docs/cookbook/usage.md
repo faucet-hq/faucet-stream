@@ -130,8 +130,8 @@ schema. A config submitted to `faucet serve` may set `pricing:` inline but not
 
 ## Run budgets
 
-A `budget:` block puts hard ceilings on what one invocation may move, so a
-run can never exceed what was agreed — the enforcement half of a
+A `budget:` block puts hard ceilings on what one **run** may move, so a run
+can never exceed what was agreed — the enforcement half of a
 [change approval](/faucet-stream/cookbook/approvals/), and useful on its own:
 
 ```yaml
@@ -142,6 +142,14 @@ budget:
   allowed_sinks: [warehouse, postgres]   # sink template names or connector kinds
 ```
 
+- **One budget per run.** Every record (and estimated byte) accepted by any
+  destination of the run counts against one ceiling: every matrix row,
+  fan-out child, shard (on any replica) and topology sink node, plus the DLQ.
+  A topology tee to two sinks counts its rows twice (they are written twice).
+  `max_duration_secs` is measured from the run's start, so rows queued behind
+  `execution.max_concurrent` spend the same clock. "A run" is one `faucet run`
+  / `faucet template run` command, one `faucet serve` run (all its shards),
+  one schedule tick, one `faucet mirror` cycle, one DLQ replay.
 - **Records and bytes** are checked *before* a page is written. A page that
   would cross the ceiling is refused whole: nothing of it lands and the
   bookmark never advances past it, so a resumed run picks the page up again.
@@ -149,16 +157,30 @@ budget:
 - **Duration** cancels the run's cooperative token when the deadline passes:
   the pipeline stops at its next page boundary and flushes (an overwrite
   aborts cleanly), and the run fails with `budget_exceeded`.
+- **Which rows fail.** Once the run's budget is spent, every row still running
+  stops at its next page boundary and every row that starts later stops at
+  once; those rows fail with `budget_exceeded` (the error reports the run's
+  total). A row that finished before the budget was spent stays a success,
+  and a `write_mode: overwrite` group whose rows all finished still commits.
+- **Sharded runs** (`faucet serve --cluster` with `shard:`) draw their
+  allowance from one ledger row per run in the run history, so shards on
+  different replicas never overspend; the deadline is the run's start on
+  each replica (bounded by clock skew). A shard holds a little unspent
+  allowance until it ends, so a run may stop slightly before a ceiling, never
+  past it; a shard reclaimed after a crash re-writes pages since its last
+  bookmark, and those count again. A non-sharded run that is requeued after a
+  crash starts its budget over. While any cluster member runs an older
+  release, a budgeted sharded run is refused (`503`).
 - **`allowed_sinks`** is checked before anything runs: a row writing to a sink
   the list does not name refuses the whole run.
 - **The DLQ counts too.** Envelopes written to the
   [dead-letter queue](/faucet-stream/cookbook/dlq/#the-dlq-is-a-governed-destination) count against
-  the same records and bytes ceilings as the main sink, so a run that fails
-  every row into the DLQ is stopped like one that writes them.
+  the same run budget as the main sinks, so a run that fails every row into
+  the DLQ is stopped like one that writes them.
 - **Follow-up work stays inside it.** A [DLQ replay](/faucet-stream/cookbook/dlq/#replaying) runs
   under the config's budget (and a tenant's per-run limits under
   `faucet serve`); a [`verify` repair](/faucet-stream/cookbook/verify/) started by a run's post-run
-  verify is bounded by what is left of that run's budget — a run that spent a
+  verify counts against that run's budget and deadline — a run that spent a
   ceiling leaves the repair nothing, so its first write is refused — and stops on its
   cancellation.
 
@@ -171,5 +193,13 @@ sink, so the run is refused rather than left unrestricted. A budget applies to e
 verdict is `FaucetError::BudgetExceeded` (error kind `budget_exceeded`,
 `InvocationErrorKind::BudgetExceeded` on the outcome). `faucet schema budget`
 prints the block's schema.
+
+**Upgrading:** before faucet-cli 1.18 every row, fan-out child, shard and
+topology sink had its own ceilings and its own clock. A config that used a
+budget as a per-row cap — three streams of 1 M rows under
+`max_records: 2000000`, or ten five-minute rows run one at a time under
+`max_duration_secs: 1800` — now stops: raise the ceiling to the whole run's
+total. `faucet validate` and `faucet run` warn once when a budgeted config
+has more than one row, a fan-out or a topology.
 
 Example: [`cli/examples/csv_to_jsonl_with_usage_budget.yaml`](https://github.com/faucet-hq/faucet-stream/blob/main/cli/examples/csv_to_jsonl_with_usage_budget.yaml).

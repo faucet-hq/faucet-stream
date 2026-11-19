@@ -48,6 +48,61 @@ fn rec(id: &str, status: RunStatus, submitted: chrono::DateTime<Utc>) -> RunReco
 
 /// `insert_new` claims an id once: a second insert of the same id is refused
 /// and leaves the first record in place.
+/// The run budget ledger of a sharded run: concurrent grants from two
+/// connections never pass the ceiling, given-back allowance is granted
+/// again, and the row goes with its run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_budget_grants_never_pass_the_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = std::sync::Arc::new(store(&dir, "budget.db").await);
+    let b =
+        std::sync::Arc::new(store_with(&dir, "budget.db", Duration::from_secs(3600), "b").await);
+    let mut tasks = Vec::new();
+    for i in 0..8 {
+        let h = if i % 2 == 0 { a.clone() } else { b.clone() };
+        tasks.push(tokio::spawn(async move {
+            let mut got = 0;
+            for _ in 0..10 {
+                got += h
+                    .budget_grant("run", (7, 100), (Some(100), None))
+                    .await
+                    .unwrap()
+                    .records;
+            }
+            got
+        }));
+    }
+    let mut total = 0;
+    for t in tasks {
+        total += t.await.unwrap();
+    }
+    assert_eq!(total, 100);
+    assert_eq!(a.budget_spent("run").await.unwrap(), Some((100, 8_000)));
+    let g = a
+        .budget_grant("run", (5, 0), (Some(100), None))
+        .await
+        .unwrap();
+    assert_eq!((g.records, g.total_records), (0, 100));
+    a.budget_give_back("run", 30, 8_000).await.unwrap();
+    let g = a
+        .budget_grant("run", (50, 10), (Some(100), Some(5)))
+        .await
+        .unwrap();
+    assert_eq!((g.records, g.bytes, g.total_records), (30, 5, 100));
+    assert_eq!(a.budget_spent("other").await.unwrap(), None);
+
+    a.upsert(&rec("run", RunStatus::Completed, Utc::now()))
+        .await
+        .unwrap();
+    assert_eq!(a.delete("run").await.unwrap(), DeleteOutcome::Deleted);
+    assert_eq!(a.budget_spent("run").await.unwrap(), None);
+    a.budget_grant("orphan", (1, 0), (Some(5), None))
+        .await
+        .unwrap();
+    a.purge_expired(Duration::from_secs(3600)).await.unwrap();
+    assert_eq!(a.budget_spent("orphan").await.unwrap(), None);
+}
+
 #[tokio::test]
 async fn insert_new_claims_an_id_once() {
     let dir = tempfile::tempdir().unwrap();

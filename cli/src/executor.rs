@@ -272,6 +272,12 @@ pub struct ExecuteOptions {
     /// request — the stricter winning). `allowed_sinks` is checked before
     /// anything runs; the others by a sink decorator per invocation.
     pub budget: Option<faucet_core::BudgetSpec>,
+    /// The run's budget ledger: every invocation of the run (rows, fan-out
+    /// children, topology sinks) counts against it, and `max_duration_secs`
+    /// runs from its start. `None` makes [`run_expanded`] start one for the
+    /// run; a caller passes one to share it (a sharded run's ledger, a verify
+    /// repair inside its run).
+    pub budget_state: Option<std::sync::Arc<faucet_core::BudgetState>>,
     /// How a `feed` source of this run reads (#1034). Only the server's
     /// governed options set it; every other caller leaves the default, under
     /// which the source runs standalone.
@@ -718,6 +724,15 @@ async fn run_expanded_unredacted(
     opts: ExecuteOptions,
 ) -> CliResult<RunSummary> {
     check_budget_sinks(&nodes, opts.budget.as_ref())?;
+    let mut opts = opts;
+    if opts.budget_state.is_none()
+        && let Some(spec) = opts.budget.as_ref().filter(|b| !b.is_empty())
+    {
+        opts.budget_state = Some(std::sync::Arc::new(faucet_core::BudgetState::for_run(
+            spec,
+            std::time::SystemTime::now(),
+        )));
+    }
     // A root's state key depends only on the run's names, so an invalid one
     // fails the run before anything is written rather than mid-run.
     for node in nodes.iter().filter(|n| matches!(n.role, NodeRole::Root)) {
@@ -2914,7 +2929,6 @@ async fn run_one_invocation(
         Some(opts.run_id.clone().unwrap_or_else(|| run_id.clone())),
         Some(run_id.clone()),
     );
-    let invocation_clock = std::time::Instant::now();
     let pipeline_name = opts.pipeline_name.clone();
     let row_id = node.id.clone();
     #[cfg(feature = "lineage")]
@@ -3319,7 +3333,7 @@ async fn run_one_invocation(
         builder = builder.outer_tap(move |s| Box::new(faucet_lineage::SamplingSink::new(s, state)));
     }
     let governed = builder.build(sink);
-    let budget_state = governed.budget_state().cloned();
+    let budget_handle = governed.budget_handle();
     let sink: Box<dyn Sink> = Box::new(governed);
 
     // 5) Assemble the runtime pipeline. The whole `with_*` builder chain (state,
@@ -3403,15 +3417,22 @@ async fn run_one_invocation(
     // from this combined `result`, then `?`-propagated below — restoring the
     // original early-return behaviour while still firing the terminal event on
     // both success and error.
-    let result: Result<faucet_core::PipelineResult, FaucetError> =
-        match Box::pin(pipeline.run()).await {
-            Ok(r) => sink.flush().await.map(|_| r),
-            Err(e) => Err(e),
-        };
+    let ran = Box::pin(pipeline.run()).await;
+    // Whether the run's budget stopped this invocation is decided the moment
+    // its pipeline returns: a sibling spending the budget afterwards does not
+    // fail an invocation that already finished.
+    let budget_stopped = budget_handle.as_ref().and_then(|h| h.end());
+    let result: Result<faucet_core::PipelineResult, FaucetError> = match ran {
+        Ok(r) => sink.flush().await.map(|_| r),
+        Err(e) => Err(e),
+    };
     // A duration ceiling cancels cooperatively, so the pipeline returns `Ok`
     // with a partial result; the verdict turns it into the budget failure
     // (a records / bytes crossing already surfaced as the write error).
-    let result = match (&result, budget_state.as_ref().and_then(|s| s.verdict())) {
+    // A budget stop cancels cooperatively, so the pipeline returns `Ok` with
+    // a partial result; the handle turns it into the budget failure only for
+    // an invocation the budget actually stopped.
+    let result = match (&result, budget_stopped) {
         (Ok(_), Some(verdict)) => Err(verdict.error()),
         _ => result,
     };
@@ -3489,13 +3510,8 @@ async fn run_one_invocation(
             // A repair is bounded by what is left of this run's budget, stops
             // with it, and retries like it (#871).
             let guards = crate::verify::RunGuards {
-                budget: opts.budget.as_ref().map(|spec| {
-                    crate::budget::remaining_budget(
-                        spec,
-                        budget_state.as_deref(),
-                        invocation_clock.elapsed(),
-                    )
-                }),
+                budget: opts.budget.clone(),
+                budget_state: opts.budget_state.clone(),
                 cancel: Some(cancel.clone()),
                 resilience: opts.resilience.clone(),
             };
@@ -5009,6 +5025,7 @@ impl ExecuteOptions {
             catalog: None,
             usage: Default::default(),
             budget: None,
+            budget_state: None,
             feed: Default::default(),
         }
     }
@@ -5662,6 +5679,7 @@ mod tests {
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )
@@ -5711,6 +5729,7 @@ mod tests {
             catalog: None,
             usage: Default::default(),
             budget: None,
+            budget_state: None,
             feed: Default::default(),
         }
     }
@@ -6436,6 +6455,7 @@ matrix:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )
@@ -6703,6 +6723,7 @@ matrix:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )
@@ -6955,6 +6976,7 @@ execution:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )
@@ -7101,6 +7123,7 @@ pipeline:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )
@@ -7173,6 +7196,7 @@ matrix:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )
@@ -7259,6 +7283,7 @@ execution:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )
@@ -7341,6 +7366,7 @@ matrix:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )
@@ -7640,6 +7666,7 @@ matrix:
             catalog: None,
             usage: Default::default(),
             budget: None,
+            budget_state: None,
             feed: Default::default(),
         }
     }
@@ -8827,6 +8854,7 @@ matrix:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )
