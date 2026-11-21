@@ -106,3 +106,42 @@ async fn a_result_with_two_columns_of_one_name_is_refused() {
     let err = pages.next().await.expect("an item").expect_err("refused");
     assert!(err.to_string().contains("two columns named"), "{err}");
 }
+
+/// A zero or invalid date reads as MySQL's own text (as mysql-cdc spells
+/// it), a type the source cannot decode fails the read, and only SQL NULL is
+/// `null`.
+#[tokio::test(flavor = "multi_thread")]
+async fn zero_dates_render_as_text_and_undecodable_cells_fail() {
+    let (_c, url) = start_mysql().await;
+    let pool = sqlx::MySqlPool::connect(&url).await.expect("pool");
+    sqlx::raw_sql(
+        "SET SESSION sql_mode = '';
+         CREATE TABLE z (id INT PRIMARY KEY, d DATE, dt DATETIME(3), ts TIMESTAMP NULL, g GEOMETRY NULL);
+         INSERT INTO z VALUES (1, '0000-00-00', '0000-00-00 00:00:00.000', '0000-00-00 00:00:00', NULL),
+                              (2, NULL, NULL, NULL, ST_GeomFromText('POINT(1 1)'));",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+    pool.close().await;
+
+    let dates = MysqlSource::new(MysqlSourceConfig::new(
+        &url,
+        "SELECT d, dt, ts FROM z ORDER BY id",
+    ))
+    .await
+    .expect("source");
+    let rows = dates.fetch_all().await.expect("fetch");
+    assert_eq!(
+        rows[0],
+        json!({"d": "0000-00-00", "dt": "0000-00-00 00:00:00", "ts": "0000-00-00 00:00:00"})
+    );
+    assert_eq!(rows[1], json!({"d": null, "dt": null, "ts": null}));
+
+    let geometry = MysqlSource::new(MysqlSourceConfig::new(&url, "SELECT g FROM z WHERE id = 2"))
+        .await
+        .expect("source");
+    let err = geometry.fetch_all().await.expect_err("not silently null");
+    assert!(err.to_string().contains("MySQL column g"), "{err}");
+    assert!(err.to_string().contains("ST_AsText(g)"), "{err}");
+}

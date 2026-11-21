@@ -37,7 +37,9 @@ rendering from `"2024-01-03 04:05:06.123456"`). The `+00:00` is a
 convention, not an offset MySQL stored: a column holding wall-clock local
 times keeps those wall-clock values, so treat the offset as "as stored" rather
 than converting them as UTC instants. `TIMESTAMP` is a real instant and is
-rendered in UTC as usual.
+rendered in UTC as usual. A zero or invalid date (`0000-00-00`, which MySQL
+accepts without `NO_ZERO_DATE`) has no instant at all and is kept as MySQL's
+own text (`"0000-00-00"`, `"0000-00-00 00:00:00"`) rather than becoming `null`.
 
 Temporal values are never truncated. A converter that knows the column's unit
 (Arrow `Timestamp(µs)`, Avro `timestamp-micros`) renders that unit's fixed

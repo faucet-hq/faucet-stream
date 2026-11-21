@@ -103,36 +103,54 @@ impl SqliteSource {
 /// decodes NULL as `""` when asked for a `String`. TEXT is parsed as JSON only
 /// when it holds an object or array, so `'19.90'`, `'00501'` and `'null'` stay
 /// the strings they are.
-fn sqlite_value_to_json(row: &sqlx::sqlite::SqliteRow, idx: usize) -> Value {
-    let Ok(raw) = row.try_get_raw(idx) else {
-        return Value::Null;
-    };
+fn sqlite_value_to_json(row: &sqlx::sqlite::SqliteRow, idx: usize) -> Result<Value, FaucetError> {
+    let raw = row
+        .try_get_raw(idx)
+        .map_err(|e| undecodable(row, idx, &e))?;
     if raw.is_null() {
-        return Value::Null;
+        return Ok(Value::Null);
     }
-    match raw.type_info().name() {
-        "INTEGER" => match row.try_get::<i64, _>(idx) {
-            Ok(v @ (0 | 1)) if declared_boolean(row, idx) => Value::Bool(v == 1),
-            Ok(v) => Value::Number(v.into()),
-            Err(_) => Value::Null,
+    Ok(match raw.type_info().name() {
+        "INTEGER" => match row
+            .try_get::<i64, _>(idx)
+            .map_err(|e| undecodable(row, idx, &e))?
+        {
+            v @ (0 | 1) if declared_boolean(row, idx) => Value::Bool(v == 1),
+            v => Value::Number(v.into()),
         },
-        "REAL" => row
-            .try_get::<f64, _>(idx)
-            .ok()
-            .map(faucet_core::fidelity::float64)
-            .unwrap_or(Value::Null),
-        "BLOB" => row
-            .try_get::<Vec<u8>, _>(idx)
-            .map(|v| {
-                use base64::Engine as _;
-                Value::String(base64::engine::general_purpose::STANDARD.encode(v))
-            })
-            .unwrap_or(Value::Null),
-        _ => row
-            .try_get::<String, _>(idx)
-            .map(text_to_json)
-            .unwrap_or(Value::Null),
-    }
+        "REAL" => faucet_core::fidelity::float64(
+            row.try_get::<f64, _>(idx)
+                .map_err(|e| undecodable(row, idx, &e))?,
+        ),
+        "BLOB" => {
+            use base64::Engine as _;
+            let v = row
+                .try_get::<Vec<u8>, _>(idx)
+                .map_err(|e| undecodable(row, idx, &e))?;
+            Value::String(base64::engine::general_purpose::STANDARD.encode(v))
+        }
+        _ => text_to_json(row.try_get::<String, _>(idx).map_err(|_| {
+            let c = column_name(row, idx);
+            FaucetError::Source(format!(
+                "SQLite column {c} holds text that is not valid UTF-8; select it as \
+                 CAST({c} AS BLOB) to read the bytes"
+            ))
+        })?),
+    })
+}
+
+fn column_name(row: &sqlx::sqlite::SqliteRow, idx: usize) -> String {
+    row.columns()
+        .get(idx)
+        .map_or_else(|| idx.to_string(), |c| c.name().to_string())
+}
+
+/// A non-NULL cell no decoder accepts fails the read; `null` is only SQL NULL.
+fn undecodable(row: &sqlx::sqlite::SqliteRow, idx: usize, e: &sqlx::Error) -> FaucetError {
+    FaucetError::Source(format!(
+        "SQLite column {} could not be decoded: {e}",
+        column_name(row, idx)
+    ))
 }
 
 /// Whether the result column is declared `BOOLEAN` / `BOOL`.
@@ -333,7 +351,7 @@ fn row_to_json(row: &sqlx::sqlite::SqliteRow) -> Result<Value, FaucetError> {
                  is lost"
             )));
         }
-        map.insert(name.to_string(), sqlite_value_to_json(row, idx));
+        map.insert(name.to_string(), sqlite_value_to_json(row, idx)?);
     }
     Ok(Value::Object(map))
 }
@@ -714,7 +732,7 @@ mod tests {
             .fetch_all(&source.pool)
             .await
             .unwrap();
-        let v = sqlite_value_to_json(&rows[0], 0);
+        let v = sqlite_value_to_json(&rows[0], 0).unwrap();
         assert_eq!(v, Value::String("AP8=".to_string()), "BLOB must be base64");
     }
 

@@ -488,3 +488,36 @@ async fn a_shard_key_holding_text_values_is_refused() {
     );
     assert_eq!(shard_plan(&url, "SELECT k FROM empty").await.unwrap(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn text_that_is_not_utf8_fails_the_read_instead_of_becoming_null() {
+    let tmp = NamedTempFile::new().expect("tempfile");
+    let url = sqlite_url(tmp.path());
+    let pool = sqlx::SqlitePool::connect(&url).await.expect("pool");
+    sqlx::raw_sql(
+        "CREATE TABLE t (id INTEGER, v TEXT);
+         INSERT INTO t VALUES (1, CAST(x'ff' AS TEXT)), (2, NULL);",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed");
+    pool.close().await;
+    let source = SqliteSource::new(SqliteSourceConfig::new(&url, "SELECT v FROM t ORDER BY id"))
+        .await
+        .expect("source");
+    let err = source.fetch_all().await.expect_err("not silently null");
+    assert!(
+        err.to_string()
+            .contains("SQLite column v holds text that is not valid UTF-8"),
+        "{err}"
+    );
+    let source = SqliteSource::new(SqliteSourceConfig::new(
+        &url,
+        "SELECT CAST(v AS BLOB) AS v FROM t ORDER BY id",
+    ))
+    .await
+    .expect("source");
+    let rows = source.fetch_all().await.expect("bytes read");
+    assert_eq!(rows[0]["v"], serde_json::json!("/w=="));
+    assert_eq!(rows[1]["v"], serde_json::Value::Null);
+}

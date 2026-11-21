@@ -167,7 +167,8 @@ SQLite has dynamic typing — values are stored as INTEGER, REAL, TEXT, BLOB, or
 | REAL (`f64`) | `number` |
 | INTEGER 0 / 1 in a column declared `BOOLEAN` / `BOOL` | `boolean` (other values stay numbers) |
 | BLOB | `string` (base64) |
-| NULL / unsupported | `null` |
+| NULL | `null` |
+| TEXT that is not valid UTF-8 | fails the read naming the column — select it as `CAST(c AS BLOB)` to read the bytes |
 
 SQLite has no native datetime / UUID / decimal types — those are stored as TEXT/INTEGER/REAL and surface accordingly. A non-finite `f64` (NaN / infinity) cannot be represented in JSON and decodes to `null`.
 
