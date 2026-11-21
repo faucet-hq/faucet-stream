@@ -57,9 +57,10 @@ async fn binary_collation_text_is_text_and_binary_is_base64() {
     };
     assert_eq!(streamed, rows, "the streaming path decodes the same way");
 
-    // Duplicate names cannot be probed; the query still runs, as before.
+    // Two columns of one name are refused rather than one being lost.
     let dup = MysqlSource::new(MysqlSourceConfig::new(&url, "SELECT raw, raw FROM t"))
         .await
         .expect("source");
-    assert_eq!(dup.fetch_all().await.expect("fetch").len(), 2);
+    let err = dup.fetch_all().await.expect_err("a column would vanish");
+    assert!(err.to_string().contains("two columns named \"raw\""), "{err}");
 }
