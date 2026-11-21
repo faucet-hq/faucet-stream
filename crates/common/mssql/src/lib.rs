@@ -17,12 +17,14 @@
 //! - [`replace_connection`] — swaps a timed-out pooled connection for a fresh one.
 //! - [`quote_ident_mssql`] — `[bracket]` identifier quoting (T-SQL idiom).
 //! - [`PARAM_LIMIT`] — MSSQL's 2100-parameter-per-request ceiling.
+//! - [`temporal`] — the one decoder for temporal columns (query and CDC sources).
 //!
 //! Auth is SQL Server authentication (username + password) only in v1;
 //! Windows/Integrated and Azure AD auth are out of scope.
 
 mod config;
 mod pool;
+pub mod temporal;
 
 pub use config::{MssqlConnectionConfig, MssqlTls, MssqlTlsMode, PARAM_LIMIT, quote_ident_mssql};
 pub use pool::{

@@ -16,6 +16,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 schemars.workspace = true
 tiberius.workspace = true
+chrono.workspace = true
 bb8.workspace = true
 tokio = { workspace = true, features = ["net"] }
 # `Compat` adapter: tiberius speaks futures-io, tokio sockets speak tokio-io.

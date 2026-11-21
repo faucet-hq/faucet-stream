@@ -579,3 +579,41 @@ async fn a_transaction_across_two_tables_is_one_page_in_order() {
         "both instances resume after the commit"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a SQL Server (mssql) container; run with `--ignored`."]
+async fn datetime_changes_render_whole_milliseconds_as_the_query_source_does() {
+    let _serial = SERIAL.lock().await;
+    let Some((_c, port)) = start_mssql_cdc().await else {
+        return;
+    };
+    let (pool, conn) = setup(port, "cdc_datetime").await;
+    exec(
+        &pool,
+        "IF OBJECT_ID('dbo.stamps') IS NULL \
+           CREATE TABLE dbo.stamps (id INT PRIMARY KEY, at DATETIME, sat SMALLDATETIME)",
+    )
+    .await;
+    exec_cdc(
+        &pool,
+        "IF NOT EXISTS (SELECT 1 FROM cdc.change_tables WHERE capture_instance = 'dbo_stamps') \
+         EXEC sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = N'stamps', \
+             @role_name = NULL, @capture_instance = N'dbo_stamps'",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    exec(
+        &pool,
+        "INSERT INTO dbo.stamps VALUES (1, '2026-03-04T10:00:00.003', '2026-03-04T10:00:00')",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let mut cfg = build_config(&conn);
+    cfg.capture_instances = vec!["dbo_stamps".to_string()];
+    let source = MssqlCdcSource::new(cfg).await.expect("source new");
+    let (records, _) = drain(&source).await;
+    let insert = records.iter().find(|r| r["op"] == "i").expect("insert");
+    assert_eq!(insert["after"]["at"], json!("2026-03-04T10:00:00.003"));
+    assert_eq!(insert["after"]["sat"], json!("2026-03-04T10:00:00.000"));
+}
