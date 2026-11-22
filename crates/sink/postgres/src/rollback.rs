@@ -221,8 +221,8 @@ impl PostgresDriver {
             .await
     }
 
-    /// Journaled keys with a before-image whose row is gone. Only called when
-    /// a later run wrote the table: such a key was deleted by it, and restoring
+    /// Journaled keys with a before-image whose row is gone and which another
+    /// run journaled later: such a key was deleted by that run, and restoring
     /// the before-image would resurrect it.
     async fn count_vanished(
         &self,
@@ -234,12 +234,13 @@ impl PostgresDriver {
         if restorable.is_empty() {
             return Ok(0);
         }
-        let select = journal_sql().later_keys().replace(
+        let select = journal_sql().later_matching_keys().replace(
             &quote_ident(faucet_core::rollback::RUN_JOURNAL_TABLE),
             &self.journal_ref(),
         );
         let later: Vec<String> = sqlx::query_scalar(&select)
             .bind(&self.config.table_name)
+            .bind(run_id)
             .bind(run_id)
             .bind(&self.config.table_name)
             .bind(run_id)
@@ -408,9 +409,7 @@ impl PostgresDriver {
         let mut conflicts = self
             .count_conflicts(&mut *conn, &entries, run_id, &opts.run_id_column)
             .await?;
-        if opts.later_runs {
-            conflicts += self.count_vanished(&mut *conn, &entries, run_id).await?;
-        }
+        conflicts += self.count_vanished(&mut *conn, &entries, run_id).await?;
         if conflicts > 0 && !opts.force {
             return Ok(RollbackOutcome::blocked(conflicts));
         }

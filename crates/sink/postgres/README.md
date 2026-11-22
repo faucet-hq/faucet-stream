@@ -572,7 +572,8 @@ every key an upsert / delete touches is journaled into `_faucet_run_journal`
 table as `<table>__faucet_prev` (a `CREATE TABLE … AS SELECT` inside the swap transaction). `faucet rollback --run <id>` then
 deletes the run's appended rows, restores the journaled before-images, or
 swaps the previous table back — refusing (unless `--force`) when a later run
-changed the same keys — and rewinds the row's bookmark and exactly-once
+changed the same keys, or when another journaled run (of any pipeline or row) deleted a
+key it changed — and rewinds the row's bookmark and exactly-once
 watermark. For a scoped overwrite (`scope:`) only the window is checked and
 restored: rows outside it keep their earlier run ids without blocking the
 rollback, and stay as they are. Sink hooks: `supports_rollback`, `rollback_run`, `forget_run`,

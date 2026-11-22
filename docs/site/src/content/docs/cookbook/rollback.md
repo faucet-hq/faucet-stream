@@ -93,8 +93,13 @@ For an overwrite the check is whole-table: if the target no longer holds this
 run's rows, a later overwrite replaced them, and the kept copy is that run's
 input — not yours.
 
-A key the run changed that a later run then **deleted** is a conflict too:
-restoring its before-image would resurrect a row someone removed on purpose.
+A key the run changed that a later journaled run then **deleted** is a
+conflict too: restoring its before-image would resurrect a row someone removed
+on purpose. This holds for a later run of any pipeline or matrix row that
+writes the same table with `rollback.journal` on, not only this row's own
+later runs. A delete made outside faucet, by a run without the journal, or
+whose journal rows another row's `retain` has already pruned cannot be
+detected.
 
 ### Rolling back a run that is not the newest
 

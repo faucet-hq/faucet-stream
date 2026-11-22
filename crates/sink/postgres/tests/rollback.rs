@@ -269,6 +269,37 @@ async fn upsert_rollback_is_blocked_by_a_later_run_unless_forced() {
 }
 
 #[tokio::test]
+async fn another_rows_journaled_delete_blocks_a_rollback_without_later_runs() {
+    let (_c, url) = start_postgres().await;
+    exec(&url, CREATE_USERS).await;
+    exec(&url, "INSERT INTO users VALUES (1, 'old-1', 'r0')").await;
+    let sink = PostgresSink::new(upsert_config(&url, "r1")).await.unwrap();
+    sink.write_batch(&[user(1, "new-1", "r1")]).await.unwrap();
+    let other = PostgresSink::new(upsert_config(&url, "other-row-run"))
+        .await
+        .unwrap();
+    other
+        .write_batch(&[json!({"id": 1, "__op": "d"})])
+        .await
+        .unwrap();
+    let out = sink
+        .rollback_run("r1", &opts(RollbackMode::Upsert))
+        .await
+        .unwrap();
+    assert_eq!((out.conflicts, out.applied), (1, false), "{out:?}");
+    assert_eq!(
+        scalar(&url, "SELECT count(*) FROM users").await,
+        0,
+        "blocked: nothing resurrected"
+    );
+    let mut forced = opts(RollbackMode::Upsert);
+    forced.force = true;
+    let out = sink.rollback_run("r1", &forced).await.unwrap();
+    assert_eq!((out.restored, out.applied), (1, true), "{out:?}");
+    assert_eq!(scalar(&url, "SELECT count(*) FROM users").await, 1);
+}
+
+#[tokio::test]
 async fn a_key_a_later_run_deleted_is_a_conflict_not_a_resurrection() {
     let (_c, url) = start_postgres().await;
     exec(&url, CREATE_USERS).await;

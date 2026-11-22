@@ -528,7 +528,8 @@ every key an upsert / delete touches is journaled into `_faucet_run_journal`
 table as `<table>__faucet_prev` (the swap `RENAME`s the old table aside instead of dropping it; the journal keys on a stored SHA-256 of the key JSON to stay under InnoDB's index size limit). `faucet rollback --run <id>` then
 deletes the run's appended rows, restores the journaled before-images, or
 swaps the previous table back — refusing (unless `--force`) when a later run
-changed the same keys — and rewinds the row's bookmark and exactly-once
+changed the same keys, or when another journaled run (of any pipeline or row) deleted a
+key it changed — and rewinds the row's bookmark and exactly-once
 watermark. Sink hooks: `supports_rollback`, `rollback_run`, `forget_run`,
 `rewind_commit_token`, `readback_source` (the `mysql` source config
 `faucet verify` reads the destination back with). See the [rollback
