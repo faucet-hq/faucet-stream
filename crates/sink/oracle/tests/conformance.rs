@@ -218,3 +218,32 @@ async fn conformance_declared_overwrite_empty_run() {
     )
     .await;
 }
+
+/// Check 28: a field whose upper-case form names an unquoted column survives
+/// `on_drift: ignore` and lands in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_drift_resolves_like_writes() {
+    let Some((_container, conn)) = common::start_oracle().await else {
+        return;
+    };
+    common::exec(
+        &conn,
+        &["CREATE TABLE D (ID NUMBER PRIMARY KEY, EMAIL VARCHAR2(200))"],
+    )
+    .await;
+    let sink = OracleSink::new(OracleSinkConfig::new(conn.clone(), "D"))
+        .await
+        .expect("sink");
+    faucet_conformance::assert_drift_resolves_like_writes(&sink, "EMAIL", "email", |id| {
+        let conn = conn.clone();
+        async move {
+            common::query_strings(&conn, &format!("SELECT EMAIL FROM D WHERE ID = {id}"))
+                .await
+                .into_iter()
+                .next()
+                .flatten()
+                .map(serde_json::Value::from)
+        }
+    })
+    .await;
+}
