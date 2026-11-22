@@ -52,6 +52,7 @@
 
 pub mod bundle;
 pub mod metrics;
+pub mod provenance;
 pub mod revalidate;
 pub mod rows;
 pub mod store;

@@ -1984,6 +1984,65 @@ mod templates {
         )
     }
 
+    /// Refuse a run composed with a community template (a synced version of
+    /// an owner its origin does not trust, [`crate::templates::provenance`])
+    /// whose stored body names something of this machine: a local path, a
+    /// local or private network address, a `file:` URL, a program, a
+    /// listener, or this machine's own identity. Sync holds such a template
+    /// back; this also covers versions synced before the rule, and a `trust:`
+    /// edited since. The run itself stays the operator's (its sink template
+    /// and overlay keep their directives and paths).
+    async fn refuse_community_resources(
+        state: &ServerState,
+        m: &crate::templates::MaterializedConfig,
+    ) -> Result<(), ServeError> {
+        #[cfg(feature = "templates-sync")]
+        let origins = state
+            .templates_sync()
+            .map(|f| crate::templates::provenance::origin_trust(&f))
+            .unwrap_or_default();
+        #[cfg(not(feature = "templates-sync"))]
+        let origins: Vec<crate::templates::provenance::OriginTrust> = Vec::new();
+        let parts = [
+            Some((m.template_id.as_str(), m.version)),
+            m.sink_id.as_deref().zip(m.sink_version),
+            m.overlay_id.as_deref().zip(m.overlay_version),
+        ];
+        for (id, version) in parts.into_iter().flatten() {
+            let Some(rec) = state
+                .history()
+                .template_get(id, Some(version))
+                .await
+                .map_err(ServeError::from)?
+            else {
+                continue;
+            };
+            let Some(owner) = crate::templates::provenance::community_owner(
+                id,
+                rec.created_by.as_deref(),
+                &origins,
+            ) else {
+                continue;
+            };
+            let doc = crate::templates::parse_body(&rec.body, rec.format)
+                .map_err(|e| ServeError::Internal(format!("template '{id}' v{version}: {e}")))?;
+            if let Some(why) = crate::hub::community_use(&doc) {
+                tracing::warn!(
+                    template = %id,
+                    version,
+                    community_template = %owner,
+                    "refusing a run of a community template that reads this machine"
+                );
+                return Err(ServeError::Forbidden(format!(
+                    "template '{id}' v{version} is a community template (`{owner}`) and {why}; \
+                     a community template may not do that unless its origin lists `{owner}` \
+                     under `trust:`"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Run a registered template (#444): resolve the version, materialize it
     /// with the caller's params (composing a sink template, applying an
     /// overlay), label the run with its provenance and [`super::submit`] it.
@@ -2063,6 +2122,7 @@ mod templates {
         )
         .await
         .map_err(map_err)?;
+        refuse_community_resources(&state, &materialized).await?;
         if !body.pool_by_operator && body.pool.is_some() {
             let doc: serde_json::Value = serde_json::from_str(&materialized.body)
                 .map_err(|e| ServeError::Internal(format!("materialized config: {e}")))?;

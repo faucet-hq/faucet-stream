@@ -37,13 +37,10 @@
 //! credentials and the system trees stay out of reach for every origin.
 
 use crate::serve::load::BodyOrigin;
-use faucet_core::resolve::{
-    ListenRange, ReferencePolicy, ResourceKind, ResourceRef, annotated_resources,
-};
+use faucet_core::resolve::{ListenRange, ReferencePolicy, ResourceRef, annotated_resources};
 use serde_json::Value;
-use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// The server's reference policies, by body origin.
 #[derive(Debug, Clone, PartialEq)]
@@ -222,73 +219,7 @@ pub fn installed() -> Arc<ServeReferencePolicy> {
         .unwrap_or_else(|_| Arc::new(ServeReferencePolicy::default()))
 }
 
-type SchemaCache = Mutex<HashMap<String, Arc<Vec<Value>>>>;
-
-fn schema_cache() -> &'static SchemaCache {
-    static CACHE: OnceLock<SchemaCache> = OnceLock::new();
-    CACHE.get_or_init(Default::default)
-}
-
-/// The config schemas of connector `kind` (its source and its sink, as
-/// registered — built-in or plugin) and of a transform of that name, whose
-/// config can name resources too (a `sql` transform's reference relations).
-fn schemas(kind: &str) -> Arc<Vec<Value>> {
-    if let Ok(cache) = schema_cache().lock()
-        && let Some(hit) = cache.get(kind)
-    {
-        return hit.clone();
-    }
-    let found: Vec<Value> = [
-        crate::registry::source_schema(kind).ok(),
-        crate::registry::sink_schema(kind).ok(),
-        crate::transforms::transform_schema(kind).ok(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    let found = Arc::new(found);
-    if let Ok(mut cache) = schema_cache().lock() {
-        cache.insert(kind.to_string(), found.clone());
-    }
-    found
-}
-
-/// The resources a `kind` connector's `config` names through annotated
-/// schema fields.
-pub fn connector_resources(kind: &str, config: &Value) -> Vec<ResourceRef> {
-    let mut seen = BTreeSet::new();
-    schemas(kind)
-        .iter()
-        .flat_map(|s| annotated_resources(s, config))
-        .filter(|r| seen.insert((r.pointer.clone(), r.kind, r.value.clone())))
-        .collect()
-}
-
-/// The resources a `kind` state store's `config` names through its own
-/// schema's annotated fields ([`crate::state::state_store_schema`]),
-/// independent of the connectors the build compiles.
-pub fn state_resources(kind: &str, config: &Value) -> Vec<ResourceRef> {
-    static CACHE: OnceLock<SchemaCache> = OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
-    let schemas = match cache.lock().ok().and_then(|c| c.get(kind).cloned()) {
-        Some(hit) => hit,
-        None => {
-            let found = Arc::new(
-                crate::state::state_store_schema(kind)
-                    .into_iter()
-                    .collect::<Vec<_>>(),
-            );
-            if let Ok(mut c) = cache.lock() {
-                c.insert(kind.to_string(), found.clone());
-            }
-            found
-        }
-    };
-    schemas
-        .iter()
-        .flat_map(|s| annotated_resources(s, config))
-        .collect()
-}
+pub use crate::resources::{connector_resources, state_resources};
 
 /// The resources a lineage transport (`{type, config}`, its `config` given
 /// here) names through the transport schema's annotated fields, with
@@ -313,7 +244,7 @@ pub fn lineage_transport_resources(kind: &str, config: &Value) -> Vec<ResourceRe
 /// servers the configured ones advertise
 /// ([`faucet_core::resolve::FOLLOWS_SERVERS_ANNOTATION`]).
 pub fn connector_follows_servers(kind: &str, config: &Value) -> bool {
-    schemas(kind)
+    crate::resources::schemas(kind)
         .iter()
         .any(|s| faucet_core::resolve::follows_servers(s, config))
 }
@@ -329,18 +260,13 @@ pub fn lineage_transport_follows_servers(kind: &str, config: &Value) -> bool {
     )
 }
 
-/// Whether connector `kind` runs a program (its schema declares a
-/// `command` field).
-pub fn runs_program(kind: &str) -> bool {
-    schemas(kind)
-        .iter()
-        .any(|s| faucet_core::resolve::declares(s, ResourceKind::Command))
-}
+pub use crate::resources::runs_program;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::ReferenceArgs;
+    use faucet_core::resolve::ResourceKind;
 
     #[cfg(feature = "transform-sql")]
     #[test]

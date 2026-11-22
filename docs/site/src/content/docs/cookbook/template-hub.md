@@ -619,10 +619,27 @@ read the machine it runs on: one that uses `${env:…}`, `${file:…}` or a secr
 directive is refused, since it could send a credential to a URL it chooses.
 So is one that reads the other template of the pairing (`${sources.…}`,
 `${sinks.…}`, `${vars.…}`) or names a connector that runs a program (`singer`).
+From a remote hub it may also not name, in what its author wrote (literal
+values, and a param's `default` and `values`): a local path, a loopback,
+link-local, private-network (RFC 1918, IPv6 unique local, shared) or
+`localhost` address, a `file:` URL, a listener, a setting that turns off
+certificate verification, or a connector that would authenticate with this
+machine's own identity (cloud default credentials, an instance role, a local
+credential file). A value the operator supplies as a param is theirs to choose.
+A hub directory on your own disk is exempt from that resource rule: its files
+are yours, like a `-c` config.
 Hand it credentials through its declared params (`--param`, `--param-env`),
 or review it and pass `--trust <owner>` (or `--trust <owner/name>`). The owner
 `--trust` matches is the namespace directory the file sits in
 (`source-templates/<owner>/`), not the file's own `owner:` field.
+
+Template sync holds the same rule: a synced community template (a namespace
+its origin does not list under `trust:`) that breaks it is reported and not
+registered. Under `faucet serve` a run of a synced community template is
+checked again when it is triggered (a version synced by an earlier release, or
+an origin whose `trust:` has changed), and refused with `403` if it breaks the
+rule. The run otherwise stays the operator's: the sink template and overlay it
+composes with keep their own directives and paths.
 
 The full id names the composed pipeline, so state keys are
 `acme/erp.faucet-hq/bigquery::invoices` and two publishers' templates never collide in a

@@ -70,6 +70,7 @@ pub mod registry;
 pub mod registry_index;
 pub mod replication;
 pub mod requires;
+pub mod resources;
 pub mod rollback;
 pub mod run_deps;
 pub mod runtime;

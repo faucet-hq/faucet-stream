@@ -338,7 +338,9 @@ a host, a `+srv` name's parent domain against the host allow-list), and
 names (`directConnection=true` or `loadBalanced=true`). `check_url` judges a host by how it is written;
 `check_url_resolved` also resolves it, and `faucet_core::http::Client`'s own
 resolver drops link-local / metadata addresses at connection time
-(`resolve::screen_resolved`), unless the policy lists that name exactly.
+(`resolve::screen_resolved`), unless the policy lists that name exactly. `resolve::is_local_host(host)` tells whether a host names this machine or
+its network (`localhost`, loopback, unspecified, private, shared, link-local or
+metadata addresses), in any numeric spelling.
 
 A connector whose own input can reach host files or the network — a SQL
 engine that can `ATTACH` or `read_csv` — exposes a boolean switch that confines

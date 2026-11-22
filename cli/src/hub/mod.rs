@@ -429,11 +429,23 @@ pub async fn compose_across_with(
     let k = parse_sink_file(&sink_file)?;
     if let Some(hub) = &source_hub {
         let official = s.is_official() && is_official_file(hub, &source_file, catalog::SOURCE_DIR);
-        refuse_untrusted_directives(&source_file, catalog::SOURCE_DIR, official, &sides.trusted)?;
+        refuse_untrusted_directives(
+            &source_file,
+            catalog::SOURCE_DIR,
+            official,
+            is_remote_hub(hub),
+            &sides.trusted,
+        )?;
     }
     if let Some(hub) = &sink_hub {
         let official = k.is_official() && is_official_file(hub, &sink_file, catalog::SINK_DIR);
-        refuse_untrusted_directives(&sink_file, catalog::SINK_DIR, official, &sides.trusted)?;
+        refuse_untrusted_directives(
+            &sink_file,
+            catalog::SINK_DIR,
+            official,
+            is_remote_hub(hub),
+            &sides.trusted,
+        )?;
     }
     let s = match with {
         Some(w) => w.expand(&s)?,
@@ -448,12 +460,26 @@ pub async fn compose_across_with(
         if let Some(h) = &hub {
             let official = d.owner.as_deref() == Some(spec::OFFICIAL_OWNER)
                 && is_official_file(h, &file, DEPLOYMENT_DIR);
-            refuse_untrusted_directives(&file, DEPLOYMENT_DIR, official, &sides.trusted)?;
+            refuse_untrusted_directives(
+                &file,
+                DEPLOYMENT_DIR,
+                official,
+                is_remote_hub(h),
+                &sides.trusted,
+            )?;
         }
         c = c.apply_overlay(&d)?;
         c.overlay_hub = hub;
     }
     Ok(c)
+}
+
+/// Whether a hub (as [`HubLocation::describe`] names it) is fetched from
+/// elsewhere rather than read from a directory the operator put on disk. A
+/// directory hub's files are the operator's, like a `-c` config, so only a
+/// remote hub's community templates are held to the resource rule.
+fn is_remote_hub(hub: &str) -> bool {
+    !matches!(HubLocation::parse(hub), Ok(HubLocation::Dir(_)))
 }
 
 /// Whether a hub (as [`HubLocation::describe`] names it) is the faucet-hq
@@ -523,12 +549,17 @@ fn location_id(path: &Path, subdir: &str) -> String {
 /// otherwise send `~/.aws/credentials` to a URL it controls — nor read what the
 /// operator gave the other template of the pairing (`${sources.*}`,
 /// `${sinks.*}`, `${vars.*}`), nor name a connector that runs a program.
+/// From a remote hub it may also not read the machine it runs on: no local
+/// path, local or private network address, `file:` URL, listener, setting
+/// that turns off verification, or authentication with this machine's own
+/// identity ([`community_use`]).
 /// Credentials reach such a template through its params (`--param` /
 /// `--param-env`), or the operator trusts it with `--trust <owner|id>`.
 pub(crate) fn refuse_untrusted_directives(
     path: &Path,
     subdir: &str,
     official: bool,
+    remote: bool,
     trusted: &[String],
 ) -> CliResult<()> {
     let id = location_id(path, subdir);
@@ -541,7 +572,12 @@ pub(crate) fn refuse_untrusted_directives(
         return Ok(());
     }
     let doc = parse_untyped(&read(path)?, path)?;
-    let Some(found) = untrusted_use(&doc) else {
+    let found = if remote {
+        community_use(&doc)
+    } else {
+        untrusted_use(&doc)
+    };
+    let Some(found) = found else {
         return Ok(());
     };
     Err(CliError::Config(format!(
@@ -579,6 +615,18 @@ pub(crate) fn untrusted_use(doc: &Value) -> Option<String> {
     found.or_else(|| {
         program_kind(doc).map(|k| format!("uses connector `{k}`, which runs a program"))
     })
+}
+
+/// What in a community template's document reads the machine it runs on:
+/// [`untrusted_use`], then the resources its connectors, state and DLQ name
+/// (local paths, local or private network addresses, `file:` URLs, programs,
+/// listeners, settings that turn off verification) and connectors that
+/// authenticate with this machine's own identity
+/// ([`crate::resources::community_resource_use`]). Only author-controlled
+/// values count: a param's `default` and closed `values`, never what the
+/// operator supplies.
+pub fn community_use(doc: &Value) -> Option<String> {
+    untrusted_use(doc).or_else(|| crate::resources::community_resource_use(doc))
 }
 
 /// The first `type:` in `doc` naming a connector that runs a program.
@@ -1280,6 +1328,72 @@ pub fn load_composed(c: &Composition, inputs: &RunInputs) -> CliResult<PipelineC
 #[allow(unsafe_code)] // tests set process environment variables
 mod tests {
     use super::*;
+
+    /// A community template may not read the machine it runs on; only
+    /// what its author wrote counts.
+    #[cfg(all(
+        feature = "source-rest",
+        feature = "source-csv",
+        feature = "source-sqlite"
+    ))]
+    #[test]
+    fn community_templates_name_nothing_of_this_machine() {
+        use serde_json::json;
+        let source =
+            |kind: &str, config: Value| json!({"source": {"type": kind, "config": config}});
+        for (doc, class) in [
+            (source("csv", json!({"path": "/etc/passwd"})), "local path"),
+            (
+                source(
+                    "sqlite",
+                    json!({"database_url": "sqlite:/var/db.sqlite", "query": "q"}),
+                ),
+                "local path",
+            ),
+            (
+                source("rest", json!({"base_url": "http://127.0.0.1:8080"})),
+                "local or private network",
+            ),
+            (
+                source("rest", json!({"base_url": "https://10.0.0.5/api"})),
+                "local or private network",
+            ),
+            (
+                json!({"params": {"p": {"default": "/home/x"}},
+                       "source": {"type": "csv", "config": {"path": "${param.p}"}}}),
+                "local path",
+            ),
+            (
+                json!({"sources": {"api": {"type": "rest", "config": {"base_url": "https://x.example"}}},
+                       "streams": [{"name": "s", "source": {"ref": "api", "config": {"base_url": "http://localhost"}}}]}),
+                "local or private network",
+            ),
+        ] {
+            let found = community_use(&doc).unwrap_or_else(|| panic!("{doc}"));
+            assert!(found.contains(class), "{found}");
+            assert!(
+                !found.contains("/etc")
+                    && !found.contains("10.0.0.5")
+                    && !found.contains("/home/x"),
+                "value-free: {found}"
+            );
+        }
+        for doc in [
+            source("rest", json!({"base_url": "https://api.example.com"})),
+            json!({"params": {"p": {}}, "source": {"type": "csv", "config": {"path": "${param.p}"}}}),
+            source("rest", json!({"base_url": "https://${param.host}/v1"})),
+        ] {
+            assert_eq!(community_use(&doc), None, "{doc}");
+        }
+        // A local directory hub's file is the operator's: only the directive
+        // rule applies there.
+        assert!(!is_remote_hub("./hub"));
+        assert!(is_remote_hub("github:faucet-hq/template-hub"));
+        assert_eq!(
+            untrusted_use(&source("csv", json!({"path": "/etc/passwd"}))),
+            None
+        );
+    }
 
     #[test]
     fn a_hub_file_is_trusted_under_the_directory_it_sits_in() {
