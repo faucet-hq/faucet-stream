@@ -29,11 +29,28 @@ in alongside these fields. `tls` is `true` or a block with a private CA
 |-----------------|------------------|---------|--------------------------------------------------------------------|
 | `subject`       | `String`         | —       | default subject every record is published to. Required.            |
 | `subject_field` | `Option<String>` | —       | top-level record field whose string value overrides `subject` per record. |
+| `allowed_subjects` | `Vec<String>` | `[]`    | subject patterns (`*` = one token, `>` = the rest) a `subject_field` subject must match; empty leaves ordinary subjects open. Needs `subject_field`. |
 | `batch_size`    | `usize`          | `1000`  | records per publish batch: the client is flushed (or the JetStream acks awaited) after each batch. `0` = one batch per page. |
 | `jetstream`     | `bool`           | `false` | publish through JetStream and await each acknowledgement; per-row outcomes (`write_batch_partial`, DLQ-routable). |
 | `publish_timeout_secs` | `u64`     | `30`    | bound on one publish batch (publishes + flush, or the acks); on a timeout the rows not yet confirmed fail with a `timeout`-class row error — a `resilience.poison` policy resubmits them, otherwise they go to the DLQ — and earlier batches keep their outcomes; a timed-out flush is retried by `resilience.retry`. |
 
 A record whose `subject_field` is missing or not a string fails on its own row.
+
+### Per-record subjects
+
+With `subject_field` the record data chooses the subject, so the sink checks
+it before publishing; a refused subject fails only its row (DLQ-routable):
+
+- A subject whose first token starts with `$` (`$JS.API…`, `$KV…`, `$SYS…`) or
+  that starts with `_INBOX.` belongs to the server and is refused, unless an
+  `allowed_subjects` pattern names that space literally (`$KV.cache.>`). `*` or
+  `>` alone never opens it.
+- A malformed subject — whitespace or a control character, an empty token
+  (`a..b`), or a wildcard token (`*`, `>`) — is refused.
+- With a non-empty `allowed_subjects`, a subject matching none of the patterns
+  is refused. Use it to confine records to the subjects the pipeline owns.
+
+The fixed `subject` is not checked.
 
 ## Example
 

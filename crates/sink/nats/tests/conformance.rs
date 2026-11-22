@@ -143,6 +143,32 @@ mod docker {
         }
     }
 
+    /// A subject a record names through `subject_field` in the server's
+    /// reserved space fails its row; the ordinary subject next to it lands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subject_field_refuses_reserved_subjects() {
+        let (_container, server) = start_nats().await;
+        let sub_client = async_nats::connect(&server).await.expect("sub connect");
+        let mut subscriber = sub_client.subscribe("orders.a").await.expect("subscribe");
+        sub_client.flush().await.unwrap();
+        let mut cfg = NatsSinkConfig::new("orders.default");
+        cfg.connection.servers = vec![server];
+        cfg.subject_field = Some("to".into());
+        let sink = NatsSink::new(cfg).await.unwrap();
+        let rows = vec![
+            serde_json::json!({"to": "orders.a"}),
+            serde_json::json!({"to": "$JS.API.INFO"}),
+        ];
+        let outcomes = sink.write_batch_partial(&rows).await.unwrap();
+        assert!(outcomes[0].is_ok(), "{outcomes:?}");
+        let err = outcomes[1].as_ref().unwrap_err().to_string();
+        assert!(err.contains("allowed_subjects"), "{err}");
+        tokio::time::timeout(std::time::Duration::from_secs(5), subscriber.next())
+            .await
+            .expect("a published message")
+            .expect("subscription open");
+    }
+
     /// JetStream mode awaits every publish acknowledgement: a row whose
     /// subject no stream stores fails alone instead of vanishing behind a
     /// green run (#789 MSG-31), and the batch is bounded by

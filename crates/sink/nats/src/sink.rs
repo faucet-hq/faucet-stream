@@ -78,7 +78,10 @@ impl NatsDriver {
         match &self.config.subject_field {
             None => Ok(self.config.subject.clone()),
             Some(field) => match record.get(field) {
-                Some(Value::String(s)) if !s.is_empty() => Ok(s.clone()),
+                Some(Value::String(s)) if !s.is_empty() => {
+                    crate::subject::check_record_subject(s, field, &self.config.allowed_subjects)?;
+                    Ok(s.clone())
+                }
                 Some(Value::String(_)) => Err(FaucetError::Sink(format!(
                     "nats sink: subject_field '{field}' resolved to an empty string"
                 ))),

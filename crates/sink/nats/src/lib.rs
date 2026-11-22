@@ -21,6 +21,7 @@
 
 pub mod config;
 pub mod sink;
+mod subject;
 
 pub use config::NatsSinkConfig;
 pub use sink::NatsSink;
