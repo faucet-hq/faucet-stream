@@ -317,7 +317,8 @@ row's [data-flow policy](/faucet-stream/cookbook/policies/) verdict is reported 
 `--live` refuses a source whose read has side effects: CDC sources, `kafka`,
 `webhook` and `websocket` (a read moves or consumes a position), and queue
 sources that acknowledge what they read — `sqs`, `pubsub`, `rabbitmq` and
-`nats` with `jetstream_stream`. A preview never writes, so those messages would
+`nats` with `jetstream_stream` or a core `queue_group` (a queue-group member takes
+messages from the group's other members). A preview never writes, so those messages would
 be removed from the queue and lost. `faucet preview`, `faucet run --dry-run`
 and `faucet run --limit` refuse the queue sources for the same reason, and a
 topology graph refuses them as source nodes. Use `--sample <fixture>` instead.
