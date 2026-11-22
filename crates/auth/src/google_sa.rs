@@ -177,13 +177,14 @@ impl GoogleServiceAccountProvider {
 
     async fn fetch(&self) -> Result<TokenResponse, FaucetError> {
         let assertion = self.assertion(jsonwebtoken::get_current_timestamp())?;
-        let reply = crate::retry::send_token_request(&self.http, || {
-            Ok(self
-                .http
-                .post(&self.token_uri)
-                .form(&[("grant_type", JWT_BEARER_GRANT), ("assertion", &assertion)]))
-        })
-        .await?;
+        let reply =
+            crate::retry::send_token_request(&self.http, crate::retry::Grant::Idempotent, || {
+                Ok(self
+                    .http
+                    .post(&self.token_uri)
+                    .form(&[("grant_type", JWT_BEARER_GRANT), ("assertion", &assertion)]))
+            })
+            .await?;
         if !reply.is_success() {
             let status = reply.status;
             let body = reply.text();

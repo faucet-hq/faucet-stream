@@ -97,7 +97,11 @@ creates it), and a failed write fails the refresh rather than leaving the next
 run with a revoked token. The stored token is re-read before every refresh and
 written back with a compare-and-set, so overlapping runs that share the grant
 never refresh with a token another run already rotated away; a grant rejected
-with `invalid_grant` is retried once when the store holds a newer token:
+with `invalid_grant` is retried once when the store holds a newer token. A
+refresh request is resent only when the IdP provably did not act on it (a
+failed connect, `429`, `503` with `Retry-After`, `temporarily_unavailable`); one
+that times out after sending fails the run rather than spend the old token a
+second time:
 
 ```yaml
 auth:

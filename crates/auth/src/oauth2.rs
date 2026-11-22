@@ -89,15 +89,16 @@ impl OAuth2ClientCredentialsProvider {
 
     async fn fetch(&self) -> Result<TokenResponse, FaucetError> {
         let scope = self.scopes.join(" ");
-        let reply = crate::retry::send_token_request(&self.http, || {
-            Ok(self.http.post(&self.token_url).form(&[
-                ("grant_type", "client_credentials"),
-                ("client_id", self.client_id.as_str()),
-                ("client_secret", self.client_secret.as_str()),
-                ("scope", scope.as_str()),
-            ]))
-        })
-        .await?;
+        let reply =
+            crate::retry::send_token_request(&self.http, crate::retry::Grant::Idempotent, || {
+                Ok(self.http.post(&self.token_url).form(&[
+                    ("grant_type", "client_credentials"),
+                    ("client_id", self.client_id.as_str()),
+                    ("client_secret", self.client_secret.as_str()),
+                    ("scope", scope.as_str()),
+                ]))
+            })
+            .await?;
         parse_token_response(reply)
     }
 }
@@ -368,10 +369,23 @@ impl OAuth2RefreshProvider {
         if let Some(scope) = &self.scope {
             form.push(("scope", scope));
         }
-        let reply = crate::retry::send_token_request(&self.http, || {
-            Ok(self.http.post(&self.token_url).form(&form))
-        })
-        .await?;
+        let reply =
+            crate::retry::send_token_request(&self.http, crate::retry::Grant::Rotating, || {
+                Ok(self.http.post(&self.token_url).form(&form))
+            })
+            .await
+            .map_err(|e| {
+                if crate::retry::may_have_reached(&e) {
+                    FaucetError::Auth(format!(
+                        "oauth2_refresh: the refresh request failed after it may have reached the \
+                     token endpoint ({e}); it is not resent, because the endpoint may already \
+                     have rotated the refresh token. If the next refresh is rejected, reconnect \
+                     the grant"
+                    ))
+                } else {
+                    e
+                }
+            })?;
         let body = parse_token_response(reply)?;
         state.access_token = Some(body.access_token.clone());
         state.expires_at = expiry_instant(body.expires_in, self.expiry_ratio);
@@ -614,6 +628,38 @@ mod tests {
             1,
             "expected exactly one token fetch"
         );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_lost_after_sending_is_not_resent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"access_token": "A", "refresh_token": "rt1"}))
+                    .set_delay(std::time::Duration::from_millis(400)),
+            )
+            .mount(&server)
+            .await;
+        let mut provider = OAuth2RefreshProvider::from_config(&serde_json::json!({
+            "token_url": server.uri(),
+            "client_id": "id",
+            "client_secret": "secret",
+            "refresh_token": "rt0",
+        }))
+        .unwrap();
+        provider.http = faucet_core::http::Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let err = provider.credential().await.unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("may already have rotated"), "{text}");
+        assert!(
+            !crate::is_rejected_grant(&err),
+            "not reported as a revoked grant"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
