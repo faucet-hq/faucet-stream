@@ -148,6 +148,7 @@ fn a_delivery_is_claimed_only_when_its_flush_policy_is_met() {
         to: 9,
         run_id: None,
         claimed_at: now,
+        blocking: false,
     });
     assert_eq!(at(&head(20, 10, 3, 1), &recorded), Decision::CheckClaim);
 }

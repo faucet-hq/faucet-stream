@@ -298,9 +298,15 @@ A file sink that replaces its output on every run is refused for it; use
 - **`failing`.** After three failed runs in a row the delivery is reported as
   `failing`. It keeps retrying, with a back-off that starts at 5 seconds and
   doubles to a minute.
-- **`stalled`.** When runs of a **single event** have failed `retries` times
-  (default 5), the delivery stalls: no more runs start, and the feed keeps
-  everything it has not delivered. A stall always names one event.
+- **`stalled`.** When runs of a **single event** with other events waiting
+  behind it have failed `retries` times in a row (default 5) over at least 10
+  minutes, the delivery stalls: no more runs start, and the feed keeps
+  everything it has not delivered. A stall always names one event. A
+  destination outage shorter than 10 minutes never stalls a delivery, however
+  busy the feed; it shows `failing` and recovers by itself. An event that is
+  the only one pending holds nothing back, so it keeps being retried (about
+  once a minute, `failing`) until it is delivered or another event arrives
+  behind it.
 
 A refusal that passes with time (the run queue is full, a tenant's run limit,
 the server is draining) backs off and is not counted. A refusal a retry cannot

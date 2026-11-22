@@ -12,6 +12,7 @@
     feature = "serve-history-postgres"
 ))]
 #![allow(clippy::disallowed_methods)] // tests pace their own polling
+#![allow(unsafe_code)] // two tests lower the stall floor through the environment
 
 use clap::Parser;
 use faucet_cli::serve::config::ServeConfig;
@@ -626,8 +627,47 @@ async fn deliveries_run_move_their_cursors_and_never_share_state() {
     assert_eq!(srv.tick().await.feeds, 0);
 }
 
+/// One pending event whose run keeps failing holds nothing back: the
+/// delivery keeps retrying (`failing`) and never stalls, even with no
+/// minimum stall time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lone_failing_event_keeps_retrying_and_never_stalls() {
+    unsafe { std::env::set_var(faucet_cli::serve::feeds::status::TEST_MIN_STALL_ENV, "0") };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut srv = Srv::start(root, &[]).await;
+    register(&srv.state, "orders_lake", &root.join("state")).await;
+    let blocker = root.join("blocked");
+    std::fs::write(&blocker, "not a directory").unwrap();
+    let mut d = delivery("lake", "orders_lake", &blocker.join("lake.jsonl"));
+    d["retries"] = json!(2);
+    service::create(&srv.state, &admin(), None, feed_spec("orders", json!([d])))
+        .await
+        .unwrap();
+    srv.append("orders", 1..=1).await;
+    let retried = srv
+        .until("orders", "lake", true, "six failed runs", |p| {
+            p.status.consecutive_failures >= 6
+        })
+        .await;
+    assert_eq!(retried.status.health, Health::Failing);
+    assert_eq!(retried.status.failures_at_one, 0);
+    assert_eq!(retried.cursor, 1);
+
+    // Another event arrives behind it: now the failing event holds it back.
+    srv.append("orders", 2..=2).await;
+    let stalled = srv
+        .until("orders", "lake", true, "stalled", |p| {
+            p.status.health == Health::Stalled
+        })
+        .await;
+    assert_eq!((stalled.cursor, stalled.status.failures_at_one), (1, 2));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failing_sink_halves_the_batch_until_one_event_stalls_and_a_skip_moves_on() {
+    // A stall needs only `retries` failures here, not minutes of them.
+    unsafe { std::env::set_var(faucet_cli::serve::feeds::status::TEST_MIN_STALL_ENV, "0") };
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let mut srv = Srv::start(root, &[]).await;
@@ -2310,6 +2350,7 @@ async fn under_feed_approval_every_change_waits_and_names_its_feed() {
 #[cfg(feature = "notify")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stall_and_a_nearly_full_feed_each_notify_once() {
+    unsafe { std::env::set_var(faucet_cli::serve::feeds::status::TEST_MIN_STALL_ENV, "0") };
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     let hook = MockServer::start().await;

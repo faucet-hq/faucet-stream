@@ -595,6 +595,7 @@ async fn claim_step(
         to: claim.to.get(),
         run_id: None,
         claimed_at: now,
+        blocking: claim.to < w.head.end(),
     };
     let recorded = w
         .update(state, |s| {
@@ -726,6 +727,7 @@ async fn check_step(state: &ServerState, rt: &FeedsRuntime, w: &Work) -> Option<
                 to: c.to.get(),
                 run_id: None,
                 claimed_at: Utc::now(),
+                blocking: c.to < w.head.end(),
             }
         }
         (Some(sc), None) => sc.clone(),

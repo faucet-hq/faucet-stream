@@ -117,7 +117,7 @@ retried by its sender.
 | `max_batch.events` | integer | `10000` | Most events one run delivers. |
 | `max_batch.bytes` | size | `64MiB` | Most payload bytes one run delivers. |
 | `start` | string | `earliest` | Where a new delivery starts: `earliest` (the oldest retained event), `latest` (after the last stored event), `seq:<n>`, or `time:<RFC 3339>`. |
-| `retries` | integer | `5` | Failed runs of a single event before the delivery stalls. |
+| `retries` | integer | `5` | Failed runs in a row of a single event, with other events waiting behind it, before the delivery stalls; the failures must also span at least 10 minutes. |
 | `pool` | string | | The [execution pool](/faucet-stream/cookbook/cluster/) the runs go to. |
 | `timeout_secs` | integer | `3600` | Per-run timeout. |
 | `labels` | map | `{}` | Static labels added to every run. `feed`, `feed_delivery` and `feed_claim` are set by the server and cannot be used. |
@@ -330,7 +330,7 @@ The [MCP server](/faucet-stream/cookbook/mcp/) has two read tools,
 |---|---|---|
 | `ok` | Delivering. | yes |
 | `failing` | Three or more runs in a row failed. It keeps retrying with a smaller batch. | yes |
-| `stalled` | Runs of a single event failed `retries` times. | no, until resume, skip or replay |
+| `stalled` | Runs of a single event that held other events back failed `retries` times in a row, over at least 10 minutes. A lone pending event that keeps failing shows `failing` and keeps being retried instead. | no, until resume, skip or replay |
 | `held` | Its bookmark and the feed store disagree (a restored store). | no, until recover |
 | `paused` | Paused by an operator, by its definition, or because its run was cancelled or rolled back. | no, until resume |
 | `needs_approval` | The server requires approval for runs and this delivery has none (or follows a channel). | no |
