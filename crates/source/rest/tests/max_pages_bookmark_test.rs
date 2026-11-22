@@ -158,7 +158,14 @@ fn assume_ordered_without_a_server_side_bind_is_refused() {
         .to_string();
     assert!(err.contains("replication_bind"), "{err}");
     assert!(RestStream::new(config.clone().replication_bind(since_bind())).is_ok());
-    assert!(RestStream::new(config.persist_cursor(true)).is_ok());
+    let err = RestStream::new(config.persist_cursor(true))
+        .err()
+        .expect("a persisted cursor cannot share the bookmark of an incremental read")
+        .to_string();
+    assert!(
+        err.contains("persist_cursor resumes from the server's cursor"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
