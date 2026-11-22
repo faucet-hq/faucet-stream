@@ -266,7 +266,7 @@ impl GrpcStream {
                     loop {
                         if emitted >= max_messages {
                             if !buffer.is_empty() {
-                                yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
+                                yield StreamPage { records: std::mem::take(&mut buffer), bookmark: Some(received(emitted)) };
                             }
                             tracing::info!(messages = emitted, "gRPC server-streaming complete (max_messages reached)");
                             return;
@@ -285,7 +285,7 @@ impl GrpcStream {
                                     secs(self.config.idle_timeout)
                                 )));
                             }
-                            yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
+                            yield StreamPage { records: std::mem::take(&mut buffer), bookmark: Some(received(emitted)) };
                             continue;
                         };
                         let next = match next {
@@ -308,12 +308,12 @@ impl GrpcStream {
                                 reauthed = false;
                                 while buffer.len() >= page_chunk {
                                     let page: Vec<Value> = buffer.drain(..page_chunk).collect();
-                                    yield StreamPage { records: page, bookmark: None };
+                                    yield StreamPage { records: page, bookmark: Some(received(emitted)) };
                                 }
                             }
                             Ok(None) => {
                                 if !buffer.is_empty() {
-                                    yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
+                                    yield StreamPage { records: std::mem::take(&mut buffer), bookmark: Some(received(emitted)) };
                                 }
                                 tracing::info!(messages = emitted, "gRPC server-streaming complete");
                                 return;
@@ -325,7 +325,7 @@ impl GrpcStream {
                     }
                 };
                 if !matches!(failure, Failure::Fatal(_)) && !buffer.is_empty() {
-                    yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
+                    yield StreamPage { records: std::mem::take(&mut buffer), bookmark: Some(received(emitted)) };
                 }
                 match failure {
                     Failure::Idle(error) => {
@@ -554,9 +554,10 @@ impl faucet_core::Source for GrpcStream {
     /// config value. Transient stream errors reconnect with exponential
     /// backoff up to `reconnect_max_attempts`, unless `terminate_on_error =
     /// true` in which case the run terminates. Server-streaming pages carry
-    /// `bookmark: None` — this source has no native cursor/offset, so
-    /// resumption is driven by user-supplied request fields (e.g. an event
-    /// id), not a faucet-managed bookmark.
+    /// the flush-only bookmark `{"received": n}` (messages received so far)
+    /// so the pipeline flushes the sink after each page; this source has no
+    /// native cursor/offset, so resumption is driven by user-supplied request
+    /// fields (e.g. an event id), never by that bookmark.
     fn stream_pages<'a>(
         &'a self,
         context: &'a std::collections::HashMap<String, Value>,
@@ -570,6 +571,12 @@ impl faucet_core::Source for GrpcStream {
             }
             RpcKind::ServerStreaming => self.server_streaming_pages(context),
         }
+    }
+
+    /// The bookmark only marks a flush point; a live feed has no position to
+    /// resume from, so a stored one is ignored.
+    async fn apply_start_bookmark(&self, _bookmark: Value) -> Result<(), FaucetError> {
+        Ok(())
     }
 
     fn connector_name(&self) -> &'static str {
@@ -600,6 +607,11 @@ impl faucet_core::Source for GrpcStream {
             self.config.method_name
         )
     }
+}
+
+/// The flush-only bookmark a server-streaming page carries.
+fn received(n: usize) -> Value {
+    serde_json::json!({ "received": n })
 }
 
 impl GrpcStream {
