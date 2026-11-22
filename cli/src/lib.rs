@@ -86,6 +86,7 @@ pub mod sla;
 pub mod sql_bind;
 pub mod state;
 pub mod status;
+pub(crate) mod sub_run;
 pub mod template_tests;
 #[cfg(feature = "templates")]
 pub mod templates;

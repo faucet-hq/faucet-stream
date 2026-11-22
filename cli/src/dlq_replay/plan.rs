@@ -7,7 +7,7 @@ use crate::config::{ConnectorSpec, DlqSpec, OnBatchErrorSpec, PipelineConfig};
 use crate::dlq_replay::reader::{DlqDecryptor, DlqReaderSource, ReplayTarget, SourceOverride};
 use crate::error::{CliError, CliResult};
 use crate::expand::{ExpandedNode, NodeRole, expand};
-use faucet_core::{DeliveryMode, DlqReason, UnwrappedEnvelope};
+use faucet_core::{DlqReason, UnwrappedEnvelope};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -213,7 +213,12 @@ pub fn build_replay_node(
         )));
     }
 
-    let mut node = select_replay_node(expand(cfg)?, row)?;
+    let selected = select_replay_node(expand(cfg)?, row)?;
+    let mut node = crate::sub_run::derive(
+        &selected,
+        crate::sub_run::SubRun::DlqReplay,
+        selected.id.clone(),
+    );
     // The replayed row's own DLQ policy and key, not the first root's.
     let original_dlq = node.dlq.clone();
 
@@ -253,14 +258,7 @@ pub fn build_replay_node(
             .into(),
     });
 
-    // A replay reads the whole DLQ location once — no bookmarking, and never
-    // exactly-once (the reader is not a deterministic-replay source).
-    node.state = None;
-    node.delivery = DeliveryMode::AtLeastOnce;
     node.sink.config = replay_sink_config(&node.sink)?;
-    // The replayed records are a few dead letters, not the complete record
-    // set a scoped cleanup deletes everything else against.
-    node.cleanup_scope = None;
     node.dlq = Some(failed_dlq_spec_sealed(
         failed_dlq,
         original_dlq.as_ref(),
@@ -844,6 +842,7 @@ mod tests {
 mod replay_shaping_tests {
     use super::*;
     use crate::config::PipelineConfig;
+    use faucet_core::DeliveryMode;
 
     /// Build the replay node for `cfg` with fixed paths.
     fn replay_node(cfg: &PipelineConfig) -> ExpandedNode {

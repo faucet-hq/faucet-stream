@@ -236,7 +236,8 @@ summary.
 
 Once you've fixed the root cause — a transform, a contract, the destination
 schema — `faucet dlq replay` re-feeds the quarantined **payloads** through a
-pipeline config (quality → contract → sink):
+pipeline config (quality → contract → sink). The replay runs the row on its own:
+its `depends_on`, `sla:`, `profiling:` and `complete_for` do not apply to it.
 
 ```shell
 $ faucet dlq replay orders.yaml --from ./dlq/contract_breaches.jsonl --dry-run

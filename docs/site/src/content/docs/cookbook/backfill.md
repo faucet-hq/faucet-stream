@@ -133,6 +133,23 @@ flush at their next page boundary), interrupted units are *not* marked done, and
 the exit code equals the failed-unit count. Without a `state:` block the marker
 is in-memory only (a warning tells you `--resume` won't survive a restart).
 
+### What a unit leaves alone
+
+Each unit runs on its own copy of the row, scoped to its window:
+
+- its bookmark lives under the unit's own key, so the live row's bookmark — and
+  a renamed row's `legacy_state_ids` bookmark, which the live row adopts on its
+  next run — is never read or moved;
+- the row's `sla:` and `profiling:` blocks do not run per unit (their baselines
+  describe the forward sync, and one window is not a run of it);
+- `depends_on` does not apply: `--row X` replays X alone even when X normally
+  waits for another row;
+- `complete_for` cleanup is skipped with a warning (one window is not the
+  complete set).
+
+A bookmark that an earlier release already moved into a unit key is not moved
+back: restore it with `faucet state` if a renamed row lost its bookmark that way.
+
 ## Idempotency: pair with upsert
 
 Backfill forces **at-least-once** delivery per unit. Replaying an overlapping

@@ -38,7 +38,7 @@ use faucet_core::diff::{
 };
 use faucet_core::observability::Labels;
 use faucet_core::shard::PkShardBounds;
-use faucet_core::{DeliveryMode, FaucetError, Source};
+use faucet_core::{FaucetError, Source};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -872,7 +872,8 @@ fn repair_target(
     write_mode: &str,
     records: Vec<Value>,
 ) -> ExpandedNode {
-    let mut repair = node.clone();
+    let mut repair =
+        crate::sub_run::derive(node, crate::sub_run::SubRun::VerifyRepair, node.id.clone());
     repair.source = ConnectorSpec {
         kind: "verify-repair".into(),
         ..node.source.clone()
@@ -889,9 +890,6 @@ fn repair_target(
         reason: "repair writes correct earlier rows; they must not shift the profile baseline"
             .into(),
     });
-    repair.state = None;
-    repair.delivery = DeliveryMode::AtLeastOnce;
-    repair.cleanup_scope = None;
     if let Value::Object(m) = &mut repair.sink.config {
         m.insert("write_mode".into(), Value::String(write_mode.into()));
         m.insert(

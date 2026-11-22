@@ -81,7 +81,8 @@ and the DLQ — still apply. Rows that exist only in the destination are left
 alone unless `--allow-delete` (a delete is not undoable). `--dry-run` plans
 the repair without writing. The sink must support keyed writes (see the
 [capability matrix](/faucet-stream/reference/connectors/)). A second `faucet verify`
-after a repair reports zero differences.
+after a repair reports zero differences. The repair runs the row on its own: its
+`depends_on`, `sla:`, `profiling:` and `complete_for` do not apply to it.
 
 ## Verifying every run: the `verify:` block
 

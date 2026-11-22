@@ -412,3 +412,36 @@ async fn replay_of_a_shared_dlq_keeps_only_the_target_rows_envelopes() {
     assert_eq!(landed, vec![json!({"id": 1}), json!({"id": 3})]);
     assert!(!eu.exists());
 }
+
+/// A replay through a row that follows another (`depends_on`) runs on its own.
+#[tokio::test]
+async fn replay_of_a_row_that_depends_on_another_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let dlq = dir.path().join("dlq.jsonl");
+    let first = dir.path().join("first.jsonl");
+    let second = dir.path().join("second.jsonl");
+    let mut env: Value =
+        serde_json::from_str(&envelope("partial", "Sink", json!({"id": 7}))).unwrap();
+    env["row"] = json!("second");
+    write_file(&dlq, &format!("{env}\n"));
+    let cfg_yaml = format!(
+        "version: 1\nname: replay\npipeline:\n  source: {{ type: csv, config: {{ path: /dev/null }} }}\n  sink: {{ type: jsonl, config: {{ path: /dev/null }} }}\nmatrix:\n  - id: first\n    sink: {{ config: {{ path: {first} }} }}\n  - id: second\n    depends_on: [first]\n    sink: {{ config: {{ path: {second} }} }}\n",
+        first = first.display(),
+        second = second.display()
+    );
+    let cfg = parse_with_extension(&cfg_yaml, "yaml").unwrap();
+    let failed = dir
+        .path()
+        .join("failed.jsonl")
+        .to_string_lossy()
+        .into_owned();
+    let mut inp: ReplayInputs<'_> = inputs("replay", false).await;
+    inp.row = Some("second");
+    inp.failed_dlq = Some(&failed);
+    let outcome = dlq_replay::replay(&cfg, dlq.to_str().unwrap(), inp)
+        .await
+        .expect("the replay of a dependent row runs");
+    assert_eq!(outcome.records_written, 1);
+    assert_eq!(read_lines(&second), vec![json!({"id": 7})]);
+    assert!(!first.exists());
+}
