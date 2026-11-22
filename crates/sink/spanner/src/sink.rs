@@ -40,6 +40,8 @@ const CELL_BUDGET: usize = 60_000;
 /// Live table metadata read from `INFORMATION_SCHEMA` (cached per sink).
 #[derive(Debug, Clone)]
 struct TableMeta {
+    /// The table's declared name (the config may spell it in another case).
+    table: String,
     /// `(name, type, nullable)` in declared column order.
     columns: Vec<(String, SpannerType, bool)>,
     /// PRIMARY KEY column names, in key order.
@@ -48,15 +50,67 @@ struct TableMeta {
 
 impl TableMeta {
     fn type_of(&self, col: &str) -> Option<&SpannerType> {
-        self.columns
-            .iter()
-            .find(|(name, _, _)| name == col)
-            .map(|(_, ty, _)| ty)
+        self.column(col).map(|(_, ty, _)| ty)
     }
 
     fn has_column(&self, col: &str) -> bool {
-        self.columns.iter().any(|(name, _, _)| name == col)
+        self.column(col).is_some()
     }
+
+    /// The column `name` addresses: GoogleSQL identifiers are
+    /// case-insensitive, so the exact spelling, else one equal ignoring ASCII
+    /// case.
+    fn column(&self, name: &str) -> Option<&(String, SpannerType, bool)> {
+        self.columns.iter().find(|(c, _, _)| c == name).or_else(|| {
+            self.columns
+                .iter()
+                .find(|(c, _, _)| c.eq_ignore_ascii_case(name))
+        })
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.columns.iter().map(|(c, _, _)| c.clone()).collect()
+    }
+
+    /// `key` spelled as the table declares its columns.
+    fn canonical_key(&self, key: &[String]) -> Vec<String> {
+        key.iter()
+            .map(|k| {
+                self.column(k)
+                    .map_or_else(|| k.clone(), |(c, _, _)| c.clone())
+            })
+            .collect()
+    }
+}
+
+/// `record` with each field renamed to the spelling of the column it
+/// addresses (exact, else equal ignoring case), so the mutation and its key
+/// read the value the table will hold. Two fields that both fold onto one
+/// column with neither spelled exactly are an error: picking one would drop
+/// the other silently.
+fn canonical_record(record: &Value, names: &[String]) -> Result<Value, String> {
+    let obj = record
+        .as_object()
+        .ok_or_else(|| "record is not a JSON object".to_string())?;
+    for column in names {
+        if obj.contains_key(column) {
+            continue;
+        }
+        let folded: Vec<&String> = obj
+            .keys()
+            .filter(|k| k.eq_ignore_ascii_case(column))
+            .collect();
+        if let [a, b, ..] = folded.as_slice() {
+            return Err(format!(
+                "fields `{a}` and `{b}` both name column `{column}`; keep one of them"
+            ));
+        }
+    }
+    Ok(Value::Object(faucet_core::canonical_record(
+        obj,
+        names,
+        faucet_core::ColumnMatching::CaseInsensitive,
+    )))
 }
 
 /// One planned mutation plus the number of cells it mutates (drives the
@@ -89,6 +143,7 @@ fn build_row_mutation(
     op: WriteOp,
     warned: &mut HashSet<String>,
 ) -> Result<Planned, String> {
+    let record = canonical_record(record, &meta.names())?;
     let obj = record
         .as_object()
         .ok_or_else(|| "record is not a JSON object".to_string())?;
@@ -142,6 +197,12 @@ fn encode_key_in_pk_order(
             .0
             .iter()
             .find(|(col, _)| col == pk_col)
+            .or_else(|| {
+                key_tuple
+                    .0
+                    .iter()
+                    .find(|(col, _)| col.eq_ignore_ascii_case(pk_col))
+            })
             .ok_or_else(|| format!("delete key is missing PK column `{pk_col}`"))?;
         let ty = meta
             .type_of(pk_col)
@@ -358,10 +419,10 @@ fn check_cleanup_cell_budget(
 
 /// Upsert/delete requires the configured `key` to be exactly the table's
 /// PRIMARY KEY columns (Spanner mutations always key on the PK). Order is
-/// irrelevant — set equality.
+/// irrelevant — set equality — and so is ASCII case, as in GoogleSQL.
 fn validate_key_matches_pk(key: &[String], pk: &[String], table: &str) -> Result<(), FaucetError> {
-    let key_set: HashSet<&str> = key.iter().map(|s| s.as_str()).collect();
-    let pk_set: HashSet<&str> = pk.iter().map(|s| s.as_str()).collect();
+    let key_set: HashSet<String> = key.iter().map(|s| s.to_ascii_lowercase()).collect();
+    let pk_set: HashSet<String> = pk.iter().map(|s| s.to_ascii_lowercase()).collect();
     if key_set != pk_set {
         return Err(FaucetError::Config(format!(
             "spanner sink: write key {key:?} must equal table `{table}`'s PRIMARY KEY columns \
@@ -580,6 +641,7 @@ impl SpannerDriver {
     /// Returns `Ok(None)` when the table does not exist.
     async fn read_meta(&self) -> Result<Option<TableMeta>, FaucetError> {
         let mut columns: Vec<(String, SpannerType, bool)> = Vec::new();
+        let mut table = self.config.table_name.clone();
         {
             let mut tx = self
                 .client
@@ -588,8 +650,9 @@ impl SpannerDriver {
                 .map_err(|e| sink_err("metadata read", e))?;
             let mut stmt = Statement::new(
                 "SELECT c.COLUMN_NAME AS name, c.SPANNER_TYPE AS spanner_type, \
-                 c.IS_NULLABLE AS is_nullable FROM INFORMATION_SCHEMA.COLUMNS c \
-                 WHERE c.TABLE_SCHEMA = '' AND c.TABLE_NAME = @table \
+                 c.IS_NULLABLE AS is_nullable, c.TABLE_NAME AS table_name \
+                 FROM INFORMATION_SCHEMA.COLUMNS c \
+                 WHERE c.TABLE_SCHEMA = '' AND LOWER(c.TABLE_NAME) = LOWER(@table) \
                  ORDER BY c.ORDINAL_POSITION",
             );
             stmt.add_param("table", &self.config.table_name);
@@ -611,6 +674,9 @@ impl SpannerDriver {
                 let nullable = row
                     .column_by_name::<String>("is_nullable")
                     .map_err(|e| sink_err("metadata decode", e))?;
+                table = row
+                    .column_by_name::<String>("table_name")
+                    .map_err(|e| sink_err("metadata decode", e))?;
                 columns.push((name, parse_spanner_type(&ty), nullable == "YES"));
             }
         }
@@ -627,7 +693,7 @@ impl SpannerDriver {
                 .map_err(|e| sink_err("metadata read", e))?;
             let mut stmt = Statement::new(
                 "SELECT ic.COLUMN_NAME AS name FROM INFORMATION_SCHEMA.INDEX_COLUMNS ic \
-                 WHERE ic.TABLE_SCHEMA = '' AND ic.TABLE_NAME = @table \
+                 WHERE ic.TABLE_SCHEMA = '' AND LOWER(ic.TABLE_NAME) = LOWER(@table) \
                  AND ic.INDEX_NAME = 'PRIMARY_KEY' ORDER BY ic.ORDINAL_POSITION",
             );
             stmt.add_param("table", &self.config.table_name);
@@ -646,7 +712,7 @@ impl SpannerDriver {
                 );
             }
         }
-        Ok(Some(TableMeta { columns, pk }))
+        Ok(Some(TableMeta { table, columns, pk }))
     }
 
     /// Cached metadata, fetched on first use. Errors when the table is absent
@@ -682,6 +748,19 @@ impl SpannerDriver {
         Ok(arc)
     }
 
+    /// The write spec with `key` spelled as the table declares its columns,
+    /// matching records already renamed by [`canonical_record`].
+    fn keyed_spec(&self, meta: &TableMeta) -> faucet_core::WriteSpec {
+        let mut spec = self.config.write.clone();
+        spec.key = meta.canonical_key(&spec.key);
+        if let Some(marker) = spec.delete_marker.as_mut()
+            && let Some((c, _, _)) = meta.column(&marker.field)
+        {
+            marker.field = c.clone();
+        }
+        spec
+    }
+
     /// Plan the whole page into mutations (mode-aware). Returns the planned
     /// mutations and the written-row count, or the first failure.
     fn plan_page(
@@ -690,7 +769,7 @@ impl SpannerDriver {
         meta: &TableMeta,
         append_op: WriteOp,
     ) -> Result<(Vec<Planned>, usize), FaucetError> {
-        let table = &self.config.table_name;
+        let table = &meta.table;
         let mut warned = self
             .warned_fields
             .lock()
@@ -709,7 +788,21 @@ impl SpannerDriver {
         }
 
         validate_key_matches_pk(&self.config.write.key, &meta.pk, table)?;
-        let plan = faucet_core::plan_writes(records, &self.config.write);
+        let names = meta.names();
+        let records = records
+            .iter()
+            .enumerate()
+            .map(|(idx, r)| {
+                canonical_record(r, &names).map_err(|msg| {
+                    FaucetError::Sink(format!(
+                        "spanner {}: row {idx}: {msg}",
+                        self.config.write.write_mode.as_str()
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let spec = self.keyed_spec(meta);
+        let plan = faucet_core::plan_writes(&records, &spec);
         if let Some((idx, msg)) = plan.failed.first() {
             return Err(FaucetError::Sink(format!(
                 "spanner {}: row {idx}: {msg}",
@@ -1271,6 +1364,10 @@ impl SchemaDriver for SpannerDriver {
         true
     }
 
+    fn column_matching(&self) -> faucet_core::ColumnMatching {
+        faucet_core::ColumnMatching::CaseInsensitive
+    }
+
     /// Apply additive schema evolution: new columns via `ADD COLUMN IF NOT
     /// EXISTS`; nullability relaxations by re-emitting the column at its
     /// current type without `NOT NULL`. Spanner cannot change a column's base
@@ -1285,7 +1382,27 @@ impl SchemaDriver for SpannerDriver {
         let table = &self.config.table_name;
         let mut statements: Vec<String> = Vec::new();
 
+        let existing = if evolution.additions.is_empty() {
+            Vec::new()
+        } else {
+            self.fetch_meta(calls)
+                .await?
+                .map(|m| m.names())
+                .unwrap_or_default()
+        };
         for c in &evolution.additions {
+            if let Some(column) = faucet_core::column_for_field(
+                &c.name,
+                &existing,
+                faucet_core::ColumnMatching::CaseInsensitive,
+            ) {
+                tracing::debug!(
+                    field = %c.name,
+                    column,
+                    "spanner evolve: the field already names a column; no ADD COLUMN"
+                );
+                continue;
+            }
             let t =
                 faucet_core::json_schema_base_type(&c.to).unwrap_or(faucet_core::SqlBaseType::Text);
             statements.push(build_add_column_sql(table, &c.name, t));
@@ -1401,8 +1518,24 @@ impl SpannerDriver {
             return Ok(outcomes);
         }
         let meta = self.require_meta(calls, records).await?;
-        let table = &self.config.table_name;
+        let table = &meta.table;
         let mode = self.config.write.write_mode.as_str();
+        let names = meta.names();
+        let mut ambiguous: Vec<(usize, String)> = Vec::new();
+        let canonical: Vec<Value> = records
+            .iter()
+            .enumerate()
+            .map(|(idx, r)| match canonical_record(r, &names) {
+                Ok(v) => v,
+                Err(msg) if r.is_object() => {
+                    ambiguous.push((idx, msg));
+                    Value::Null
+                }
+                Err(_) => r.clone(),
+            })
+            .collect();
+        let records = canonical.as_slice();
+        let spec = self.keyed_spec(&meta);
         let mut planned: Vec<Planned> = Vec::with_capacity(records.len());
         if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
             let mut warned = self
@@ -1420,7 +1553,7 @@ impl SpannerDriver {
             }
         } else {
             validate_key_matches_pk(&self.config.write.key, &meta.pk, table)?;
-            let plan = faucet_core::plan_writes(records, &self.config.write);
+            let plan = faucet_core::plan_writes(records, &spec);
             let mut failed_keys: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
             {
@@ -1438,8 +1571,7 @@ impl SpannerDriver {
                     ) {
                         Ok(p) => planned.push(p),
                         Err(msg) => {
-                            if let Some(k) =
-                                faucet_core::write_mode::record_key(record, &self.config.write.key)
+                            if let Some(k) = faucet_core::write_mode::record_key(record, &spec.key)
                             {
                                 failed_keys.insert(faucet_core::key_to_doc_id(&k, ""), msg);
                             }
@@ -1457,7 +1589,7 @@ impl SpannerDriver {
             }
             if !failed_keys.is_empty() {
                 for (idx, record) in records.iter().enumerate() {
-                    let msg = faucet_core::write_mode::record_key(record, &self.config.write.key)
+                    let msg = faucet_core::write_mode::record_key(record, &spec.key)
                         .and_then(|k| failed_keys.get(&faucet_core::key_to_doc_id(&k, "")));
                     if let Some(msg) = msg {
                         outcomes[idx] = Err(FaucetError::Sink(format!("spanner {mode}: {msg}")));
@@ -1467,6 +1599,9 @@ impl SpannerDriver {
             for (idx, msg) in &plan.failed {
                 outcomes[*idx] = Err(FaucetError::Sink(format!("spanner {mode}: {msg}")));
             }
+        }
+        for (idx, msg) in ambiguous {
+            outcomes[idx] = Err(FaucetError::Sink(format!("spanner {mode}: {msg}")));
         }
         for chunk in chunk_by_cells(planned, self.config.batch_size, CELL_BUDGET) {
             self.client
@@ -1590,6 +1725,7 @@ mod tests {
 
     fn meta() -> TableMeta {
         TableMeta {
+            table: "t".into(),
             columns: vec![
                 ("id".into(), SpannerType::Int64, false),
                 ("name".into(), SpannerType::String, true),
@@ -1602,6 +1738,7 @@ mod tests {
 
     fn composite_meta() -> TableMeta {
         TableMeta {
+            table: "t".into(),
             columns: vec![
                 ("tenant".into(), SpannerType::String, false),
                 ("id".into(), SpannerType::Int64, false),
@@ -1644,6 +1781,68 @@ mod tests {
         )
         .unwrap();
         assert_eq!(warned.len(), before);
+    }
+
+    fn mixed_case_meta() -> TableMeta {
+        TableMeta {
+            table: "Users".into(),
+            columns: vec![
+                ("UserId".into(), SpannerType::Int64, false),
+                ("Email".into(), SpannerType::String, true),
+            ],
+            pk: vec!["UserId".into()],
+        }
+    }
+
+    fn written_columns(p: &Planned) -> Vec<String> {
+        match &p.mutation.operation {
+            Some(Operation::Insert(w) | Operation::InsertOrUpdate(w)) => w.columns.clone(),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fields_match_columns_ignoring_case_and_an_exact_spelling_wins() {
+        let mut warned = HashSet::new();
+        let m = mixed_case_meta();
+        let p = build_row_mutation(
+            "Users",
+            &json!({"userid": 1, "email": "a@x"}),
+            &m,
+            WriteOp::Insert,
+            &mut warned,
+        )
+        .unwrap();
+        assert_eq!(written_columns(&p), vec!["UserId", "Email"]);
+        assert!(warned.is_empty(), "no field was dropped: {warned:?}");
+        let exact = canonical_record(&json!({"UserId": 1, "userid": 2}), &m.names()).unwrap();
+        assert_eq!(exact, json!({"UserId": 1}));
+        assert!(m.has_column("userid") && m.type_of("EMAIL").is_some());
+        assert_eq!(
+            m.canonical_key(&["userid".into()]),
+            vec!["UserId".to_string()]
+        );
+    }
+
+    #[test]
+    fn two_fields_folding_onto_one_column_fail_the_row() {
+        let mut warned = HashSet::new();
+        let err = build_row_mutation(
+            "Users",
+            &json!({"UserId": 1, "email": "a", "EMAIL": "b"}),
+            &mixed_case_meta(),
+            WriteOp::Insert,
+            &mut warned,
+        )
+        .unwrap_err();
+        assert!(err.contains("both name column `Email`"), "{err}");
+    }
+
+    #[test]
+    fn key_and_pk_compare_ignoring_case() {
+        assert!(validate_key_matches_pk(&["userid".into()], &["UserId".into()], "t").is_ok());
+        let kt = faucet_core::KeyTuple(vec![("userid".into(), json!(7))]);
+        assert!(build_delete_mutation("Users", &kt, &mixed_case_meta()).is_ok());
     }
 
     #[test]
@@ -2065,6 +2264,7 @@ mod tests {
     #[test]
     fn written_keys_match_their_canonical_live_form() {
         let meta = TableMeta {
+            table: "t".into(),
             columns: vec![
                 ("id".into(), SpannerType::Int64, false),
                 ("at".into(), SpannerType::Timestamp, false),
