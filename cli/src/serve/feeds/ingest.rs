@@ -1215,6 +1215,13 @@ async fn handle(
         ));
     };
     let refuse = |r: Refusal| (Some(feed.clone()), r);
+    if feed.derived.signature_unreadable.is_some() {
+        return Err(refuse(Refusal::unavailable(
+            "seal",
+            "the feed's signature secret cannot be read on this server; retry later",
+            RETRY_STORE_SECS,
+        )));
+    }
     let spec = &feed.spec.ingest;
     let _reading = match (&token, &spec.auth.signature) {
         (None, Some(_)) => {
@@ -1286,7 +1293,7 @@ async fn handle(
     if let Some(sig) = &spec.auth.signature {
         let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
         let lookup = |h: &str| headers.get(h).and_then(|v| v.to_str().ok());
-        if !sig.check().verify(lookup, &body, now) {
+        if sig.secret.is_empty() || !sig.check().verify(lookup, &body, now) {
             return Err(refuse(Refusal::unauthorized()));
         }
         replay = replay_key(sig, &headers, now);

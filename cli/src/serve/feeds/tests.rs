@@ -387,6 +387,7 @@ fn feed(tenant: Option<&str>) -> Feed {
         approved: false,
         revision: 3,
         ensured: true,
+        derived: Default::default(),
     }
 }
 

@@ -983,6 +983,127 @@ async fn a_signed_feed_checks_the_signature_and_its_timestamp() {
     assert_eq!(srv.watermark("hooks", &uid).await, 2);
 }
 
+/// A stored feed whose signature secret this server cannot open stays
+/// listed, refuses senders with 503 (never checking a signature against the
+/// stored ciphertext), and can be repaired or deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feed_whose_secret_will_not_open_refuses_senders_and_can_be_repaired() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &[]).await;
+    for name in ["hooks", "gone"] {
+        srv.feed(json!({
+            "name": name,
+            "ingest": {"auth": {"signature": {"header": "X-Signature", "secret": "hmac-secret-1"}}}
+        }))
+        .await;
+    }
+    let post = |secret: String| {
+        let body = r#"{"id": 1}"#;
+        srv.send(
+            srv.client
+                .post(srv.url("/v1/feeds/hooks/events"))
+                .header("content-type", "application/json")
+                .header("x-signature", sign(&secret, body.as_bytes()))
+                .body(body),
+        )
+    };
+    assert_eq!(post("hmac-secret-1".into()).await.status, 202);
+
+    // This server's vault key changes: the stored secret no longer opens.
+    srv.state.set_vault(Some(Arc::new(
+        faucet_cli::serve::vault::Vault::new("another-vault-key-0123456789abcdef", &[]).unwrap(),
+    )));
+    srv.state.feeds().refresh_now(&srv.state).await.unwrap();
+    let view = service::get(&srv.state, &admin(), None, "hooks")
+        .await
+        .unwrap();
+    assert_eq!(view.feed.status, "secret_unreadable");
+    assert!(
+        view.feed
+            .warnings
+            .iter()
+            .any(|w| w.contains("refuses every request")),
+        "{:?}",
+        view.feed.warnings
+    );
+    assert_eq!(
+        view.feed
+            .spec
+            .ingest
+            .auth
+            .signature
+            .as_ref()
+            .unwrap()
+            .secret,
+        "$sealed"
+    );
+    let ready = srv.state.feeds().readiness();
+    assert_eq!(
+        ready.secret_unreadable,
+        vec!["gone".to_string(), "hooks".to_string()]
+    );
+
+    let sealed = srv
+        .state
+        .history()
+        .feed_get("-/hooks")
+        .await
+        .unwrap()
+        .unwrap()
+        .spec
+        .ingest
+        .auth
+        .signature
+        .unwrap()
+        .secret;
+    let ciphertext = sealed.trim_start_matches("$sealed:").to_string();
+    for secret in [
+        "hmac-secret-1".to_string(),
+        sealed,
+        ciphertext,
+        String::new(),
+    ] {
+        let refused = post(secret).await;
+        assert_eq!(refused.status, 503, "{}", refused.body);
+        assert!(refused.retry_after.is_some());
+        assert!(
+            refused.body.to_string().contains("cannot be read"),
+            "{}",
+            refused.body
+        );
+    }
+
+    // Keeping the unreadable secret is refused; sending a new one repairs it.
+    let mut spec = service::get(&srv.state, &admin(), None, "hooks")
+        .await
+        .unwrap()
+        .feed
+        .spec;
+    let kept = service::update(&srv.state, &admin(), None, "hooks", spec.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(kept.api_error().error.code, "unprocessable", "{kept:?}");
+    assert!(
+        kept.api_error()
+            .error
+            .message
+            .contains("can no longer be opened"),
+        "{kept:?}"
+    );
+    spec.ingest.auth.signature.as_mut().unwrap().secret = "hmac-secret-2".into();
+    service::update(&srv.state, &admin(), None, "hooks", spec)
+        .await
+        .unwrap();
+    srv.state.feeds().refresh_now(&srv.state).await.unwrap();
+    assert_eq!(post("hmac-secret-2".into()).await.status, 202);
+
+    // The other one can still be deleted.
+    service::delete(&srv.state, &admin(), None, "gone")
+        .await
+        .unwrap();
+    assert!(service::find(&srv.state, None, "gone").await.is_err());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn duplicates_rate_limits_and_a_full_feed_are_answered_as_the_feed_says() {
     let dir = tempfile::tempdir().unwrap();

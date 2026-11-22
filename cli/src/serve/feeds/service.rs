@@ -136,7 +136,8 @@ pub struct FeedView {
     /// When the newest retained event was received.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_event_at: Option<DateTime<Utc>>,
-    /// Worst first: `held`, `stalled`, `full` (an undelivered limit is
+    /// Worst first: `held`, `secret_unreadable` (this server cannot open the
+    /// signature secret, so it refuses senders), `stalled`, `full` (an undelivered limit is
     /// reached), `over_quota` (the tenant's feeds in this store hold its
     /// whole byte quota, delivered events kept for replay included),
     /// `paused` or `receiving`.
@@ -614,6 +615,15 @@ async fn views(state: &ServerState, feeds: &[Arc<Feed>]) -> Result<Vec<FeedView>
                 _ => None,
             };
             let mut out = view(&feed, head, undelivered, &statuses(state, &feed).await?);
+            if let Some(why) = &feed.derived.signature_unreadable {
+                if out.status != "held" {
+                    out.status = "secret_unreadable".into();
+                }
+                out.warnings.push(format!(
+                    "{why}; this server refuses every request to the feed with 503 until it \
+                     runs with the vault key the feed was made under or the secret is set again"
+                ));
+            }
             if matches!(out.status.as_str(), "receiving" | "paused")
                 && let Some(t) = feed.tenant()
                 && over.contains(&(t.to_string(), feed.spec.store.clone()))
@@ -1426,6 +1436,7 @@ pub async fn check_file_deliveries(state: &ServerState) -> Result<(), String> {
             approved: true,
             revision: 0,
             ensured: false,
+            derived: Default::default(),
         };
         for d in spec.deliveries.iter().filter(|d| d.pipeline.is_some()) {
             check_delivery(state, &feed, d).await.map_err(|e| {

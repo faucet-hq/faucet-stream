@@ -55,7 +55,7 @@ request must satisfy both.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `header` | string | required | The request header that carries the signature. |
-| `secret` | string | required | The shared signing secret. In the feeds file, use a `${env:…}` or secret reference. Through the API it is sealed with the vault key (a server without one refuses it) and read back as `$sealed`; sending `$sealed` back keeps the stored secret. |
+| `secret` | string | required | The shared signing secret. In the feeds file, use a `${env:…}` or secret reference. Through the API it is sealed with the vault key (a server without one refuses it) and read back as `$sealed`; sending `$sealed` back keeps the stored secret. A server whose vault key cannot open the stored secret (another key, a key rotated without `--vault-previous-key`) still lists, edits and deletes the feed, shows it as `secret_unreadable`, and answers every ingest request to it with `503` (reason `seal`, with `Retry-After`) so senders retry against a server that can; for a feed with no token that answer is given before any check, so it tells a caller the feed exists. Sending `$sealed` back for such a feed is refused (`422`); send the secret itself to repair it. |
 | `algorithm` | `sha256` \| `sha512` | `sha256` | The HMAC digest. |
 | `encoding` | `hex` \| `base64` | `hex` | How the digest is written in the header. Hex is matched without regard to case. |
 | `prefix` | string | | Text before the digest in the header value, such as `sha256=`. |
@@ -339,7 +339,9 @@ The [MCP server](/faucet-stream/cookbook/mcp/) has two read tools,
 A delivery's last run has one of these outcomes: `delivered`, `failed`,
 `refused`, `cancelled`, `claim_lost`, `held`.
 
-**A feed** shows the worst of its deliveries: `held`, then `stalled`, then
+**A feed** shows the worst of its deliveries: `held`, then
+`secret_unreadable` (this server cannot open the feed's signature secret and
+refuses its senders with `503`), then `stalled`, then
 `full` (an undelivered limit is reached and new events are refused), then
 `over_quota` (its tenant's feeds in this feed store hold the tenant's whole
 `max_feed_bytes`, delivered events kept for replay included, so new events
@@ -504,8 +506,9 @@ admitted (an unknown feed or a credential no feed accepts).
 ### `/readyz`
 
 `/readyz` has a `feeds` object: `started` (a feed exists, so the scheduler
-runs here), `store_ok`, `feeds` (how many), and the `stalled` and `held`
-deliveries by name. An unreachable feed store sets `store_ok: false`; it does
+runs here), `store_ok`, `feeds` (how many), the `stalled` and `held`
+deliveries by name, and `secret_unreadable` (feeds whose signature secret this
+server cannot open) when there are any. An unreachable feed store sets `store_ok: false`; it does
 not fail the readiness check.
 
 ## Where the data lives

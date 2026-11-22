@@ -125,6 +125,17 @@ pub struct Feed {
     pub revision: u64,
     /// The feed and its deliveries exist in the store.
     pub ensured: bool,
+    /// What this server learned about the feed when it loaded it.
+    pub derived: Derived,
+}
+
+/// What a server learned about a feed when it loaded its definition, beside
+/// the definition itself.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Derived {
+    /// The sealed signature secret does not open with this server's vault
+    /// key; the spec's secret is then empty and ingest refuses every request.
+    pub signature_unreadable: Option<String>,
 }
 
 impl Feed {
@@ -258,6 +269,10 @@ pub struct Readiness {
     pub feeds: usize,
     pub stalled: Vec<String>,
     pub held: Vec<String>,
+    /// Feeds whose signature secret this server cannot open: they refuse
+    /// every ingest request with `503`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub secret_unreadable: Vec<String>,
 }
 
 /// The ids of a `--feeds` file feed, kept in the run history's settings so
@@ -520,6 +535,14 @@ impl FeedsRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         r.started = self.started();
+        r.secret_unreadable = self
+            .snapshot()
+            .feeds
+            .iter()
+            .filter(|f| f.derived.signature_unreadable.is_some())
+            .map(|f| f.label())
+            .collect();
+        r.secret_unreadable.sort();
         r
     }
 
@@ -729,6 +752,7 @@ impl FeedsRuntime {
             approved: true,
             revision: 0,
             ensured: false,
+            derived: Derived::default(),
         };
         let already = self
             .ensured
@@ -813,11 +837,20 @@ pub async fn ensure_in_store(
     Ok(())
 }
 
-/// The runnable form of a stored feed: its signature secret opened.
+/// The runnable form of a stored feed: its signature secret opened. A secret
+/// that does not open leaves the feed usable for everything but ingest: its
+/// secret is emptied (never the sealed text, which is no secret) and
+/// [`Derived::signature_unreadable`] says why.
 pub fn feed_of_record(state: &ServerState, record: &FeedRecord) -> Result<Feed, String> {
     let uid = FeedUid::new(record.uid.clone()).map_err(|e| e.to_string())?;
     let mut spec = record.spec.clone();
-    secrets::open_signature(state, &mut spec, &record.uid)?;
+    let mut derived = Derived::default();
+    if let Err(e) = secrets::open_signature(state, &mut spec, &record.uid) {
+        if let Some(sig) = spec.ingest.auth.signature.as_mut() {
+            sig.secret.clear();
+        }
+        derived.signature_unreadable = Some(e);
+    }
     let mut deliveries = BTreeMap::new();
     for (name, meta) in &record.deliveries {
         deliveries.insert(
@@ -836,6 +869,7 @@ pub fn feed_of_record(state: &ServerState, record: &FeedRecord) -> Result<Feed, 
         approved: record.approved,
         revision: record.revision,
         ensured: true,
+        derived,
     })
 }
 

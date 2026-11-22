@@ -1297,6 +1297,7 @@ impl Scheduler {
             feeds: snapshot.feeds.len(),
             stalled,
             held,
+            secret_unreadable: Vec::new(),
         });
     }
 }
