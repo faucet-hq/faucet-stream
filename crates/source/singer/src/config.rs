@@ -8,11 +8,14 @@ use faucet_core::JsonSchema;
 use faucet_core::Value;
 use serde::{Deserialize, Serialize};
 
-/// What to do when the tap emits a line that is not valid Singer JSON.
+/// What to do when the tap emits a line that is not a Singer message (plain
+/// text, a JSON log line without a `type`). A `RECORD`, `STATE` or `SCHEMA`
+/// message that cannot be read always fails the run, whatever this says:
+/// skipping it would lose a row or checkpoint past it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MalformedPolicy {
-    /// Log the offending line at `warn` and continue (default).
+    /// Log the line at `warn` and continue (default).
     #[default]
     Skip,
     /// Abort the run with a [`faucet_core::FaucetError::Source`].
@@ -75,8 +78,9 @@ pub struct SingerSourceConfig {
     #[serde(default = "default_max_line_bytes")]
     pub max_line_bytes: usize,
 
-    /// How to handle a line that is not valid Singer JSON. Default
-    /// [`MalformedPolicy::Skip`].
+    /// How to handle a line that is not a Singer message. Default
+    /// [`MalformedPolicy::Skip`]. A broken `RECORD` / `STATE` / `SCHEMA`
+    /// message always fails the run.
     #[serde(default)]
     pub on_malformed: MalformedPolicy,
 

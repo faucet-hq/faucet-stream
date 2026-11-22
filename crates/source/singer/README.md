@@ -51,7 +51,7 @@ Singer **target** as a faucet sink; the protocol types both share live in
 | `flush_on_state` | bool | `true` | Flush a page (and checkpoint) on every STATE message |
 | `idle_timeout_secs` | int / null | `3600` | Abort if no output arrives within this many seconds (`null` waits forever). Also bounds `--discover` |
 | `max_line_bytes` | int | `67108864` (64 MiB) | Longest tap output line accepted; a longer one fails the run instead of exhausting memory |
-| `on_malformed` | `skip` \| `fail` | `skip` | What to do with a non-Singer output line |
+| `on_malformed` | `skip` \| `fail` | `skip` | What to do with a line that is not a Singer message (plain text, a JSON log line without a `type`). A `RECORD`, `STATE` or `SCHEMA` message that cannot be read (truncated JSON, a missing `record`, a non-object `record`) **always fails the run**, before the next `STATE` is checkpointed, so no row is skipped past. Bare `NaN` / `Infinity` / `-Infinity` (Python's spelling) are read as `null` and counted as non-finite values. |
 | `inherit_env` | bool \| string[] | `true` | Which of faucet's environment variables the tap sees — see [Environment](#environment--inherit_env) |
 
 ## Environment — `inherit_env`

@@ -75,6 +75,10 @@ and counts it:
 On the columnar (Arrow) path a non-finite float is still a float; it becomes a
 counted `null` only where a batch is turned into JSON rows.
 
+A Singer tap written in Python spells these as bare `NaN`, `Infinity` and
+`-Infinity`, which is not JSON. The Singer source reads them as counted `null`s
+rather than skipping the record.
+
 ## How sinks read the renderings
 
 - A string bound into an exact-decimal column is parsed by the server, never

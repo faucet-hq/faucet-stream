@@ -46,6 +46,74 @@ pub fn parse_line(line: &str) -> Result<SingerMessage, String> {
     }
     let value: Value =
         faucet_core::fidelity::from_str(trimmed).map_err(|e| format!("not valid JSON: {e}"))?;
+    message_from_value(&value)
+}
+
+/// Why a tap's stdout line is not a usable Singer message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LineError {
+    /// Not a Singer message: a blank line, plain text, or a JSON value with
+    /// no string `type` (a structured log line).
+    NotSinger(String),
+    /// A Singer message that cannot be read: an object-looking line that is
+    /// not valid JSON, or a `RECORD` / `STATE` / `SCHEMA` missing a required
+    /// field. Skipping it would lose a row or a checkpoint.
+    Broken {
+        /// The message's `type`, when it could be read.
+        message_type: Option<String>,
+        /// What is wrong with it.
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for LineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LineError::NotSinger(reason) => f.write_str(reason),
+            LineError::Broken {
+                message_type: Some(t),
+                reason,
+            } => write!(f, "{t}: {reason}"),
+            LineError::Broken { reason, .. } => f.write_str(reason),
+        }
+    }
+}
+
+/// Parse one line of a **tap's** stdout, telling a line that is not a Singer
+/// message apart from a Singer message that is broken.
+///
+/// Python taps write non-finite floats as bare `NaN` / `Infinity`; those
+/// become `null`, counted as non-finite values
+/// ([`faucet_core::fidelity::from_str_allow_non_finite`]).
+pub fn parse_tap_line(line: &str) -> Result<SingerMessage, LineError> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Err(LineError::NotSinger("blank line".into()));
+    }
+    let value = match faucet_core::fidelity::from_str_allow_non_finite(trimmed) {
+        Ok(v) => v,
+        Err(e) if trimmed.starts_with('{') => {
+            return Err(LineError::Broken {
+                message_type: None,
+                reason: format!("not valid JSON: {e}"),
+            });
+        }
+        Err(e) => return Err(LineError::NotSinger(format!("not valid JSON: {e}"))),
+    };
+    let message_type = value.get("type").and_then(Value::as_str).map(str::to_owned);
+    if message_type.is_none() {
+        return Err(LineError::NotSinger(
+            "missing or non-string `type` field".into(),
+        ));
+    }
+    message_from_value(&value).map_err(|reason| LineError::Broken {
+        message_type,
+        reason,
+    })
+}
+
+fn message_from_value(value: &Value) -> Result<SingerMessage, String> {
     let obj = value
         .as_object()
         .ok_or_else(|| "message is not a JSON object".to_string())?;
@@ -203,6 +271,52 @@ fn string_array(v: Option<&Value>) -> Option<Vec<String>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn a_tap_line_with_nan_parses_as_a_counted_null() {
+        let counter = faucet_core::fidelity::NonFiniteCounter::new();
+        let msg = counter
+            .scope(async {
+                parse_tap_line(r#"{"type":"RECORD","stream":"s","record":{"v":NaN,"t":"NaN"}}"#)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            msg,
+            SingerMessage::Record {
+                stream: "s".into(),
+                record: json!({"v": null, "t": "NaN"})
+            }
+        );
+        assert_eq!(counter.count(), 1);
+    }
+
+    #[test]
+    fn tap_lines_tell_non_singer_text_from_broken_messages() {
+        let broken = |line: &str| matches!(parse_tap_line(line), Err(LineError::Broken { .. }));
+        let other = |line: &str| matches!(parse_tap_line(line), Err(LineError::NotSinger(_)));
+        assert!(broken(r#"{"type":"RECORD","stream":"s","record":{"a":1"#));
+        assert!(broken(r#"{"stream":"s","record":{"a":"#));
+        assert!(broken(r#"{"type":"RECORD","stream":"s","record":[1]}"#));
+        assert!(broken(r#"{"type":"STATE"}"#));
+        assert!(broken(r#"{"type":"SCHEMA","stream":"s"}"#));
+        assert!(other(r#"{"level":"info","msg":"hello"}"#));
+        assert!(other("INFO starting tap"));
+        assert!(other(""));
+        assert!(other("[1, 2]"));
+        assert!(matches!(
+            parse_tap_line(r#"{"type":"ACTIVATE_VERSION","stream":"s","version":1}"#),
+            Ok(SingerMessage::Other { .. })
+        ));
+        let err = parse_tap_line(r#"{"type":"STATE"}"#).unwrap_err();
+        assert_eq!(err.to_string(), "STATE: STATE missing `value`");
+        assert!(
+            parse_tap_line(r#"{"type":"RECORD","stream":"s","record":{"a":1"#)
+                .unwrap_err()
+                .to_string()
+                .starts_with("not valid JSON")
+        );
+    }
 
     #[test]
     fn parses_record() {
