@@ -1207,6 +1207,25 @@ macro_rules! impl_feed_store {
                 Ok(Some(u64::try_from(bytes).unwrap_or(0)))
             }
 
+            async fn do_tenant_bytes(
+                &self,
+                tenant: &$crate::TenantId,
+            ) -> $crate::Result<Option<u64>> {
+                use sqlx::Row;
+                use $crate::sql::stmt;
+                let row = sqlx::query(stmt!(
+                    Self::D,
+                    "SELECT CAST(COALESCE(SUM(bytes), 0) AS BIGINT) \
+                     FROM faucet_feed_heads WHERE tenant = ?"
+                ))
+                .bind(tenant.as_str())
+                .fetch_one(&self.pool)
+                .await
+                .map_err(Self::be)?;
+                let bytes: i64 = row.try_get(0).map_err(Self::be)?;
+                Ok(Some(u64::try_from(bytes).unwrap_or(0)))
+            }
+
             async fn do_hourly_counts(
                 &self,
                 feed: &$crate::FeedUid,
@@ -1856,6 +1875,14 @@ macro_rules! impl_feed_store {
                 from: $crate::Seq,
             ) -> $crate::Result<Option<u64>> {
                 $crate::sql::each(calls, "bytes_from", || self.do_bytes_from(feed, from)).await
+            }
+
+            async fn tenant_bytes(
+                &self,
+                calls: &faucet_core::io::CallContext,
+                tenant: &$crate::TenantId,
+            ) -> $crate::Result<Option<u64>> {
+                $crate::sql::each(calls, "tenant_bytes", || self.do_tenant_bytes(tenant)).await
             }
 
             async fn hourly_counts(

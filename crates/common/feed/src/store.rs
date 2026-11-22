@@ -92,6 +92,14 @@ pub trait FeedStore: Send + Sync {
         Ok(None)
     }
 
+    /// Payload bytes every feed of `tenant` in this store holds together:
+    /// the figure the tenant's byte quota is checked against, delivered
+    /// events kept for replay included. `None`: the backend cannot say.
+    async fn tenant_bytes(&self, calls: &CallContext, tenant: &TenantId) -> Result<Option<u64>> {
+        let _ = (calls, tenant);
+        Ok(None)
+    }
+
     /// Retained events stored in each of the last `hours` hours by the
     /// store's clock, oldest hour first, in one query. `None`: the backend
     /// cannot say.

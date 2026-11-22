@@ -332,7 +332,9 @@ A delivery's last run has one of these outcomes: `delivered`, `failed`,
 
 **A feed** shows the worst of its deliveries: `held`, then `stalled`, then
 `full` (an undelivered limit is reached and new events are refused), then
-`paused` (every delivery is paused), else `receiving`.
+`over_quota` (its tenant's feeds in this feed store hold the tenant's whole
+`max_feed_bytes`, delivered events kept for replay included, so new events
+are refused), then `paused` (every delivery is paused), else `receiving`.
 
 A feed reports two sizes. `retained_bytes` is every event it still holds,
 including delivered events kept for replay. `undelivered_bytes` is what its
@@ -407,7 +409,7 @@ the file.
 | `tail <feed> [-n <N>] [--follow] [--interval-secs <n>] [--payload]` | Print the newest retained events, oldest first (10 by default, at most 200). `--follow` keeps printing new ones, looking every `--interval-secs` (default 2); use it on a PostgreSQL feed store, because nothing else can write to a SQLite store while `tail` holds it. `--payload` prints payloads too, never a sealed event's. |
 | `stats <feed>` | The feed's size, what the last 24 hours brought, and each delivery's backlog. |
 | `cursor <feed> [<delivery>]` | Where each delivery reads next: position, epoch, pending events, live claim and gaps. Read-only. |
-| `push <feed> [<file>] [--content-type <type>] [--dedupe-key <key>]` | Append events from a file or stdin straight to the feed's store, with the checks, dedupe and sealing the ingest route applies. No sender credential, rate limit or tenant quota applies. |
+| `push <feed> [<file>] [--content-type <type>] [--dedupe-key <key>]` | Append events from a file or stdin straight to the feed's store, with the checks, dedupe and sealing the ingest route applies. No sender credential or rate limit applies; the tenant's byte quota and the feed's undelivered limits do (the store checks them). |
 | `send --url <ingest URL> …` | Post events to a running server over HTTP, as a sender does. Needs no `--store`. |
 | `token create <feed> <token name> [--expires-at <RFC 3339>]` | Issue a token; its text is printed once. |
 | `token list <feed>` | The feed's tokens, never their text. |
@@ -415,7 +417,8 @@ the file.
 
 `send` goes through the ingest route, so the feed's credential, limits, rate
 limit and tenant quota all apply; `push` writes to the store directly and
-skips the credential, the rate limit and the tenant quota. `send` flags: `-f <file>` (default stdin), `--content-type` (default
+skips the credential and the rate limits (the tenant's byte quota and the
+feed's undelivered limits are checked by the store, so they still apply). `send` flags: `-f <file>` (default stdin), `--content-type` (default
 `application/json`), `--token-env <VAR>` (or `--token`, which other processes
 on the host can see), `--signature-secret-env <VAR>` with
 `--signature-header <name>` and, to match the feed's signature settings,

@@ -136,7 +136,10 @@ pub struct FeedView {
     /// When the newest retained event was received.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_event_at: Option<DateTime<Utc>>,
-    /// `receiving`, `stalled`, `held`, `full` or `paused`.
+    /// Worst first: `held`, `stalled`, `full` (an undelivered limit is
+    /// reached), `over_quota` (the tenant's feeds in this store hold its
+    /// whole byte quota, delivered events kept for replay included),
+    /// `paused` or `receiving`.
     pub status: String,
     /// The path senders post events to.
     pub ingest_path: String,
@@ -505,9 +508,74 @@ const VIEWS_AT_ONCE: usize = 8;
 
 /// The views of `feeds`: one `heads` and one newest-event query per store,
 /// then each feed's statuses and last-24-hours figures side by side.
+/// The payload bytes all of `tenant`'s feeds hold in each store they are
+/// in: what its byte quota is checked against in that store (delivered
+/// events kept for replay included). A store that cannot be read is left
+/// out.
+async fn tenant_store_bytes(
+    state: &ServerState,
+    snapshot: &super::Snapshot,
+    tenant: &str,
+) -> BTreeMap<String, u64> {
+    let mut by_store: BTreeMap<&str, Vec<FeedUid>> = BTreeMap::new();
+    for f in snapshot.feeds.iter().filter(|f| f.tenant() == Some(tenant)) {
+        by_store
+            .entry(f.spec.store.as_str())
+            .or_default()
+            .push(f.uid.clone());
+    }
+    let Ok(id) = faucet_common_feed::TenantId::new(tenant) else {
+        return BTreeMap::new();
+    };
+    let calls = store_calls();
+    let mut out = BTreeMap::new();
+    for (name, uids) in by_store {
+        let Ok(store) = state.feeds().stores().get(name).await else {
+            continue;
+        };
+        let held = match store.tenant_bytes(&calls, &id).await {
+            Ok(Some(held)) => held,
+            Ok(None) => match store.heads(&calls, &uids).await {
+                Ok(heads) => heads.iter().map(|h| h.bytes).sum(),
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+        out.insert(name.to_string(), held);
+    }
+    out
+}
+
+/// The `(tenant, store)` pairs whose feeds hold the tenant's whole byte
+/// quota there, so they refuse new events.
+async fn over_quota(state: &ServerState, feeds: &[Arc<Feed>]) -> HashSet<(String, String)> {
+    let tenants: std::collections::BTreeSet<&str> =
+        feeds.iter().filter_map(|f| f.tenant()).collect();
+    let mut out = HashSet::new();
+    if tenants.is_empty() {
+        return out;
+    }
+    let snapshot = state.feeds().snapshot();
+    for t in tenants {
+        let Ok(Some(record)) = state.history().tenant_get(t).await else {
+            continue;
+        };
+        let Some(max) = record.limits.max_feed_bytes else {
+            continue;
+        };
+        for (store, held) in tenant_store_bytes(state, &snapshot, t).await {
+            if held >= max {
+                out.insert((t.to_string(), store));
+            }
+        }
+    }
+    out
+}
+
 async fn views(state: &ServerState, feeds: &[Arc<Feed>]) -> Result<Vec<FeedView>, ServeError> {
     use futures::StreamExt;
     let rt = state.feeds();
+    let over = &over_quota(state, feeds).await;
     let mut by_store: std::collections::BTreeMap<&str, Vec<FeedUid>> = Default::default();
     for f in feeds {
         by_store
@@ -546,6 +614,12 @@ async fn views(state: &ServerState, feeds: &[Arc<Feed>]) -> Result<Vec<FeedView>
                 _ => None,
             };
             let mut out = view(&feed, head, undelivered, &statuses(state, &feed).await?);
+            if matches!(out.status.as_str(), "receiving" | "paused")
+                && let Some(t) = feed.tenant()
+                && over.contains(&(t.to_string(), feed.spec.store.clone()))
+            {
+                out.status = "over_quota".into();
+            }
             out.refused_recent = state.feeds().ingest().refusals(feed.uid.as_str()).len() as u64;
             let (Some(store), Some(head)) = (store, head) else {
                 return Ok(out);
@@ -620,10 +694,17 @@ async fn hourly_24h(state: &ServerState, feed: &Feed) -> Vec<u64> {
 #[derive(Debug, Clone, Serialize)]
 pub struct Quotas {
     pub tenant: String,
+    /// Every feed of the tenant, not only the listed page's.
     pub feeds: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_feeds: Option<u32>,
+    /// The bytes the tenant's feeds hold in the store where they hold the
+    /// most, delivered events kept for replay included: what
+    /// `max_feed_bytes` is checked against, per store.
     pub stored_bytes: u64,
+    /// The same, for each store, when the tenant's feeds are in more than one.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub stored_bytes_by_store: BTreeMap<String, u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_feed_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -688,11 +769,22 @@ pub async fn overview(
                 .map_err(ServeError::from)?
                 .map(|r| r.limits)
                 .unwrap_or_default();
+            let snapshot = listed(state).await?;
+            let by_store = tenant_store_bytes(state, &snapshot, t).await;
             Some(Quotas {
                 tenant: t.clone(),
-                feeds: feeds.len() as u64,
+                feeds: snapshot
+                    .feeds
+                    .iter()
+                    .filter(|f| f.tenant() == Some(t.as_str()))
+                    .count() as u64,
                 max_feeds: limits.max_feeds,
-                stored_bytes: feeds.iter().filter_map(|f| f.retained_bytes).sum(),
+                stored_bytes: by_store.values().copied().max().unwrap_or(0),
+                stored_bytes_by_store: if by_store.len() > 1 {
+                    by_store
+                } else {
+                    BTreeMap::new()
+                },
                 max_feed_bytes: limits.max_feed_bytes,
                 max_feed_events_per_sec: limits.max_feed_events_per_sec,
             })

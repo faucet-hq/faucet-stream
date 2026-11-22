@@ -1033,7 +1033,15 @@ paths:
         (kept in the run history) and those of the `--feeds` file (read-only),
         each with its store position, its deliveries and their status, and what
         the last 24 hours brought (`events_24h`, `bytes_24h`, `last_event_at`).
-        With a tenant, the tenant's quotas too. `ingest_on_api` is `false` when
+        With a tenant, the tenant's quotas too, counted over all of its feeds
+        whatever the page: `feeds`, and `stored_bytes` (the bytes its feeds
+        hold in the store where they hold the most, delivered events kept for
+        replay included: what `max_feed_bytes` is checked against in each
+        store), with `stored_bytes_by_store` when its feeds are in more than
+        one store. A feed's `status` is, worst first, `held`, `stalled`,
+        `full` (an undelivered limit is reached), `over_quota` (the tenant's
+        feeds in this store hold its whole byte quota), `paused` or
+        `receiving`. `ingest_on_api` is `false` when
         `--feeds-listen` serves the ingest routes on another listener.
         Each feed carries `retained_bytes` (every retained event, the
         delivered ones kept for replay included) and `undelivered_bytes`

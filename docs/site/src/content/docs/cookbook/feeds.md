@@ -471,7 +471,7 @@ limits, its budget and its state namespace.
 |---|---|
 | `max_feeds` | Most feeds the tenant may have. |
 | `max_feed_events_per_sec` | Most events a second its feeds accept together, per server (`429` past it). |
-| `max_feed_bytes` | Most bytes its feeds may hold together; past it they refuse new events (`503`). |
+| `max_feed_bytes` | Most bytes its feeds may hold together in one feed store, including delivered events kept for replay (`retention.max_age`); past it they refuse new events (`503 full`, feed status `over_quota`) until retention removes old events. Lower `retention.max_age` to free room sooner. |
 
 `--tenant-delivery-min-interval-secs` (default 10) is the shortest gap between
 two runs of a tenant feed's delivery, whatever its `flush.min_interval` says.

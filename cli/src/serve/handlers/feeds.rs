@@ -131,21 +131,24 @@ fn in_flight(runs: Vec<(String, Option<String>)>) -> Response {
 pub async fn list(
     State(state): State<ServerState>,
     Extension(actor): Extension<AuthContext>,
-    Query(q): Query<Scope>,
-    Query(page): Query<PageQuery>,
+    Query(q): Query<ListQuery>,
 ) -> Result<Json<FeedList>, ServeError> {
     let page = service::Page {
-        after: page.after,
-        limit: page.limit,
+        after: q.after,
+        limit: q.limit,
     };
     service::overview(&state, &actor, q.tenant.as_deref(), page)
         .await
         .map(Json)
 }
 
-/// Where a page of `GET /v1/feeds` starts and how long it is.
+/// `GET /v1/feeds`: the tenant whose feeds are meant (a tenant principal's
+/// own is implied), where the page starts and how long it is.
 #[derive(Debug, Default, Deserialize)]
-pub struct PageQuery {
+#[serde(deny_unknown_fields)]
+pub struct ListQuery {
+    #[serde(default)]
+    pub tenant: Option<String>,
     #[serde(default)]
     pub after: Option<String>,
     #[serde(default)]

@@ -3146,10 +3146,24 @@ async fn a_changed_tenant_byte_quota_reaches_its_existing_feeds() {
     srv.tick().await;
     store.append(&calls, &feed.uid, big()).await.unwrap();
 
-    history.tenant_upsert(&tenant(7000)).await.unwrap();
+    history.tenant_upsert(&tenant(6000)).await.unwrap();
     srv.tick().await;
     let full = store.append(&calls, &feed.uid, big()).await.unwrap_err();
     assert!(full.to_string().contains("is full"), "{full}");
+
+    // Nothing waits to be delivered, yet the feed is over the tenant's
+    // quota: the quota counts what the store keeps, and the view says so.
+    let listed = service::overview(&srv.state, &admin(), Some("acme"), Default::default())
+        .await
+        .unwrap();
+    let quotas = listed.quotas.unwrap();
+    let view = service::get(&srv.state, &admin(), Some("acme"), "orders")
+        .await
+        .unwrap();
+    assert_eq!(view.feed.status, "over_quota", "{quotas:?}");
+    assert_eq!((quotas.feeds, quotas.stored_bytes), (1, 6000));
+    assert_eq!(quotas.max_feed_bytes, Some(6000));
+    assert!(quotas.stored_bytes_by_store.is_empty());
 }
 
 /// A delivery whose definition was stored but whose store position was

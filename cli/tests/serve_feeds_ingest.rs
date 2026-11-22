@@ -2424,6 +2424,55 @@ async fn the_management_api_serves_feeds_to_each_role_and_audits_every_change() 
             "max_feed_bytes": 1_000_000, "max_feed_events_per_sec": 50
         })
     );
+    // The list pages; the tenant's quotas cover every feed on every page.
+    for name in ["app2", "app3"] {
+        let mut more = tenant_feed.clone();
+        more["name"] = json!(name);
+        let made = call(M::POST, "/v1/feeds", "acme-tok", Some(more)).await;
+        assert_eq!(made.status, 201, "{}", made.body);
+    }
+    let first = call(M::GET, "/v1/feeds?limit=2", "acme-tok", None).await;
+    assert_eq!(first.status, 200, "{}", first.body);
+    let names = |page: &Answer| -> Vec<String> {
+        page.body["feeds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(names(&first), vec!["app", "app2"]);
+    let next = first.body["next"].as_str().unwrap().to_string();
+    let second = call(
+        M::GET,
+        &format!("/v1/feeds?tenant=acme&after={next}&limit=2"),
+        "acme-tok",
+        None,
+    )
+    .await;
+    assert_eq!(second.status, 200, "{}", second.body);
+    assert_eq!(names(&second), vec!["app3"]);
+    assert!(second.body.get("next").is_none_or(Value::is_null));
+    for page in [&first, &second] {
+        assert_eq!(page.body["quotas"]["feeds"], 3);
+        assert_eq!(page.body["quotas"], first.body["quotas"]);
+    }
+    assert_eq!(
+        call(M::GET, "/v1/feeds?page=2", "acme-tok", None)
+            .await
+            .status,
+        400
+    );
+    for name in ["app2", "app3"] {
+        let gone = call(
+            M::DELETE,
+            &format!("/v1/feeds/{name}?tenant=acme"),
+            "admin-tok",
+            None,
+        )
+        .await;
+        assert_eq!(gone.status, 204, "{}", gone.body);
+    }
     assert_eq!(
         call(M::GET, "/v1/feeds/app", "acme-tok", None).await.status,
         200

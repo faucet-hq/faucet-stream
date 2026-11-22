@@ -588,6 +588,14 @@ pub async fn limits_refuse_and_store_nothing(backend: &dyn Backend) {
     assert_eq!(full_limit(refused), FullLimit::TenantBytes);
     let other_tenant = f.feed(quota.clone()).await;
     f.append(&other_tenant, vec![sized(90)]).await;
+    if let Some(held) = f
+        .store
+        .tenant_bytes(&f.calls, &tenant)
+        .await
+        .expect("tenant_bytes")
+    {
+        assert_eq!(held, 100, "the bytes the quota is checked against");
+    }
 
     let by_events = f.feed(StoreLimits::new().undelivered_max_events(3)).await;
     f.fill(&by_events, 5).await;

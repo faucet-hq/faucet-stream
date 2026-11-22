@@ -947,6 +947,21 @@ fn admit(
 
 fn full_refusal(e: &FeedError) -> Option<Refusal> {
     match e {
+        FeedError::Full {
+            limit: faucet_common_feed::FullLimit::TenantBytes,
+            max,
+            actual,
+            ..
+        } => Some(Refusal::unavailable(
+            "full",
+            format!(
+                "the tenant's quota is reached (tenant_bytes): its feeds in this store would hold \
+                 {actual} of the {max} bytes allowed (max_feed_bytes), counting delivered events \
+                 kept for replay; room frees up as retention removes events older than \
+                 retention.max_age; retry later"
+            ),
+            RETRY_FULL_SECS,
+        )),
         FeedError::Full { limit, .. } => Some(Refusal::unavailable(
             "full",
             format!(
@@ -2115,6 +2130,34 @@ mod tests {
         .unwrap();
         assert_eq!(full.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(full.retry_after, Some(RETRY_FULL_SECS));
+        assert!(full.message.contains("(undelivered_bytes)") && full.message.contains("catch up"));
+        let quota = full_refusal(&FeedError::Full {
+            feed: FeedUid::new("f").unwrap(),
+            limit: faucet_common_feed::FullLimit::TenantBytes,
+            max: 100,
+            actual: 120,
+        })
+        .unwrap();
+        assert_eq!(
+            (quota.status, quota.reason),
+            (StatusCode::SERVICE_UNAVAILABLE, "full")
+        );
+        assert!(
+            quota.message.contains("(tenant_bytes)"),
+            "{}",
+            quota.message
+        );
+        assert!(
+            quota.message.contains("120 of the 100 bytes"),
+            "{}",
+            quota.message
+        );
+        assert!(
+            quota.message.contains("retention.max_age"),
+            "{}",
+            quota.message
+        );
+        assert!(!quota.message.contains("catch up"), "{}", quota.message);
         assert!(full_refusal(&FeedError::Unavailable("x".into())).is_none());
     }
 }
