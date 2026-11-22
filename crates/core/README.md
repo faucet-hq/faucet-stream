@@ -544,6 +544,11 @@ them into a `Sink` / `Source`:
 | `MessageConsumer` | `MessageSourceDriver` → `DriverSource` | acknowledging a page only after the pipeline wrote it |
 | `HttpDriver` | `HttpSinkDriver` → `DriverSink` | per-record concurrency, array chunks, never reporting a delivered row failed |
 
+A `MessageDriver` whose `publish` decides rows over several attempts or as
+confirms arrive keeps them in a `RowOutcomes`: a request that fails as a whole
+then fails only the rows still undecided, and a row nobody decided is never
+reported delivered.
+
 The SQL and object-store families live in their common crates
 (`faucet_common_sql::SqlDriver`, `faucet_common_file::ObjectStoreDriver`).
 
@@ -896,7 +901,7 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `state` | `StateStore` trait, `MemoryStateStore`, `FileStateStore`, `validate_state_key` |
 | `dlq` | `DlqConfig`, `OnBatchError`, `DlqReason`, `DlqStats`, `build_envelope` |
 | `governance` | `Governance`, `GovernedSinkBuilder`, `GovernedSink`, `DlqGovernance`, `PolicyGovernance`, `Pass`, `OptOut`, `SINK_LAYERS` — one builder for every guarantee (#875, #870); `GovernedPage`, `GovernedEnvelopes`, `GovernedOutput` — the governed-page typestate (RFC 0014) |
-| `driver` | `SinkDriver` (+ `StagingDriver`, `CommitTokenDriver`, `CleanupDriver`, `SchemaDriver`, `RollbackDriver`, `ColumnarDriver`), `DriverSink`, `SourceDriver`, `DriverSource`, `MessageDriver`, `MessageSinkDriver`, `MessageConsumer`, `MessageSourceDriver`, `HttpDriver`, `HttpSinkDriver` — family drivers (RFC 0014) |
+| `driver` | `SinkDriver` (+ `StagingDriver`, `CommitTokenDriver`, `CleanupDriver`, `SchemaDriver`, `RollbackDriver`, `ColumnarDriver`), `DriverSink`, `SourceDriver`, `DriverSource`, `MessageDriver`, `MessageSinkDriver`, `MessageConsumer`, `MessageSourceDriver`, `RowOutcomes`, `HttpDriver`, `HttpSinkDriver` — family drivers (RFC 0014) |
 | `columnar` | `values_to_record_batch`, `record_batch_to_values`, `check_integral`, `binary_values_for_arrow_json` — JSON ⇄ Arrow (`arrow` feature). Binary columns read base64; a `FixedSizeBinary(16)` (UUID) column also reads a dashed UUID or 32 hex digits, which no base64 of 16 bytes can be |
 | `accounting` | `WriteReport`, `RowAccounts`, `RowAccountsSnapshot` — per-page row accounting (#879) |
 | `fidelity` | Canonical value renderings (#885) — `decimal_text`, `decimal_from_i128`, `decimal_from_pg_numeric`, `integer_*`, `number_text`, `float64` / `float32`, `binary`, `timestamp*`, `date`, `time`, `from_str` / `from_slice` / `parse_json`, `from_str_allow_non_finite` (bare `NaN` / `Infinity` as counted `null`), `non_integer_text`, `is_exact_decimal_type`, `NonFiniteCounter` |

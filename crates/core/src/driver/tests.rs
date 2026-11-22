@@ -1949,3 +1949,55 @@ async fn a_whole_page_write_that_loses_rows_fails() {
     ));
     assert!(sink.write_batch_reported(&rows).await.is_err());
 }
+
+#[test]
+fn row_outcomes_fail_only_undecided_rows_and_keep_cut_types() {
+    let mut outcomes = RowOutcomes::new();
+    assert!(!outcomes.has_decisions());
+    outcomes.confirm(0);
+    outcomes.fail(1, FaucetError::Sink("own".into()));
+    outcomes.confirm(2);
+    outcomes.reopen(2);
+    assert!(outcomes.has_decisions());
+    assert!(outcomes.is_decided(0) && !outcomes.is_decided(2));
+    let timeout = FaucetError::Timeout {
+        operation: "broker publish".into(),
+        after: Duration::from_secs(3),
+    };
+    outcomes.fail_undecided([0, 1, 2], &timeout, "broker");
+    assert!(matches!(outcomes.get(0), Some(Ok(()))));
+    assert!(matches!(outcomes.get(1), Some(Err(FaucetError::Sink(m))) if m == "own"));
+    assert!(matches!(
+        outcomes.get(2),
+        Some(Err(FaucetError::Timeout { operation, after })) if operation == "broker publish" && *after == Duration::from_secs(3)
+    ));
+
+    let mut cancelled = RowOutcomes::new();
+    cancelled.fail_undecided(
+        [0],
+        &FaucetError::Cancelled {
+            operation: "publish call".into(),
+        },
+        "broker",
+    );
+    cancelled.fail_undecided([1], &FaucetError::Source("down".into()), "broker");
+    let map = cancelled.into_map();
+    assert!(
+        matches!(&map[&0], Err(FaucetError::Cancelled { operation }) if operation == "publish call")
+    );
+    assert!(matches!(&map[&1], Err(FaucetError::Sink(m)) if m.starts_with("broker publish: ")));
+}
+
+#[test]
+fn row_outcomes_never_report_an_undecided_row_as_delivered() {
+    let mut outcomes = RowOutcomes::new();
+    outcomes.confirm(0);
+    outcomes.confirm(2);
+    let rows = outcomes.into_rows(3, "broker");
+    assert_eq!(rows.len(), 3);
+    assert!(rows[0].is_ok() && rows[2].is_ok());
+    assert!(matches!(
+        &rows[1],
+        Err(FaucetError::Sink(m)) if m == "broker publish: no outcome was recorded for this message; treating it as not delivered"
+    ));
+}

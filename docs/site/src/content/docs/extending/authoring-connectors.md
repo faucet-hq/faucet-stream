@@ -69,6 +69,11 @@ installs the run's context and recorder into it through `set_call_context` /
 `set_roundtrip_recorder`, so the run's deadline, cancel token and metering
 still reach every request.
 
+A `MessageDriver` whose `publish` decides rows over several attempts or as
+confirms arrive should keep them in a `faucet_core::driver::RowOutcomes`: when
+the request or group then fails as a whole, `fail_undecided` fails only the
+rows still open, and `into_rows` never reports an undecided row as delivered.
+
 ### A sink driver
 
 The family-neutral contract is one write primitive plus optional groups. A
