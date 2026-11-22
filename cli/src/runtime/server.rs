@@ -951,6 +951,9 @@ pub async fn cancel(
             "ok",
         )
         .await;
+        if state.cluster().enabled() {
+            persist_local_cancel(state, id).await;
+        }
         return Ok(CancelOutcome::Requested);
     }
     let rec = state
@@ -1013,6 +1016,28 @@ pub async fn cancel(
     }
     // Single instance, no local token: the run is finishing or just finished.
     Ok(CancelOutcome::Finished)
+}
+
+/// How long a cancel answered from a local token waits to record the cancel
+/// in the history.
+const LOCAL_CANCEL_WRITE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Record a cancel this instance answered from its own token, so the run's
+/// shards on peers, and a split still in progress, stop too. Best effort: the
+/// local token already stops this instance's part.
+async fn persist_local_cancel(state: &ServerState, id: &str) {
+    match tokio::time::timeout(LOCAL_CANCEL_WRITE, state.history().request_cancel(id)).await {
+        Ok(Ok(())) => runner::maybe_finalize_parent(state, id).await,
+        Ok(Err(e)) => tracing::warn!(
+            run_id = %id,
+            error = %e,
+            "could not record the cancel in the run history; only this replica's part stops now"
+        ),
+        Err(_) => tracing::warn!(
+            run_id = %id,
+            "recording the cancel in the run history timed out; only this replica's part stops now"
+        ),
+    }
 }
 
 // ── Read operations ──────────────────────────────────────────────────────────
@@ -2303,6 +2328,7 @@ mod tests {
             state_format: 0,
             pools: None,
             capabilities: caps,
+            clock_offset_ms: None,
         };
         state
             .cluster()
@@ -2341,6 +2367,7 @@ mod tests {
                 state_format: 0,
                 pools: Vec::new(),
                 capabilities: Vec::new(),
+                clock_offset_ms: None,
             })
             .await
             .unwrap();
@@ -2387,6 +2414,7 @@ mod tests {
                 state_format: 0,
                 pools: Vec::new(),
                 capabilities: Vec::new(),
+                clock_offset_ms: None,
             })
             .await
             .unwrap();
@@ -2414,6 +2442,7 @@ mod tests {
                 state_format: 0,
                 pools: None,
                 capabilities: None,
+                clock_offset_ms: None,
             }]);
         let actor = crate::serve::rbac::AuthContext {
             principal: "alice".into(),
@@ -2484,6 +2513,7 @@ mod tests {
                 state_format: 0,
                 pools: Vec::new(),
                 capabilities: Vec::new(),
+                clock_offset_ms: None,
             })
             .await
             .unwrap();
@@ -2511,6 +2541,7 @@ mod tests {
                 state_format: 0,
                 pools: None,
                 capabilities: None,
+                clock_offset_ms: None,
             }]);
         let actor = crate::serve::rbac::AuthContext {
             principal: "alice".into(),

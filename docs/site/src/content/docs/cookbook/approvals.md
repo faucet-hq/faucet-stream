@@ -103,6 +103,10 @@ anything material moved (a template version was launched in the meantime, the
 default config now points somewhere else), the request becomes `invalidated`
 with the difference spelled out and **nothing runs**: the approver reviewed
 something else. A rotated secret or a live probe result is not material.
+An approved launch launches exactly the version the reviewer saw, and only
+over the live version the reviewer saw: if another launch moves the live
+version while it executes, it is `invalidated` ("the template's live version
+changed since approval") and nothing is launched.
 
 Under `--auth-config` the requester is also checked again: if it is no longer
 a principal in the file, now holds a lower role than when it asked, or is

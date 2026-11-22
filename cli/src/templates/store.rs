@@ -39,6 +39,15 @@ fn label_write_err(
                 version: Some(version),
             }
         }
+        history::HistoryError::LaunchRaced {
+            id,
+            expected,
+            found,
+        } => CliError::TemplateLaunchRaced {
+            id,
+            expected,
+            found,
+        },
         other => registry_err(what, other),
     }
 }
@@ -1033,6 +1042,20 @@ pub async fn launch(
     target: VersionSelector,
     launched_by: Option<&str>,
 ) -> CliResult<LaunchOutcome> {
+    launch_expecting(store, id, target, None, launched_by).await
+}
+
+/// [`launch`], made only while the live version is `expect_stable` (checked
+/// with the launch write; `Some(None)`: nothing launched yet). A mismatch is
+/// [`CliError::TemplateLaunchRaced`]. An approved launch change passes the
+/// live version its reviewer saw, so it never launches over another one.
+pub async fn launch_expecting(
+    store: &TemplateStore,
+    id: &str,
+    target: VersionSelector,
+    expect_stable: Option<Option<u32>>,
+    launched_by: Option<&str>,
+) -> CliResult<LaunchOutcome> {
     let version = resolve_version(store, id, target).await?;
     require_version(store, id, version).await?;
     let before = template_state(store, id).await?;
@@ -1062,7 +1085,7 @@ pub async fn launch(
         crate::templates::bundle::require_passing(store, id, version, "launch", launched_by)
             .await?;
     let seq = store
-        .template_launch(id, version, launched_by, Some(&claim))
+        .template_launch_expecting(id, version, launched_by, Some(&claim), expect_stable)
         .await
         .map_err(|e| label_write_err(id, version, "launch", "template launch write", e))?;
     Ok(LaunchOutcome {

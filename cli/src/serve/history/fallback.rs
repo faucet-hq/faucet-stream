@@ -316,6 +316,9 @@ macro_rules! strict {
 
 #[async_trait]
 impl RunHistory for FallbackHistory {
+    async fn db_now(&self) -> Result<chrono::DateTime<chrono::Utc>, HistoryError> {
+        via!(self, p => p.db_now(), f => f.db_now())
+    }
     async fn claim_idempotency(
         &self,
         key: &str,
@@ -491,6 +494,23 @@ impl RunHistory for FallbackHistory {
 
     // ── Source shards (Mode B, #230) ─────────────────────────────────────────
 
+    async fn start_owned(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
+        strict!(self, p => p.start_owned(rec), f => f.start_owned(rec))
+    }
+    async fn coordinate_shards(
+        &self,
+        sharded: &RunRecord,
+        shards: &[super::ShardInsert],
+    ) -> Result<super::CoordinateOutcome, HistoryError> {
+        strict!(
+            self,
+            p => p.coordinate_shards(sharded, shards),
+            f => f.coordinate_shards(sharded, shards)
+        )
+    }
+    async fn cancel_flagged_shards(&self) -> Result<usize, HistoryError> {
+        strict!(self, p => p.cancel_flagged_shards(), f => f.cancel_flagged_shards())
+    }
     async fn insert_shards(
         &self,
         run_id: &str,
@@ -1123,17 +1143,18 @@ impl RunHistory for FallbackHistory {
     async fn template_delete_tag(&self, id: &str, tag: &str) -> Result<bool, HistoryError> {
         strict!(self, p => p.template_delete_tag(id, tag), f => f.template_delete_tag(id, tag))
     }
-    async fn template_launch(
+    async fn template_launch_expecting(
         &self,
         id: &str,
         version: u32,
         launched_by: Option<&str>,
         evidence: Option<&super::templates::EvidenceClaim>,
+        expect_stable: Option<Option<u32>>,
     ) -> Result<Option<u32>, HistoryError> {
         strict!(
             self,
-            p => p.template_launch(id, version, launched_by, evidence),
-            f => f.template_launch(id, version, launched_by, evidence)
+            p => p.template_launch_expecting(id, version, launched_by, evidence, expect_stable),
+            f => f.template_launch_expecting(id, version, launched_by, evidence, expect_stable)
         )
     }
     async fn template_record_test(

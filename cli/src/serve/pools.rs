@@ -382,6 +382,7 @@ mod tests {
             state_format: faucet_core::state_version::STATE_FORMAT,
             pools: pools.map(|p| p.iter().map(|s| s.to_string()).collect()),
             capabilities: None,
+            clock_offset_ms: None,
         }
     }
 

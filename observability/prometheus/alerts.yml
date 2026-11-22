@@ -299,6 +299,19 @@ groups:
             fail, this instance cancels its own runs before their leases
             expire, and /readyz is reporting 503 until the database answers.
 
+      - alert: FaucetServeClockSkew
+        expr: abs(faucet_serve_clock_offset_seconds) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "faucet serve instance's clock is {{ $value }}s off the history database's"
+          description: >
+            This replica's clock differs from the run-history database's by
+            more than 10 seconds. Leases and failover use the database's clock
+            and are unaffected, but run timestamps, timeouts and schedule ticks
+            use this one. Check NTP on the replica (and on the database host).
+
       - alert: FaucetServePoolStarved
         expr: min by (pool) (faucet_serve_runs_pending) > 0
         for: 15m

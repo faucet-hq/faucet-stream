@@ -29,6 +29,7 @@ fn beat(state_format: u32) -> InstanceHeartbeat {
         state_format,
         pools: faucet_cli::serve::pools::default_only(),
         capabilities: Vec::new(),
+        clock_offset_ms: None,
     }
 }
 

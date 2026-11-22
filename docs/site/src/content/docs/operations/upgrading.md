@@ -124,6 +124,23 @@ not roll a replica back below that release while runs in other pools are
 pending. The run-history schema moves to version 7 (an added `pool` column);
 the previous release still reads it.
 
+Run and shard leases are written on the history database's clock from the
+release that advertises `db_clock_leases`. Until every member runs it, a run or
+shard owned by a member without it (whose lease came from that member's own
+clock) gets one extra lease TTL before a new member reclaims it, so a dead old
+member's runs fail over up to `--lease-ttl-secs` later during the upgrade. An
+old member reclaiming a new member's run still compares on its own clock, as
+before; that lasts only until the upgrade finishes. The run-history schema
+moves to version 10 (an added `clock_offset_ms` column); version 9 binaries
+still read it.
+
+From the same release a sharded run is split in one owner-fenced transaction.
+A release before it splits without the fence, so during a rolling upgrade a run
+whose split is retried by an old member after a new one already split it (a
+stalled coordinator whose run was reclaimed) can still get shard rows from two
+plans. It needs a coordinator stalled for longer than the lease TTL, and ends
+when no old member is left.
+
 ## Guarantee and how it is tested
 
 - A golden fixture of every source's released bookmark shapes — bare, in the

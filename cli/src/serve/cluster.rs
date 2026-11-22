@@ -463,6 +463,7 @@ mod tests {
             state_format: 0,
             pools: Some(vec!["a".into()]),
             capabilities: None,
+            clock_offset_ms: None,
         };
         h.set_live_members(vec![m]);
         assert_eq!(

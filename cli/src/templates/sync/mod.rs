@@ -351,7 +351,11 @@ impl SyncLease {
                 Err(e) if !Self::unavailable(&e) => return Ok(None),
                 Err(e) => return Err(CliError::Internal(format!("reading the sync lease: {e}"))),
             };
-            let now = chrono::Utc::now();
+            let now = match store.db_now().await {
+                Ok(t) => t,
+                Err(e) if !Self::unavailable(&e) => return Ok(None),
+                Err(e) => return Err(CliError::Internal(format!("reading the sync lease: {e}"))),
+            };
             let held = current
                 .as_deref()
                 .and_then(|c| serde_json::from_str::<SyncLease>(c).ok())
@@ -389,7 +393,7 @@ impl SyncLease {
     async fn release_value(store: &TemplateStore, origin: &str, mine: &str) {
         let done = serde_json::json!(SyncLease {
             holder: Self::me().to_string(),
-            expires: chrono::Utc::now(),
+            expires: store.db_now().await.unwrap_or_else(|_| chrono::Utc::now()),
         })
         .to_string();
         if let Err(e) = store

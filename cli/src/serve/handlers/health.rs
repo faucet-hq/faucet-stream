@@ -65,6 +65,7 @@ pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
                 "listen": m.listen,
                 "pools": m.pools,
                 "capabilities": m.capabilities,
+                "clock_offset_ms": m.clock_offset_ms,
                 "in_flight": m.in_flight,
                 "max_concurrent": m.max_concurrent,
             })).collect::<Vec<_>>(),
@@ -180,6 +181,7 @@ mod tests {
                 state_format: 1,
                 pools: Some(vec!["private".into()]),
                 capabilities: Some(vec!["policy_pin".into()]),
+                clock_offset_ms: Some(12),
             }]);
         let resp = readyz(axum::extract::State(st)).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -196,6 +198,7 @@ mod tests {
         );
         assert_eq!(v["cluster"]["members"][0]["listen"], "10.0.0.2:8080");
         assert_eq!(v["cluster"]["members"][0]["capabilities"][0], "policy_pin");
+        assert_eq!(v["cluster"]["members"][0]["clock_offset_ms"], 12);
         assert_eq!(v["pending_finalize"], 0);
         assert!(v["policy_seed"].is_null());
         assert_eq!(v["status"], "ready");

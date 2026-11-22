@@ -5,3 +5,6 @@
 # when a listed metric is charted or no longer emitted. Chart a metric unless
 # it genuinely has no place on a dashboard.
 faucet_notifications_pending: a gauge of batches waiting in the background queue; read it with the dropped counter (reason="queue_full"/"deadline") already charted
+faucet_serve_clock_offset_seconds: a per-replica diagnostic for timestamps and timeouts (leases use the database clock); alerted on by FaucetServeClockSkew and shown per member on /readyz
+faucet_serve_runs_lost_ownership_total: a rare failover event (a replica found its claimed run owned by a peer before starting it); counted for investigation, nothing to trend
+faucet_serve_shard_coordinations_total: one increment per sharded run split; the outcome label is for investigating a lost or cancelled split, not for trending

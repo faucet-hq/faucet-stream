@@ -2066,12 +2066,13 @@ impl RunHistory for MemoryHistory {
         Ok(existed)
     }
 
-    async fn template_launch(
+    async fn template_launch_expecting(
         &self,
         id: &str,
         version: u32,
         launched_by: Option<&str>,
         evidence: Option<&templates::EvidenceClaim>,
+        expect_stable: Option<Option<u32>>,
     ) -> Result<Option<u32>, HistoryError> {
         let store = self
             .templates
@@ -2089,8 +2090,18 @@ impl RunHistory for MemoryHistory {
         let log = launches.entry(id.to_string()).or_default();
         // Re-launching what is already stable is a no-op: appending would make
         // `previous` a duplicate of `stable` and destroy the rollback target.
-        if templates::stable_version(log) == Some(version) {
+        let stable = templates::stable_version(log);
+        if stable == Some(version) {
             return Ok(None);
+        }
+        if let Some(expected) = expect_stable
+            && expected != stable
+        {
+            return Err(HistoryError::LaunchRaced {
+                id: id.to_string(),
+                expected,
+                found: stable,
+            });
         }
         if let Some(claim) = evidence {
             claim.check(&version_results(&tests, id, version))?;
