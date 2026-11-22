@@ -392,6 +392,13 @@ Inspect the exact fields with `faucet schema source <name>` / `faucet schema sin
   so a file written after the source widens picks up the new schema. A Parquet
   file's schema is immutable once opened, so a field appearing only later *within
   a single file* is dropped with a per-file one-shot warning.
+- **Kafka source and sink — `extra_client_config`** — a raw option faucet sets
+  itself is refused when its value disagrees: on the source `bootstrap.servers`,
+  `group.id`, `auto.offset.reset`, `enable.auto.commit` (must stay `false`) and
+  `isolation.level` (must stay `read_committed`); on the sink `bootstrap.servers`,
+  `acks` and `enable.idempotence` (set the typed fields), and `transactional.id`
+  always. A `from_path` topic may not name the commit-token topic, nor an internal
+  `__…` topic unless `allow_internal_topics: true`.
 - **MongoDB CDC source** — `max_staged_records` (default 1,000,000) caps the
   in-memory change-event buffer (including under `batch_size: 0`) and aborts with
   a typed error rather than risking OOM, mirroring `postgres-cdc` / `mysql-cdc`.

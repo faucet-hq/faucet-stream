@@ -86,10 +86,12 @@ impl KafkaDriver {
     fn resolve_topic(&self, record: &Value) -> Result<String, FaucetError> {
         match &self.config.topic {
             KafkaSinkTopic::Fixed { name } => Ok(name.clone()),
-            KafkaSinkTopic::FromPath { path } => {
-                extract::string_at(record, path)?.ok_or_else(|| {
+            KafkaSinkTopic::FromPath { path, .. } => {
+                let topic = extract::string_at(record, path)?.ok_or_else(|| {
                     FaucetError::Sink(format!("topic.path '{path}' did not resolve for record"))
-                })
+                })?;
+                self.config.check_record_topic(&topic)?;
+                Ok(topic)
             }
         }
     }
@@ -291,7 +293,7 @@ impl SinkDriver for KafkaDriver {
         use crate::config::KafkaSinkTopic;
         let topic = match &self.config.topic {
             KafkaSinkTopic::Fixed { name } => name.clone(),
-            KafkaSinkTopic::FromPath { path } => format!("(from_path:{path})"),
+            KafkaSinkTopic::FromPath { path, .. } => format!("(from_path:{path})"),
         };
         format!("kafka://{}?topic={}", self.config.brokers, topic)
     }

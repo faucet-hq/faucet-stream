@@ -111,7 +111,7 @@ All fields are keys under `sink.config`.
 | `batch_size` | int | `1000` | In-flight `FuturesUnordered` send-window cap per `write_batch`, and the seed for librdkafka's `queue.buffering.max.messages`. **`0` = no cap** (bounded only by `max_in_flight`). See [Streaming & batching](#streaming--batching). |
 | `linger` | int (seconds) | `0` *(5ms)* | Time the producer waits to accumulate a batch before flushing. The default is **5 ms**; for other sub-second values set `linger.ms` via `extra_client_config`. |
 | `compression` | `"none" \| "gzip" \| "snappy" \| "lz4" \| "zstd"` | `"none"` | Producer-side compression codec. See [Compression](#compression). |
-| `extra_client_config` | object (string→string) | `{}` | Raw librdkafka client properties. **Overrides** anything set by `auth` or the typed fields above. Under `faucet serve`, keys naming a broker (`bootstrap.servers`, `metadata.broker.list`), a URL (`*.url`) or a file (`*.location`, `*.file`, `sasl.kerberos.keytab`) are checked like the typed fields, and keys that load or run a program (`plugin.library.paths`, `ssl.engine.location`, `ssl.providers`, `*.cmd`) are refused for configs the server does not trust. |
+| `extra_client_config` | object (string→string) | `{}` | Raw librdkafka client properties, applied after `auth` and the typed fields. Options faucet derives from a typed field are refused when the value disagrees: `bootstrap.servers` / `metadata.broker.list` (use `brokers`), `acks` / `request.required.acks` (use `acks`), `enable.idempotence` (use `idempotent`); `transactional.id` is always refused (faucet derives it under `delivery: exactly_once`). Restating faucet's value is allowed; other keys (`linger.ms`, `compression.type`, …) override the typed fields. Under `faucet serve`, keys naming a broker (`bootstrap.servers`, `metadata.broker.list`), a URL (`*.url`) or a file (`*.location`, `*.file`, `sasl.kerberos.keytab`) are checked like the typed fields, and keys that load or run a program (`plugin.library.paths`, `ssl.engine.location`, `ssl.providers`, `*.cmd`) are refused for configs the server does not trust. |
 
 ### Effectively-once
 
@@ -147,6 +147,8 @@ topic:
 ```
 
 For `from_path`, the path must resolve to a non-empty string for **every** record — a missing or non-string value is always fatal. `on_key_error` does **not** apply to topic routing.
+
+A record may not route to the exactly-once commit-token topic (`commit_token_topic`, default `__faucet_commit_token`), since that would move another pipeline's committed position, nor to an internal topic (a name starting with `__`) unless `allow_internal_topics: true` is set on the `from_path` topic. Such a record fails its row.
 
 ## Encoding
 

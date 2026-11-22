@@ -295,6 +295,7 @@ async fn dataset_uri_for_both_topic_modes() {
         &brokers,
         KafkaSinkTopic::FromPath {
             path: "$.dest".into(),
+            allow_internal_topics: false,
         },
     ))
     .await
@@ -337,6 +338,7 @@ async fn null_topic_path_is_unresolved() {
         "127.0.0.1:1",
         KafkaSinkTopic::FromPath {
             path: "$.dest".into(),
+            allow_internal_topics: false,
         },
     );
     let sink = KafkaSink::new(cfg).await.unwrap();
