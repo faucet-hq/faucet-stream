@@ -1043,7 +1043,7 @@ mod templates {
     };
     use faucet_cli::serve::load::ConfigFormat;
 
-    fn draft(id: &str, description: Option<&str>) -> TemplateDraft {
+    pub(super) fn draft(id: &str, description: Option<&str>) -> TemplateDraft {
         TemplateDraft {
             id: TemplateId::parse(id).unwrap(),
             name: Some(id.to_string()),
@@ -3100,4 +3100,36 @@ async fn coordinate_shards_is_one_fenced_transaction() {
         .unwrap();
     assert_eq!(a.cancel_flagged_shards().await.unwrap(), 2);
     assert_eq!(a.shard_progress("s2").await.unwrap().cancelled, 2);
+}
+
+/// Pruning keeps a version a stored schedule pins, on a SQL history.
+#[tokio::test]
+async fn pruning_keeps_a_schedule_pinned_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(&dir, "pins.db").await;
+    let schedule: faucet_cli::serve::history::schedules::ScheduleRecord =
+        serde_json::from_value(serde_json::json!({
+            "id": "s1",
+            "spec": {
+                "name": "nightly",
+                "cron": "0 3 * * *",
+                "template": {"id": "orders", "version": "2"}
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "created_by": "u",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "updated_by": "u",
+            "revision": 1
+        }))
+        .unwrap();
+    assert!(s.schedule_insert(&schedule).await.unwrap());
+    let retain = faucet_cli::serve::history::templates::VERSION_RETAIN as u32;
+    for _ in 0..retain + 3 {
+        s.template_register(&templates::draft("orders", None))
+            .await
+            .unwrap();
+    }
+    let kept = s.template_versions("orders").await.unwrap();
+    assert!(kept.contains(&2), "{kept:?}");
+    assert!(!kept.contains(&1) && !kept.contains(&3), "{kept:?}");
 }

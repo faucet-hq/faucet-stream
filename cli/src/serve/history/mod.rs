@@ -2760,22 +2760,85 @@ pub trait RunHistory: Send + Sync {
                 protected.insert(v);
             }
         }
-        // A pending launch request names the version it will launch.
-        let pending = self
-            .change_list(&crate::serve::changes::ChangeListFilter {
-                status: Some(crate::serve::changes::ChangeStatus::Pending),
-                kind: Some(crate::serve::changes::ChangeKind::TemplateLaunch),
-                ..Default::default()
-            })
-            .await?;
-        protected.extend(templates::launch_request_pins(
-            pending.iter().map(|c| &c.payload),
-            id,
-        ));
-        for stale in templates::versions_to_prune(versions, &protected) {
+        protected.extend(self.template_pins(id).await?);
+        let stale = templates::versions_to_prune(versions, &protected);
+        if !stale.is_empty() {
+            tracing::debug!(
+                template = %id,
+                kept = ?protected,
+                "pruning old template versions; launched, labelled and pinned versions are kept"
+            );
+        }
+        for stale in stale {
             self.template_delete(id, Some(stale)).await?;
         }
         Ok(())
+    }
+
+    /// The versions of `id` something names by number, so pruning keeps them:
+    /// stored schedules and feed deliveries, pending and approved (incl.
+    /// deferred) launch, schedule and feed change requests, and the pins of
+    /// the server's own files ([`file_pins`](Self::file_pins)). Pins name
+    /// versions across ids: a schedule of template A pinning sink template B
+    /// at v7 keeps B v7. A run change carries a materialized config, not a
+    /// template reference, so it pins nothing.
+    async fn template_pins(
+        &self,
+        id: &str,
+    ) -> Result<std::collections::BTreeSet<u32>, HistoryError> {
+        use crate::serve::changes::{ChangeKind, ChangeListFilter, ChangeStatus};
+        let mut pins = self.file_pins();
+        for s in self.schedule_list().await? {
+            if let Ok(v) = serde_json::to_value(&s.spec.template) {
+                pins.extend(templates::reference_pins(&v));
+            }
+        }
+        for f in self.feed_list().await? {
+            for d in &f.spec.deliveries {
+                if let Some(t) = &d.template
+                    && let Ok(v) = serde_json::to_value(t)
+                {
+                    pins.extend(templates::reference_pins(&v));
+                }
+            }
+        }
+        let mut protected = templates::pinned_versions(&pins, id);
+        for status in [ChangeStatus::Pending, ChangeStatus::Approved] {
+            let changes = self
+                .change_list(&ChangeListFilter {
+                    status: Some(status),
+                    limit: u32::MAX as usize,
+                    ..Default::default()
+                })
+                .await?;
+            protected.extend(templates::launch_request_pins(
+                changes
+                    .iter()
+                    .filter(|c| c.kind == ChangeKind::TemplateLaunch)
+                    .map(|c| &c.payload),
+                id,
+            ));
+            let referenced: Vec<templates::Pin> = changes
+                .iter()
+                .filter(|c| matches!(c.kind, ChangeKind::Schedule | ChangeKind::Feed))
+                .flat_map(|c| templates::change_references(&c.payload))
+                .flat_map(templates::reference_pins)
+                .collect();
+            protected.extend(templates::pinned_versions(&referenced, id));
+        }
+        Ok(protected)
+    }
+
+    /// Record the template versions the server's own files pin
+    /// (`--schedules`, `--triggers`, `--feeds`), so pruning keeps them. They
+    /// live as long as this history handle; the default keeps none.
+    fn set_file_pins(&self, pins: Vec<templates::Pin>) {
+        let _ = pins;
+    }
+
+    /// The pins [`set_file_pins`](Self::set_file_pins) recorded.
+    fn file_pins(&self) -> Vec<templates::Pin> {
+        Vec::new()
     }
 
     /// The recovery probe: a write the backend must accept to count as

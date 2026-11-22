@@ -811,6 +811,66 @@ pub fn launch_request_pins<'a>(
         .collect()
 }
 
+/// A template version a schedule, trigger, feed delivery or change request
+/// names by number, so pruning keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Pin {
+    pub id: String,
+    pub version: u32,
+}
+
+/// The numeric pins in a template reference (`{id, version, sink,
+/// sink_version, overlay, overlay_version}`, the shape schedules, triggers
+/// and feed deliveries share). A channel (`stable`, `prod`, …) follows its
+/// pointer, which is protected on its own, so it pins nothing.
+pub fn reference_pins(reference: &serde_json::Value) -> Vec<Pin> {
+    let number = |v: Option<&serde_json::Value>| -> Option<u32> {
+        match v? {
+            serde_json::Value::Number(n) => n.as_u64().and_then(|v| u32::try_from(v).ok()),
+            serde_json::Value::String(s) => s.parse().ok(),
+            _ => None,
+        }
+    };
+    let id = |k: &str| reference.get(k).and_then(serde_json::Value::as_str);
+    [
+        ("id", "version"),
+        ("sink", "sink_version"),
+        ("overlay", "overlay_version"),
+    ]
+    .into_iter()
+    .filter_map(|(name, version)| {
+        Some(Pin {
+            id: id(name)?.to_string(),
+            version: number(reference.get(version))?,
+        })
+    })
+    .collect()
+}
+
+/// The template references a schedule or feed change request's payload
+/// carries (`spec.template`, `spec.deliveries[].template`).
+pub fn change_references(payload: &serde_json::Value) -> Vec<&serde_json::Value> {
+    let Some(spec) = payload.get("spec") else {
+        return Vec::new();
+    };
+    let mut out: Vec<&serde_json::Value> = spec.get("template").into_iter().collect();
+    if let Some(deliveries) = spec.get("deliveries").and_then(serde_json::Value::as_array) {
+        out.extend(deliveries.iter().filter_map(|d| d.get("template")));
+    }
+    out
+}
+
+/// The versions of `id` that `pins` name.
+pub fn pinned_versions<'a>(
+    pins: impl IntoIterator<Item = &'a Pin>,
+    id: &str,
+) -> std::collections::BTreeSet<u32> {
+    pins.into_iter()
+        .filter(|p| p.id == id)
+        .map(|p| p.version)
+        .collect()
+}
+
 pub fn versions_to_prune(
     mut versions: Vec<u32>,
     protected: &std::collections::BTreeSet<u32>,

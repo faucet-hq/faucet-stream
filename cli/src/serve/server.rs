@@ -1327,6 +1327,41 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         #[cfg(feature = "triggers")]
         triggers_handle,
     );
+    // Template versions this server's own files pin are never pruned.
+    {
+        #[allow(unused_mut)]
+        let mut references: Vec<serde_json::Value> = Vec::new();
+        #[cfg(all(feature = "schedule", feature = "templates"))]
+        references.extend(
+            schedules_file
+                .iter()
+                .filter_map(|s| serde_json::to_value(&s.template).ok()),
+        );
+        #[cfg(feature = "triggers")]
+        if let Some(t) = &triggers {
+            references.extend(
+                t.triggers
+                    .iter()
+                    .filter_map(|c| c.spec.template.as_ref())
+                    .filter_map(|t| serde_json::to_value(t).ok()),
+            );
+        }
+        #[cfg(feature = "feeds")]
+        references.extend(
+            feeds_file
+                .feeds
+                .iter()
+                .flat_map(|f| f.deliveries.iter())
+                .filter_map(|d| d.template.as_ref())
+                .filter_map(|t| serde_json::to_value(t).ok()),
+        );
+        state.history().set_file_pins(
+            references
+                .iter()
+                .flat_map(crate::serve::history::templates::reference_pins)
+                .collect(),
+        );
+    }
     // Template tests this server runs screen for its credentials and record
     // this instance on their results (#856).
     #[cfg(feature = "templates")]

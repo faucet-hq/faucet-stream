@@ -173,7 +173,10 @@ impl FallbackHistory {
         let p = match (self.primary.get(), &self.connector) {
             (Some(p), _) => p,
             (None, Some(connect)) => match connect().await {
-                Ok(p) => self.primary.get_or_init(|| p),
+                Ok(p) => {
+                    p.set_file_pins(self.fallback.file_pins());
+                    self.primary.get_or_init(|| p)
+                }
                 Err(e) => {
                     tracing::debug!(backend = self.label, error = %e, "run-history backend still unreachable");
                     return false;
@@ -318,6 +321,15 @@ macro_rules! strict {
 impl RunHistory for FallbackHistory {
     async fn db_now(&self) -> Result<chrono::DateTime<chrono::Utc>, HistoryError> {
         via!(self, p => p.db_now(), f => f.db_now())
+    }
+    fn set_file_pins(&self, pins: Vec<super::templates::Pin>) {
+        if let Some(p) = self.primary.get() {
+            p.set_file_pins(pins.clone());
+        }
+        self.fallback.set_file_pins(pins);
+    }
+    fn file_pins(&self) -> Vec<super::templates::Pin> {
+        self.fallback.file_pins()
     }
     async fn claim_idempotency(
         &self,

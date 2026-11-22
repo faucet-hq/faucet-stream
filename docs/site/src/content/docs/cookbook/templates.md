@@ -1111,6 +1111,14 @@ refused: the reference stays unresolved in the persisted body and resolves on
 the executing instance. Non-clustered servers store no config body and are
 unaffected.
 
+A template keeps its newest 20 versions; an older one is deleted when a new
+version is registered, unless something still names it: the launched
+(`stable`) and `previous` versions, every channel, and every version a
+schedule, a trigger, a feed delivery or a pending or approved change request
+pins by number (including a sink or overlay version a source template's
+schedule names). A channel pin (`stable`, `prod`) follows its pointer and keeps
+whatever the pointer names.
+
 ## Hosting templates in a repo or bucket (sync)
 
 *(requires the `templates-sync` build feature; S3 / GCS / Azure Blob origins

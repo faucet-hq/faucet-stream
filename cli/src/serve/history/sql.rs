@@ -3544,6 +3544,8 @@ macro_rules! impl_sql_history {
             /// How far ahead each upsert / heartbeat pushes a run's lease.
             lease_ttl: std::time::Duration,
             stmts: $crate::serve::history::sql::Stmts,
+            /// Template versions the server's own files pin.
+            file_pins: std::sync::RwLock<Vec<$crate::serve::history::templates::Pin>>,
         }
 
         impl $name {
@@ -3675,6 +3677,7 @@ macro_rules! impl_sql_history {
                     instance_id,
                     lease_ttl,
                     stmts,
+                    file_pins: std::sync::RwLock::new(Vec::new()),
                 }
             }
 
@@ -3786,6 +3789,16 @@ macro_rules! impl_sql_history {
                 &self,
             ) -> Result<chrono::DateTime<chrono::Utc>, $crate::serve::history::HistoryError> {
                 self.read_db_now().await
+            }
+
+            fn set_file_pins(&self, pins: Vec<$crate::serve::history::templates::Pin>) {
+                if let Ok(mut p) = self.file_pins.write() {
+                    *p = pins;
+                }
+            }
+
+            fn file_pins(&self) -> Vec<$crate::serve::history::templates::Pin> {
+                self.file_pins.read().map(|p| p.clone()).unwrap_or_default()
             }
 
             async fn claim_idempotency(

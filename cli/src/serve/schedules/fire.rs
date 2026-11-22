@@ -530,8 +530,28 @@ async fn fire_target(
     match trigger_template(state.clone(), principal, spec.template.id.clone(), body).await {
         Ok(TriggerOutcome::Run(r)) => TargetResult::Started(r.run.run_id),
         Ok(TriggerOutcome::PendingApproval(c)) => TargetResult::Started(format!("change:{}", c.id)),
+        Err(ServeError::NotFound) => TargetResult::Failed(missing_template(&spec.template)),
         Err(e) => classify(e, tenant),
     }
+}
+
+/// Why a schedule's template could not be found: a pinned version that no
+/// longer exists (deleted by hand: pruning keeps pinned versions) is named.
+pub fn missing_template(t: &crate::serve::history::schedules::ScheduleTemplate) -> String {
+    let pins = serde_json::to_value(t)
+        .map(|v| crate::serve::history::templates::reference_pins(&v))
+        .unwrap_or_default();
+    if pins.is_empty() {
+        return "the template was not found".to_string();
+    }
+    let named: Vec<String> = pins
+        .iter()
+        .map(|p| format!("v{} of template '{}'", p.version, p.id))
+        .collect();
+    format!(
+        "the template was not found: it pins {}; if one of them was deleted, re-pin the schedule",
+        named.join(", ")
+    )
 }
 
 #[cfg(test)]
@@ -684,6 +704,15 @@ mod tests {
             classify(ServeError::Forbidden("no".into()), None),
             TargetResult::Failed(_)
         ));
+        let mut t: crate::serve::history::schedules::ScheduleTemplate =
+            serde_json::from_value(serde_json::json!({"id": "orders"})).unwrap();
+        assert_eq!(missing_template(&t), "the template was not found");
+        t.version = Some("3".into());
+        assert!(
+            missing_template(&t).contains("v3 of template 'orders'"),
+            "{}",
+            missing_template(&t)
+        );
     }
 
     fn pinned() -> ScheduleSpec {
