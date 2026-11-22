@@ -347,3 +347,141 @@ async fn natural_pagination_end_still_emits_bookmark() {
     assert_eq!(records.len(), 2);
     assert_eq!(bookmark, Some(json!("2026-01-02T00:00:00Z")));
 }
+
+/// Pages `/items` (no token) → A → B → A: B points back at an earlier page.
+async fn cycling_feed() -> MockServer {
+    let server = MockServer::start().await;
+    for (token, next, id, ts) in [
+        ("A", "B", 2, "2026-01-02T00:00:00Z"),
+        ("B", "A", 3, "2026-01-03T00:00:00Z"),
+    ] {
+        Mock::given(method("GET"))
+            .and(path("/items"))
+            .and(query_param("page_token", token))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": id, "updated_at": ts}],
+                "next_page_token": next
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": 1, "updated_at": "2026-01-01T00:00:00Z"}],
+            "next_page_token": "A"
+        })))
+        .with_priority(5)
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn a_cursor_that_loops_back_to_an_earlier_page_fails_a_full_refresh() {
+    let server = cycling_feed().await;
+    let config = RestStreamConfig::new(&server.uri(), "/items")
+        .records_path("$.data[*]")
+        .pagination(cursor());
+    let (records, outcome) = drain_result(&RestStream::new(config).unwrap()).await;
+    assert_eq!(records.len(), 3, "every page read is delivered once");
+    let err = outcome.expect_err("a loop leaves pages unread");
+    assert!(
+        err.contains("Cursor pagination repeated an earlier"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn an_unordered_incremental_pass_that_loops_keeps_no_bookmark() {
+    let server = cycling_feed().await;
+    let config = RestStreamConfig::new(&server.uri(), "/items")
+        .records_path("$.data[*]")
+        .replication_method(ReplicationMethod::Incremental)
+        .replication_key("updated_at")
+        .pagination(cursor());
+    let (_, outcome) = drain_result(&RestStream::new(config).unwrap()).await;
+    assert!(outcome.is_err(), "{outcome:?}");
+}
+
+#[tokio::test]
+async fn an_ordered_pushed_pass_that_loops_keeps_the_largest_key_read() {
+    let server = cycling_feed().await;
+    let config = RestStreamConfig::new(&server.uri(), "/items")
+        .records_path("$.data[*]")
+        .replication_method(ReplicationMethod::Incremental)
+        .replication_key("updated_at")
+        .replication_bind(since_bind())
+        .assume_ordered(true)
+        .pagination(cursor());
+    let (records, bookmark) = drain(&RestStream::new(config).unwrap()).await;
+    assert_eq!(records.len(), 3);
+    assert_eq!(bookmark, Some(json!("2026-01-03T00:00:00Z")));
+}
+
+#[tokio::test]
+async fn a_link_header_that_loops_back_fails() {
+    let server = MockServer::start().await;
+    let base = server.uri();
+    for (page, next) in [("2", "3"), ("3", "2")] {
+        Mock::given(method("GET"))
+            .and(path("/items"))
+            .and(query_param("page", page))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data": [{"id": page}]}))
+                    .insert_header(
+                        "link",
+                        format!("<{base}/items?page={next}>; rel=\"next\"").as_str(),
+                    ),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"data": [{"id": "1"}]}))
+                .insert_header(
+                    "link",
+                    format!("<{base}/items?page=2>; rel=\"next\"").as_str(),
+                ),
+        )
+        .with_priority(5)
+        .mount(&server)
+        .await;
+    let config = RestStreamConfig::new(&server.uri(), "/items")
+        .records_path("$.data[*]")
+        .pagination(PaginationStyle::LinkHeader);
+    let (records, outcome) = drain_result(&RestStream::new(config).unwrap()).await;
+    assert_eq!(records.len(), 3);
+    let err = outcome.expect_err("a link loop leaves pages unread");
+    assert!(err.contains("LinkHeader pagination repeated"), "{err}");
+}
+
+#[tokio::test]
+async fn a_server_echoing_the_stored_cursor_ends_without_a_repeat_page() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/items"))
+        .and(query_param("page_token", "S"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": 9}],
+            "next_page_token": "S"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let config = RestStreamConfig::new(&server.uri(), "/items")
+        .records_path("$.data[*]")
+        .pagination(cursor())
+        .persist_cursor(true);
+    let stream = RestStream::new(config).unwrap();
+    stream.apply_start_bookmark(json!("S")).await.unwrap();
+    let (records, bookmark) = drain(&stream).await;
+    assert_eq!(records, vec![json!({"id": 9})]);
+    assert_eq!(bookmark, Some(json!("S")));
+}

@@ -237,29 +237,68 @@ pub struct PaginationState {
     /// is paged past instead of failing the pass.
     #[doc(hidden)]
     pub allow_repeated_pages: bool,
+    /// Set by [`PaginationStyle::advance`] when a cursor or next link
+    /// repeated an earlier, non-adjacent one: the pass went round a loop, so
+    /// the pages behind it were never read.
+    #[doc(hidden)]
+    pub cycle: bool,
+}
+
+/// How a next cursor or link relates to the ones this pass followed.
+#[derive(Debug, PartialEq, Eq)]
+enum TokenSeen {
+    New,
+    /// The one just used: the server's end-of-feed echo.
+    Adjacent,
+    /// One followed earlier in the pass: a loop.
+    Earlier,
+}
+
+/// A cursor or link as `length / FNV` for logs and errors; the text itself
+/// can be an opaque credential-like value or carry a key in its query.
+pub(crate) fn token_digest(t: &str) -> String {
+    format!(
+        "{} chars, fnv {:016x}",
+        t.chars().count(),
+        faucet_core::shard::shard_hash(t)
+    )
 }
 
 impl PaginationState {
-    /// Record `token` as followed; `true` when it was already followed this
-    /// pass (a pagination cycle).
-    fn token_repeats(&mut self, token: Option<&String>) -> bool {
-        match token {
-            Some(t) => {
-                Some(t) == self.previous_token.as_ref() || !self.seen_tokens.insert(t.clone())
-            }
-            None => false,
+    /// Classify `token` against the cursors and links this pass followed,
+    /// recording it as followed. `current_url` is the URL of the request just
+    /// made (link styles). An earlier repeat sets [`Self::cycle`].
+    fn classify_token(&mut self, token: Option<&String>, current_url: Option<&str>) -> TokenSeen {
+        let Some(t) = token else {
+            return TokenSeen::New;
+        };
+        if Some(t) == self.previous_token.as_ref() || Some(t.as_str()) == current_url {
+            return TokenSeen::Adjacent;
         }
+        if self.seen_tokens.insert(t.clone()) {
+            return TokenSeen::New;
+        }
+        self.cycle = true;
+        TokenSeen::Earlier
+    }
+
+    /// Seed the pass with a cursor stored by an earlier run, so a server that
+    /// echoes it back ends the pass instead of re-reading its page.
+    pub(crate) fn seed_cursor(&mut self, cursor: String) {
+        self.seen_tokens.insert(cursor.clone());
+        self.previous_token = Some(cursor.clone());
+        self.next_token = Some(cursor);
     }
 
     /// Record the URL just fetched (when the transport tagged it), so a next
     /// link pointing back at an earlier page is caught too.
-    fn note_request_url(&mut self, headers: &HeaderMap) {
-        if let Some(url) = headers
+    fn note_request_url(&mut self, headers: &HeaderMap) -> Option<String> {
+        let url = headers
             .get(crate::url_util::REQUEST_URL_HEADER)
-            .and_then(|v| v.to_str().ok())
-        {
-            self.seen_tokens.insert(url.to_owned());
-        }
+            .and_then(|v| v.to_str().ok())?
+            .to_owned();
+        self.seen_tokens.insert(url.clone());
+        Some(url)
     }
 
     /// Record `fp` as seen. `Ok(true)` when the previous page had it (a
@@ -282,6 +321,20 @@ impl PaginationState {
              `total_path` ends paging on the server's own count); if pages can legitimately \
              repeat, set `allow_repeated_pages: true` together with `max_pages`"
         )))
+    }
+}
+
+fn warn_repeat(kind: &str, seen: TokenSeen, token: &str) {
+    match seen {
+        TokenSeen::Earlier => tracing::warn!(
+            "pagination loop: {kind} ({}) repeated an earlier one — stopping; pages behind \
+             the loop were not read",
+            token_digest(token)
+        ),
+        _ => tracing::warn!(
+            "pagination: {kind} ({}) repeated the one just used — stopping",
+            token_digest(token)
+        ),
     }
 }
 
@@ -336,6 +389,21 @@ fn pick_cursor(agg: RecordCursorAgg, current: Value, candidate: Value) -> Value 
 }
 
 impl PaginationStyle {
+    /// The style's config name, for messages.
+    pub(crate) fn style_name(&self) -> &'static str {
+        match self {
+            PaginationStyle::None => "None",
+            PaginationStyle::Cursor { .. } => "Cursor",
+            PaginationStyle::CursorInBody { .. } => "CursorInBody",
+            PaginationStyle::LinkHeader => "LinkHeader",
+            PaginationStyle::NextLinkInBody { .. } => "NextLinkInBody",
+            PaginationStyle::PageNumber { .. } => "PageNumber",
+            PaginationStyle::Offset { .. } => "Offset",
+            PaginationStyle::OffsetInBody { .. } => "OffsetInBody",
+            PaginationStyle::RecordFieldCursor { .. } => "RecordFieldCursor",
+        }
+    }
+
     pub fn apply_params(&self, params: &mut HashMap<String, String>, state: &PaginationState) {
         match self {
             PaginationStyle::None => {}
@@ -406,11 +474,9 @@ impl PaginationStyle {
                 let has_next = cursor::advance(body, next_token_path, &mut state.next_token)?;
                 if has_next {
                     let next = state.next_token.clone();
-                    if state.token_repeats(next.as_ref()) {
-                        tracing::warn!(
-                            "pagination loop detected: cursor {:?} repeated — stopping",
-                            state.next_token
-                        );
+                    let seen = state.classify_token(next.as_ref(), None);
+                    if seen != TokenSeen::New {
+                        warn_repeat("cursor", seen, next.as_deref().unwrap_or_default());
                         return Ok(false);
                     }
                     state.previous_token = state.next_token.clone();
@@ -425,11 +491,9 @@ impl PaginationStyle {
                 let has_next = cursor::advance(body, next_token_path, &mut state.next_token)?;
                 if has_next {
                     let next = state.next_token.clone();
-                    if state.token_repeats(next.as_ref()) {
-                        tracing::warn!(
-                            "pagination loop detected: body cursor {:?} repeated — stopping",
-                            state.next_token
-                        );
+                    let seen = state.classify_token(next.as_ref(), None);
+                    if seen != TokenSeen::New {
+                        warn_repeat("body cursor", seen, next.as_deref().unwrap_or_default());
                         return Ok(false);
                     }
                     state.previous_token = state.next_token.clone();
@@ -439,11 +503,10 @@ impl PaginationStyle {
             PaginationStyle::LinkHeader => match link_header::extract_next_link(headers) {
                 Some(link) => {
                     let link = resolve_against_request(headers, &link)?;
-                    state.note_request_url(headers);
-                    if state.token_repeats(Some(&link)) {
-                        tracing::warn!(
-                            "pagination loop detected: link {link:?} repeated — stopping"
-                        );
+                    let current = state.note_request_url(headers);
+                    let seen = state.classify_token(Some(&link), current.as_deref());
+                    if seen != TokenSeen::New {
+                        warn_repeat("link", seen, &link);
                         state.next_link = None;
                         return Ok(false);
                     }
@@ -467,13 +530,11 @@ impl PaginationStyle {
                                 ))
                             })?);
                     }
-                    state.note_request_url(headers);
+                    let current = state.note_request_url(headers);
                     let next = state.next_link.clone();
-                    if state.token_repeats(next.as_ref()) {
-                        tracing::warn!(
-                            "pagination loop detected: next_link {:?} repeated — stopping",
-                            state.next_link
-                        );
+                    let seen = state.classify_token(next.as_ref(), current.as_deref());
+                    if seen != TokenSeen::New {
+                        warn_repeat("next_link", seen, next.as_deref().unwrap_or_default());
                         return Ok(false);
                     }
                     state.previous_token = state.next_link.clone();
@@ -848,11 +909,40 @@ mod new_style_tests {
     #[test]
     fn an_absent_token_never_repeats() {
         let mut state = PaginationState::default();
-        assert!(!state.token_repeats(None));
-        assert!(!state.token_repeats(None));
+        assert_eq!(state.classify_token(None, None), TokenSeen::New);
+        assert_eq!(state.classify_token(None, None), TokenSeen::New);
         let t = "a".to_string();
-        assert!(!state.token_repeats(Some(&t)));
-        assert!(state.token_repeats(Some(&t)));
+        assert_eq!(state.classify_token(Some(&t), None), TokenSeen::New);
+        assert_eq!(state.classify_token(Some(&t), None), TokenSeen::Earlier);
+        assert!(state.cycle);
+    }
+
+    #[test]
+    fn a_repeat_of_the_token_just_used_is_adjacent_and_an_older_one_a_cycle() {
+        let (a, b) = ("a".to_string(), "b".to_string());
+        let mut state = PaginationState::default();
+        assert_eq!(state.classify_token(Some(&a), None), TokenSeen::New);
+        state.previous_token = Some(a.clone());
+        assert_eq!(state.classify_token(Some(&a), None), TokenSeen::Adjacent);
+        assert!(!state.cycle);
+        assert_eq!(state.classify_token(Some(&b), None), TokenSeen::New);
+        state.previous_token = Some(b.clone());
+        assert_eq!(state.classify_token(Some(&a), None), TokenSeen::Earlier);
+        assert!(state.cycle);
+
+        let mut link = PaginationState::default();
+        assert_eq!(
+            link.classify_token(Some(&"u1".to_string()), Some("u1")),
+            TokenSeen::Adjacent
+        );
+        let mut seeded = PaginationState::default();
+        seeded.seed_cursor("s".into());
+        assert_eq!(seeded.next_token.as_deref(), Some("s"));
+        assert_eq!(
+            seeded.classify_token(Some(&"s".to_string()), None),
+            TokenSeen::Adjacent
+        );
+        assert!(token_digest("secret").starts_with("6 chars, fnv "));
     }
 
     #[test]

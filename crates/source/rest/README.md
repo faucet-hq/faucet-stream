@@ -402,7 +402,7 @@ a catalog endpoint, a REST admin API) is pure YAML, never a code path.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `list` | object / null | — | Step 1: listing request — `get` (path), `items` (JSONPath to the array), `name` (JSONPath per item), optional `keep_if` predicate and `exclude_name_suffixes`, and `next` (JSONPath to the next page's URL — absolute or relative to `base_url`; pages are followed until it is null/empty/repeats; without it only the first page is read). Omit when `objects` is supplied directly. |
+| `list` | object / null | — | Step 1: listing request — `get` (path), `items` (JSONPath to the array), `name` (JSONPath per item), optional `keep_if` predicate and `exclude_name_suffixes`, and `next` (JSONPath to the next page's URL — absolute or relative to `base_url`; pages are followed until it is null/empty or repeats the page just read; a link back to an earlier page fails discovery, since datasets behind the loop were never listed; without it only the first page is read). Omit when `objects` is supplied directly. |
 | `objects` | array<string> **or** string | `[]` | Datasets supplied directly — a list or a comma-separated string, so one run-param can drive it (`objects: "${param.objects}"`). |
 | `describe` | object / null | — | Step 2: per-dataset field discovery — `get` (templated path), `fields`/`field_name`/`field_type`/`field_nullable` JSONPaths, a `type_map`, and `skip_types`. Omit when the source returns every column by default. |
 | `emit.config` | object | — | Step 3: JSON deep-merged into the dataset's source config (e.g. a query built from `${field_names}`). Every string leaf is templated. |
@@ -970,17 +970,22 @@ The `pagination` field selects a `PaginationStyle` (tagged by `type`). `max_page
 | Style (`type`) | Fields | Stops when |
 |----------------|--------|------------|
 | `None` | — | After the first page. |
-| `Cursor` | `next_token_path`, `param_name` | Next-token JSONPath is null/absent, or the same cursor repeats (loop detection). |
-| `CursorInBody` | `next_token_path`, `body_cursor_field` | POST-search endpoints: the next-page cursor is read from the response body and written **into the request JSON body** at `body_cursor_field` (rather than a query param). Stops when the cursor is null/absent or repeats. E.g. a CRM `POST …/search` — `$.paging.next.after` → `after`. A JSON Pointer (`/variables/after`) targets a nested location (a new key of an existing object, or an existing value). |
-| `LinkHeader` | — | No `rel="next"` in the `Link` response header, or the same link repeats. |
-| `NextLinkInBody` | `next_link_path` | Next-page URL is absent, null, empty, or repeats. |
+| `Cursor` | `next_token_path`, `param_name` | Next-token JSONPath is null/absent, or the cursor just used comes back (an earlier one fails the run; see below). |
+| `CursorInBody` | `next_token_path`, `body_cursor_field` | POST-search endpoints: the next-page cursor is read from the response body and written **into the request JSON body** at `body_cursor_field` (rather than a query param). Stops when the cursor is null/absent or the one just used comes back. E.g. a CRM `POST …/search` — `$.paging.next.after` → `after`. A JSON Pointer (`/variables/after`) targets a nested location (a new key of an existing object, or an existing value). |
+| `LinkHeader` | — | No `rel="next"` in the `Link` response header, or the link just followed comes back. |
+| `NextLinkInBody` | `next_link_path` | Next-page URL is absent, null, empty, or the one just followed. |
 | `PageNumber` | `param_name`, `start_page`, `page_size`, `page_size_param` | A zero-record page, or the same records as the previous page (content-stagnation detection for APIs that clamp out-of-range pages); a repeat of an earlier, non-adjacent page fails the run. |
 | `Offset` | `offset_param`, `limit_param`, `limit`, `total_path`, `rows_path`, `stop_when_short` *(optional)* | A zero-record page, offset reaches `total` (via `total_path`), or an identical repeated page. Without `total_path` a short page does **not** stop paging — the server may cap `limit` — so the walk ends on the empty page after it; set `stop_when_short: true` for a server that never caps a page but rejects an offset past the end (`400`/`416`). The offset advances by the records received, or by the matches of `rows_path` (required when `records_path` fans out to nested children or `record_ancestors` is set). |
 
-"Repeats" means any cursor, link or page already seen in the same pass, not
-only the previous one, so a server alternating between two cursors (A→B→A)
-stops instead of looping; a next link pointing back at a URL already fetched
-counts as a repeat. A page (`PageNumber` / `Offset` / `OffsetInBody`)
+A cursor or link equal to the one just used (or a next link pointing back at
+the URL just fetched) is the server's end-of-feed echo and ends paging
+normally. One equal to an **earlier** cursor or link of the same pass (a
+server alternating A→B→A) means paging went round a loop and the pages behind
+it were never read, so the run **fails** — whether the pass is incremental or a
+full refresh. The one exception is an incremental pass declared
+`assume_ordered` with a `replication_bind`: it keeps the largest key read,
+since the unread rows sort after it and the next run starts there. Errors and
+logs show a repeated cursor or link by length and hash, never its text. A page (`PageNumber` / `Offset` / `OffsetInBody`)
 identical to the **previous** one is dropped and paging stops; one identical
 to an earlier, non-adjacent page fails the run, since the server is cycling or
 two pages hold identical records and rows may be unread. For a feed whose pages

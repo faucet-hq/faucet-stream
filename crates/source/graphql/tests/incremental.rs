@@ -240,3 +240,48 @@ async fn a_truncated_run_advances_the_bookmark_only_for_ordered_bound_results() 
         .expect("an unordered truncated pass fails");
     assert!(err.to_string().contains("cannot advance"), "{err}");
 }
+
+/// A full read whose server cycles its cursors without a has-next flag fails
+/// instead of ending green with the pages behind the loop unread.
+#[tokio::test]
+async fn a_cursor_cycle_on_a_full_read_fails() {
+    let server = MockServer::start().await;
+    let page = |cursor: &str, id: u64| {
+        json!({"data": {"orders": {
+            "edges": [{"node": {"id": id}}],
+            "pageInfo": {"endCursor": cursor}
+        }}})
+    };
+    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits = n.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |_: &wiremock::Request| {
+            let i = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = match i {
+                0 => page("a", 1),
+                1 => page("b", 2),
+                _ => page("a", 3),
+            };
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+    let mut cfg = config(&server);
+    cfg.replication_method = faucet_core::ReplicationMethod::FullTable;
+    cfg.replication_key = None;
+    cfg.replication_bind = None;
+    let source = GraphqlStream::new(cfg);
+    let ctx = std::collections::HashMap::new();
+    let pages: Vec<_> = source.stream_pages(&ctx, 10).collect().await;
+    let delivered: usize = pages
+        .iter()
+        .filter_map(|p| p.as_ref().ok())
+        .map(|p| p.records.len())
+        .sum();
+    assert_eq!(delivered, 3, "every page read is delivered");
+    let err = pages
+        .into_iter()
+        .find_map(Result::err)
+        .expect("a cursor loop fails the run");
+    assert!(err.to_string().contains("went round a loop"), "{err}");
+}

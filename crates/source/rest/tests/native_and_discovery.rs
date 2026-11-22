@@ -841,6 +841,39 @@ async fn discovery_recipe_follows_list_pages() {
 }
 
 #[tokio::test]
+async fn discovery_list_paging_that_loops_back_fails() {
+    let server = MockServer::start().await;
+    for (page, next) in [("2", "/objects?page=3"), ("3", "/objects?page=2")] {
+        Mock::given(method("GET"))
+            .and(path("/objects"))
+            .and(query_param("page", page))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [{"name": format!("p{page}")}], "next": next
+            })))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/objects"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{"name": "a"}], "next": "/objects?page=2"
+        })))
+        .mount(&server)
+        .await;
+    let stream = RestStream::new(recipe_config(
+        &server,
+        json!({
+            "list": { "get": "/objects", "items": "$.items[*]", "name": "$.name", "next": "$.next" },
+            "emit": { "config": { "path": "/${name}" } }
+        }),
+    ))
+    .unwrap();
+    let err = stream.discover().await.unwrap_err().to_string();
+    assert!(err.contains("went round a loop"), "{err}");
+    assert!(!err.contains("page=2"), "the link is not printed: {err}");
+}
+
+#[tokio::test]
 async fn discovery_list_links_resolve_under_a_versioned_base_url() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

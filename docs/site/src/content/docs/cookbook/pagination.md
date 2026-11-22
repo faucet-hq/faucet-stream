@@ -25,14 +25,21 @@ apply to windowed passes or across `requests:` entries.
 | Style | Stops when |
 |-------|-----------|
 | `None` | after the first page |
-| `Cursor` | the next-token JSONPath is null/absent (or repeats) |
-| `CursorInBody` | the next-token JSONPath is null/absent (or repeats) — for POST-search APIs that take the cursor in the request body |
+| `Cursor` | the next-token JSONPath is null/absent (or the cursor just used comes back) |
+| `CursorInBody` | the next-token JSONPath is null/absent (or the cursor just used comes back) — for POST-search APIs that take the cursor in the request body |
 | `PageNumber` | a page returns zero records (or repeats the previous page; repeating an earlier, non-adjacent page fails the run, since rows may be unread — set `allow_repeated_pages: true` with `max_pages` for a feed whose pages can legitimately repeat) |
 | `Offset` | the offset reaches `total` (via `total_path`), or an empty page arrives (a short page alone does not stop it: servers clamp `limit`; `stop_when_short: true` opts in for servers that reject an offset past the end) |
 | `OffsetInBody` | like `Offset` (`total`, an empty page, or `stop_when_short: true`) — offset/limit are written into the JSON **request body** (POST-query APIs) |
 | `RecordFieldCursor` | a short page arrives — keyset paging by the running max/min of a **record field** |
 | `LinkHeader` | there's no `rel="next"` in the `Link` response header |
 | `NextLinkInBody` | the next-page URL in the body is absent, null, or empty |
+
+A cursor or link equal to the one just used is the server's end-of-feed echo
+and ends paging normally. One equal to an **earlier** cursor or link of the
+same pass means paging went round a loop: the pages behind it were never read,
+so the run fails, for incremental and full-refresh reads alike. An incremental
+pass declared `assume_ordered` with a `replication_bind` keeps the largest key
+read instead, because the unread rows sort after it.
 
 :::note
 An HTTP **`204 No Content`** (or any 2xx with an empty body) is treated as an
@@ -70,7 +77,7 @@ source:
 
 The first request sends `body` unchanged; each later request adds
 `body[body_cursor_field] = <cursor>`. Pagination stops when the cursor is
-null/absent or repeats.
+null/absent or the one just used comes back.
 
 `body_cursor_field` may be a JSON Pointer for a nested location, so a GraphQL
 API reached through the REST source can page by `variables.after`:
