@@ -63,7 +63,7 @@ pub(crate) fn plan_shards(
     let selected: Vec<EligibleShard> = shards
         .into_iter()
         .filter(|s| allowlist.is_empty() || allowlist.iter().any(|a| a == &s.id))
-        .filter(|s| !s.closed || include_closed || bookmarks.get(&s.id).is_some())
+        .filter(|s| !s.closed || include_closed || bookmarks.has_position(&s.id))
         .collect();
     let planned: std::collections::HashSet<String> =
         selected.iter().map(|s| s.id.clone()).collect();
@@ -79,9 +79,9 @@ pub(crate) fn plan_shards(
             let parent_read = s
                 .parents
                 .iter()
-                .any(|p| planned.contains(p) || bookmarks.get(p).is_some());
+                .any(|p| planned.contains(p) || bookmarks.has_position(p));
             PlannedShard {
-                from_trim_horizon: bookmarks.get(&s.id).is_none() && parent_read,
+                from_trim_horizon: !bookmarks.has_position(&s.id) && parent_read,
                 id: s.id,
                 wait_for,
             }
@@ -571,6 +571,25 @@ mod tests {
             "an expired parent is not waited on"
         );
         assert!(gone[0].from_trim_horizon);
+    }
+
+    #[test]
+    fn a_closed_shard_read_without_records_is_still_drained() {
+        let mut quiet = ShardBookmarks::default();
+        quiet.caught_up("parent", 100);
+        let all = vec![
+            shard("parent", true),
+            child("left", &["parent"]),
+            child("right", &["parent"]),
+        ];
+        let plan = plan_shards(all.clone(), &[], false, &quiet);
+        assert_eq!(ids(&plan), ["parent", "left", "right"]);
+        assert!(!plan[0].from_trim_horizon);
+        assert_eq!(plan[1].wait_for, ["parent"]);
+        assert!(plan[1].from_trim_horizon);
+
+        let unread = plan_shards(all, &[], false, &ShardBookmarks::default());
+        assert_eq!(ids(&unread), ["left", "right"]);
     }
 
     #[test]
