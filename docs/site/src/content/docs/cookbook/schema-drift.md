@@ -170,7 +170,7 @@ Not every sink can evolve, and a schemaless sink has no schema to diverge from.
 | `elasticsearch` | ✅ | ✅ (add fields only) |
 | `spanner` | ✅ | ✅ (add + NOT NULL relax; no base-type widening) |
 | `iceberg` | ✅ | ✅ (add columns only) |
-| `oracle` | ✅ | ✅ (add, integer→decimal widening, NOT NULL relax) |
+| `oracle` | ✅ (`auto_columns`; schemaless in `json_column` mode) | ✅ (add, integer→decimal widening, NOT NULL relax) |
 | `databricks` | ✅ | ✅ (add columns, numeric widening to `DOUBLE`, NOT NULL relax) |
 | `jsonl`, `csv`, `stdout`, `mongodb`, `redis`, `http`, `kafka`, `s3`, `gcs`, `snowflake`, `parquet`, `dynamodb` | — (inert) | — |
 

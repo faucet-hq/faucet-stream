@@ -5876,6 +5876,24 @@ pipeline:
         }
     }
 
+    #[cfg(feature = "sink-oracle")]
+    #[test]
+    fn oracle_json_column_refuses_evolve_and_keyed_modes() {
+        let sink = "{ type: oracle, config: { connect_string: 'h/svc', username: u, password: p, \
+                    table: t, column_mapping: { type: json_column, column: DOC } } }";
+        let evolve = cfg(&format!(
+            "version: 1\npipeline:\n  source: {{ type: rest, config: {{ base_url: https://x }} }}\n  sink: {sink}\n  schema:\n    on_drift: evolve\n"
+        ));
+        let err = expand(&evolve).unwrap_err().to_string();
+        assert!(err.contains("evolve"), "{err}");
+        let upsert = sink.replace("config: {", "config: { write_mode: upsert, key: [id],");
+        let upsert = cfg(&format!(
+            "version: 1\npipeline:\n  source: {{ type: rest, config: {{ base_url: https://x }} }}\n  sink: {upsert}\n"
+        ));
+        let err = expand(&upsert).unwrap_err().to_string();
+        assert!(err.contains("upsert"), "{err}");
+    }
+
     /// #752: a child row writing a truncating file sink at a fixed path would
     /// keep only the last parent's rows — refused at load time.
     #[test]

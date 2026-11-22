@@ -817,6 +817,15 @@ impl Sink for OracleSink {
 }
 
 impl OracleDriver {
+    /// Whether records land whole in one JSON column (no per-field columns,
+    /// so no schema to report, evolve or key on).
+    fn json_column(&self) -> bool {
+        matches!(
+            self.inner.config.column_mapping,
+            OracleColumnMapping::JsonColumn { .. }
+        )
+    }
+
     /// Run `f` on the blocking pool as one backend call named `op` (#880):
     /// the run's deadline ends the wait promptly; the session's statement
     /// timeout bounds the blocking work itself.
@@ -997,12 +1006,16 @@ impl SinkDriver for OracleDriver {
     }
 
     fn write_modes(&self) -> &'static [WriteMode] {
-        &[
-            WriteMode::Append,
-            WriteMode::Upsert,
-            WriteMode::Delete,
-            WriteMode::Overwrite,
-        ]
+        if self.json_column() {
+            &[WriteMode::Append, WriteMode::Overwrite]
+        } else {
+            &[
+                WriteMode::Append,
+                WriteMode::Upsert,
+                WriteMode::Delete,
+                WriteMode::Overwrite,
+            ]
+        }
     }
 
     fn dedups_by_key(&self) -> bool {
@@ -1022,12 +1035,20 @@ impl SinkDriver for OracleDriver {
     }
 
     fn schema(&self) -> Option<&dyn SchemaDriver> {
-        Some(self)
+        (!self.json_column()).then_some(self as &dyn SchemaDriver)
     }
 
     fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
-        derived
-            .to_builder()
+        let json = self.json_column();
+        let builder = derived.to_builder();
+        let builder = if json {
+            builder
+                .schema_evolution(false)
+                .schema_report(faucet_core::SchemaReport::Schemaless)
+        } else {
+            builder
+        };
+        builder
             .declared_types(
                 self.inner.config.create_table
                     && matches!(
@@ -1226,6 +1247,10 @@ impl CommitTokenDriver for OracleDriver {
 
 #[async_trait]
 impl SchemaDriver for OracleDriver {
+    fn column_matching(&self) -> faucet_core::ColumnMatching {
+        faucet_core::ColumnMatching::UpperFold
+    }
+
     async fn current_schema(&self, calls: &CallSlot) -> Result<Option<Value>, FaucetError> {
         self.run(calls, "current_schema", |i| {
             let conn = i.conn()?;
