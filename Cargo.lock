@@ -5096,6 +5096,7 @@ name = "faucet-common-mssql"
 version = "1.3.2"
 dependencies = [
  "bb8",
+ "chrono",
  "faucet-core",
  "percent-encoding",
  "schemars 1.2.1",
