@@ -201,10 +201,13 @@ serve:
     backend: ""
     # sqlite: defaults to a file on the mounted volume (see persistence).
     # postgres: a DSN. The URL reaches the pod as FAUCET_SERVE_HISTORY, never
-    # on the command line; a postgres DSN is stored in a chart-managed Secret.
+    # on the command line; any url (but `memory`) is stored in a chart-managed
+    # Secret. With backend unset, the backend is read from the url
+    # (postgres:// or postgresql://, sqlite:, memory).
     url: ""
     # Or read the URL from your own Secret (recommended for postgres, so the
-    # password never sits in Helm values). Pods restart on a `url` change;
+    # password never sits in Helm values). Set backend with it: the chart
+    # cannot read the Secret to tell postgres from sqlite. Pods restart on a `url` change;
     # after changing an existingSecret's value, restart the deployment yourself.
     existingSecret: ""
     existingSecretKey: FAUCET_SERVE_HISTORY

@@ -1,0 +1,12 @@
+# A postgresql:// url with backend unset is shared history: replicas and
+# cluster mode render.
+# expect: replicas: 2
+# expect: name: t-faucet-stream-serve-history
+# expect-not: value: "postgresql://
+serve:
+  enabled: true
+  replicaCount: 2
+  cluster:
+    enabled: true
+  history:
+    url: "postgresql://faucet:dummy-secret@db.example:5432/faucet"

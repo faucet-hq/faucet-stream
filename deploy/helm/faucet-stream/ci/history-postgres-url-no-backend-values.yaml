@@ -1,0 +1,9 @@
+# With backend unset, a postgres:// url is a postgres history, and the DSN
+# reaches the pod from the chart's Secret, never as a plain env value.
+# expect: name: t-faucet-stream-serve-history
+# expect: key: FAUCET_SERVE_HISTORY
+# expect-not: value: "postgres://
+serve:
+  enabled: true
+  history:
+    url: "postgres://faucet:dummy-secret@db.example:5432/faucet"

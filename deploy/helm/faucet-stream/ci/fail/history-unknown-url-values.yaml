@@ -1,0 +1,5 @@
+# expect-error: cannot tell the history backend from serve.history.url
+serve:
+  enabled: true
+  history:
+    url: "mysql://faucet:dummy-secret@db.example:3306/faucet"

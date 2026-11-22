@@ -39,7 +39,7 @@ spec:
         {{- if .Values.secret.create }}
         checksum/secret: {{ include (print $.Template.BasePath "/secret-env.yaml") . | sha256sum }}
         {{- end }}
-        {{- if and (eq (include "faucet-stream.historyBackend" $) "postgres") .Values.serve.history.url (not .Values.serve.history.existingSecret) }}
+        {{- if include "faucet-stream.historyUrlSecret" . }}
         checksum/serve-history: {{ include (print $.Template.BasePath "/secret-serve-history.yaml") . | sha256sum }}
         {{- end }}
         {{- /* Over the explicit credentials only: a lookup-derived random token
@@ -218,16 +218,11 @@ spec:
               value: {{ $mountPath | quote }}
             {{- else }}
             {{- if or .Values.serve.history.existingSecret .Values.serve.history.url }}
-            {{- if or .Values.serve.history.existingSecret (eq (include "faucet-stream.historyBackend" $) "postgres") }}
             - name: FAUCET_SERVE_HISTORY
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.serve.history.existingSecret | default (include "faucet-stream.historySecretName" .) }}
                   key: {{ .Values.serve.history.existingSecretKey }}
-            {{- else }}
-            - name: FAUCET_SERVE_HISTORY
-              value: {{ .Values.serve.history.url | quote }}
-            {{- end }}
             {{- else if eq (include "faucet-stream.historyBackend" $) "sqlite" }}
             - name: FAUCET_SERVE_HISTORY
               value: {{ printf "sqlite://%s/history.db" $mountPath | quote }}

@@ -1,0 +1,8 @@
+# A sqlite url goes through the chart's Secret too.
+# expect: name: t-faucet-stream-serve-history
+# expect: secretKeyRef:
+# expect-not: value: "sqlite:
+serve:
+  enabled: true
+  history:
+    url: "sqlite:/var/lib/faucet/other.db"

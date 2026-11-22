@@ -124,6 +124,9 @@ and declares it a volume, and the chart mounts its PVC there when
 `serve.history` is unset. A root filesystem that cannot be written refuses to
 start rather than running on memory. See
 [Backing up the server database](/faucet-stream/operations/backup/).
+In the chart, `serve.history.url` always reaches the pod from a Secret, and
+with `serve.history.backend` unset the backend is read from the URL; a
+`serve.history.existingSecret` needs `serve.history.backend` set.
 
 The [Helm chart](https://github.com/faucet-hq/faucet-stream/tree/main/deploy/helm/faucet-stream)
 renders all of these, verifies at startup that the image holds the connectors
