@@ -759,7 +759,11 @@ async fn postgres_db_clock_fenced_start_and_atomic_split() {
     );
     a.request_cancel("pg-split").await.unwrap();
     assert_eq!(a.shard_progress("pg-split").await.unwrap().cancelled, 700);
-    assert_eq!(a.cancel_flagged_shards().await.unwrap(), 0, "nothing left pending");
+    assert_eq!(
+        a.cancel_flagged_shards().await.unwrap(),
+        0,
+        "nothing left pending"
+    );
 
     let rep = a.reclaim_orphans(3).await.unwrap();
     assert_eq!(
