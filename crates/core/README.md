@@ -899,7 +899,7 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `driver` | `SinkDriver` (+ `StagingDriver`, `CommitTokenDriver`, `CleanupDriver`, `SchemaDriver`, `RollbackDriver`, `ColumnarDriver`), `DriverSink`, `SourceDriver`, `DriverSource`, `MessageDriver`, `MessageSinkDriver`, `MessageConsumer`, `MessageSourceDriver`, `HttpDriver`, `HttpSinkDriver` — family drivers (RFC 0014) |
 | `columnar` | `values_to_record_batch`, `record_batch_to_values`, `check_integral`, `binary_values_for_arrow_json` — JSON ⇄ Arrow (`arrow` feature). Binary columns read base64; a `FixedSizeBinary(16)` (UUID) column also reads a dashed UUID or 32 hex digits, which no base64 of 16 bytes can be |
 | `accounting` | `WriteReport`, `RowAccounts`, `RowAccountsSnapshot` — per-page row accounting (#879) |
-| `fidelity` | Canonical value renderings (#885) — `decimal_text`, `decimal_from_i128`, `decimal_from_pg_numeric`, `integer_*`, `number_text`, `float64` / `float32`, `binary`, `timestamp*`, `date`, `time`, `from_str` / `from_slice` / `parse_json`, `non_integer_text`, `is_exact_decimal_type`, `NonFiniteCounter` |
+| `fidelity` | Canonical value renderings (#885) — `decimal_text`, `decimal_from_i128`, `decimal_from_pg_numeric`, `integer_*`, `number_text`, `float64` / `float32`, `binary`, `timestamp*`, `date`, `time`, `from_str` / `from_slice` / `parse_json`, `from_str_allow_non_finite` (bare `NaN` / `Infinity` as counted `null`), `non_integer_text`, `is_exact_decimal_type`, `NonFiniteCounter` |
 | `json_numbers` | `parse_json_exact` / `JsonBigNumbers` — exactness of numbers in JSON text a database stored |
 | `idempotency` | `DeliveryMode`, `format_token`, `parse_token`, `wrap_state`, `unwrap_state` |
 | `state_version` | Versioned state envelope (#736) — `StoredState`, `wrap_versioned`, `peel_versioned`, `check_compat`, `resolve_for_source`, `StateCodec`, `VersionedStateStore` |
@@ -907,9 +907,9 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `quality` | Per-record / per-batch checks (`quality` / `quality-jsonschema` features) |
 | `contract` | Versioned data contracts — `ContractSpec`, `CompiledContract`, `apply_contract`, JSON-Schema / OpenLineage exports (the `contract` feature) |
 | `masking` | PII detection + column-level masking — `MaskingSpec`, `CompiledMasking`, `apply_masking`, `Detector`, `MaskAction`; `MaskingProof` / `proof::{rules_fingerprint, derive_key}` sign a DLQ envelope's `masking` object (`DlqGovernance::with_masking_proof`) (the `masking` feature) |
-| `replication` | `ReplicationMethod`, `filter_incremental`, `max_replication_value` |
+| `replication` | `ReplicationMethod`, `filter_incremental`, `max_replication_value`, `bookmark_after_pass` (`PassEnd`, `Truncation`, `ResumeRules`): the bookmark a paginated pass that stopped early (page cap, repeated cursor, loop) may keep |
 | `retry` | `execute_with_retry` (exponential backoff + jitter) |
-| `io` | `CallContext`, `CallSlot`, `DEFAULT_CALL_TIMEOUT` — the backend-call wrapper (#880) |
+| `io` | `CallContext`, `CallSlot`, `DEFAULT_CALL_TIMEOUT` — the backend-call wrapper (#880); `CallContext::non_idempotent` retries only attempts that provably never took effect (a decline or a failed connect) |
 | `http` | `Client`, `ClientBuilder`, `status_error`, `is_cross_origin`, `strip_credentials`, `ResponseTooLarge` |
 | `tls` | `TlsOptions`, `LoadedTls`, `ClientPem` (server verification + client certificates), `TlsClientConfig` (HTTP-source mTLS), `ensure_crypto_provider` (the process-wide rustls provider) |
 | `batching` | `chunks`, `into_chunks`, `map_concurrent`, `for_each_concurrent`, `ConcurrencyLimit` |
