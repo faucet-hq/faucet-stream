@@ -551,6 +551,9 @@ struct CycleResult {
     /// A table's run was refused by another run's live lease: the mirror
     /// fails as a whole rather than recording a table failure.
     lease_held: Option<String>,
+    /// Tables the stream could not resume (no committed position it can
+    /// start from): they go back to snapshot, with the reason.
+    resnapshot: BTreeMap<String, String>,
 }
 
 /// Stream every active table for one cycle (one shared stream per group).
@@ -589,6 +592,7 @@ async fn run_cycle(
             Ok(group) => {
                 out.tables.extend(group.tables);
                 out.new_tables.extend(group.new_tables);
+                out.resnapshot.extend(group.resnapshot);
                 out.lease_held = out.lease_held.or(group.lease_held);
                 if group.source_error.is_some() {
                     out.source_error = group.source_error;
@@ -684,7 +688,14 @@ async fn run_group(
     match demux {
         Ok(d) => {
             out.new_tables = d.new_tables;
+            for table in d.resnapshot.keys() {
+                out.tables.remove(table);
+            }
+            out.resnapshot = d.resnapshot;
             for table in d.dead {
+                if out.resnapshot.contains_key(&table) {
+                    continue;
+                }
                 out.tables
                     .entry(table)
                     .or_insert_with(|| Err("the table's pipeline stopped".into()));
@@ -939,6 +950,10 @@ impl Driver {
         let mut failures = Vec::new();
         {
             let mut state = self.shared.state.lock().await;
+            for (table, reason) in &result.resnapshot {
+                tracing::warn!(pipeline = %self.shared.opts.pipeline_name, table = %table, "mirror: {reason}");
+                multi_state::mark_resnapshot(&mut state, table, reason, now);
+            }
             for (table, r) in &result.tables {
                 match r {
                     Ok(()) => {

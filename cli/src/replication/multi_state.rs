@@ -433,6 +433,16 @@ pub fn record_failure(
     }
 }
 
+/// Send `name` back to snapshot (its stream position is lost): it becomes
+/// `pending` with `reason` as its last error.
+pub fn mark_resnapshot(state: &mut MirrorState, name: &str, reason: &str, now: DateTime<Utc>) {
+    if let Some(t) = state.tables.get_mut(name) {
+        t.set_phase(TablePhase::Pending, now);
+        t.last_error = Some(reason.to_string());
+        state.updated_at = now;
+    }
+}
+
 /// Record a clean stream cycle for `name`.
 pub fn record_success(state: &mut MirrorState, name: &str, now: DateTime<Utc>) {
     if let Some(t) = state.tables.get_mut(name) {
@@ -499,6 +509,24 @@ mod tests {
         mark_snapshot_started(&mut state, "t", json!(2), 1, now);
         mark_snapshot_done(&mut state, "t", now);
         assert_eq!(state.tables["t"].phase, TablePhase::Active);
+    }
+
+    #[test]
+    fn a_table_sent_back_to_snapshot_is_pending_and_due() {
+        let now = Utc::now();
+        let mut state = MirrorState::new(now);
+        state
+            .tables
+            .insert("t".into(), TableState::new(TablePhase::Active, now));
+        mark_resnapshot(&mut state, "t", "no committed position", now);
+        assert_eq!(state.tables["t"].phase, TablePhase::Pending);
+        assert_eq!(
+            state.tables["t"].last_error.as_deref(),
+            Some("no committed position")
+        );
+        assert_eq!(due_for_snapshot(&state, 0, now), vec!["t".to_string()]);
+        mark_resnapshot(&mut state, "missing", "x", now);
+        assert!(!state.tables.contains_key("missing"));
     }
 
     #[test]
