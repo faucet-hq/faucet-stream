@@ -602,3 +602,161 @@ async fn decode_pipeline_names_empty_csv_headers() {
         vec![serde_json::json!({"id": "1", "amount": "2", "column_2": "3", "column_3": "4"})]
     );
 }
+
+fn row_page(id: u32, token: Option<&str>) -> String {
+    let token = token
+        .map(|t| format!("<resultId>{t}</resultId>"))
+        .unwrap_or_default();
+    format!("<response><data><row><id>{id}</id></row></data>{token}</response>")
+}
+
+fn body_cursor(server: &MockServer) -> XmlStreamConfig {
+    XmlStreamConfig::new(server.uri(), "/gw")
+        .method(reqwest::Method::POST)
+        .body("<readByQuery/>")
+        .records_element_path("response.data.row")
+        .pagination(XmlPagination::BodyCursor {
+            next_token_path: "resultId".into(),
+            next_body: "<readMore><resultId>${next_token}</resultId></readMore>".into(),
+        })
+}
+
+/// A body cursor that loops back to an earlier one (A → B → A) fails the run
+/// instead of reading the same pages forever.
+#[tokio::test]
+async fn a_body_cursor_that_loops_back_fails() {
+    let server = MockServer::start().await;
+    for (needle, id, next) in [("readByQuery", 1, "A"), (">A<", 2, "B"), (">B<", 3, "A")] {
+        Mock::given(method("POST"))
+            .and(path("/gw"))
+            .and(body_string_contains(needle))
+            .respond_with(ResponseTemplate::new(200).set_body_string(row_page(id, Some(next))))
+            .mount(&server)
+            .await;
+    }
+    let err = XmlStream::new(body_cursor(&server))
+        .fetch_all()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("repeated an earlier cursor"), "{err}");
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+}
+
+/// The cursor just used coming back still ends paging normally.
+#[tokio::test]
+async fn a_body_cursor_echoing_the_one_just_used_ends_paging() {
+    let server = MockServer::start().await;
+    for (needle, id, next) in [("readByQuery", 1, "A"), (">A<", 2, "A")] {
+        Mock::given(method("POST"))
+            .and(path("/gw"))
+            .and(body_string_contains(needle))
+            .respond_with(ResponseTemplate::new(200).set_body_string(row_page(id, Some(next))))
+            .mount(&server)
+            .await;
+    }
+    let records = XmlStream::new(body_cursor(&server))
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 2);
+}
+
+fn page_number(server: &MockServer) -> XmlStreamConfig {
+    XmlStreamConfig::new(server.uri(), "/list")
+        .records_element_path("response.data.row")
+        .pagination(XmlPagination::PageNumber {
+            param_name: "page".into(),
+            start_page: 1,
+            page_size: None,
+            page_size_param: None,
+            stop_when_short: false,
+        })
+}
+
+/// A server alternating between two pages fails the run; with
+/// `allow_repeated_pages` and `max_pages` it is paged past to the cap.
+#[tokio::test]
+async fn alternating_pages_fail_unless_repeats_are_allowed() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/list"))
+        .respond_with(move |req: &wiremock::Request| {
+            let page: u32 = req
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "page")
+                .and_then(|(_, v)| v.parse().ok())
+                .unwrap_or(1);
+            ResponseTemplate::new(200).set_body_string(row_page(page % 2, None))
+        })
+        .mount(&server)
+        .await;
+    let err = XmlStream::new(page_number(&server))
+        .fetch_all()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("identical to an earlier, non-adjacent page"),
+        "{err}"
+    );
+
+    let records = XmlStream::new(page_number(&server).allow_repeated_pages(true).max_pages(5))
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 5);
+}
+
+/// A 200 response that lacks the records' container (an error document)
+/// fails the run; `allow_missing_records_path` accepts it as empty, and an
+/// empty container still ends paging normally.
+#[tokio::test]
+async fn a_response_without_the_records_container_fails() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/list"))
+        .and(wiremock::matchers::query_param("page", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(row_page(1, None)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/list"))
+        .and(wiremock::matchers::query_param("page", "2"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("<Error><Code>RATE</Code></Error>"),
+        )
+        .mount(&server)
+        .await;
+    let err = XmlStream::new(page_number(&server))
+        .fetch_all()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("has no `response.data` element"), "{err}");
+
+    let records = XmlStream::new(page_number(&server).allow_missing_records_path(true))
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+
+    let empty = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/list"))
+        .and(wiremock::matchers::query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<response><data/></response>"))
+        .mount(&empty)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/list"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(row_page(1, None)))
+        .mount(&empty)
+        .await;
+    let records = XmlStream::new(page_number(&empty))
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+}

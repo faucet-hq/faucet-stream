@@ -489,11 +489,20 @@ impl XmlDriver {
             return crate::decode::run_decode(xml_text.as_bytes(), &self.config.decode).await;
         }
         let mut records = Vec::new();
-        convert::stream_extract(
-            xml_text,
-            self.config.records_element_path.as_deref(),
-            |rec| records.push(rec),
-        )?;
+        let path = self.config.records_element_path.as_deref();
+        let seen = convert::stream_extract_checked(xml_text, path, |rec| records.push(rec))?;
+        if let Some(path) = path
+            && !seen.container
+            && !self.config.allow_missing_records_path
+        {
+            let parent = path.rsplit_once('.').map_or(path, |(parent, _)| parent);
+            return Err(FaucetError::Source(format!(
+                "xml: the response has no `{parent}` element (records_element_path `{path}`); \
+                 it is usually an error document served with HTTP 200, or a renamed element. \
+                 Set allow_missing_records_path: true if the API omits the container on an \
+                 empty result"
+            )));
+        }
         Ok(records)
     }
 
@@ -513,6 +522,10 @@ impl XmlDriver {
                 _ => None,
             };
             let mut prev_fingerprint: Option<u64> = None;
+            let mut seen_fingerprints: std::collections::HashSet<u64> =
+                std::collections::HashSet::new();
+            let mut seen_tokens: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             let mut fault_logged = false;
             // Body-cursor pagination (#544): the token for the next request;
             // `None` on the first page → the configured body/soap is sent.
@@ -551,10 +564,24 @@ impl XmlDriver {
                     break;
                 }
                 prev_fingerprint = Some(fingerprint);
+                if record_count > 0
+                    && !seen_fingerprints.insert(fingerprint)
+                    && !self.config.allow_repeated_pages
+                {
+                    Err::<(), _>(FaucetError::Source(
+                        "xml: pagination returned a page identical to an earlier, non-adjacent \
+                         page; the server is cycling pages (or two pages carry identical \
+                         records), so rows may be unread. Check the paging parameters; if \
+                         pages can legitimately repeat, set `allow_repeated_pages: true` \
+                         together with `max_pages`"
+                            .into(),
+                    ))?;
+                }
 
                 // Advance pagination. Without a total, only an empty page ends
                 // page/offset paging: a short page may just be the server
                 // clamping the requested size (API-15).
+                let mut cycled = false;
                 let more = match &self.config.pagination {
                     Some(XmlPagination::PageNumber { page_size, stop_when_short, .. }) => {
                         page_number = page_number.map(|p| p + 1);
@@ -571,6 +598,9 @@ impl XmlDriver {
                             Some(t)
                                 if !t.trim().is_empty() && token.as_deref() != Some(t.as_str()) =>
                             {
+                                if !seen_tokens.insert(t.clone()) {
+                                    cycled = true;
+                                }
                                 token = Some(t);
                                 true
                             }
@@ -580,6 +610,14 @@ impl XmlDriver {
                     None => false,
                 };
                 yield records;
+                if cycled {
+                    Err::<(), _>(FaucetError::Source(
+                        "xml: BodyCursor pagination repeated an earlier cursor (not the one just \
+                         used), so paging went round a loop and the pages behind it were never \
+                         read; stopping rather than ending the run with rows missing"
+                            .into(),
+                    ))?;
+                }
                 if !more {
                     break;
                 }
