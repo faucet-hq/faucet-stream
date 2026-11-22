@@ -347,6 +347,12 @@ serve:
   # The shortest gap between the ticks of a schedule a tenant owns (seconds).
   tenantScheduleMinIntervalSecs: 300
 
+  # Prometheus series: counter and histogram series not updated for this many
+  # seconds leave /metrics until emitted again (gauges never expire).
+  # --metrics-idle-timeout-secs; 0 keeps every series.
+  metrics:
+    idleTimeoutSecs: 86400
+
   # Feeds (#1034): --feeds. Image feature `feeds` (the published `full` image
   # has it). A feed is a durable event log senders push into over HTTP
   # (POST /v1/feeds/{name}/events); each delivery runs a pipeline over it.

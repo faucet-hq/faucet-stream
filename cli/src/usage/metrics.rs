@@ -38,7 +38,7 @@ fn take_thousandths(carry: &mut f64, amount: f64) -> u64 {
 fn thousandths(metric: &'static str, r: &UsageRecord, amount: f64) -> u64 {
     let key = (
         metric,
-        r.pipeline.clone(),
+        crate::exec_metrics::pipeline_label(r.tenant.as_deref(), &r.pipeline),
         r.row.clone(),
         r.cost.currency.clone(),
     );
@@ -70,7 +70,13 @@ fn describe() {
 /// Emit one finished invocation's usage.
 pub fn record(r: &UsageRecord) {
     describe();
-    let base = [("pipeline", r.pipeline.clone()), ("row", r.row.clone())];
+    let base = [
+        (
+            "pipeline",
+            crate::exec_metrics::pipeline_label(r.tenant.as_deref(), &r.pipeline),
+        ),
+        ("row", r.row.clone()),
+    ];
     counter!(
         "faucet_usage_estimated_cost_total",
         "pipeline" => base[0].1.clone(),

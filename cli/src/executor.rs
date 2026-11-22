@@ -2149,7 +2149,7 @@ async fn run_unit(
     // it as a histogram so per-matrix-row time is observable on a scrape, not just
     // in `--output json`.
     crate::exec_metrics::record_invocation(
-        &opts.pipeline_name,
+        &opts.metric_pipeline(),
         &row_id,
         &unit.node.source.kind,
         &unit.node.sink.kind,
@@ -2198,7 +2198,7 @@ async fn run_unit(
             if let CliError::Faucet(FaucetError::BudgetExceeded { budget, .. }) = &e {
                 metrics::counter!(
                     "faucet_budget_exceeded_total",
-                    "pipeline" => opts.pipeline_name.clone(),
+                    "pipeline" => opts.metric_pipeline(),
                     "row" => row_id.clone(),
                     "budget" => budget.clone(),
                 )
@@ -2804,6 +2804,7 @@ async fn build_pipeline<'a>(
 ) -> CliResult<Pipeline<'a, dyn Source + 'a, dyn Sink + 'a>> {
     let mut pipeline = Pipeline::new(source, sink)
         .with_name(pipeline_name.to_owned())
+        .with_metric_name(opts.metric_pipeline())
         .with_row(row_id.to_owned())
         .with_run_id(run_id.to_owned())
         .with_usage_meter(observers.meter)
@@ -2936,6 +2937,8 @@ async fn run_one_invocation(
     #[cfg(feature = "lineage")]
     let lineage_cfg = opts.lineage_cfg.clone();
     let obs_labels = Labels::new(pipeline_name.clone(), row_id.clone(), run_id.clone());
+    let metric_pipeline = opts.metric_pipeline();
+    let metric_labels = Labels::new(metric_pipeline.clone(), row_id.clone(), run_id.clone());
     // Whether this invocation records into the Data Movement Catalog (#279):
     // roots only, and never for dry-run / --limit / shard runs (their volumes
     // and datasets are partial or synthetic) — the same scoping as SLA.
@@ -2954,7 +2957,7 @@ async fn run_one_invocation(
         crate::governance::GovernanceRequest {
             node,
             opts,
-            pipeline: &pipeline_name,
+            pipeline: &metric_pipeline,
             row: &row_id,
             run_id: &run_id,
             cancel: &cancel,
@@ -3207,7 +3210,7 @@ async fn run_one_invocation(
                     source,
                     stages,
                     batch_fns,
-                    obs_labels.clone(),
+                    metric_labels.clone(),
                 )?
                 .with_row_accounts(Arc::clone(&row_accounts)),
             )
@@ -3220,7 +3223,7 @@ async fn run_one_invocation(
             source
         } else {
             Box::new(
-                faucet_core::TransformingSource::new(source, stages, obs_labels.clone())?
+                faucet_core::TransformingSource::new(source, stages, metric_labels.clone())?
                     .with_row_accounts(Arc::clone(&row_accounts)),
             )
         }
@@ -3498,7 +3501,7 @@ async fn run_one_invocation(
                 repair: spec.repair,
                 allow_delete: spec.allow_delete,
                 dry_run: false,
-                pipeline_name: pipeline_name.clone(),
+                pipeline_name: metric_pipeline.clone(),
                 execution: opts.execution.clone(),
                 auth: opts.auth.clone(),
                 clock: opts.clock,
@@ -3662,7 +3665,7 @@ async fn run_one_invocation(
             spec,
             sla_store.as_ref(),
             state_key,
-            &obs_labels.pipeline,
+            &metric_labels.pipeline,
             &obs_labels.row,
             outcome,
             chrono::Utc::now().timestamp(),
@@ -3670,7 +3673,7 @@ async fn run_one_invocation(
         .await;
         v.extend(crate::sla::evaluate_lag_post_run(
             spec,
-            &obs_labels.pipeline,
+            &metric_labels.pipeline,
             &obs_labels.row,
             observers.lag.last().as_ref(),
         ));
@@ -3692,7 +3695,7 @@ async fn run_one_invocation(
                     spec,
                     sla_store.as_ref(),
                     state_key,
-                    &obs_labels.pipeline,
+                    &metric_labels.pipeline,
                     &obs_labels.row,
                     &run_id,
                     profile,
@@ -4987,6 +4990,17 @@ fn value_to_string_brief(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         other => other.to_string(),
+    }
+}
+
+impl ExecuteOptions {
+    /// The `pipeline` label value of this run's metrics:
+    /// [`crate::exec_metrics::pipeline_label`] of the tenant scope and name.
+    pub fn metric_pipeline(&self) -> String {
+        crate::exec_metrics::pipeline_label(
+            self.state_scope.namespace.as_deref(),
+            &self.pipeline_name,
+        )
     }
 }
 
@@ -7068,6 +7082,66 @@ execution:
             assert_eq!(o.error_kind, Some(InvocationErrorKind::Skipped), "{o:?}");
         }
         assert!(summary.skipped_count() >= 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tenant_run_labels_core_and_cli_metrics_tenant_name() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _local = ::metrics::set_default_local_recorder(&recorder);
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("in.csv");
+        std::fs::write(&csv, "x\n1\n2\n").unwrap();
+        let yaml = format!(
+            r#"version: 1
+pipeline:
+  source: {{ type: csv, config: {{ path: {csv} }} }}
+  sink:   {{ type: jsonl, config: {{ path: {out} }} }}
+"#,
+            csv = csv.display(),
+            out = dir.path().join("out.jsonl").display(),
+        );
+        let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
+        let mut opts = ExecuteOptions::for_tests("labelled");
+        opts.state_scope.namespace = Some("acme".into());
+        assert_eq!(opts.metric_pipeline(), "acme::labelled");
+        let summary = run_expanded(expand(&cfg).unwrap(), opts).await.unwrap();
+        assert_eq!(summary.failure_count(), 0, "{summary:?}");
+        let pipelines = |name: &str| -> Vec<String> {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter(|(k, ..)| k.key().name() == name)
+                .flat_map(|(k, ..)| {
+                    k.key()
+                        .labels()
+                        .filter(|l| l.key() == "pipeline")
+                        .map(|l| l.value().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        for metric in [
+            "faucet_pipeline_runs_total",
+            "faucet_source_records_total",
+            "faucet_pipeline_invocation_duration_seconds",
+            "faucet_usage_bytes_total",
+        ] {
+            let got = pipelines(metric);
+            assert!(!got.is_empty(), "{metric} not emitted");
+            assert!(
+                got.iter().all(|p| p == "acme::labelled"),
+                "{metric}: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_metric_pipeline_is_the_name_without_a_tenant() {
+        assert_eq!(crate::exec_metrics::pipeline_label(None, "p"), "p");
+        assert_eq!(crate::exec_metrics::pipeline_label(Some("t"), "p"), "t::p");
     }
 
     #[tokio::test]

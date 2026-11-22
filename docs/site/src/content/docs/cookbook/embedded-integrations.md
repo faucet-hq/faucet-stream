@@ -343,6 +343,11 @@ its tenant.
 
 ## Metrics
 
+Every metric of a tenant's run carries `pipeline="<tenant>::<name>"` (the
+tenant's state-key namespace), so tenants whose configs share a name do not
+share series. Notifications, usage records and run history keep the plain name;
+they are already scoped to the tenant.
+
 | Metric | Meaning |
 |---|---|
 | `faucet_serve_tenant_runs_total{tenant,outcome}` | Finished tenant runs. |

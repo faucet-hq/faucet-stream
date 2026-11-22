@@ -133,6 +133,7 @@ pub struct Pipeline<'a, So: Source + ?Sized, Si: Sink + ?Sized> {
     sink: &'a Si,
     state_store: Option<Arc<dyn StateStore>>,
     name: Option<String>,
+    metric_name: Option<String>,
     row: Option<String>,
     run_id: Option<String>,
     dlq: Option<DlqConfig>,
@@ -254,6 +255,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             sink,
             state_store: None,
             name: None,
+            metric_name: None,
             row: None,
             run_id: None,
             dlq: None,
@@ -380,6 +382,15 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         self
     }
 
+    /// The `pipeline` label value of the run's metrics when it differs from
+    /// [`with_name`](Self::with_name) (a multi-tenant host labels a tenant's
+    /// run `{tenant}::{name}` so equal names stay apart). Spans, logs and DLQ
+    /// envelopes keep the name.
+    pub fn with_metric_name(mut self, name: impl Into<String>) -> Self {
+        self.metric_name = Some(name.into());
+        self
+    }
+
     /// Set the matrix row id used in spans and metric labels.
     /// Defaults to `""` (Prometheus treats empty labels as absent).
     pub fn with_row(mut self, row: impl Into<String>) -> Self {
@@ -484,6 +495,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
     fn governance_specs<'s>(
         &'s self,
         pipeline: &'s str,
+        envelope_pipeline: &'s str,
         row: &'s str,
         run_id: &'s str,
         sink_name: &'s str,
@@ -497,6 +509,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             contract: self.contract.as_ref(),
             schema_drift: self.schema_drift.as_ref(),
             pipeline,
+            envelope_pipeline,
             row,
             run_id,
             sink_name,
@@ -667,7 +680,11 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         use tracing::Instrument;
 
         // Resolve identity for this run.
-        let name = self.name.clone().unwrap_or_else(|| "unnamed".to_string());
+        let plain_name = self.name.clone().unwrap_or_else(|| "unnamed".to_string());
+        let name = self
+            .metric_name
+            .clone()
+            .unwrap_or_else(|| plain_name.clone());
         let row = self.row.clone().unwrap_or_default();
         let run_id = self
             .run_id
@@ -727,7 +744,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
         // the span correctly enters/exits across awaits.
         let span = tracing::info_span!(
             "faucet.pipeline.run",
-            pipeline = %name,
+            pipeline = %plain_name,
             row = %row,
             run_id = %run_id,
             source = %wrapped_source.connector_name(),
@@ -933,7 +950,13 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                     );
                 // No record pass is configured here (the planner refuses them), hence the clearance.
                 let clearance = self
-                    .governance_specs(&name, &row, &run_id, wrapped_sink.connector_name())
+                    .governance_specs(
+                        &name,
+                        &plain_name,
+                        &row,
+                        &run_id,
+                        wrapped_sink.connector_name(),
+                    )
                     .clearance();
                 let has_governance = clearance.is_none();
                 if native_mechanics_ok {
@@ -1018,7 +1041,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                     };
                     let sink_name = wrapped_sink.connector_name();
                     let row_accounts = self.row_accounts.clone();
-                    let specs = self.governance_specs(&name, &row, &run_id, sink_name);
+                    let specs = self.governance_specs(&name, &plain_name, &row, &run_id, sink_name);
                     return Box::pin(run_stream_columnar(
                         &wrapped_source,
                         &wrapped_sink,
@@ -1113,6 +1136,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
                 batch_outcomes: self.batch_outcomes.clone(),
                 source_drains_on_cancel,
                 row_accounts: self.row_accounts.clone(),
+                envelope_pipeline: Some(plain_name.clone()),
             };
             let cleanup = self
                 .cleanup
@@ -1291,7 +1315,7 @@ impl<'a, So: Source + ?Sized, Si: Sink + ?Sized> Pipeline<'a, So, Si> {
             throttle.wait(),
             run_started.elapsed(),
         ) {
-            tracing::warn!(pipeline = %name, row = %row, "{msg}");
+            tracing::warn!(pipeline = %plain_name, row = %row, "{msg}");
         }
 
         // Final run-counter increment. On error, also attach a `kind` label
@@ -1804,6 +1828,9 @@ pub(crate) struct StreamExtras {
     pub(crate) source_drains_on_cancel: bool,
     /// Per-run row accounting (#879).
     pub(crate) row_accounts: Option<Arc<crate::accounting::RowAccounts>>,
+    /// The pipeline name DLQ envelopes carry when the metric labels use
+    /// another (see [`Pipeline::with_metric_name`]).
+    pub(crate) envelope_pipeline: Option<String>,
 }
 
 #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
@@ -1822,6 +1849,10 @@ where
     let state_store = options.state_store.clone();
     let state_key = options.state_key.clone();
     let pipeline_name = options.pipeline_name.unwrap_or_else(|| "unnamed".into());
+    let envelope_pipeline = extras
+        .envelope_pipeline
+        .clone()
+        .unwrap_or_else(|| pipeline_name.clone());
     let row = options.row.unwrap_or_default();
     let run_id = options.run_id.unwrap_or_default();
     let dlq = options.dlq.clone();
@@ -2145,6 +2176,7 @@ where
                         contract: contract.as_ref(),
                         schema_drift: schema_drift.as_ref(),
                         pipeline: &pipeline_name,
+                        envelope_pipeline: &envelope_pipeline,
                         row: &row,
                         run_id: &run_id,
                         sink_name,
@@ -2405,7 +2437,7 @@ where
                                                             DlqReason::Partial
                                                         },
                                                         sink_name,
-                                                        &pipeline_name,
+                                                        &envelope_pipeline,
                                                         &row,
                                                         offset + j,
                                                     )
@@ -4792,6 +4824,44 @@ mod tests {
         let stats = result.dlq.unwrap();
         assert_eq!(stats.records_dlq, 2);
         assert_eq!(stats.pages_with_failures, 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_metric_name_labels_metrics_while_envelopes_keep_the_name() {
+        use crate::observability::decorator::source_tests::{LOCK, snapshotter};
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = snapshotter();
+        let source = MockSource((0..2).map(|i| json!({"i": i})).collect());
+        let main = PartialSink::new(vec![1]);
+        let dlq = std::sync::Arc::new(MockSink::new());
+        Pipeline::new(&source, &main)
+            .with_name("metric-name-etl")
+            .with_metric_name("tenant-a::metric-name-etl")
+            .with_row("r")
+            .with_dlq(DlqConfig::new(dlq.clone()))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(dlq.0.lock().unwrap()[0]["pipeline"], "metric-name-etl");
+        let labels: Vec<String> = snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == "faucet_pipeline_runs_total")
+            .flat_map(|(k, ..)| {
+                k.key()
+                    .labels()
+                    .filter(|l| l.key() == "pipeline")
+                    .map(|l| l.value().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            labels.iter().any(|l| l == "tenant-a::metric-name-etl"),
+            "{labels:?}"
+        );
+        assert!(!labels.iter().any(|l| l == "metric-name-etl"), "{labels:?}");
     }
 
     #[cfg(feature = "masking")]

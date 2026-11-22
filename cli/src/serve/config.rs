@@ -204,6 +204,9 @@ pub struct ServeConfig {
     pub preview: PreviewConfig,
     /// Run-ownership lease TTL for multi-instance orphan fencing (#146 H7).
     pub lease_ttl: Duration,
+    /// Counter and histogram series idle this long leave `/metrics`; `None`
+    /// keeps them (`--metrics-idle-timeout-secs 0`).
+    pub metrics_idle_timeout: Option<Duration>,
     pub probe_timeout: Duration,
     pub env_file: Option<PathBuf>,
     pub no_env_file: bool,
@@ -807,6 +810,8 @@ impl ServeConfig {
                 args.preview_max_rows,
             ),
             lease_ttl: Duration::from_secs(args.lease_ttl_secs),
+            metrics_idle_timeout: (args.metrics_idle_timeout_secs > 0)
+                .then(|| Duration::from_secs(args.metrics_idle_timeout_secs)),
             probe_timeout: Duration::from_secs(args.probe_timeout_secs),
             env_file: args.env_file,
             no_env_file: args.no_env_file,
@@ -1020,6 +1025,7 @@ mod tests {
             preview_default_rows: crate::serve::preview::DEFAULT_PREVIEW_ROWS,
             preview_max_rows: crate::serve::preview::MAX_PREVIEW_ROWS,
             lease_ttl_secs: 30,
+            metrics_idle_timeout_secs: 86_400,
             probe_timeout_secs: 10,
             env_file: None,
             no_env_file: false,

@@ -2758,6 +2758,16 @@ pub struct ServeArgs {
     /// Only relevant with a persistent (postgres/sqlite) history backend.
     #[arg(long, default_value_t = 30)]
     pub lease_ttl_secs: u64,
+    /// Drop counter and histogram series not updated for this many seconds
+    /// from `/metrics` until they are emitted again (gauges never expire).
+    /// Bounds the memory and scrape size of a long-running server. `0` keeps
+    /// every series.
+    #[arg(
+        long,
+        env = "FAUCET_SERVE_METRICS_IDLE_TIMEOUT_SECS",
+        default_value_t = 86_400
+    )]
+    pub metrics_idle_timeout_secs: u64,
     /// Per-probe timeout for `doctor_first` preflight (seconds).
     #[arg(long, default_value_t = 10)]
     pub probe_timeout_secs: u64,

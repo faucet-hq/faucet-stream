@@ -631,6 +631,7 @@ impl Governance {
             contract: self.contract.as_ref(),
             schema_drift: self.schema_drift.as_ref(),
             pipeline: "unnamed",
+            envelope_pipeline: "unnamed",
             row: "",
             run_id: "",
             sink_name: sink.connector_name(),

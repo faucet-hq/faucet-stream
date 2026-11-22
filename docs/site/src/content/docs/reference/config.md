@@ -1832,6 +1832,23 @@ observability:
 | `timeout_secs` | integer | `10` | Per-export timeout in seconds. Timed-out exports are counted in `faucet_otel_export_failures_total` but do not fail the run. |
 | `metric_interval_secs` | integer | `60` | How often (in seconds) accumulated metric points are pushed to the collector. |
 
+### `prometheus:`
+
+Serves a Prometheus `/metrics` endpoint.
+
+```yaml
+observability:
+  prometheus:
+    listen: "127.0.0.1:9464"
+    idle_timeout_secs: 86400
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `listen` | string | required | Socket address the scrape endpoint binds. |
+| `buckets` | list of numbers | faucet's defaults | Histogram bucket boundaries (seconds) applied to every histogram. |
+| `idle_timeout_secs` | integer | `86400` for `faucet schedule` and `faucet mirror`, none for one-shot commands | Counter and histogram series not updated for this many seconds leave `/metrics` until they are emitted again; gauges never expire. `0` keeps every series. A counter that comes back restarts at zero, which `rate()` / `increase()` read as a reset. |
+
 **Coexistence:** `observability.otel:` and `observability.prometheus:` are
 fully independent; both can be active at the same time and metrics fan out to
 both exporters. Export failures are never propagated to the pipeline — they

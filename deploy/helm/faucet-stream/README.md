@@ -581,6 +581,7 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `serve.feeds.listen.allowedHosts` | `[]` | `--feeds-allowed-host`; empty = any host |
 | `serve.feeds.listen.ingress` | disabled | an Ingress for the ingest Service only: `enabled`, `className`, `annotations`, `hosts`, `tls` |
 | `serve.tenantDeliveryMinIntervalSecs` | `10` | `--tenant-delivery-min-interval-secs` |
+| `serve.metrics.idleTimeoutSecs` | `86400` | `--metrics-idle-timeout-secs`: counter and histogram series idle this long leave `/metrics` until emitted again; gauges never expire; `0` keeps every series |
 | `serve.policy.store` | `server` | `--policy-store`: `server` keeps approved versions in the history store (the file only seeds an empty store); `file` makes the file the policy, read-only in the console (needs `serve.policy.enabled`) |
 | `serve.cluster.vaultKey.existingSecret` | `""` | vault key (`FAUCET_VAULT_KEY`) that seals clustered template runs' `secret: true` params; `cluster.previousKeys` open values sealed under an earlier key |
 | `serve.tenants.enabled` | `false` | tenants; needs `vaultKey.existingSecret` (+ `existingSecretKey`, default `FAUCET_VAULT_KEY`) and persistent history |

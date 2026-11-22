@@ -444,8 +444,11 @@ async fn policy_gate(
         if report.violated() {
             let merged = serde_json::to_value(&loaded.cfg).unwrap_or(Value::Null);
             let fp = crate::serve::idempotency::fingerprint(&merged, loaded.cfg.name.as_deref());
-            let pipeline = loaded.cfg.name.as_deref().unwrap_or("serve");
-            crate::policy::record_metrics(pipeline, &report);
+            let pipeline = crate::exec_metrics::pipeline_label(
+                loaded.tenant.as_deref().map(|t| t.values.id.as_str()),
+                loaded.cfg.name.as_deref().unwrap_or("serve"),
+            );
+            crate::policy::record_metrics(&pipeline, &report);
             crate::serve::audit::record_detail(
                 state,
                 actor,
@@ -1180,11 +1183,10 @@ pub async fn verify(
     let loaded = &admitted.loaded;
     let permit = runner::inline_permit(state)?;
     let auth = loaded.auth_catalog().map_err(cli_to_serve)?;
-    let pipeline_name = loaded
-        .cfg
-        .name
-        .clone()
-        .unwrap_or_else(|| "verify".to_string());
+    let pipeline_name = crate::exec_metrics::pipeline_label(
+        loaded.tenant.as_deref().map(|t| t.values.id.as_str()),
+        loaded.cfg.name.as_deref().unwrap_or("verify"),
+    );
     let mut spec = loaded.cfg.verify.clone().unwrap_or_default();
     if let Some(n) = req.max_differences {
         spec.max_differences = n;

@@ -3668,6 +3668,16 @@
             "format": "double"
           },
           "default": null
+        },
+        "idle_timeout_secs": {
+          "description": "Drop counter and histogram series not updated for this many seconds\nfrom `/metrics` until they are emitted again; gauges never expire. `0`\nkeeps every series. Defaults to 86400 (24 h) for `faucet schedule` and\n`faucet mirror`, and to never for one-shot commands.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "default": null
         }
       },
       "additionalProperties": false,

@@ -26,6 +26,8 @@ pub(crate) struct GovernanceSpecs<'a> {
     pub contract: Option<&'a Arc<crate::contract::CompiledContract>>,
     pub schema_drift: Option<&'a crate::drift::SchemaDriftPolicy>,
     pub pipeline: &'a str,
+    /// The pipeline name DLQ envelopes carry (`pipeline` labels metrics).
+    pub envelope_pipeline: &'a str,
     pub row: &'a str,
     /// Only read by the masking/quality/contract label builders, so it is
     /// dead under a build with none of those features.
@@ -112,6 +114,11 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
     use crate::dlq::{DlqReason, build_envelope};
 
     let pipeline_name = specs.pipeline;
+    #[cfg_attr(
+        not(any(feature = "quality", feature = "contract")),
+        allow(unused_variables)
+    )]
+    let envelope_pipeline = specs.envelope_pipeline;
     let row = specs.row;
     let sink_name = specs.sink_name;
 
@@ -155,7 +162,7 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
                         &err,
                         DlqReason::Quality,
                         sink_name,
-                        pipeline_name,
+                        envelope_pipeline,
                         row,
                         qr.page_index,
                     )
@@ -210,7 +217,7 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
                         &err,
                         DlqReason::Contract,
                         sink_name,
-                        pipeline_name,
+                        envelope_pipeline,
                         row,
                         page_index,
                     )
@@ -282,6 +289,7 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
                         sink,
                         sink_name,
                         pipeline_name,
+                        envelope_pipeline,
                         row,
                         &mut state.dest_schema_cache,
                         &mut drift_envelopes,
@@ -370,6 +378,7 @@ async fn apply_drift_policy<Si: Sink + ?Sized>(
     sink: &Si,
     sink_name: &str,
     pipeline_name: &str,
+    envelope_pipeline: &str,
     row: &str,
     dest_schema_cache: &mut Option<Option<Value>>,
     drift_envelopes: &mut Vec<Value>,
@@ -466,7 +475,7 @@ async fn apply_drift_policy<Si: Sink + ?Sized>(
                 records,
                 page_indices,
                 sink_name,
-                pipeline_name,
+                envelope_pipeline,
                 row,
             );
             drift_envelopes.extend(env);
@@ -541,7 +550,7 @@ async fn apply_drift_policy<Si: Sink + ?Sized>(
                             records,
                             page_indices,
                             sink_name,
-                            pipeline_name,
+                            envelope_pipeline,
                             row,
                         );
                         drift_envelopes.extend(env);
@@ -677,6 +686,7 @@ mod tests {
                 &Null,
                 "null",
                 "p",
+                "p",
                 "",
                 &mut cache,
                 &mut envelopes,
@@ -718,6 +728,7 @@ mod tests {
             &indices,
             &Null,
             "null",
+            "p",
             "p",
             "",
             &mut None,

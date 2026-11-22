@@ -1109,6 +1109,13 @@ pub struct PrometheusSpec {
     /// buckets when `None`.
     #[serde(default)]
     pub buckets: Option<Vec<f64>>,
+
+    /// Drop counter and histogram series not updated for this many seconds
+    /// from `/metrics` until they are emitted again; gauges never expire. `0`
+    /// keeps every series. Defaults to 86400 (24 h) for `faucet schedule` and
+    /// `faucet mirror`, and to never for one-shot commands.
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
 }
 
 /// Tracing / log-level configuration.

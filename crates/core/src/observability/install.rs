@@ -47,6 +47,10 @@ pub struct PrometheusConfig {
     /// runs (run / invocation duration, schedule lateness, sink flush, verify)
     /// get 0.1 s..24 h.
     pub buckets: Option<Vec<f64>>,
+    /// Drop counter and histogram series not updated for this long from the
+    /// recorder (and so from `/metrics`) until they are emitted again. Gauges
+    /// never expire. `None` keeps every series for the life of the process.
+    pub idle_timeout: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -365,6 +369,82 @@ pub fn with_default_buckets(
     Ok(builder)
 }
 
+/// Expire counter and histogram series that saw no update for `timeout`
+/// (`None` keeps them). Gauges are left out on purpose: staleness alerts read
+/// gauges (`faucet_pipeline_last_bookmark_unix_seconds`, heartbeats) that must
+/// stay while a pipeline is idle. An expired counter that is emitted again
+/// restarts at zero, which `rate` / `increase` read as a reset.
+///
+/// The exporter prunes on render, so emit through the `metrics` macros on each
+/// update: a metric handle kept across an expiry keeps writing to a series
+/// that is never rendered again.
+#[cfg(feature = "observability-install")]
+pub fn with_idle_timeout(
+    builder: metrics_exporter_prometheus::PrometheusBuilder,
+    timeout: Option<std::time::Duration>,
+) -> metrics_exporter_prometheus::PrometheusBuilder {
+    use metrics_util::MetricKindMask;
+    builder.idle_timeout(MetricKindMask::COUNTER | MetricKindMask::HISTOGRAM, timeout)
+}
+
+/// How often [`prune_idle_series`] renders: a quarter of the idle timeout,
+/// never more often than once a minute.
+#[cfg(feature = "observability-install")]
+pub fn prune_interval(idle: std::time::Duration) -> std::time::Duration {
+    (idle / 4).max(std::time::Duration::from_secs(60))
+}
+
+/// Render `handle` every [`prune_interval`] and discard the output, so expired
+/// series are dropped from memory even when nothing scrapes `/metrics`. Runs
+/// until the future is dropped.
+#[cfg(feature = "observability-install")]
+pub async fn prune_idle_series(
+    handle: metrics_exporter_prometheus::PrometheusHandle,
+    idle: std::time::Duration,
+) {
+    let mut tick = tokio::time::interval(prune_interval(idle));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        drop(handle.render());
+    }
+}
+
+/// Install `recorder` globally and run `exporter` (plus the pruning task when
+/// `idle` is set) on the ambient runtime, or on a background thread's runtime
+/// when there is none. Returns `false` when a recorder was already installed.
+#[cfg(feature = "observability-install")]
+fn install_built(
+    recorder: metrics_exporter_prometheus::PrometheusRecorder,
+    exporter: metrics_exporter_prometheus::ExporterFuture,
+    idle: Option<std::time::Duration>,
+    runtime: Option<tokio::runtime::Runtime>,
+) -> Result<bool, InstallError> {
+    let handle = recorder.handle();
+    if metrics::set_global_recorder(recorder).is_err() {
+        return Ok(false);
+    }
+    let work = async move {
+        if let Some(idle) = idle {
+            tokio::spawn(prune_idle_series(handle, idle));
+        }
+        let _ = exporter.await;
+    };
+    match runtime {
+        None => {
+            tokio::spawn(work);
+        }
+        Some(rt) => {
+            std::thread::Builder::new()
+                .name("faucet-prometheus".into())
+                .spawn(move || rt.block_on(work))
+                .map_err(|e| InstallError::PrometheusInstall(e.to_string()))?;
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(feature = "observability-install")]
 fn install_prometheus_only(
     p: &PrometheusConfig,
@@ -381,6 +461,46 @@ fn install_prometheus_only(
             })?;
 
     let builder = with_buckets(PrometheusBuilder::new().with_http_listener(listen), p)?;
+
+    if p.idle_timeout.is_some() {
+        let builder = with_idle_timeout(builder, p.idle_timeout);
+        let build = |b: PrometheusBuilder| {
+            b.build().map_err(|e| match e {
+                BuildError::FailedToCreateHTTPListener(msg) => InstallError::PrometheusBind {
+                    listen: p.listen.clone(),
+                    source: std::io::Error::other(msg),
+                },
+                other => InstallError::PrometheusInstall(other.to_string()),
+            })
+        };
+        let installed = match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                let (recorder, exporter) = {
+                    let _g = rt.enter();
+                    build(builder)?
+                };
+                install_built(recorder, exporter, p.idle_timeout, None)?
+            }
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| InstallError::PrometheusInstall(e.to_string()))?;
+                let (recorder, exporter) = {
+                    let _g = rt.enter();
+                    build(builder)?
+                };
+                install_built(recorder, exporter, p.idle_timeout, Some(rt))?
+            }
+        };
+        if installed {
+            report.prometheus_listen = Some(p.listen.clone());
+        } else {
+            tracing::warn!("Prometheus recorder already installed; continuing");
+            report.prometheus_already_installed = true;
+        }
+        return Ok(());
+    }
 
     match builder.install() {
         Ok(()) => report.prometheus_listen = Some(p.listen.clone()),
@@ -435,17 +555,22 @@ fn install_fanout(
             })?;
     // build() returns (recorder, /metrics exporter future) WITHOUT setting the
     // global recorder, so we can fan it out.
-    let (prom_recorder, prom_exporter) =
-        with_buckets(PrometheusBuilder::new().with_http_listener(listen), p)?
-            .build()
-            .map_err(|e| match e {
-                BuildError::FailedToCreateHTTPListener(msg) => InstallError::PrometheusBind {
-                    listen: p.listen.clone(),
-                    source: std::io::Error::other(msg),
-                },
-                other => InstallError::PrometheusInstall(other.to_string()),
-            })?;
+    let (prom_recorder, prom_exporter) = with_idle_timeout(
+        with_buckets(PrometheusBuilder::new().with_http_listener(listen), p)?,
+        p.idle_timeout,
+    )
+    .build()
+    .map_err(|e| match e {
+        BuildError::FailedToCreateHTTPListener(msg) => InstallError::PrometheusBind {
+            listen: p.listen.clone(),
+            source: std::io::Error::other(msg),
+        },
+        other => InstallError::PrometheusInstall(other.to_string()),
+    })?;
 
+    let prune = p
+        .idle_timeout
+        .map(|idle| prune_idle_series(prom_recorder.handle(), idle));
     match crate::observability::otel::build_meter_provider(otel) {
         Ok((mp, otel_recorder)) => {
             let fanout = FanoutBuilder::default()
@@ -460,6 +585,9 @@ fn install_fanout(
                 report.otel_signals.push("metrics");
                 *otel_meter = Some(mp);
                 tokio::spawn(prom_exporter);
+                if let Some(prune) = prune {
+                    tokio::spawn(prune);
+                }
             }
         }
         Err(e) => {
@@ -471,6 +599,9 @@ fn install_fanout(
             } else {
                 report.prometheus_listen = Some(p.listen.clone());
                 tokio::spawn(prom_exporter);
+                if let Some(prune) = prune {
+                    tokio::spawn(prune);
+                }
             }
         }
     }
@@ -598,6 +729,7 @@ mod tests {
         let p = PrometheusConfig {
             listen: "127.0.0.1:0".into(),
             buckets,
+            idle_timeout: None,
         };
         let recorder = with_buckets(metrics_exporter_prometheus::PrometheusBuilder::new(), &p)
             .unwrap()
@@ -608,6 +740,62 @@ mod tests {
             metrics::histogram!("faucet_source_page_duration_seconds").record(0.2);
         });
         handle.render()
+    }
+
+    #[test]
+    fn idle_counters_and_histograms_expire_but_gauges_stay() {
+        let recorder = with_idle_timeout(
+            metrics_exporter_prometheus::PrometheusBuilder::new(),
+            Some(std::time::Duration::from_millis(200)),
+        )
+        .build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            metrics::counter!("faucet_test_idle_total").increment(1);
+            metrics::histogram!("faucet_test_idle_seconds").record(1.0);
+            metrics::gauge!("faucet_test_idle_gauge").set(1.0);
+        });
+        let before = handle.render();
+        assert!(before.contains("faucet_test_idle_total"), "{before}");
+        #[allow(clippy::disallowed_methods)] // waits past the idle timeout; no runtime here
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let after = handle.render();
+        assert!(!after.contains("faucet_test_idle_total"), "{after}");
+        assert!(!after.contains("faucet_test_idle_seconds"), "{after}");
+        assert!(after.contains("faucet_test_idle_gauge 1"), "{after}");
+        metrics::with_local_recorder(&recorder, || {
+            metrics::counter!("faucet_test_idle_total").increment(1);
+        });
+        assert!(handle.render().contains("faucet_test_idle_total 1"));
+    }
+
+    #[test]
+    fn install_with_an_idle_timeout_and_no_runtime_returns_ok() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = ObservabilityConfig {
+            prometheus: Some(PrometheusConfig {
+                listen: "127.0.0.1:0".into(),
+                buckets: None,
+                idle_timeout: Some(std::time::Duration::from_secs(3600)),
+            }),
+            tracing: None,
+            otel: None,
+        };
+        let report = install_observability(&cfg).expect("install");
+        assert!(report.prometheus_listen.is_some() || report.prometheus_already_installed);
+    }
+
+    #[test]
+    fn prune_interval_is_a_quarter_of_the_timeout_and_at_least_a_minute() {
+        use std::time::Duration;
+        assert_eq!(
+            prune_interval(Duration::from_secs(86_400)),
+            Duration::from_secs(21_600)
+        );
+        assert_eq!(
+            prune_interval(Duration::from_secs(10)),
+            Duration::from_secs(60)
+        );
     }
 
     #[test]
@@ -664,6 +852,7 @@ mod tests {
             prometheus: Some(PrometheusConfig {
                 listen: "not-a-socket".into(),
                 buckets: None,
+                idle_timeout: None,
             }),
             tracing: None,
             otel: None,
@@ -696,6 +885,7 @@ mod tests {
                 listen: "127.0.0.1:0".into(),
                 // Exercise the explicit-buckets branch.
                 buckets: Some(vec![0.01, 0.1, 1.0]),
+                idle_timeout: None,
             }),
             tracing: Some(TracingConfig {
                 level: "info".into(),

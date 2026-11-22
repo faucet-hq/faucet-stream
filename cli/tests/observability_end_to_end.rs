@@ -226,6 +226,7 @@ fn install_observability_returns_typed_error_on_garbage_listen() {
         prometheus: Some(PrometheusConfig {
             listen: "totally bogus".into(),
             buckets: None,
+            idle_timeout: None,
         }),
         tracing: None,
         otel: None,

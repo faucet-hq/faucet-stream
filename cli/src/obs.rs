@@ -30,6 +30,30 @@ pub fn resolve_tracing_level(cli_flag: Option<&str>, yaml_level: Option<&str>) -
 /// the `otel` feature is compiled in. Logs a one-shot warning if an `otel:` block
 /// is present but the binary was built without `--features otel`.
 pub fn build_observability_config(cfg: &PipelineConfig) -> ObservabilityConfig {
+    build_observability_config_for(cfg, false)
+}
+
+/// The idle timeout long-running commands give counters and histograms when
+/// the config does not set `observability.prometheus.idle_timeout_secs`.
+pub const LONG_RUNNING_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(86_400);
+
+/// The series idle timeout from `idle_timeout_secs` (`0` = never), else the
+/// long-running default.
+pub fn idle_timeout(secs: Option<u64>, long_running: bool) -> Option<std::time::Duration> {
+    match secs {
+        Some(0) => None,
+        Some(n) => Some(std::time::Duration::from_secs(n)),
+        None => long_running.then_some(LONG_RUNNING_IDLE_TIMEOUT),
+    }
+}
+
+/// [`build_observability_config`] for a command that runs for a long time
+/// (`long_running`: `faucet schedule`, `faucet mirror`), which expires idle
+/// counter and histogram series by default.
+pub fn build_observability_config_for(
+    cfg: &PipelineConfig,
+    long_running: bool,
+) -> ObservabilityConfig {
     let level = resolve_tracing_level(
         None,
         cfg.observability
@@ -47,6 +71,7 @@ pub fn build_observability_config(cfg: &PipelineConfig) -> ObservabilityConfig {
             .map(|p| PrometheusConfig {
                 listen: p.listen.clone(),
                 buckets: p.buckets.clone(),
+                idle_timeout: idle_timeout(p.idle_timeout_secs, long_running),
             }),
         tracing: level.map(|l| TracingConfig { level: l }),
         ..Default::default()
@@ -81,8 +106,14 @@ pub fn build_observability_config(cfg: &PipelineConfig) -> ObservabilityConfig {
 /// Install Prometheus + tracing from the config's `observability:` block. Logs
 /// (does not fail) when a recorder/subscriber is already installed.
 pub fn install(cfg: &PipelineConfig) -> CliResult<()> {
+    install_for(cfg, false)
+}
+
+/// [`install`] for a long-running command (see
+/// [`build_observability_config_for`]).
+pub fn install_for(cfg: &PipelineConfig, long_running: bool) -> CliResult<()> {
     crate::set_build_version();
-    let obs_cfg = build_observability_config(cfg);
+    let obs_cfg = build_observability_config_for(cfg, long_running);
     let report = install_observability(&obs_cfg)?;
     if let Some(addr) = report.prometheus_listen.as_deref() {
         tracing::info!("Prometheus /metrics listening on {addr}");
@@ -221,5 +252,45 @@ observability:
         #[cfg(feature = "otel")]
         assert!(obs.otel.is_some());
         let _ = obs;
+    }
+
+    #[test]
+    fn idle_timeout_defaults_only_for_long_running_commands() {
+        use std::time::Duration;
+        assert_eq!(idle_timeout(None, false), None);
+        assert_eq!(idle_timeout(None, true), Some(LONG_RUNNING_IDLE_TIMEOUT));
+        assert_eq!(idle_timeout(Some(0), true), None);
+        assert_eq!(idle_timeout(Some(60), false), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn maps_the_prometheus_idle_timeout() {
+        let yaml = r#"
+version: 1
+pipeline:
+  source: { type: rest, config: { base_url: "http://x" } }
+  sink: { type: stdout, config: {} }
+observability:
+  prometheus: { listen: "127.0.0.1:0", idle_timeout_secs: 120 }
+"#;
+        let cfg = crate::config::parse_with_extension(yaml, "yaml").unwrap();
+        let p = build_observability_config(&cfg).prometheus.unwrap();
+        assert_eq!(p.idle_timeout, Some(std::time::Duration::from_secs(120)));
+        let bare = yaml.replace(", idle_timeout_secs: 120", "");
+        let cfg = crate::config::parse_with_extension(&bare, "yaml").unwrap();
+        assert_eq!(
+            build_observability_config(&cfg)
+                .prometheus
+                .unwrap()
+                .idle_timeout,
+            None
+        );
+        assert_eq!(
+            build_observability_config_for(&cfg, true)
+                .prometheus
+                .unwrap()
+                .idle_timeout,
+            Some(LONG_RUNNING_IDLE_TIMEOUT)
+        );
     }
 }
