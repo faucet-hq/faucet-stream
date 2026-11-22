@@ -213,8 +213,8 @@ pub struct RestStreamConfig {
     /// the first unread page, and an exclusive (`>`) server filter would skip
     /// them; the client-side filter is inclusive, so the re-read rows at that
     /// key arrive again (pair with an upsert sink). Ignored for windowed
-    /// passes and across `requests:` entries (a truncated entry fails the
-    /// run).
+    /// passes; with several `requests:` entries it applies to each entry's
+    /// own pass.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub assume_ordered: bool,
     /// Fixed delay between page requests, in seconds — a politeness knob for
@@ -322,7 +322,9 @@ pub struct RestStreamConfig {
     /// `requests:` — one entry per request: a context map whose values are
     /// substituted into `path` placeholders. The stream is executed once per
     /// entry and results are concatenated. Empty means run once with no
-    /// substitution. The pre-#670 spelling `partitions:` is still accepted.
+    /// substitution. With incremental replication (or `window:`) and more
+    /// than one entry, each entry reads from and stores its own bookmark. The
+    /// pre-#670 spelling `partitions:` is still accepted.
     #[serde(default, rename = "requests", alias = "partitions")]
     pub partitions: Vec<HashMap<String, Value>>,
     /// `request_concurrency:` — maximum number of `requests` entries fetched
@@ -333,9 +335,8 @@ pub struct RestStreamConfig {
     /// and the `stream_pages` path the pipeline actually drives, where it used
     /// to be silently ignored. Above 1, partition pages **interleave**: the
     /// streams are polled together, so a page from partition 3 can arrive
-    /// before partition 1 has finished. Partitions are disjoint and the
-    /// persisted bookmark is a max across all of them, so this changes
-    /// throughput rather than the resume position — but a downstream that
+    /// before partition 1 has finished. Each entry keeps its own bookmark,
+    /// so this changes throughput rather than the resume position — but a downstream that
     /// assumed partition-at-a-time page order no longer gets it.
     #[serde(
         default,
@@ -1206,6 +1207,28 @@ impl RestStreamConfig {
                  several `requests:` entries — each would be seeded with another entry's cursor"
                     .into(),
             ));
+        }
+        if self
+            .odata
+            .as_ref()
+            .and_then(|o| o.partition.as_ref())
+            .is_some_and(|p| p.key.is_some())
+        {
+            if self.persist_cursor {
+                return Err(faucet_core::FaucetError::Config(
+                    "rest: `persist_cursor` resumes one cursor, so it cannot be combined with \
+                     OData key ranges (`odata.partition.key`), which page several ranges"
+                        .into(),
+                ));
+            }
+            if self.partitions.len() > 1 {
+                return Err(faucet_core::FaucetError::Config(
+                    "rest: OData key ranges (`odata.partition.key`) tile one entity, so they \
+                     cannot be combined with several `requests:` entries, which the key-range \
+                     read would ignore"
+                        .into(),
+                ));
+            }
         }
         if self.async_job.is_some() && !self.partitions.is_empty() {
             return Err(faucet_core::FaucetError::Config(

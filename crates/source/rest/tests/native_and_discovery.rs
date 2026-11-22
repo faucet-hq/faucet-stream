@@ -431,6 +431,122 @@ async fn key_range_partitioning_tiles_the_entity_and_suppresses_bookmarks() {
     assert_eq!(records, 4, "one page per planned range (count: 4)");
 }
 
+/// An incremental OData read over key ranges, the range pages each holding
+/// one row whose `ts` is `1..=4` in arrival order (`next` adds a next link).
+async fn key_range_incremental(
+    next: bool,
+    max_pages: Option<usize>,
+) -> (MockServer, RestStreamConfig) {
+    let server = MockServer::start().await;
+    for (order, key) in [("RecId asc", 1), ("RecId desc", 8)] {
+        Mock::given(method("GET"))
+            .and(path("/Ledger"))
+            .and(query_param("$orderby", order))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "value": [{ "RecId": key }] })),
+            )
+            .mount(&server)
+            .await;
+    }
+    let n = Arc::new(AtomicUsize::new(0));
+    let uri = server.uri();
+    Mock::given(method("GET"))
+        .and(path("/Ledger"))
+        .respond_with(move |_: &wiremock::Request| {
+            let ts = n.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut body = json!({ "value": [{ "RecId": 5, "ts": ts }] });
+            if next {
+                body["@odata.nextLink"] = json!(format!("{uri}/Ledger?page={ts}"));
+            }
+            ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+    let mut cfg = RestStreamConfig::new(&server.uri(), "/Ledger")
+        .replication_method(faucet_core::ReplicationMethod::Incremental)
+        .replication_key("ts");
+    cfg.odata = Some(
+        serde_json::from_value(json!({
+            "version": "v4",
+            "entity": "Ledger",
+            "partition": { "objects": "Ledger", "key": "RecId", "workers": 2, "count": 4 }
+        }))
+        .unwrap(),
+    );
+    cfg.records_path = Some("$.value[*]".into());
+    cfg.max_pages = max_pages;
+    (server, cfg)
+}
+
+#[tokio::test]
+async fn an_incremental_key_range_read_persists_the_largest_range_bookmark() {
+    let (_server, cfg) = key_range_incremental(false, None).await;
+    let stream = RestStream::new(cfg.clone()).unwrap();
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let pages: Vec<_> = <RestStream as Source>::stream_pages(&stream, &ctx, 1000)
+        .collect()
+        .await;
+    let bookmarks: Vec<Value> = pages
+        .iter()
+        .filter_map(|p| p.as_ref().unwrap().bookmark.clone())
+        .collect();
+    assert_eq!(bookmarks, vec![json!(4)], "one bookmark, after every range");
+    let last = pages.last().unwrap().as_ref().unwrap();
+    assert!(last.records.is_empty());
+
+    let (_server, cfg) = key_range_incremental(false, None).await;
+    let resumed = RestStream::new(cfg).unwrap();
+    resumed.apply_start_bookmark(json!(100)).await.unwrap();
+    let records: usize = <RestStream as Source>::stream_pages(&resumed, &ctx, 1000)
+        .map(|p| p.unwrap().records.len())
+        .fold(0, |a, b| async move { a + b })
+        .await;
+    assert_eq!(records, 0, "every range filters from the stored bookmark");
+}
+
+#[tokio::test]
+async fn a_truncated_key_range_fails_an_incremental_read() {
+    let (_server, cfg) = key_range_incremental(true, Some(1)).await;
+    let stream = RestStream::new(cfg).unwrap();
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let pages: Vec<_> = <RestStream as Source>::stream_pages(&stream, &ctx, 1000)
+        .collect()
+        .await;
+    let err = pages
+        .into_iter()
+        .find_map(Result::err)
+        .expect("a truncated range fails the read")
+        .to_string();
+    assert!(err.contains("max_pages (1)"), "{err}");
+}
+
+#[test]
+fn key_ranges_refuse_a_persisted_cursor_and_several_requests() {
+    let mut cfg = RestStreamConfig::new("http://x", "/Ledger");
+    cfg.odata = Some(
+        serde_json::from_value(json!({
+            "version": "v4",
+            "entity": "Ledger",
+            "partition": { "objects": "Ledger", "key": "RecId" }
+        }))
+        .unwrap(),
+    );
+    let two = cfg
+        .clone()
+        .add_partition(HashMap::from([("a".to_string(), json!(1))]))
+        .add_partition(HashMap::from([("a".to_string(), json!(2))]));
+    let err = RestStream::new(two).err().unwrap().to_string();
+    assert!(err.contains("several `requests:`"), "{err}");
+    let cursor = cfg
+        .pagination(faucet_source_rest::PaginationStyle::Cursor {
+            next_token_path: "$.next".into(),
+            param_name: "c".into(),
+        })
+        .persist_cursor(true);
+    let err = RestStream::new(cursor).err().unwrap().to_string();
+    assert!(err.contains("OData key ranges"), "{err}");
+}
+
 #[tokio::test]
 async fn key_range_partitioning_on_an_empty_entity_yields_nothing() {
     let server = MockServer::start().await;

@@ -1579,3 +1579,24 @@ fn a_persisted_rest_cursor_resumes_from_its_bookmark() {
     ));
     assert!(!source_resumes_from_bookmark("rest", &json!({})));
 }
+
+#[cfg(feature = "source-rest")]
+#[test]
+fn rest_bookmarks_are_versioned_with_the_per_entry_shape() {
+    assert_eq!(source_state_schema("rest"), 1);
+    assert_eq!(migrate_source_state("rest", 0, json!(5)).unwrap(), json!(5));
+    let per_entry = json!({"requests": {"a": 1}});
+    assert_eq!(
+        migrate_source_state("rest", 1, per_entry.clone()).unwrap(),
+        per_entry
+    );
+    assert!(migrate_source_state("rest", 2, json!(5)).is_err());
+    let built = faucet_source_rest::RestStream::new(faucet_source_rest::RestStreamConfig::new(
+        "http://x", "/y",
+    ))
+    .unwrap();
+    assert_eq!(
+        faucet_core::Source::state_schema(&built),
+        source_state_schema("rest")
+    );
+}

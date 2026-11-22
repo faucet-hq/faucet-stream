@@ -169,7 +169,7 @@ fn assume_ordered_without_a_server_side_bind_is_refused() {
 }
 
 #[tokio::test]
-async fn an_ordered_truncated_requests_entry_fails_instead_of_stalling() {
+async fn an_ordered_truncated_requests_entry_keeps_its_own_bookmark() {
     let server = two_page_feed().await;
     let config = RestStreamConfig::new(&server.uri(), "/items")
         .records_path("$.data[*]")
@@ -184,8 +184,30 @@ async fn an_ordered_truncated_requests_entry_fails_instead_of_stalling() {
     let (records, outcome) = drain_result(&RestStream::new(config).unwrap()).await;
 
     assert_eq!(records.len(), 4, "every entry's fetched page is delivered");
-    let err = outcome.expect_err("an unconsolidated bookmark must not be a silent stall");
-    assert!(err.contains("`requests:`"), "{err}");
+    let bookmark = outcome.expect("each ordered entry resumes from its own largest key");
+    assert_eq!(
+        bookmark,
+        Some(json!({"requests": {
+            "e77abed24194121d": "2026-01-02T00:00:00Z",
+            "96366955c414205b": "2026-01-02T00:00:00Z"
+        }}))
+    );
+}
+
+#[tokio::test]
+async fn an_unordered_truncated_requests_entry_fails() {
+    let server = two_page_feed().await;
+    let config = RestStreamConfig::new(&server.uri(), "/items")
+        .records_path("$.data[*]")
+        .replication_method(ReplicationMethod::Incremental)
+        .replication_key("updated_at")
+        .pagination(cursor())
+        .max_pages(1)
+        .add_partition(HashMap::from([("region".to_string(), json!("eu"))]))
+        .add_partition(HashMap::from([("region".to_string(), json!("us"))]));
+    let (_, outcome) = drain_result(&RestStream::new(config).unwrap()).await;
+    let err = outcome.expect_err("an unordered entry cut short cannot keep a bookmark");
+    assert!(err.contains("max_pages (1)"), "{err}");
 }
 
 #[tokio::test]

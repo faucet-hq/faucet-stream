@@ -138,3 +138,9 @@ the previous release still reads it.
 - `mongodb-cdc` shipped the first real migration (schema 0 → 1: the
   invalidate flag became explicit); its integration test resumes a pipeline
   from a released schema-0 bookmark against a live replica set.
+- `rest` moved to schema 1: an incremental (or windowed) source with several
+  `requests:` entries keeps a bookmark per entry (`{"requests": {...}}`), and
+  a schema-0 bookmark becomes every entry's start. An older release refuses
+  every REST bookmark written at schema 1, so rolling back needs
+  `faucet state reset` for those rows. Frozen fixtures:
+  `crates/source/rest/tests/fixtures/requests-bookmark-*.json`.

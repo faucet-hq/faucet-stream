@@ -1,0 +1,11 @@
+{
+  "faucet_state": 1,
+  "owner": "rest",
+  "schema": 1,
+  "data": {
+    "requests": {
+      "e77abed24194121d": 100,
+      "96366955c414205b": 50
+    }
+  }
+}

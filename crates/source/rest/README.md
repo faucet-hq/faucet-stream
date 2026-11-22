@@ -122,7 +122,7 @@ the secrets/redaction boundary like any other config string.
 | `drop_key_prefixes` | list | `[]` | Drop per-record keys starting with any of these prefixes — protocol control fields (OData's `@odata.etag`, JSON:API's `links`, HAL's `_links`) are metadata, not data, and are often invalid column names downstream. An `odata:` block implies `@odata.`, so existing OData configs need no change (#654). |
 | `max_pages` | int / null | unset | Optional cap on pages fetched per pass, across **all** pagination styles. Unset by default — every style stops on its own end signal and loop guards. A pass the cap cuts short keeps only a `persist_cursor` bookmark; an incremental or windowed pass it cuts short **fails the run** (a record-derived or window bookmark would skip the unread pages, and keeping none would re-read them every run), unless `assume_ordered` is set. |
 | `allow_repeated_pages` | bool | `false` | Keep paging when a `PageNumber` / `Offset` / `OffsetInBody` page holds the same records as an earlier, non-adjacent page of the pass, instead of failing the run — for feeds whose pages can legitimately repeat. Requires `max_pages` (refused at load time otherwise), which then bounds a server that cycles pages. A page identical to the page just before it still ends paging. |
-| `assume_ordered` | bool | `false` | The feed returns records in ascending `replication_key` order: an incremental pass `max_pages` cuts short persists the largest key it read and resumes from it next run. With `max_pages` it requires a `replication_bind` (refused at load time otherwise) — only a bookmark the server filters on moves the next run past the pages already read. The bind must compare **inclusively** (`>=`, e.g. `template: "gte|${bookmark}"`): rows sharing the last key read can sit on the first unread page, and a strict `>` filter would skip them for good. The rows re-read at that key arrive again, so pair it with an upsert sink. Ignored for windowed passes and across `requests:` entries — a `requests:` run that `max_pages` cuts short fails its incremental pass, because the per-entry bookmarks cannot be consolidated. |
+| `assume_ordered` | bool | `false` | The feed returns records in ascending `replication_key` order: an incremental pass `max_pages` cuts short persists the largest key it read and resumes from it next run. With `max_pages` it requires a `replication_bind` (refused at load time otherwise) — only a bookmark the server filters on moves the next run past the pages already read. The bind must compare **inclusively** (`>=`, e.g. `template: "gte|${bookmark}"`): rows sharing the last key read can sit on the first unread page, and a strict `>` filter would skip them for good. The rows re-read at that key arrive again, so pair it with an upsert sink. Ignored for windowed passes. With several `requests:` entries it applies to each entry's own pass, since each entry keeps its own bookmark. |
 | `request_delay` | int (seconds) / null | `null` | Delay between consecutive page requests. |
 
 **Body & keyset pagination.** Two styles page without a query param or a response token:
@@ -473,8 +473,13 @@ source:
 Each `key_ranges.objects` entity whose `$metadata` declares a single **integer**
 key is tiled with `faucet_core::shard::plan_pk_shards` (the same primitive the
 SQL sources shard with) and fetched as concurrent `$filter` ranges; entities
-without such a key fall back to sequential paging. Ranges are planned per run —
-never bookmarked.
+without such a key fall back to sequential paging. Ranges are planned per run.
+With incremental replication the read persists one bookmark — the largest of
+the ranges' bookmarks — once every range finished (the ranges are disjoint
+slices of one entity with one replication clock); a range cut short by
+`max_pages` or a pagination loop fails an incremental read and persists
+nothing for a full refresh. Key ranges are refused together with
+`persist_cursor` and with more than one `requests:` entry.
 
 When `$metadata` is available, each emitted row's sink patch also carries the
 entity's column `schema` from its EDM types, so a typed sink declares real
@@ -775,8 +780,8 @@ the parsed document this path deliberately never materializes.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `requests` | array<map> | `[]` | Each entry is a context map substituted into `path` placeholders. The stream runs once per entry and concatenates results. Empty = run once with no substitution. Formerly `partitions` (still accepted, with a deprecation warning). |
-| `request_concurrency` | int / null | `null` | Max `requests` entries fetched concurrently. `null` / `0` / `1` = sequential. Honoured on both the buffering and the streaming read path since #624 (it was inert on the streaming one, which is the path `faucet run` drives). Above 1 the entries' pages **interleave** — entries are disjoint and the bookmark is a max across them, so only page order changes. Formerly `partition_concurrency` (still accepted). |
+| `requests` | array<map> | `[]` | Each entry is a context map substituted into `path` placeholders. The stream runs once per entry and concatenates results. Empty = run once with no substitution. With incremental replication (or `window:`) and more than one entry, each entry reads from and keeps **its own** bookmark, stored as `{"requests": {"<entry id>": <bookmark>, …}}` (the id is a hash of the entry's values, so no value lands in state; an entry rendered differently on every run, e.g. from `${now.*}`, gets a new id each run, starts from `start_replication_value` and logs a warning). A bookmark stored by an earlier release is every entry's start. Removing an entry drops its position; with one entry left it resumes from that entry's position and stores a plain bookmark again. Stored REST state is at schema 1 from this release, so an older release refuses it: rolling back needs a state reset. Formerly `partitions` (still accepted, with a deprecation warning). |
+| `request_concurrency` | int / null | `null` | Max `requests` entries fetched concurrently. `null` / `0` / `1` = sequential. Honoured on both the buffering and the streaming read path since #624 (it was inert on the streaming one, which is the path `faucet run` drives). Above 1 the entries' pages **interleave** — each entry keeps its own bookmark, so only page order changes. Formerly `partition_concurrency` (still accepted). |
 
 ## Authentication
 

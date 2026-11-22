@@ -15,6 +15,7 @@ pub mod extract;
 pub mod format;
 pub mod odata;
 pub mod pagination;
+mod requests_bookmark;
 pub mod retry;
 pub mod route;
 pub mod serde_helpers;
@@ -41,5 +42,6 @@ pub use config::{
 pub use decode::{DecodeStep, ParseFormat, ParseSpec, SimpleStep, UnzipSpec};
 pub use descriptor::DESCRIPTOR;
 pub use pagination::PaginationStyle;
+pub use requests_bookmark::{STATE_SCHEMA, migrate_state};
 pub use route::{RecordsRoute, RouteBy, RouteTarget};
 pub use stream::RestStream;

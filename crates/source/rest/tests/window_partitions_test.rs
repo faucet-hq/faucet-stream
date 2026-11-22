@@ -100,10 +100,14 @@ async fn concurrent_partitions_each_send_their_own_window_bounds() {
     assert_eq!(seen.len(), 12, "4 partitions × 3 windows, each once");
     assert_eq!(records.len(), 12);
     let bm = bookmark.expect("every partition finished its windows");
-    assert!(
-        bm.as_str().unwrap().starts_with("2024-01-04T00:00:00"),
-        "{bm}"
-    );
+    let entries = bm["requests"].as_object().expect("a bookmark per entry");
+    assert_eq!(entries.len(), 4, "{bm}");
+    for end in entries.values() {
+        assert!(
+            end.as_str().unwrap().starts_with("2024-01-04T00:00:00"),
+            "{bm}"
+        );
+    }
 }
 
 struct PagedFirst;
@@ -175,7 +179,7 @@ impl Respond for NumericIds {
 }
 
 #[tokio::test]
-async fn the_consolidated_bookmark_orders_numeric_strings_numerically() {
+async fn each_entry_keeps_its_own_numeric_string_bookmark() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path_regex(r"^/p/\d+$"))
@@ -193,5 +197,13 @@ async fn the_consolidated_bookmark_orders_numeric_strings_numerically() {
         .collect();
     let (records, bookmark) = drain(&RestStream::new(cfg).unwrap()).await;
     assert_eq!(records.len(), 2);
-    assert_eq!(bookmark, Some(json!("10")));
+    let bm = bookmark.expect("a bookmark per entry");
+    let mut values: Vec<&str> = bm["requests"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    values.sort_unstable();
+    assert_eq!(values, vec!["10", "9"]);
 }
