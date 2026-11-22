@@ -4140,7 +4140,7 @@ impl RestDriver {
             });
         }
         self.client
-            .json(resp)
+            .json_value(resp)
             .await
             .map_err(|e| FaucetError::Source(format!("rest: OData key-bounds body: {e}")))
     }

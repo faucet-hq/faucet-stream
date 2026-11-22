@@ -454,7 +454,7 @@ impl GraphqlDriver {
                                     DEFAULT_ERROR_BODY_MAX_LEN,
                                 )
                                 .await?;
-                                return self.client.json(resp).await;
+                                return self.client.json_value(resp).await;
                             }
                             self.read_with_matchers(resp, matches).await
                         }

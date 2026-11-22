@@ -80,6 +80,24 @@ async fn graphql_source_keeps_the_corpus() {
 }
 
 #[tokio::test]
+async fn graphql_source_keeps_over_precise_literals_exact() {
+    let doc =
+        br#"{"data":{"rows":[{"amount":12345678901234567890.12,"big":18446744073709551616}]}}"#;
+    let server = serve("POST", "/", doc.to_vec(), "application/json").await;
+    let source = GraphqlStream::try_new(
+        GraphqlStreamConfig::new(server.uri(), "query { rows }").records_path("$.data.rows[*]"),
+    )
+    .expect("graphql source");
+    let records = faucet_core::Source::fetch_all(&source).await.expect("read");
+    assert_eq!(
+        records,
+        vec![
+            serde_json::json!({"amount": "12345678901234567890.12", "big": "18446744073709551616"})
+        ]
+    );
+}
+
+#[tokio::test]
 async fn xml_source_keeps_every_rendering() {
     let opts = faucet_core::FormatOptions::default();
     let sent = vec![fidelity::flat_corpus()];

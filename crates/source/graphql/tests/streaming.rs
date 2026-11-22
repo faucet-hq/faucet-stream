@@ -564,3 +564,29 @@ async fn null_variables_still_carry_the_cursor_and_page_size() {
     );
     assert!(requests.iter().all(|r| request_first(r) == Some(2)));
 }
+
+/// A number too precise for a 64-bit float keeps its exact digits.
+#[tokio::test]
+async fn stream_pages_keep_over_precise_numbers_exact() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"data":{"rows":[{"amount":12345678901234567890.12,"big":18446744073709551616,"small":1.5}]}}"#,
+            "application/json",
+        ))
+        .mount(&server)
+        .await;
+    let source = GraphqlStream::new(
+        GraphqlStreamConfig::new(server.uri(), "{ rows { amount big small } }")
+            .records_path("$.data.rows[*]"),
+    );
+    let pages: Vec<_> = source
+        .stream_pages(&HashMap::new(), DEFAULT_BATCH_SIZE)
+        .collect()
+        .await;
+    let records = &pages[0].as_ref().unwrap().records;
+    assert_eq!(
+        records[0],
+        json!({"amount": "12345678901234567890.12", "big": "18446744073709551616", "small": 1.5})
+    );
+}

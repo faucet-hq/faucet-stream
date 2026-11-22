@@ -973,7 +973,9 @@ impl Client {
         })
     }
 
-    /// Read the whole body as JSON.
+    /// Read the whole body as JSON into a typed value. For a body read as a
+    /// `Value`, use [`json_value`](Self::json_value), which keeps numbers
+    /// exact.
     pub async fn json<T: DeserializeOwned>(&self, resp: Response) -> Result<T, FaucetError> {
         let bytes = self.bytes(resp).await?;
         Ok(serde_json::from_slice(&bytes)?)
