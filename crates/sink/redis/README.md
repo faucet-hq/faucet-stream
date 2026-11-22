@@ -93,7 +93,7 @@ Setting either on another sink type is a config error. The connection reconnects
 |--------|--------|---------------|-----------|
 | `List` | `key: string` | `RPUSH` | Append each record, serialized to a JSON string, to the list at `key`. |
 | `Stream` | `key: string` | `XADD` | Append each record as a stream entry at `key` with an auto-generated ID (`*`). Top-level object fields become entry fields; a non-object record is stored as a single `_data` field. |
-| `KeyValue` | `key_field: string` | `SET` | Store each record under a key read from its `key_field` (a string, number or boolean). The full record (serialized JSON) is the value. A record whose `key_field` is missing, `null`, an object or an array fails **that row** (DLQ-routable via `write_batch_partial`) — it is never stored under a rendered key such as `"null"`, which would collapse those records onto one key. Without a DLQ the batch fails before any of it is written. |
+| `KeyValue` | `key_field: string` | `SET` | Store each record under a key read from its `key_field` (a string, number or boolean). The full record (serialized JSON) is the value. A record whose `key_field` is missing, `null`, an object or an array fails **that row** (DLQ-routable via `write_batch_partial`) — it is never stored under a rendered key such as `"null"`, which would collapse those records onto one key. A record whose key starts with `_faucet_commit_token:` (where exactly-once watermarks live) fails its row too, so record data can never overwrite a pipeline's committed position. Without a DLQ the batch fails before any of it is written. |
 
 #### Stream entry field mapping
 

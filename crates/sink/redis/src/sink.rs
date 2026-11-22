@@ -496,6 +496,13 @@ fn record_command_args(
                     )));
                 }
             };
+            if key.starts_with(&commit_token_key("")) {
+                return Err(FaucetError::Sink(format!(
+                    "key field '{key_field}' names a key under the reserved \
+                     `{}` prefix, where exactly-once watermarks live",
+                    commit_token_key("")
+                )));
+            }
             let serialized = serde_json::to_string(record)
                 .map_err(|e| FaucetError::Sink(format!("JSON serialization failed: {e}")))?;
             Ok(vec!["SET".into(), key, serialized])
@@ -679,6 +686,18 @@ mod tests {
             FaucetError::Sink(m) => assert!(m.contains("missing key field 'id'"), "got: {m}"),
             other => panic!("expected Sink error, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_record_key_under_the_commit_token_prefix_fails_its_row() {
+        let t = RedisSinkType::KeyValue {
+            key_field: "id".into(),
+        };
+        let err = record_command_args(&t, &json!({"id": "_faucet_commit_token:orders::row1"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reserved"), "{err}");
+        assert!(record_command_args(&t, &json!({"id": "_faucet_commit_tokens"})).is_ok());
     }
 
     #[test]
