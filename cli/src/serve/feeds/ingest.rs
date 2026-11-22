@@ -454,7 +454,7 @@ pub fn split(content_type: &str, body: &[u8], max_event_bytes: u64) -> Result<Ve
 }
 
 fn fit_key(key: String) -> String {
-    if key.len() <= MAX_DEDUPE_KEY {
+    if key.len() <= MAX_DEDUPE_KEY && !key.chars().any(char::is_control) {
         return key;
     }
     format!("sha256:{}", super::service::token_hash(&key))
@@ -621,10 +621,13 @@ fn ack_of(events: Vec<Appended>) -> AppendAck {
     }
 }
 
-/// Whether `e` proves the append stored nothing and may hold for one
-/// request of a group only.
-fn refused_whole(e: &FeedError) -> bool {
-    matches!(e, FeedError::Full { .. })
+/// Whether `e` proves the group's append stored nothing and may come from
+/// one request of it: a limit one request would cross, or a statement the
+/// store refused before its commit. A store that failed at or after its
+/// commit answers `Unavailable` (whether anything was stored is unknown),
+/// and a cancelled or timed-out call is unknown too; those fail the group.
+fn retry_alone(e: &FeedError) -> bool {
+    matches!(e, FeedError::Full { .. }) || !(e.is_transient() || matches!(e, FeedError::Call(_)))
 }
 
 fn group_failed(e: &FeedError) -> FeedError {
@@ -634,8 +637,11 @@ fn group_failed(e: &FeedError) -> FeedError {
 }
 
 /// Append the requests of `jobs` in one store transaction and answer each.
-/// Only a refusal that stored nothing (a limit one request would cross)
-/// is tried again request by request; any other failure fails the group.
+/// A failure that proves nothing was stored ([`retry_alone`]) is tried
+/// again request by request, so one request the store refuses fails alone;
+/// any other failure fails the group. Tried alone, a request whose outcome
+/// is unknown, or a second refusal in a row (the store refuses everything),
+/// fails the requests still waiting without trying them.
 async fn commit(store: &dyn FeedStore, uid: &FeedUid, label: &str, jobs: Vec<Job>) {
     let calls = store_calls();
     commit_with(label, jobs, |events| store.append(&calls, uid, events)).await;
@@ -660,7 +666,7 @@ where
                 }
                 return;
             }
-            Err(e) if refused_whole(&e) => {}
+            Err(e) if retry_alone(&e) => {}
             Err(e) => {
                 for job in jobs {
                     let _ = job.reply.send(Err(group_failed(&e)));
@@ -670,6 +676,7 @@ where
         }
     }
     let mut broken: Option<FeedError> = None;
+    let mut refused_before = false;
     for job in jobs {
         if let Some(e) = &broken {
             let _ = job.reply.send(Err(group_failed(e)));
@@ -678,10 +685,10 @@ where
         let started = Instant::now();
         let result = append(job.events).await;
         metrics::append_duration(label, started.elapsed());
-        if let Err(e) = &result
-            && !refused_whole(e)
-        {
-            broken = Some(group_failed(e));
+        match &result {
+            Ok(_) | Err(FeedError::Full { .. }) => refused_before = false,
+            Err(e) if retry_alone(e) && !refused_before => refused_before = true,
+            Err(e) => broken = Some(group_failed(e)),
         }
         let _ = job.reply.send(result.map(|a| ack_of(a.events)));
     }
@@ -2073,7 +2080,7 @@ mod tests {
                             })
                             .collect(),
                     }),
-                    _ => Err(FeedError::Backend("timeout".into())),
+                    _ => Err(FeedError::Unavailable("timeout".into())),
                 }
             }
         })
@@ -2084,13 +2091,121 @@ mod tests {
         }
         assert!(got[0].as_ref().is_ok_and(|a| a.stored() == 1));
         assert!(matches!(got[1], Err(FeedError::Full { .. })));
-        assert!(matches!(got[2], Err(FeedError::Backend(_))));
-        assert!(matches!(got[3], Err(FeedError::Unavailable(_))));
+        assert!(matches!(&got[2], Err(FeedError::Unavailable(m)) if m == "timeout"));
+        assert!(matches!(&got[3], Err(FeedError::Unavailable(m)) if m.contains("unknown")));
         assert_eq!(
             calls.load(Ordering::SeqCst),
             4,
             "the last request is not tried"
         );
+    }
+
+    fn stored(events: &[NewEvent]) -> AppendAck {
+        AppendAck {
+            first_seq: None,
+            last_seq: None,
+            duplicates: 0,
+            events: events
+                .iter()
+                .map(|_| Appended {
+                    id: "a".into(),
+                    seq: faucet_common_feed::Seq(1),
+                    duplicate: false,
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_the_store_refuses_fails_alone_and_its_neighbours_are_stored_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let (group, answers) = jobs(3);
+        commit_with("f", group, |events| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let bad = events.iter().any(|e| e.payload == b"e1");
+            async move {
+                if bad {
+                    Err(FeedError::Backend("invalid byte sequence".into()))
+                } else {
+                    Ok(stored(&events))
+                }
+            }
+        })
+        .await;
+        let mut got = Vec::new();
+        for answer in answers {
+            got.push(answer.await.unwrap());
+        }
+        assert!(got[0].as_ref().is_ok_and(|a| a.stored() == 1));
+        assert!(matches!(got[1], Err(FeedError::Backend(_))));
+        assert!(got[2].as_ref().is_ok_and(|a| a.stored() == 1));
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "the group, then each once");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_or_ambiguous_group_is_never_tried_request_by_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for failure in [
+            || {
+                FeedError::Call(faucet_core::FaucetError::Cancelled {
+                    operation: "append".into(),
+                })
+            },
+            || FeedError::Unavailable("the append's outcome is unknown".into()),
+        ] {
+            let calls = AtomicUsize::new(0);
+            let (group, answers) = jobs(3);
+            commit_with("f", group, |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move { Err(failure()) }
+            })
+            .await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            for answer in answers {
+                assert!(matches!(
+                    answer.await.unwrap(),
+                    Err(FeedError::Unavailable(_))
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_that_refuses_everything_is_not_tried_for_every_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let (group, answers) = jobs(5);
+        commit_with("f", group, |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(FeedError::Backend("permission denied".into())) }
+        })
+        .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the group and two requests"
+        );
+        for answer in answers {
+            assert!(answer.await.unwrap().is_err());
+        }
+    }
+
+    #[test]
+    fn a_key_with_a_control_character_is_stored_hashed() {
+        for key in ["a\u{0}b", "tab\there", "\u{1f}", "line\n"] {
+            let fitted = fit_key(key.to_string());
+            assert!(
+                fitted.starts_with("sha256:") && fitted.len() == 71,
+                "{key:?}"
+            );
+            assert_eq!(
+                fitted,
+                fit_key(key.to_string()),
+                "the same key, the same hash"
+            );
+        }
+        assert_eq!(fit_key("plain-key é".into()), "plain-key é");
     }
 
     #[test]

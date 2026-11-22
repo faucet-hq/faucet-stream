@@ -83,7 +83,7 @@ impl Dialect {
                 .map(|n| matches!(n & 0xff, 5 | 6 | 13))
                 .unwrap_or(false),
             Dialect::Postgres => {
-                matches!(code, "55P03" | "25P03")
+                matches!(code, "55P03" | "25P03" | "25006")
                     || ["08", "40", "53", "57"].iter().any(|p| code.starts_with(p))
             }
         }
@@ -895,34 +895,44 @@ macro_rules! impl_feed_store {
                     .await
                     .map_err(Self::be)?;
                 }
-                tx.commit().await.map_err(Self::be)?;
-
-                let mut ack = AppendAck {
-                    first_seq: acked.first().map(|(s, _)| seq_of(*s)).transpose()?,
-                    last_seq: acked.last().map(|(s, _)| seq_of(*s)).transpose()?,
-                    ..AppendAck::default()
+                // From the commit on, a failure leaves it unknown whether the
+                // events were stored: never report it as a refusal.
+                let unknown = |e: FeedError| {
+                    FeedError::Unavailable(format!(
+                        "the append's outcome is unknown (it failed at or after its commit): {e}"
+                    ))
                 };
-                for slot in slots {
-                    match slot {
-                        Slot::Fresh(at) => {
-                            let (seq, id) = &acked[at];
-                            ack.events.push(Appended {
-                                id: id.clone(),
-                                seq: seq_of(*seq)?,
-                                duplicate: false,
-                            });
-                        }
-                        Slot::Stored(seq, id) => {
-                            ack.duplicates += 1;
-                            ack.events.push(Appended {
-                                id,
-                                seq: seq_of(seq)?,
-                                duplicate: true,
-                            });
+                tx.commit().await.map_err(Self::be).map_err(unknown)?;
+
+                let acknowledge = || -> $crate::Result<AppendAck> {
+                    let mut ack = AppendAck {
+                        first_seq: acked.first().map(|(s, _)| seq_of(*s)).transpose()?,
+                        last_seq: acked.last().map(|(s, _)| seq_of(*s)).transpose()?,
+                        ..AppendAck::default()
+                    };
+                    for slot in slots {
+                        match slot {
+                            Slot::Fresh(at) => {
+                                let (seq, id) = &acked[at];
+                                ack.events.push(Appended {
+                                    id: id.clone(),
+                                    seq: seq_of(*seq)?,
+                                    duplicate: false,
+                                });
+                            }
+                            Slot::Stored(seq, id) => {
+                                ack.duplicates += 1;
+                                ack.events.push(Appended {
+                                    id,
+                                    seq: seq_of(seq)?,
+                                    duplicate: true,
+                                });
+                            }
                         }
                     }
-                }
-                Ok(ack)
+                    Ok(ack)
+                };
+                acknowledge().map_err(unknown)
             }
 
             async fn do_heads(
@@ -2032,3 +2042,19 @@ macro_rules! impl_feed_store {
     };
 }
 pub(crate) use impl_feed_store;
+
+#[cfg(test)]
+mod tests {
+    use super::Dialect;
+
+    #[test]
+    fn a_read_only_or_restarting_postgres_is_unavailable_not_a_refusal() {
+        for code in ["25006", "57P04", "55P03", "40001", "08006", "53300"] {
+            assert!(Dialect::Postgres.transient(code), "{code}");
+        }
+        for code in ["22021", "23505", "42501", "42P01"] {
+            assert!(!Dialect::Postgres.transient(code), "{code}");
+        }
+        assert!(Dialect::Sqlite.transient("5") && !Dialect::Sqlite.transient("19"));
+    }
+}

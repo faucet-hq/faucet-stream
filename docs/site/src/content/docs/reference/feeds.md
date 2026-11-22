@@ -82,8 +82,17 @@ create` prints it), and the feed is still created.
 | `on_duplicate` | `accept` \| `conflict` | `accept` | What the sender of a duplicate is told: `202` with `duplicate: true`, or `409`. |
 
 With `header`, a request of several events uses `<value>:<index>` as each
-event's key. A key longer than 256 characters is stored as its SHA-256. An
-event without a key is stored without dedupe.
+event's key. A key longer than 256 bytes, or holding a control character
+(a NUL, a tab, a newline), is stored as its SHA-256 (`sha256:<hex>`, also what
+the event browser shows); equal keys still match. An event without a key is
+stored without dedupe.
+
+Requests that arrive together are stored in one transaction. When the store
+refuses that transaction before committing it, each request is tried alone,
+so a request the store cannot take fails by itself (`503 store`) and the
+others are stored once. When the store fails at or after the commit (the
+outcome is unknown), every request of the transaction gets `503` and is
+retried by its sender.
 
 ### `retention`
 

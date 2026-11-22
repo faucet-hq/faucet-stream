@@ -1067,6 +1067,25 @@ async fn duplicates_rate_limits_and_a_full_feed_are_answered_as_the_feed_says() 
         (&json!(false), &json!(1))
     );
     assert_eq!(srv.watermark("strict", &strict_uid).await, 2);
+    // A key holding a control character is stored (hashed) and still dedupes.
+    let control = r#"{"event": {"id": "a\u0000b"}}"#;
+    let stored = srv.push("strict", &strict, control).await;
+    assert_eq!(stored.status, 202, "{}", stored.body);
+    assert_eq!(srv.push("strict", &strict, control).await.status, 409);
+    let keyed = srv
+        .store("strict")
+        .await
+        .read(&store_calls(), &strict_uid, Seq(3), Seq(4))
+        .await
+        .unwrap();
+    assert!(
+        keyed.events[0]
+            .dedupe_key
+            .as_deref()
+            .is_some_and(|k| k.starts_with("sha256:")),
+        "{:?}",
+        keyed.events[0].dedupe_key
+    );
 
     // A rate limit: the burst passes, the next request waits.
     let (limited_uid, limited) = srv
