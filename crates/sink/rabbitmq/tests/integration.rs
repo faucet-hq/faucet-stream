@@ -65,6 +65,28 @@ async fn a_channel_error_in_a_later_group_keeps_earlier_outcomes() {
     assert_eq!(wait_ready(&broker.url, "big", 2).await, 2);
 }
 
+/// A channel error inside one publish group fails the rows from the
+/// failing message on and never reports a row delivered that did not land.
+/// Whether the broker's confirm for the first row arrives before the channel
+/// closes is a race, so the row before the failing one may go either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_channel_error_inside_a_group_fails_only_unconfirmed_rows() {
+    let broker = start_broker_with(Some("-rabbit max_message_size 4096")).await;
+    declare_queue(&broker.url, "big").await;
+    let mut cfg = sink_cfg(&broker.url, "big");
+    cfg.batch_size = 10;
+    let sink = RabbitMqSink::new(cfg).await.unwrap();
+    let rows = [
+        json!({"a": 1}),
+        json!({"blob": "x".repeat(8192)}),
+        json!({"a": 3}),
+    ];
+    let outcomes = sink.write_batch_partial(&rows).await.unwrap();
+    assert!(outcomes[1].is_err() && outcomes[2].is_err(), "{outcomes:?}");
+    let delivered = outcomes.iter().filter(|o| o.is_ok()).count();
+    assert!(wait_ready(&broker.url, "big", 1).await as usize >= delivered);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn exchange_kind_mismatch_is_a_config_error() {
     let broker = start_broker().await;

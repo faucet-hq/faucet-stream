@@ -47,12 +47,18 @@ flattened in alongside these fields:
 | `value_format`         | `json`/`string`/`bytes` | `json`  | body encoding (`string` needs string records, `bytes` base64 strings) |
 | `persistent`           | `bool`                  | `true`  | delivery mode 2 (persisted on durable queues) |
 | `mandatory`            | `bool`                  | `true`  | return unroutable messages as row errors (takes effect with `confirm`; ignored without it) |
-| `publish_timeout_secs` | `u64`                   | `60`    | bound on one publish batch and its confirms — a broker resource alarm blocks publishers indefinitely; on a timeout the rows not yet confirmed fail with a `timeout`-class row error — a `resilience.poison` policy resubmits them, otherwise they go to the DLQ — and earlier groups keep their outcomes |
+| `publish_timeout_secs` | `u64`                   | `60`    | bound on one publish batch and its confirms — a broker resource alarm blocks publishers indefinitely; on a timeout the rows not yet confirmed fail with a `timeout`-class row error — a `resilience.poison` policy resubmits them, otherwise they go to the DLQ — and rows the broker already confirmed, in this batch or an earlier one, keep their outcome |
 | `confirm`              | `bool`                  | `true`  | wait for publisher confirms |
 | `batch_size`           | `usize`                 | `1000`  | messages published before awaiting their confirms (`0` = whole batch) |
 
 Exactly one of `routing_key` / `routing_key_field` / `routing_key_jsonpath` is
 required. Messages carry a `content_type` matching `value_format`.
+
+With `routing_key_field` or `routing_key_jsonpath` the record data chooses the
+routing key, so on the default exchange (`exchange: ""`) a record can route to
+any queue the connection may publish to. Use a named exchange with explicit
+bindings, or a static `routing_key`, when record data is not trusted to pick
+the destination.
 
 ## Example
 
