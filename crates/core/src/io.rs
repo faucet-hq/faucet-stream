@@ -72,6 +72,7 @@ struct Inner {
     recorder: Option<Arc<RoundtripRecorder>>,
     metered: Option<bool>,
     redactor: Option<CallRedactor>,
+    non_idempotent: bool,
 }
 
 /// Everything one backend call needs: timeout, deadline, retry policy, cancel
@@ -98,6 +99,7 @@ impl fmt::Debug for CallContext {
             .field("cancel", &self.inner.cancel.is_some())
             .field("recorder", &self.inner.recorder.is_some())
             .field("redactor", &self.inner.redactor.is_some())
+            .field("non_idempotent", &self.inner.non_idempotent)
             .finish()
     }
 }
@@ -182,6 +184,22 @@ impl CallContext {
         self.edit(|i| i.redactor = Some(redactor))
     }
 
+    /// Mark the call as not safe to repeat once the backend may have acted on
+    /// it (a write, a grant that rotates a credential). A failed attempt is
+    /// then retried only when the request provably did not take effect: an
+    /// explicit decline ([`FaucetError::RateLimited`], an HTTP `429`) or a
+    /// failure to connect. An attempt timeout, a connection lost after
+    /// sending, and any other status are returned at once. Once set, no
+    /// layered context turns it off.
+    pub fn non_idempotent(self) -> Self {
+        self.edit(|i| i.non_idempotent = true)
+    }
+
+    /// Whether [`non_idempotent`](Self::non_idempotent) is set.
+    pub fn is_non_idempotent(&self) -> bool {
+        self.inner.non_idempotent
+    }
+
     /// This context with every field it leaves unset taken from `base`.
     pub fn inherit(&self, base: &CallContext) -> CallContext {
         let (mine, b) = (&*self.inner, &*base.inner);
@@ -198,6 +216,7 @@ impl CallContext {
                 recorder: mine.recorder.clone().or_else(|| b.recorder.clone()),
                 metered: mine.metered.or(b.metered),
                 redactor: mine.redactor.clone().or_else(|| b.redactor.clone()),
+                non_idempotent: mine.non_idempotent || b.non_idempotent,
             }),
         }
     }
@@ -383,6 +402,9 @@ impl CallContext {
             self.inner.cancel.as_ref(),
             recorder,
             self.inner.rate_limit_retries,
+            self.inner
+                .non_idempotent
+                .then_some(crate::resilience::not_processed as fn(&FaucetError) -> bool),
             attempt,
         );
         let cancelled = async {
@@ -699,6 +721,79 @@ mod tests {
             url: "http://h/x".into(),
             body: String::new(),
         }
+    }
+
+    async fn attempts_of(ctx: &CallContext, err: impl Fn() -> FaucetError) -> u32 {
+        let n = AtomicU32::new(0);
+        let _ = ctx
+            .call("op", || {
+                n.fetch_add(1, Ordering::SeqCst);
+                let e = err();
+                async move { Err::<(), _>(e) }
+            })
+            .await;
+        n.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn a_non_idempotent_call_retries_only_what_never_took_effect() {
+        let ctx = CallContext::new().with_retry(fast(3)).non_idempotent();
+        assert!(ctx.is_non_idempotent());
+        assert_eq!(
+            attempts_of(&ctx, || FaucetError::RateLimited(Duration::ZERO)).await,
+            3
+        );
+        assert_eq!(attempts_of(&ctx, || status(429)).await, 3);
+        assert_eq!(attempts_of(&ctx, || status(503)).await, 1);
+        assert_eq!(attempts_of(&ctx, || status(502)).await, 1);
+        let timeout = || FaucetError::Timeout {
+            operation: "op call".into(),
+            after: Duration::from_millis(1),
+        };
+        assert_eq!(attempts_of(&ctx, timeout).await, 1);
+        let idempotent = CallContext::new().with_retry(fast(3));
+        assert_eq!(attempts_of(&idempotent, timeout).await, 3);
+        assert_eq!(attempts_of(&idempotent, || status(502)).await, 3);
+    }
+
+    #[tokio::test]
+    async fn a_non_idempotent_call_retries_a_failed_connect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = reqwest::Client::new();
+        let ctx = CallContext::new().with_retry(fast(2)).non_idempotent();
+        let n = AtomicU32::new(0);
+        let err = ctx
+            .call("op", || {
+                n.fetch_add(1, Ordering::SeqCst);
+                let req = client.post(format!("http://{addr}/x"));
+                async move {
+                    req.send()
+                        .await
+                        .map_err(crate::http::transport_error)
+                        .map(|_| ())
+                }
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, FaucetError::Http(e) if e.is_connect()),
+            "{err:?}"
+        );
+        assert_eq!(n.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn no_layered_context_turns_non_idempotent_off() {
+        let local = CallContext::new().with_retry(fast(3)).non_idempotent();
+        let installed = CallContext::new().with_retry(fast(5));
+        let eff = local.inherit(&installed);
+        assert!(eff.is_non_idempotent());
+        assert!(CallContext::new().inherit(&local).is_non_idempotent());
+        assert!(!CallContext::new().inherit(&installed).is_non_idempotent());
+        assert_eq!(attempts_of(&eff, || status(502)).await, 1);
+        assert!(format!("{eff:?}").contains("non_idempotent: true"));
     }
 
     #[test]
