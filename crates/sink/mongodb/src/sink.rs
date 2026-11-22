@@ -333,31 +333,86 @@ const INSERT_RESENDS: u32 = 3;
 /// MongoDB's duplicate-key error code.
 const DUPLICATE_KEY: i32 = 11000;
 
-/// The rejections of an `insert_many` as `(index, message)`. On a re-sent
-/// batch a duplicate key on a document whose `_id` this sink generated means
-/// the document landed in an earlier attempt, so it is not a failure.
-fn landed_on_resend(
+/// Rejected batch positions with the server's message.
+type Rejections = Vec<(usize, String)>;
+
+/// Split the rejections of an `insert_many` (`(index, code, message)`) into
+/// `(candidates, others)`. On a re-sent batch a duplicate key on a document
+/// whose `_id` this sink generated may mean the document landed in an earlier
+/// attempt — or that it collided on another unique index and never landed —
+/// so it is a candidate for a read-back. Every other rejection is a failure.
+fn resend_duplicates(
     rejected: Vec<(usize, i32, String)>,
     resent: bool,
     generated_id: impl Fn(usize) -> bool,
-) -> Vec<(usize, String)> {
-    rejected
+) -> (Rejections, Rejections) {
+    let (candidates, others): (Vec<_>, Vec<_>) = rejected
         .into_iter()
-        .filter(|(pos, code, _)| !(resent && *code == DUPLICATE_KEY && generated_id(*pos)))
-        .map(|(pos, _, msg)| (pos, msg))
-        .collect()
+        .partition(|(pos, code, _)| resent && *code == DUPLICATE_KEY && generated_id(*pos));
+    let strip = |v: Vec<(usize, i32, String)>| v.into_iter().map(|(p, _, m)| (p, m)).collect();
+    (strip(candidates), strip(others))
 }
 
-fn insert_step(n: usize, ordered: bool, rejected: &[(usize, String)]) -> InsertStep {
+/// Settle the read-back candidates of a re-sent batch: a candidate whose
+/// generated `_id` was `found` in the collection landed in an earlier attempt;
+/// one that was not is a real rejection (it collided on another unique index).
+/// When the read-back itself failed, every candidate stays a rejection — a
+/// possible DLQ duplicate, never a row counted written that is not. Returns
+/// `(rejected, landed positions)`.
+fn settle_candidates(
+    candidates: Vec<(usize, String)>,
+    mut rejected: Vec<(usize, String)>,
+    found: Result<&std::collections::HashSet<usize>, &FaucetError>,
+) -> (Vec<(usize, String)>, std::collections::HashSet<usize>) {
+    let mut landed = std::collections::HashSet::new();
+    for (pos, msg) in candidates {
+        match found {
+            Ok(found) if found.contains(&pos) => {
+                landed.insert(pos);
+            }
+            Ok(_) => rejected.push((pos, msg)),
+            Err(e) => rejected.push((
+                pos,
+                format!("MongoDB could not confirm whether the document was written after a re-send: {e}"),
+            )),
+        }
+    }
+    (rejected, landed)
+}
+
+/// What one `insert_many` of `n` documents settled, given its rejected
+/// `(index, message)` pairs and the positions confirmed `landed` in an
+/// earlier attempt. An ordered insert stops at its first rejected or landed
+/// position: the documents after it were not tried, so only those up to it
+/// are settled (a landed one as written) and the caller re-sends the rest.
+fn insert_step(
+    n: usize,
+    ordered: bool,
+    rejected: &[(usize, String)],
+    landed: &std::collections::HashSet<usize>,
+) -> InsertStep {
     let mut failed: Vec<(usize, String)> =
         rejected.iter().filter(|(i, _)| *i < n).cloned().collect();
     failed.sort_by_key(|(i, _)| *i);
-    if ordered && let Some((first, _)) = failed.first().cloned() {
-        failed.truncate(1);
-        return InsertStep {
-            failed,
-            consumed: first + 1,
-        };
+    if ordered {
+        let first_failed = failed.first().map(|(i, _)| *i);
+        let first_landed = landed.iter().copied().filter(|i| *i < n).min();
+        match (first_failed, first_landed) {
+            (Some(f), l) if l.is_none_or(|l| f < l) => {
+                failed.truncate(1);
+                return InsertStep {
+                    failed,
+                    consumed: f + 1,
+                };
+            }
+            (_, Some(l)) => {
+                return InsertStep {
+                    failed: Vec::new(),
+                    consumed: l + 1,
+                };
+            }
+            _ => {}
+        }
     }
     InsertStep {
         failed,
@@ -762,10 +817,18 @@ impl MongoDriver {
                     }
                 },
             };
-            let rejected = landed_on_resend(rejected, resends > 0, |pos| {
+            let (candidates, rejected) = resend_duplicates(rejected, resends > 0, |pos| {
                 generated.contains(&batch[pos].0)
             });
-            let step = insert_step(take, ordered, &rejected);
+            let (rejected, landed) = if candidates.is_empty() {
+                (rejected, std::collections::HashSet::new())
+            } else {
+                let found = self
+                    .landed_positions(calls, &collection, batch, &candidates)
+                    .await;
+                settle_candidates(candidates, rejected, found.as_ref())
+            };
+            let step = insert_step(take, ordered, &rejected, &landed);
             maybe_committed |= step.consumed > step.failed.len();
             for (pos, msg) in &step.failed {
                 outcomes[batch[*pos].0] = Err(FaucetError::Sink(format!(
@@ -777,6 +840,52 @@ impl MongoDriver {
             pending = &pending[step.consumed..];
         }
         Ok(outcomes)
+    }
+
+    /// The batch positions among `candidates` whose `_id` is in the
+    /// collection, read from the primary so a lagging secondary cannot hide a
+    /// document an earlier attempt inserted.
+    async fn landed_positions(
+        &self,
+        calls: &CallSlot,
+        collection: &mongodb::Collection<Document>,
+        batch: &[(usize, Document)],
+        candidates: &[(usize, String)],
+    ) -> Result<std::collections::HashSet<usize>, FaucetError> {
+        use futures::TryStreamExt as _;
+        let ids: Vec<bson::Bson> = candidates
+            .iter()
+            .filter_map(|(pos, _)| batch[*pos].1.get("_id").cloned())
+            .collect();
+        let found: Vec<Document> = calls
+            .call("read_back", || async {
+                collection
+                    .find(bson::doc! { "_id": { "$in": ids.clone() } })
+                    .projection(bson::doc! { "_id": 1 })
+                    .selection_criteria(mongodb::options::SelectionCriteria::ReadPreference(
+                        mongodb::options::ReadPreference::Primary,
+                    ))
+                    .await
+                    .map_err(sink_err("MongoDB read-back failed"))?
+                    .try_collect()
+                    .await
+                    .map_err(sink_err("MongoDB read-back failed"))
+            })
+            .await?;
+        let found: std::collections::HashSet<bson::oid::ObjectId> = found
+            .iter()
+            .filter_map(|d| d.get_object_id("_id").ok())
+            .collect();
+        Ok(candidates
+            .iter()
+            .map(|(pos, _)| *pos)
+            .filter(|pos| {
+                batch[*pos]
+                    .1
+                    .get_object_id("_id")
+                    .is_ok_and(|id| found.contains(&id))
+            })
+            .collect())
     }
 
     /// Staging collection used while an overwrite run is in flight.
@@ -1750,21 +1859,53 @@ mod tests {
     #[test]
     fn insert_step_settles_unordered_batches_and_resumes_ordered_ones() {
         let rejected = vec![(3, "dup".to_string()), (1, "bad".to_string())];
-        let step = insert_step(5, false, &rejected);
+        let none = std::collections::HashSet::new();
+        let step = insert_step(5, false, &rejected, &none);
         assert_eq!(step.consumed, 5);
         assert_eq!(
             step.failed.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
             vec![1, 3]
         );
-        let step = insert_step(5, true, &rejected);
+        let step = insert_step(5, true, &rejected, &none);
         assert_eq!(step.consumed, 2);
         assert_eq!(step.failed, vec![(1, "bad".to_string())]);
-        let step = insert_step(4, true, &[]);
+        let step = insert_step(4, true, &[], &none);
         assert_eq!((step.consumed, step.failed.len()), (4, 0));
     }
 
     #[test]
-    fn a_resend_treats_duplicates_of_generated_ids_as_landed() {
+    fn an_ordered_step_stops_at_a_landed_document() {
+        let landed: std::collections::HashSet<usize> = [2].into_iter().collect();
+        let step = insert_step(5, true, &[(4, "dup".to_string())], &landed);
+        assert_eq!((step.consumed, step.failed.len()), (3, 0));
+        let step = insert_step(5, true, &[(1, "bad".to_string())], &landed);
+        assert_eq!(step.consumed, 2);
+        assert_eq!(step.failed, vec![(1, "bad".to_string())]);
+        let step = insert_step(5, false, &[(4, "dup".to_string())], &landed);
+        assert_eq!(step.consumed, 5);
+        assert_eq!(step.failed, vec![(4, "dup".to_string())]);
+    }
+
+    #[test]
+    fn read_back_candidates_settle_found_missing_and_unknown() {
+        let candidates = || vec![(0, "dup _id".to_string()), (1, "dup email".to_string())];
+        let found: std::collections::HashSet<usize> = [0].into_iter().collect();
+        let (rejected, landed) =
+            settle_candidates(candidates(), vec![(2, "invalid".to_string())], Ok(&found));
+        assert_eq!(landed, found);
+        assert_eq!(
+            rejected,
+            vec![(2, "invalid".to_string()), (1, "dup email".to_string())]
+        );
+        let err = FaucetError::Sink("down".into());
+        let (rejected, landed) = settle_candidates(candidates(), Vec::new(), Err(&err));
+        assert!(landed.is_empty());
+        assert_eq!(rejected.len(), 2);
+        assert!(rejected[0].1.contains("could not confirm"), "{rejected:?}");
+    }
+
+    #[test]
+    fn a_resend_reads_back_duplicates_of_generated_ids() {
         let rejected = || {
             vec![
                 (0, DUPLICATE_KEY, "dup".to_string()),
@@ -1773,12 +1914,19 @@ mod tests {
             ]
         };
         let generated = |pos: usize| pos == 0;
+        let (candidates, others) = resend_duplicates(rejected(), true, generated);
         assert_eq!(
-            landed_on_resend(rejected(), true, generated),
-            vec![(1, "dup".to_string()), (2, "invalid".to_string())],
-            "only a generated id's duplicate on a re-send has landed"
+            candidates,
+            vec![(0, "dup".to_string())],
+            "only a generated id's duplicate on a re-send may have landed"
         );
-        assert_eq!(landed_on_resend(rejected(), false, generated).len(), 3);
+        assert_eq!(
+            others,
+            vec![(1, "dup".to_string()), (2, "invalid".to_string())]
+        );
+        let (candidates, others) = resend_duplicates(rejected(), false, generated);
+        assert!(candidates.is_empty());
+        assert_eq!(others.len(), 3);
     }
 
     #[test]
