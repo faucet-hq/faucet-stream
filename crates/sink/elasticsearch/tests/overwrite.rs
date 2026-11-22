@@ -64,13 +64,82 @@ async fn overwrite_stages_then_swaps_alias_across_sink_instances() {
         vec![json!({"id": 1}), json!({"id": 2})]
     );
     let indices = fake.index_names();
-    assert_eq!(indices.len(), 1, "old index dropped: {indices:?}");
-    assert!(indices[0].starts_with("orders-faucet-ovw-"));
+    assert_eq!(indices.len(), 2, "{indices:?}");
+    assert!(
+        indices.contains(&"orders-old".to_string()),
+        "an index no overwrite created is left in place: {indices:?}"
+    );
+    assert!(indices.iter().any(|i| i.starts_with("orders-faucet-ovw-")));
     assert_eq!(
         fake.alias_names(),
         vec![INDEX.to_string()],
         "marker detached"
     );
+}
+
+async fn overwrite_once(base: &str, docs: &[serde_json::Value]) {
+    overwrite_sink(base).begin_overwrite().await.expect("begin");
+    overwrite_sink(base).write_batch(docs).await.expect("write");
+    overwrite_sink(base)
+        .commit_overwrite()
+        .await
+        .expect("commit");
+}
+
+#[tokio::test]
+async fn commit_drops_an_earlier_overwrite_index_nothing_else_reads() {
+    let (server, fake) = cluster().await;
+    fake.add_index(
+        "orders-faucet-ovw-1a2b",
+        vec![json!({"id": 0})],
+        Some(INDEX),
+    );
+    overwrite_once(&server.uri(), &[json!({"id": 1})]).await;
+    let indices = fake.index_names();
+    assert_eq!(indices.len(), 1, "{indices:?}");
+    assert_ne!(indices[0], "orders-faucet-ovw-1a2b");
+    assert_eq!(fake.alias_docs(INDEX), vec![json!({"id": 1})]);
+}
+
+#[tokio::test]
+async fn commit_keeps_an_earlier_overwrite_index_another_alias_reads() {
+    let (server, fake) = cluster().await;
+    fake.add_index(
+        "orders-faucet-ovw-1a2b",
+        vec![json!({"id": 0})],
+        Some(INDEX),
+    );
+    fake.0
+        .lock()
+        .unwrap()
+        .aliases
+        .entry("all-data".into())
+        .or_default()
+        .insert("orders-faucet-ovw-1a2b".into());
+    overwrite_once(&server.uri(), &[json!({"id": 1})]).await;
+    assert!(
+        fake.index_names()
+            .contains(&"orders-faucet-ovw-1a2b".to_string())
+    );
+    assert_eq!(fake.alias_docs("all-data"), vec![json!({"id": 0})]);
+    assert_eq!(fake.alias_docs(INDEX), vec![json!({"id": 1})]);
+}
+
+#[tokio::test]
+async fn commit_keeps_the_old_index_when_its_aliases_cannot_be_read() {
+    let (server, fake) = cluster().await;
+    fake.add_index(
+        "orders-faucet-ovw-1a2b",
+        vec![json!({"id": 0})],
+        Some(INDEX),
+    );
+    fake.0.lock().unwrap().fail_index_alias_reads = true;
+    overwrite_once(&server.uri(), &[json!({"id": 1})]).await;
+    assert!(
+        fake.index_names()
+            .contains(&"orders-faucet-ovw-1a2b".to_string())
+    );
+    assert_eq!(fake.alias_docs(INDEX), vec![json!({"id": 1})]);
 }
 
 #[tokio::test]
@@ -251,5 +320,10 @@ async fn concurrent_overwrite_runs_keep_their_own_documents() {
     sink(&b).commit_overwrite().await.expect("commit b");
     assert_eq!(fake.alias_docs(INDEX), vec![json!({"id": 3})]);
     assert_eq!(fake.alias_names(), vec![INDEX.to_string()]);
-    assert_eq!(fake.index_names().len(), 1);
+    let names = fake.index_names();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(
+        names.contains(&"orders-old".to_string()),
+        "an index no overwrite created stays: {names:?}"
+    );
 }

@@ -713,3 +713,21 @@ async fn an_oversized_response_body_is_a_typed_error() {
             .is_some()
     );
 }
+
+#[test]
+fn only_indices_an_overwrite_created_are_recognised() {
+    assert!(created_by_overwrite("orders", "orders-faucet-ovw-1a2b"));
+    assert!(created_by_overwrite(
+        "orders",
+        &staging_index_name("orders", 0xdead_beef)
+    ));
+    assert!(!created_by_overwrite("orders", "orders-v1"));
+    assert!(!created_by_overwrite("orders", "orders-faucet-ovw-"));
+    assert!(!created_by_overwrite("orders", "orders-faucet-ovw-staging"));
+    assert!(!created_by_overwrite(
+        "orders",
+        "orders-faucet-ovw-staging-abc"
+    ));
+    assert!(!created_by_overwrite("orders", "orders-faucet-ovw-1A2B"));
+    assert!(!created_by_overwrite("other", "orders-faucet-ovw-1a2b"));
+}

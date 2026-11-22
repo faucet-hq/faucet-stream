@@ -1,7 +1,7 @@
 //! A small stateful Elasticsearch stand-in for the overwrite lifecycle: indices
 //! with their documents and mappings, aliases, `_bulk` (honouring
 //! `require_alias`; an action with an `_id` replaces or deletes that
-//! document), `_aliases`, `_refresh`, `_delete_by_query` (`term` filters and
+//! document), `_aliases`, `GET <index>/_alias`, `_refresh`, `_delete_by_query` (`term` filters and
 //! `must_not` ids), create and delete. A document written with an `_id` is
 //! stored with it under `_id`.
 
@@ -14,6 +14,8 @@ use wiremock::{Request, Respond, ResponseTemplate};
 pub struct State {
     pub indices: BTreeMap<String, (Vec<Value>, Value)>,
     pub aliases: BTreeMap<String, BTreeSet<String>>,
+    /// Answer `GET /<index>/_alias` with a 500.
+    pub fail_index_alias_reads: bool,
 }
 
 #[derive(Clone, Default)]
@@ -91,6 +93,22 @@ impl Respond for FakeCluster {
                 } else {
                     ResponseTemplate::new(404)
                 }
+            }
+            ("GET", [index, "_alias"]) => {
+                if st.fail_index_alias_reads {
+                    return ResponseTemplate::new(500)
+                        .set_body_json(json!({"error": "unavailable"}));
+                }
+                if !st.indices.contains_key(*index) {
+                    return not_found();
+                }
+                let aliases: serde_json::Map<String, Value> = st
+                    .aliases
+                    .iter()
+                    .filter(|(_, targets)| targets.contains(*index))
+                    .map(|(a, _)| (a.clone(), json!({})))
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(json!({ *index: { "aliases": aliases } }))
             }
             ("GET", [index, "_mapping"]) => match st.indices.get(*index) {
                 Some((_, mappings)) => ResponseTemplate::new(200)

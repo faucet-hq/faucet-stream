@@ -84,6 +84,21 @@ fn staging_index_name(alias: &str, nonce: u128) -> String {
     format!("{alias}-faucet-ovw-{nonce:x}")
 }
 
+/// Whether `index` is a physical index an overwrite run of `alias` created
+/// ([`staging_index_name`]): `<alias>-faucet-ovw-` followed by lowercase hex
+/// digits only, so the staging marker aliases never match.
+fn created_by_overwrite(alias: &str, index: &str) -> bool {
+    index
+        .strip_prefix(alias)
+        .and_then(|rest| rest.strip_prefix("-faucet-ovw-"))
+        .is_some_and(|hex| {
+            !hex.is_empty()
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
 /// Build the body for an atomic `POST /_aliases` swap: detach `alias` from every
 /// `previous` physical index and attach it to `staging`, all applied atomically
 /// by Elasticsearch. Pure.
@@ -210,6 +225,73 @@ impl EsDriver {
                 .map(|m| m.keys().cloned().collect())
                 .unwrap_or_default(),
         ))
+    }
+
+    /// The aliases that point at `index` (empty when it has none or no longer
+    /// exists).
+    async fn index_aliases(
+        &self,
+        calls: &CallSlot,
+        index: &str,
+        auth: &ElasticsearchAuth,
+    ) -> Result<Vec<String>, FaucetError> {
+        let url = format!("{}/{}/_alias", self.config.base_url, index);
+        let resp = self
+            .send_once(
+                calls,
+                "request",
+                Self::apply_auth_value(self.client.get(&url), auth),
+            )
+            .await?;
+        if resp.status().as_u16() == 404 {
+            return Ok(Vec::new());
+        }
+        let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
+        let body: Value = self.client.json::<Value>(resp).await?;
+        Ok(body
+            .as_object()
+            .into_iter()
+            .flat_map(|m| m.values())
+            .filter_map(|v| v.get("aliases").and_then(Value::as_object))
+            .flat_map(|a| a.keys().cloned())
+            .collect())
+    }
+
+    /// Delete `old`, detached from the read alias by a commit, only when an
+    /// earlier overwrite run created it and no other alias still points at it;
+    /// otherwise leave it in place with a warning.
+    async fn drop_detached(
+        &self,
+        calls: &CallSlot,
+        alias: &str,
+        old: &str,
+        auth: &ElasticsearchAuth,
+    ) {
+        if !created_by_overwrite(alias, old) {
+            tracing::warn!(
+                index = %old,
+                "overwrite: left index '{old}' in place — it was not created by an overwrite \
+                 run; delete it yourself once nothing reads it"
+            );
+            return;
+        }
+        match self.index_aliases(calls, old, auth).await {
+            Ok(others) if others.is_empty() => {
+                if let Err(e) = self.overwrite_delete_index(calls, old, auth).await {
+                    tracing::warn!(index = %old, error = %e, "overwrite: could not delete old index after swap");
+                }
+            }
+            Ok(others) => tracing::warn!(
+                index = %old,
+                aliases = %others.join(", "),
+                "overwrite: left index '{old}' in place — other aliases still point at it"
+            ),
+            Err(e) => tracing::warn!(
+                index = %old,
+                error = %e,
+                "overwrite: left index '{old}' in place — could not read its aliases"
+            ),
+        }
     }
 
     /// This run's staging marker alias (see [`run_staging_alias`]).
@@ -1715,11 +1797,10 @@ impl StagingDriver for EsDriver {
             .await?;
         check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
 
-        // Best-effort drop of the now-detached old physical indices.
+        // Best-effort drop of the now-detached old indices an earlier
+        // overwrite created and nothing else reads.
         for old in &previous {
-            if let Err(e) = self.overwrite_delete_index(calls, old, &auth).await {
-                tracing::warn!(index = %old, error = %e, "overwrite: could not delete old index after swap");
-            }
+            self.drop_detached(calls, &alias, old, &auth).await;
         }
         tracing::info!(alias = %alias, staging = %staging, "Elasticsearch overwrite committed (alias swapped)");
         Ok(())

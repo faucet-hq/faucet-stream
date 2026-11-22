@@ -104,7 +104,12 @@ dataset and a failed/cancelled run leaves the previous data intact:
    `require_alias=true`, so a write without a staging index fails instead of
    creating one);
 2. `commit` atomically repoints the read alias with one `POST /_aliases` call
-   (and detaches the marker), then drops the old physical index;
+   (and detaches the marker), then drops each old physical index that an
+   earlier overwrite run created (`{index}-faucet-ovw-<hex>`) and that no other
+   alias still points at. Any other index the alias pointed at (one you built
+   by hand, or one another alias also serves) is detached and left in place
+   with a warning; delete it yourself once nothing reads it. A multi-index
+   alias gives the staging index the first index's mappings and settings;
 3. a failed run instead drops the staging index (`abort`) and never touches the
    alias.
 
