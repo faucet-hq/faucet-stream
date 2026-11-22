@@ -534,3 +534,84 @@ async fn a_response_without_hits_reads_as_empty() {
         ElasticsearchSource::new(ElasticsearchSourceConfig::new(server.uri(), "test")).unwrap();
     assert!(source.fetch_all().await.unwrap().is_empty());
 }
+
+/// Mount a search returning `first` and a scroll returning `scroll`.
+async fn search_then_scroll(first: Value, scroll: Value) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/test/_search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(first))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/_search/scroll"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(scroll))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/_search/scroll"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"succeeded": true})))
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn read_err(server: &MockServer) -> String {
+    ElasticsearchSource::new(ElasticsearchSourceConfig::new(server.uri(), "test"))
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap_err()
+        .to_string()
+}
+
+fn hit(id: u64) -> Value {
+    json!({"_index": "test", "_id": id.to_string(), "_source": {"id": id}})
+}
+
+/// A search or scroll page the cluster reports as incomplete (failed shards,
+/// a timed-out search) fails the read instead of ending it with documents
+/// missing; skipped shards are not a failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_incomplete_search_or_scroll_fails_the_read() {
+    let failed = json!({"total": 2, "failed": 1, "failures": [
+        {"index": "test", "reason": {"type": "node_disconnected_exception", "reason": "node left"}}
+    ]});
+    let server = search_then_scroll(
+        json!({"_scroll_id": "s1", "_shards": failed, "hits": {"hits": [hit(1)]}}),
+        json!({"_scroll_id": "s1", "hits": {"hits": []}}),
+    )
+    .await;
+    let err = read_err(&server).await;
+    assert!(
+        err.contains("1 of 2 shard(s) failed (node_disconnected_exception on test: node left)"),
+        "{err}"
+    );
+
+    let server = search_then_scroll(
+        json!({"_scroll_id": "s1", "hits": {"hits": [hit(1)]}}),
+        json!({"_scroll_id": "s1", "_shards": failed, "hits": {"hits": [hit(2)]}}),
+    )
+    .await;
+    assert!(read_err(&server).await.contains("shard(s) failed"));
+
+    let server = search_then_scroll(
+        json!({"_scroll_id": "s1", "timed_out": true, "hits": {"hits": [hit(1)]}}),
+        json!({"_scroll_id": "s1", "hits": {"hits": []}}),
+    )
+    .await;
+    assert!(read_err(&server).await.contains("timed out"));
+
+    let server = search_then_scroll(
+        json!({"_scroll_id": "s1", "_shards": {"total": 5, "failed": 0, "skipped": 2},
+               "hits": {"hits": [hit(1)]}}),
+        json!({"_scroll_id": "s1", "hits": {"hits": []}}),
+    )
+    .await;
+    let records = ElasticsearchSource::new(ElasticsearchSourceConfig::new(server.uri(), "test"))
+        .unwrap()
+        .fetch_all()
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+}

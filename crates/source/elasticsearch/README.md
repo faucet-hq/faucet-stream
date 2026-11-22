@@ -17,6 +17,7 @@ Reach for it when you need to export logs, metrics, orders, or any indexed docum
 - **Shared auth providers** — `auth: { ref: <name> }` points at a provider in the CLI's top-level `auth:` catalog, so many sources share one token with single-flight refresh.
 - **Unconditional scroll cleanup** — the open `_scroll_id` is always sent to `DELETE _search/scroll` on every exit path (clean drain, `max_pages` truncation, mid-stream error, or the consumer dropping the stream) via an RAII guard, so the cluster never leaks server-side scroll state.
 - **Matrix-context interpolation** — `${field.path}` placeholders in `index` and `query` resolve against the parent-record context at runtime, so one config can fan out across indices or query values.
+- **Incomplete results fail the run** — a search or scroll response whose `_shards.failed` is non-zero, or that reports `timed_out: true`, fails the read (naming up to three failures by type and index) instead of ending it with documents missing. Skipped shards are not a failure.
 - **`max_pages` cap** — bound the number of scroll responses for previews or partial exports.
 - **No-batching sentinel** — `batch_size: 0` drains the whole result through the scroll API (10 000 documents per request) into one page, for small lookup indices or sinks that prefer one large request.
 - **Client built once** — the `reqwest` client is constructed in `new()` and reused for every request.
