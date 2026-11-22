@@ -22,6 +22,7 @@ fn opts(name: &str, max_concurrent: Option<usize>) -> ExecuteOptions {
             max_concurrent: Some(n),
             on_error: faucet_cli::config::OnError::Continue,
             adaptive_batch_size: None,
+            max_fan_out_records: None,
         }),
         concurrency: None,
         dry_run: false,

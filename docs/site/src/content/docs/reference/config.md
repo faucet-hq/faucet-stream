@@ -1000,6 +1000,19 @@ Every classification needs at least one of `fields` / `field_pattern` /
   (abort pending and in-flight work on first failure).
 - `schedule` — the order ready sibling rows queue for a permit: `declared`
   (default, matrix order) or `lpt`.
+- `max_fan_out_records` — the most records one parent invocation may hand its
+  child rows (default `1000000`, between `1` and `10000000`). Each captured
+  record becomes a child invocation held in memory until it runs. A page that
+  would pass the cap is refused whole: the parent's own write of that page fails
+  with `budget exceeded: execution.max_fan_out_records` (error kind
+  `budget_exceeded`) and its children are skipped. A warning is logged once a
+  fan-out passes 100,000 records.
+
+Invocations start as concurrency permits free up, in `schedule` order, so at
+most `max_concurrent` exist at a time however wide a fan-out is. Each level of
+the matrix (roots, then their children and dependents) finishes before the next
+starts. After an external cancel (serve cancel / timeout / shutdown, a schedule
+run timeout, Ctrl-C), rows that had not started are reported skipped.
 
 ### Dispatch order (`schedule: lpt`)
 

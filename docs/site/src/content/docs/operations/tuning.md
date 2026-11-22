@@ -35,7 +35,9 @@ your database's connection limit.
 - The HTTP sink sends per-record requests concurrently under a semaphore.
 - Kafka sink uses `FuturesUnordered` batched sends with QueueFull retry.
 - At the pipeline level, `execution.max_concurrent` bounds how many matrix rows
-  run at once.
+  run at once; child invocations of a wide fan-out start as permits free up.
+- `execution.max_fan_out_records` (default 1,000,000) bounds the records a
+  parent hands its children, which the executor holds in memory.
 
 ## Retries
 

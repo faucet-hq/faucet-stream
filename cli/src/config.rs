@@ -1013,6 +1013,47 @@ pub struct ExecutionSpec {
     /// (#644). Defaults to `declared` — today's behaviour, byte for byte.
     #[serde(default)]
     pub schedule: DispatchOrder,
+
+    /// Most records one parent invocation may hand its child rows (`parent:`
+    /// fan-out), default 1,000,000. Every captured record becomes one child
+    /// invocation, held in memory until its children run. A page that would
+    /// pass the cap is refused whole: the parent's own write of that page fails
+    /// with `budget exceeded: execution.max_fan_out_records` and its children
+    /// are skipped. Must be between 1 and 10,000,000. A warning is logged when
+    /// a fan-out passes 100,000 records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fan_out_records: Option<u64>,
+}
+
+/// The default of [`ExecutionSpec::max_fan_out_records`].
+pub const DEFAULT_MAX_FAN_OUT_RECORDS: u64 = 1_000_000;
+/// The largest accepted [`ExecutionSpec::max_fan_out_records`].
+pub const MAX_FAN_OUT_RECORDS_CEILING: u64 = 10_000_000;
+/// A parent fan-out past this many records logs a warning.
+pub const FAN_OUT_WARN_RECORDS: u64 = 100_000;
+
+impl ExecutionSpec {
+    /// The fan-out cap in force (the configured value or the default).
+    pub fn fan_out_cap(spec: Option<&ExecutionSpec>) -> u64 {
+        spec.and_then(|e| e.max_fan_out_records)
+            .unwrap_or(DEFAULT_MAX_FAN_OUT_RECORDS)
+    }
+
+    /// Refuse a `max_fan_out_records` of `0` or above the ceiling.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.max_fan_out_records {
+            Some(0) => Err(
+                "execution.max_fan_out_records must be at least 1 (the cap bounds \
+                 the memory a parent's fan-out holds; there is no unlimited setting)"
+                    .into(),
+            ),
+            Some(n) if n > MAX_FAN_OUT_RECORDS_CEILING => Err(format!(
+                "execution.max_fan_out_records is {n}; the largest accepted value is \
+                 {MAX_FAN_OUT_RECORDS_CEILING}"
+            )),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// How the executor orders ready sibling rows competing for permits (#644).

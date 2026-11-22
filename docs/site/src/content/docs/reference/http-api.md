@@ -702,7 +702,7 @@ template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
 | `GET` | `/v1/runs` | `200` | List runs (filters below) |
 | `GET` | `/v1/runs/{id}` | `200` | Get one run record |
 | `DELETE` | `/v1/runs/{id}` | `204` | Remove a terminal run from history |
-| `POST` | `/v1/runs/{id}/cancel` | `202` / `200` | Request cancel (202) or no-op if terminal (200) |
+| `POST` | `/v1/runs/{id}/cancel` | `202` / `200` | Request cancel (202) or no-op if terminal (200); rows that had not started are reported skipped |
 | `GET` | `/v1/overview` | `200` | Fleet trends over the run history for the console's Overview page (`since`, `until`, `bucket`, `pipeline`, `pool`, `label`, `tenant`, `stale_after`, `top`) — viewer / `RunRead` |
 | `GET` | `/v1/runs/{id}/config` | `200` | The run's stored config (`{format, body, redacted}`); masked below an unscoped admin; `404` when none was stored (only clustered runs store one) — `RunRead`, audit `run.config` |
 | `GET` | `/v1/runs/{id}/logs` | `200` | Stream the run's logs (`text/event-stream`), or read persisted logs with `?format=jsonl\|text` |

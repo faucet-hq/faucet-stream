@@ -103,6 +103,13 @@ for the full grammar.
 
 `execution.on_error: continue` lets sibling subtrees finish when one fails (the
 failed subtree is skipped); `stop` aborts pending and in-flight work on the first
-failure. `stop` cancels in-flight tasks at their next `await`, which can leave
+failure. Under either setting, a cancelled run (a serve cancel or timeout, a
+schedule run timeout, Ctrl-C) starts nothing more: rows that had not started,
+and the `depends_on` rows and children of a row the cancel cut short, are
+reported skipped.
+
+A parent's fan-out is held in memory, one record per child invocation, up to
+`execution.max_fan_out_records` (default 1,000,000): a parent page that would
+pass it fails the parent and skips its children. `stop` cancels in-flight tasks at their next `await`, which can leave
 partial sink state — acceptable for idempotent sinks, something to know for
 others.

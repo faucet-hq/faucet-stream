@@ -344,6 +344,9 @@ pub fn expand(cfg: &PipelineConfig) -> CliResult<Vec<ExpandedNode>> {
     // batch-size controller here (the shared `validate`/`run`/`preview`/
     // `doctor`/`schedule` gate) so `faucet validate` rejects a bad block
     // rather than only surfacing it mid-run in the executor.
+    if let Some(e) = cfg.execution.as_ref() {
+        e.validate().map_err(CliError::Config)?;
+    }
     if let Some(ab) = cfg
         .execution
         .as_ref()

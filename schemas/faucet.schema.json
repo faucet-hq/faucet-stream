@@ -3443,6 +3443,15 @@
           "description": "Order in which ready sibling rows queue for a concurrency permit\n(#644). Defaults to `declared` — today's behaviour, byte for byte.",
           "$ref": "#/$defs/DispatchOrder",
           "default": "declared"
+        },
+        "max_fan_out_records": {
+          "description": "Most records one parent invocation may hand its child rows (`parent:`\nfan-out), default 1,000,000. Every captured record becomes one child\ninvocation, held in memory until its children run. A page that would\npass the cap is refused whole: the parent's own write of that page fails\nwith `budget exceeded: execution.max_fan_out_records` and its children\nare skipped. Must be between 1 and 10,000,000. A warning is logged when\na fan-out passes 100,000 records.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         }
       },
       "additionalProperties": false
