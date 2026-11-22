@@ -8,7 +8,9 @@
 use crate::config::SqsSinkConfig;
 use aws_sdk_sqs::Client;
 use aws_sdk_sqs::types::SendMessageBatchRequestEntry;
-use faucet_core::driver::{DriverSink, MessageDriver, MessageSinkDriver, OutboundMessage};
+use faucet_core::driver::{
+    DriverSink, MessageDriver, MessageSinkDriver, OutboundMessage, RowOutcomes,
+};
 use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::{FaucetError, RowOutcome};
 use serde_json::Value;
@@ -225,15 +227,35 @@ impl Encoded {
 
 impl SqsDriver {
     /// Send one chunk, retrying per-entry partial failures with backoff.
-    /// Returns per-entry outcomes keyed by input index; a whole-request failure
-    /// that outlives the retry budget is the outer `Err`.
+    /// Returns per-entry outcomes keyed by input index. A whole-request
+    /// failure that outlives the retry budget is the outer `Err` while no
+    /// entry is decided yet; after a partial success it fails only the entries
+    /// still undecided, and the ones SQS already answered keep their outcome.
     async fn put_chunk(
         &self,
         calls: &CallSlot,
         mut pending: Vec<Encoded>,
     ) -> Result<BTreeMap<usize, Result<(), FaucetError>>, FaucetError> {
+        let mut outcomes = RowOutcomes::new();
+        match self.send_attempts(calls, &mut pending, &mut outcomes).await {
+            Ok(()) => Ok(outcomes.into_map()),
+            Err(e) if !outcomes.has_decisions() => Err(e),
+            Err(e) => {
+                outcomes.fail_undecided(pending.iter().map(|p| p.index), &e, "sqs");
+                Ok(outcomes.into_map())
+            }
+        }
+    }
+
+    /// The attempts of one chunk. `pending` is left holding the entries still
+    /// to send when an attempt fails as a whole.
+    async fn send_attempts(
+        &self,
+        calls: &CallSlot,
+        pending: &mut Vec<Encoded>,
+        outcomes: &mut RowOutcomes,
+    ) -> Result<(), FaucetError> {
         let retry_cfg = self.config.retry_spec();
-        let mut outcomes: BTreeMap<usize, Result<(), FaucetError>> = BTreeMap::new();
         let mut attempt = 0usize;
         loop {
             let entries: Vec<SendMessageBatchRequestEntry> = pending
@@ -269,7 +291,7 @@ impl SqsDriver {
                 Ok(out) => {
                     for s in out.successful() {
                         if let Ok(idx) = s.id().parse::<usize>() {
-                            outcomes.insert(idx, Ok(()));
+                            outcomes.confirm(idx);
                         }
                     }
                     let mut retry_indices: HashSet<usize> = HashSet::new();
@@ -280,38 +302,38 @@ impl SqsDriver {
                         // sender_fault ⇒ a client-side problem that will not
                         // succeed on retry; treat as permanent.
                         if f.sender_fault() || attempt + 1 >= retry_cfg.max_attempts {
-                            outcomes.insert(
+                            outcomes.fail(
                                 idx,
-                                Err(FaucetError::Sink(format!(
+                                FaucetError::Sink(format!(
                                     "sqs: message rejected after {} attempt(s): {}: {}",
                                     attempt + 1,
                                     f.code(),
                                     f.message().unwrap_or("(no message)")
-                                ))),
+                                )),
                             );
                         } else {
                             retry_indices.insert(idx);
                         }
                     }
-                    for e in &pending {
-                        if !outcomes.contains_key(&e.index) && !retry_indices.contains(&e.index) {
-                            outcomes.insert(
+                    for e in pending.iter() {
+                        if !outcomes.is_decided(e.index) && !retry_indices.contains(&e.index) {
+                            outcomes.fail(
                                 e.index,
-                                Err(FaucetError::Sink(
+                                FaucetError::Sink(
                                     "sqs: SendMessageBatch response neither confirmed nor \
                                      rejected this message; treating it as not delivered"
                                         .to_string(),
-                                )),
+                                ),
                             );
                         }
                     }
                     if retry_indices.is_empty() {
-                        return Ok(outcomes);
+                        return Ok(());
                     }
                     if faucet_common_sqs::is_fifo(&self.config.queue_url) {
-                        retry_indices = fifo_resend(&pending, &retry_indices);
+                        retry_indices = fifo_resend(pending, &retry_indices);
                         for idx in &retry_indices {
-                            outcomes.remove(idx);
+                            outcomes.reopen(*idx);
                         }
                     }
                     pending.retain(|e| retry_indices.contains(&e.index));
@@ -493,12 +515,26 @@ fn merge_chunk(
             }
         }
         Err(e) => {
-            let msg = e.to_string();
             for (idx, group) in indices.into_iter().zip(groups) {
                 failed_groups.insert(group);
-                merged.insert(idx, Err(FaucetError::Sink(msg.clone())));
+                merged.insert(idx, Err(request_failure(&e)));
             }
         }
+    }
+}
+
+/// The error each entry of a request that failed as a whole gets: a timeout
+/// or cancel keeps its type, anything else its text.
+fn request_failure(e: &FaucetError) -> FaucetError {
+    match e {
+        FaucetError::Cancelled { operation } => FaucetError::Cancelled {
+            operation: operation.clone(),
+        },
+        FaucetError::Timeout { operation, after } => FaucetError::Timeout {
+            operation: operation.clone(),
+            after: *after,
+        },
+        other => FaucetError::Sink(other.to_string()),
     }
 }
 
@@ -575,10 +611,11 @@ impl MessageDriver for SqsDriver {
             .enumerate()
             .map(|(i, m)| Encoded::from_message(i, m))
             .collect();
-        let mut shipped = self.ship(calls, encoded).await?;
-        let outcomes: Vec<RowOutcome> = (0..n)
-            .map(|i| shipped.remove(&i).unwrap_or(Ok(())))
-            .collect();
+        let mut shipped = RowOutcomes::new();
+        for (i, o) in self.ship(calls, encoded).await? {
+            shipped.decide(i, o);
+        }
+        let outcomes = shipped.into_rows(n, "sqs");
         let delivered = outcomes.iter().filter(|o| o.is_ok()).count();
         tracing::info!(
             queue = %self.config.queue_url,
@@ -671,6 +708,42 @@ fn fifo_dedup_problem(fifo: bool, content_dedup: bool, dedup_field: bool) -> Opt
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_request_cut_short_fails_its_entries_with_the_cut_type() {
+        let mut merged = BTreeMap::new();
+        let mut failed_groups = HashSet::new();
+        let cut = FaucetError::Timeout {
+            operation: "put call".into(),
+            after: Duration::from_secs(1),
+        };
+        merge_chunk(
+            &mut merged,
+            &mut failed_groups,
+            vec![0],
+            vec![None],
+            Err(cut),
+        );
+        merge_chunk(
+            &mut merged,
+            &mut failed_groups,
+            vec![1],
+            vec![None],
+            Err(FaucetError::Cancelled {
+                operation: "put call".into(),
+            }),
+        );
+        merge_chunk(
+            &mut merged,
+            &mut failed_groups,
+            vec![2],
+            vec![None],
+            Err(FaucetError::Sink("sqs: refused".into())),
+        );
+        assert!(matches!(merged[&0], Err(FaucetError::Timeout { .. })));
+        assert!(matches!(merged[&1], Err(FaucetError::Cancelled { .. })));
+        assert!(matches!(&merged[&2], Err(FaucetError::Sink(m)) if m.contains("sqs: refused")));
+    }
 
     #[test]
     fn a_serialization_failure_names_the_record() {
