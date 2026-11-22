@@ -3453,8 +3453,8 @@ impl SourceDriver for RestDriver {
     fn state_key(&self) -> Option<String> {
         // A source is only made resumable (executor wraps it + persists the
         // bookmark) when it reports a state key. Incremental replication (#630)
-        // is meaningless without persistence, so opt in automatically when
-        // replicating incrementally — otherwise `replication_method: incremental`
+        // and `persist_cursor` are meaningless without persistence, so opt in
+        // automatically for either — otherwise `replication_method: incremental`
         // + a `state:` block would silently full-refresh every run. The CLI
         // executor overrides the concrete key per invocation (StateKeyOverride);
         // the fallback below matters for library callers driving `Pipeline`
@@ -3463,11 +3463,12 @@ impl SourceDriver for RestDriver {
         // resume from each other's bookmark. FNV-1a from core keeps the derived
         // key stable across Rust releases.
         self.config.state_key.clone().or_else(|| {
-            (self.config.replication_method == ReplicationMethod::Incremental
-                && (self.config.replication_key.is_some()
-                    || self.config.async_job.as_ref().is_some_and(|j| {
-                        j.inject_mode() == crate::async_job::InjectMode::Template
-                    })))
+            (self.config.persist_cursor
+                || (self.config.replication_method == ReplicationMethod::Incremental
+                    && (self.config.replication_key.is_some()
+                        || self.config.async_job.as_ref().is_some_and(|j| {
+                            j.inject_mode() == crate::async_job::InjectMode::Template
+                        }))))
             .then(|| {
                 format!(
                     "rest:{:016x}",
@@ -4986,6 +4987,19 @@ mod tests {
         cfg2.state_key = Some("mykey".into());
         let ex = RestStream::new(cfg2).unwrap();
         assert_eq!(ex.state_key().as_deref(), Some("mykey"));
+    }
+
+    #[test]
+    fn a_persisted_cursor_opts_into_a_state_key() {
+        use faucet_core::Source;
+        let cfg = RestStreamConfig::new("https://api.example.com", "/x")
+            .pagination(PaginationStyle::Cursor {
+                next_token_path: "$.next".into(),
+                param_name: "cursor".into(),
+            })
+            .persist_cursor(true);
+        let key = RestStream::new(cfg).unwrap().state_key();
+        assert!(key.is_some_and(|k| k.starts_with("rest:")));
     }
 
     fn template_job() -> crate::async_job::AsyncJobConfig {

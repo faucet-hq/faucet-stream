@@ -1565,3 +1565,17 @@ fn unknown_kinds_report_no_host_identity_and_no_runtime_check() {
     assert!(!source_checks_host_identity_at_runtime("no-such-kind"));
     assert!(!sink_checks_host_identity_at_runtime("no-such-kind"));
 }
+
+#[cfg(feature = "source-rest")]
+#[test]
+fn a_persisted_rest_cursor_resumes_from_its_bookmark() {
+    assert!(source_resumes_from_bookmark(
+        "rest",
+        &json!({"persist_cursor": true})
+    ));
+    assert!(!source_resumes_from_bookmark(
+        "rest",
+        &json!({"persist_cursor": false})
+    ));
+    assert!(!source_resumes_from_bookmark("rest", &json!({})));
+}

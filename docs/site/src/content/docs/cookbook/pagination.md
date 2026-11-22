@@ -177,7 +177,7 @@ By default the cursor is an exclusive bound, so `field` must be unique: rows sha
 
 ## Resumable cursor & multi-array responses
 
-- **`persist_cursor: true`** on a `Cursor` / `CursorInBody` stream saves the terminal cursor as the run's bookmark (via a `state:` store) and seeds it into the next run's first request — so an envelope-cursor feed (e.g. a `/transactions/sync` endpoint) resumes incrementally instead of re-pulling from the start.
+- **`persist_cursor: true`** on a `Cursor` / `CursorInBody` stream saves the terminal cursor as the run's bookmark (via a `state:` store) and seeds it into the next run's first request — so an envelope-cursor feed (e.g. a `/transactions/sync` endpoint) resumes incrementally instead of re-pulling from the start. A `state:` block is all it needs. It cannot be combined with `replication_method: incremental` / `replication_key` / `replication_bind` (they would share one bookmark), and a resuming cursor feed is refused with `write_mode: overwrite` and with `complete_for` cleanup, since each run reads only the delta.
 - **`records_multi`** emits several response arrays in one pass (one pagination advance), each stamped with a configurable `op_field` — pair with a sink `write_mode: upsert` + `delete_marker` to route added/modified→upsert and removed→delete from a single sync response.
 - **`record_ancestors`** lifts fields from an enclosing array-element ancestor onto records unwrapped from a nested `records_path` (e.g. keep an event's envelope `id` on each unwrapped object).
 

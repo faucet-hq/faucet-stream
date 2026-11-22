@@ -1455,6 +1455,7 @@ pub fn source_resumes_from_bookmark(kind: &str, config: &Value) -> bool {
         || (kind == "file" && config.get("incremental").is_some_and(|v| !v.is_null()))
         || (kind == "iceberg" && mode == Some("incremental"))
         || (kind == "dynamodb" && mode == Some("streams"))
+        || (kind == "rest" && config.get("persist_cursor") == Some(&Value::Bool(true)))
         || kind.ends_with("-cdc")
         || matches!(kind, "feed" | "kafka" | "kinesis" | "singer")
 }
