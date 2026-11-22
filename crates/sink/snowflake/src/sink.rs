@@ -1333,32 +1333,54 @@ impl CommitTokenDriver for SnowflakeDriver {
         }
 
         let (sql, count) = if records.is_empty() {
-            let sql = idempotent::build_commit_only_statement_inline(
+            let sql = idempotent::build_guarded_commit_only_statement_inline(
                 &self.config.database,
                 &self.config.schema,
                 scope,
                 token,
             );
-            (sql, idempotent::COMMIT_ONLY_STATEMENT_COUNT)
+            (sql, idempotent::GUARDED_COMMIT_ONLY_STATEMENT_COUNT)
         } else {
             let inserts = size_chunks(records, MAX_PAYLOAD_BYTES)
                 .into_iter()
                 .map(|r| self.build_insert_inline(&records[r]))
                 .collect::<Result<Vec<_>, _>>()?;
-            let sql = idempotent::build_transaction_statement_inline_multi(
+            let sql = idempotent::build_guarded_transaction_statement_inline_multi(
                 &inserts,
                 &self.config.database,
                 &self.config.schema,
                 scope,
                 token,
             );
-            (sql, idempotent::COMMIT_ONLY_STATEMENT_COUNT + inserts.len())
+            (
+                sql,
+                idempotent::GUARDED_COMMIT_ONLY_STATEMENT_COUNT + inserts.len(),
+            )
         };
 
         warn_if_oversized_statement(&sql);
         let parameters = json!({ "MULTI_STATEMENT_COUNT": count.to_string() });
-        self.execute_statement(calls, &sql, None, Some(parameters))
-            .await?;
+        if let Err(e) = self
+            .execute_statement(calls, &sql, None, Some(parameters))
+            .await
+        {
+            if !e.to_string().contains(idempotent::WATERMARK_AHEAD_MARKER) {
+                return Err(e);
+            }
+            let stored = self.last_token(calls, scope).await?;
+            return match faucet_core::check_watermark(stored.as_deref(), token) {
+                faucet_core::WatermarkCheck::Committed => {
+                    tracing::warn!(
+                        scope,
+                        token,
+                        "Snowflake exactly-once: an earlier attempt of this page committed; \
+                         counting it written"
+                    );
+                    Ok(WriteReport::accepted(records.len()))
+                }
+                _ => Err(faucet_core::watermark_ahead_error(scope, token)),
+            };
+        }
 
         tracing::info!(
             table = %format!(

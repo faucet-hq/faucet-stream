@@ -415,7 +415,10 @@ records and the token atomically inside its own transaction:
   multi-statement transaction (a typed `INSERT … SELECT FROM
   UNNEST(JSON_QUERY_ARRAY(@payload))` plus a `MERGE` into the
   `_faucet_commit_token` watermark table in the target dataset), so both land
-  atomically.
+  atomically. The transaction first checks the stored watermark and raises when
+  another attempt already committed this page or a later one; the sink counts
+  the page written only when the stored token is this page's own, else the
+  run fails and the next run resumes from the destination's watermark.
 - **Kafka sink** — a transactional producer writes each page's records plus a
   commit-token record into a compacted side-topic (default
   `__faucet_commit_token`, auto-created with `cleanup.policy=compact`) inside one
@@ -424,8 +427,11 @@ records and the token atomically inside its own transaction:
   consumers should read the destination with `isolation.level=read_committed`.
 
 - **Snowflake sink** — one multi-statement SQL API request
-  (`BEGIN; INSERT …; MERGE INTO _faucet_commit_token …; COMMIT;`) commits the
-  page and the watermark in a single Snowflake transaction.
+  (`BEGIN; UPDATE …; SELECT …; INSERT …; MERGE INTO _faucet_commit_token …;
+  COMMIT;`) commits the page and the watermark in a single Snowflake
+  transaction. The `UPDATE` takes the watermark table's lock and the `SELECT`
+  fails when the scope already holds a commit at or past the page, with the
+  same resolution as BigQuery.
 - **Redis sink** — one `MULTI`/`EXEC` transaction appends the page's commands
   plus a `SET _faucet_commit_token:<scope> <token>`.
 - **Cloud Spanner sink** — one read-write transaction buffers the page's

@@ -84,8 +84,8 @@ async fn write_batch_idempotent_sends_one_atomic_multi_statement_transaction() {
     );
     assert!(ddl.get("parameters").is_none(), "DDL is single-statement");
 
-    // Request 2: the atomic transaction — BEGIN + INSERT + MERGE + COMMIT,
-    // MULTI_STATEMENT_COUNT "4", and no bindings: the SQL API rejects bind
+    // Request 2: the atomic transaction — BEGIN + lock + guard + INSERT +
+    // MERGE + COMMIT, MULTI_STATEMENT_COUNT "6", and no bindings: the SQL API rejects bind
     // variables in a multi-statement request (SQL-44).
     let tx: Value = serde_json::from_slice(&requests[1].body).unwrap();
     let tx_sql = tx["statement"].as_str().unwrap();
@@ -93,7 +93,7 @@ async fn write_batch_idempotent_sends_one_atomic_multi_statement_transaction() {
     assert!(tx_sql.contains("INSERT INTO \"DB\".\"PUBLIC\".\"events\""));
     assert!(tx_sql.contains("MERGE INTO \"DB\".\"PUBLIC\".\"_faucet_commit_token\""));
     assert!(tx_sql.trim_end().ends_with("COMMIT;"), "sql: {tx_sql}");
-    assert_eq!(tx["parameters"]["MULTI_STATEMENT_COUNT"], "4");
+    assert_eq!(tx["parameters"]["MULTI_STATEMENT_COUNT"], "6");
 
     assert!(tx.get("bindings").is_none(), "body: {tx}");
     assert!(!tx_sql.contains('?'), "sql: {tx_sql}");
@@ -203,7 +203,7 @@ async fn empty_page_still_commits_the_token() {
     assert!(tx_sql.starts_with("BEGIN;"), "sql: {tx_sql}");
     assert!(!tx_sql.contains("INSERT INTO"), "no page insert: {tx_sql}");
     assert!(tx_sql.contains("MERGE INTO"), "sql: {tx_sql}");
-    assert_eq!(tx["parameters"]["MULTI_STATEMENT_COUNT"], "3");
+    assert_eq!(tx["parameters"]["MULTI_STATEMENT_COUNT"], "5");
     assert!(tx.get("bindings").is_none(), "body: {tx}");
     assert!(tx_sql.contains(&format!(
         "SELECT '{SCOPE}' AS \"scope\", '{TOKEN}' AS \"token\""
@@ -502,4 +502,89 @@ fn without_describe(requests: Vec<wiremock::Request>) -> Vec<wiremock::Request> 
         .into_iter()
         .filter(|r| !String::from_utf8_lossy(&r.body).contains("information_schema.columns"))
         .collect()
+}
+
+const OURS: &str = "00000000000000000007#{\"o\":7}";
+
+/// The guard statement failed with the marker; the token read decides.
+async fn mount_guard_fired(server: &MockServer, stored: &str) {
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains("BEGIN;"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": "100038",
+            "message": "Numeric value 'faucet-eo-watermark-ahead:00000000000000000007#' is not recognized"
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .and(body_string_contains("SELECT \\\"token\\\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": "090001",
+            "data": [[stored]]
+        })))
+        .mount(server)
+        .await;
+    mount_success(server).await;
+}
+
+#[tokio::test]
+async fn a_guard_hit_on_this_pages_own_token_counts_the_page_written() {
+    let server = MockServer::start().await;
+    mount_guard_fired(&server, OURS).await;
+    let sink = SnowflakeSink::new(sample_config())
+        .unwrap()
+        .with_endpoint(endpoint(&server));
+    let written = sink
+        .write_batch_idempotent(&make_records(2), SCOPE, OURS)
+        .await
+        .expect("an earlier attempt committed this exact page");
+    assert_eq!(written, 2);
+}
+
+#[tokio::test]
+async fn a_guard_hit_on_another_writers_token_fails_the_page() {
+    let server = MockServer::start().await;
+    mount_guard_fired(&server, "00000000000000000007#{\"o\":9}").await;
+    let sink = SnowflakeSink::new(sample_config())
+        .unwrap()
+        .with_endpoint(endpoint(&server));
+    let err = sink
+        .write_batch_idempotent(&make_records(2), SCOPE, OURS)
+        .await
+        .expect_err("another writer's commit is not this page's");
+    assert!(!err.is_retriable(), "{err:?}");
+    assert!(
+        err.to_string()
+            .contains("already holds a commit at or past page 7"),
+        "{err}"
+    );
+}
+
+/// Two live writers on one scope: one commits, the other hits the guard.
+/// Needs a Snowflake account (`FAUCET_SNOWFLAKE_LIVE_CONFIG` = a sink config
+/// as JSON); run by hand with `--ignored`.
+#[tokio::test]
+#[ignore = "needs a live Snowflake account; set FAUCET_SNOWFLAKE_LIVE_CONFIG and run with --ignored"]
+async fn live_two_writers_on_one_scope_commit_once() {
+    let Ok(raw) = std::env::var("FAUCET_SNOWFLAKE_LIVE_CONFIG") else {
+        return;
+    };
+    let cfg = || serde_json::from_str(&raw).expect("sink config JSON");
+    let a = SnowflakeSink::new(cfg()).expect("sink a");
+    let b = SnowflakeSink::new(cfg()).expect("sink b");
+    let scope = format!("live::{}", std::process::id());
+    let ta = "00000000000000000001#{\"w\":\"a\"}";
+    let tb = "00000000000000000001#{\"w\":\"b\"}";
+    let records = make_records(1);
+    let (ra, rb) = tokio::join!(
+        a.write_batch_idempotent(&records, &scope, ta),
+        b.write_batch_idempotent(&records, &scope, tb)
+    );
+    assert_eq!(
+        usize::from(ra.is_ok()) + usize::from(rb.is_ok()),
+        1,
+        "exactly one writer commits page 1: {ra:?} / {rb:?}"
+    );
 }

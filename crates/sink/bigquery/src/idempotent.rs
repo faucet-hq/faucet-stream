@@ -323,6 +323,30 @@ WHEN NOT MATCHED THEN INSERT ({scope}, {token}, updated_at) VALUES (S.{scope}, S
     )
 }
 
+/// The message the watermark guard raises when the scope already holds a
+/// commit at or past the page's sequence. Recognised only on the
+/// exactly-once path.
+pub const WATERMARK_AHEAD_MARKER: &str = "faucet-eo-watermark-ahead";
+
+/// The first statement of an exactly-once transaction: roll back and raise
+/// [`WATERMARK_AHEAD_MARKER`] when the scope's stored token is at or past
+/// `@token`'s sequence. Tokens start with a fixed-width 20-digit sequence, so
+/// comparing that prefix as text orders them numerically. If another writer
+/// commits after the check, BigQuery aborts this transaction for the
+/// concurrent update on the token table and the retry sees the commit.
+pub fn build_watermark_guard(project: &str, dataset: &str) -> String {
+    format!(
+        "IF EXISTS (SELECT 1 FROM {t} WHERE {scope} = @scope \
+AND SUBSTR({token}, 1, 20) >= SUBSTR(@token, 1, 20)) THEN\n\
+  ROLLBACK TRANSACTION;\n\
+  RAISE USING MESSAGE = '{WATERMARK_AHEAD_MARKER}';\n\
+END IF",
+        t = commit_table_ref(project, dataset),
+        scope = COMMIT_TOKEN_SCOPE_COL,
+        token = COMMIT_TOKEN_TOKEN_COL,
+    )
+}
+
 /// The atomic overwrite swap (#492): replace `target_ref`'s contents with
 /// `temp_ref`'s in one multi-statement transaction. `TRUNCATE`+`INSERT … SELECT`
 /// (rather than `CREATE OR REPLACE … AS SELECT`) preserves the target table's
@@ -379,7 +403,8 @@ pub(crate) fn build_insert_select(
     )
 }
 
-/// The full atomic transaction: typed INSERT of the page + watermark MERGE.
+/// The full atomic transaction: the watermark guard, the typed INSERT of the
+/// page and the watermark MERGE.
 pub fn build_transaction_sql(
     columns: &[FieldSpec],
     project: &str,
@@ -387,7 +412,8 @@ pub fn build_transaction_sql(
     table: &str,
 ) -> String {
     format!(
-        "BEGIN TRANSACTION;\n{insert};\n{merge};\nCOMMIT TRANSACTION;",
+        "BEGIN TRANSACTION;\n{guard};\n{insert};\n{merge};\nCOMMIT TRANSACTION;",
+        guard = build_watermark_guard(project, dataset),
         insert = build_insert_select(columns, project, dataset, table),
         merge = build_merge_token(project, dataset),
     )
@@ -1083,6 +1109,22 @@ mod tests {
             build_merge_token("p", "d"),
             "MERGE `p.d._faucet_commit_token` T USING (SELECT @scope AS scope, @token AS token) S ON T.scope = S.scope WHEN MATCHED THEN UPDATE SET token = S.token, updated_at = CURRENT_TIMESTAMP() WHEN NOT MATCHED THEN INSERT (scope, token, updated_at) VALUES (S.scope, S.token, CURRENT_TIMESTAMP())"
         );
+    }
+
+    #[test]
+    fn the_watermark_guard_rolls_back_and_raises_the_marker() {
+        assert_eq!(
+            build_watermark_guard("p", "d"),
+            "IF EXISTS (SELECT 1 FROM `p.d._faucet_commit_token` WHERE scope = @scope \
+AND SUBSTR(token, 1, 20) >= SUBSTR(@token, 1, 20)) THEN\nROLLBACK TRANSACTION;\n\
+RAISE USING MESSAGE = 'faucet-eo-watermark-ahead';\nEND IF"
+        );
+        let cols = vec![scalar("id", BqType::Int64)];
+        let sql = build_transaction_sql(&cols, "p", "d", "t");
+        let g = sql.find("IF EXISTS").unwrap();
+        let i = sql.find("INSERT INTO").unwrap();
+        assert!(sql.starts_with("BEGIN TRANSACTION;\nIF EXISTS"), "{sql}");
+        assert!(g < i, "the guard runs before the page is written: {sql}");
     }
 
     #[test]

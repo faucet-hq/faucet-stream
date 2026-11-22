@@ -571,3 +571,146 @@ async fn last_committed_token_errors_when_select_has_no_schema() {
         other => panic!("expected a fail-safe Sink error, got: {other:?}"),
     }
 }
+
+/// A watermark-guarded page whose guard fires: the transaction raised the
+/// marker, so the sink reads the stored token and decides.
+async fn mount_guard_fired(server: &MockServer, stored: &str, abort_first: bool) {
+    Mock::given(method("POST"))
+        .and(path(queries_path()))
+        .and(body_string_contains("CREATE TABLE IF NOT EXISTS"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(done_query("job-c")))
+        .mount(server)
+        .await;
+    mount_job_done(server, "job-c").await;
+    if abort_first {
+        Mock::given(method("POST"))
+            .and(path(queries_path()))
+            .and(body_string_contains("BEGIN TRANSACTION"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(done_query("job-abort")))
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
+        mount_job_failed(
+            server,
+            "job-abort",
+            "Transaction is aborted due to concurrent update against table p.d._faucet_commit_token",
+        )
+        .await;
+    }
+    Mock::given(method("POST"))
+        .and(path(queries_path()))
+        .and(body_string_contains("BEGIN TRANSACTION"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(done_query("job-guard")))
+        .mount(server)
+        .await;
+    mount_job_failed(server, "job-guard", "faucet-eo-watermark-ahead at [4:3]").await;
+    Mock::given(method("POST"))
+        .and(path(queries_path()))
+        .and(body_string_contains("SELECT token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "kind": "bigquery#queryResponse",
+            "jobComplete": true,
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-sel"},
+            "schema": {"fields": [{"name": "token", "type": "STRING", "mode": "NULLABLE"}]},
+            "rows": [{"f": [{"v": stored}]}],
+            "totalRows": "1"
+        })))
+        .mount(server)
+        .await;
+}
+
+const OURS: &str = "00000000000000000004#{\"o\":4}";
+
+#[tokio::test]
+async fn a_guard_hit_on_this_pages_own_token_counts_the_page_written() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_guard_fired(&server, OURS, false).await;
+    let (sink, _sa) = build_sink(&server).await;
+    let written = sink
+        .write_batch_idempotent(&[json!({"id": 1, "name": "a"})], "s", OURS)
+        .await
+        .expect("an earlier attempt committed this exact page");
+    assert_eq!(written, 1);
+}
+
+#[tokio::test]
+async fn a_guard_hit_on_another_writers_token_fails_the_page() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_guard_fired(&server, "00000000000000000004#{\"o\":9}", false).await;
+    let (sink, _sa) = build_sink(&server).await;
+    let err = sink
+        .write_batch_idempotent(&[json!({"id": 1, "name": "a"})], "s", OURS)
+        .await
+        .expect_err("another writer's commit is not this page's");
+    assert!(!err.is_retriable(), "{err:?}");
+    assert!(
+        err.to_string()
+            .contains("already holds a commit at or past page 4"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_concurrent_abort_then_a_guard_hit_on_the_retry_is_resolved_by_the_token() {
+    let server = MockServer::start().await;
+    mount_token_endpoint(&server).await;
+    mount_table_schema(&server).await;
+    mount_guard_fired(&server, OURS, true).await;
+    let (sink, _sa) = build_sink(&server).await;
+    let written = sink
+        .write_batch_idempotent(&[json!({"id": 1, "name": "a"})], "s", OURS)
+        .await
+        .expect("the retry sees the earlier commit of this page");
+    assert_eq!(written, 1);
+    let bodies = captured_query_bodies(&server).await;
+    let txs: Vec<_> = bodies
+        .iter()
+        .filter(|b| {
+            b["query"]
+                .as_str()
+                .unwrap_or("")
+                .contains("BEGIN TRANSACTION")
+        })
+        .collect();
+    assert_eq!(txs.len(), 2, "one retry after the concurrent-update abort");
+    assert!(txs[0]["query"].as_str().unwrap().contains("IF EXISTS"));
+}
+
+/// Two live writers on one scope: one commits, the other gets the guard.
+/// Needs a billed BigQuery project (`FAUCET_BQ_LIVE_PROJECT`, credentials
+/// from the environment); run by hand with `--ignored`.
+#[tokio::test]
+#[ignore = "needs a live BigQuery project; set FAUCET_BQ_LIVE_PROJECT and run with --ignored"]
+async fn live_two_writers_on_one_scope_commit_once() {
+    let Ok(project) = std::env::var("FAUCET_BQ_LIVE_PROJECT") else {
+        return;
+    };
+    let dataset = std::env::var("FAUCET_BQ_LIVE_DATASET").unwrap_or_else(|_| "faucet_eo".into());
+    let cfg = || {
+        BigQuerySinkConfig::new(
+            &project,
+            &dataset,
+            "eo_two_writers",
+            BigQueryCredentials::ApplicationDefault,
+        )
+    };
+    let a = BigQuerySink::new(cfg()).await.expect("sink a");
+    let b = BigQuerySink::new(cfg()).await.expect("sink b");
+    let scope = format!("live::{}", std::process::id());
+    let ta = "00000000000000000001#{\"w\":\"a\"}";
+    let tb = "00000000000000000001#{\"w\":\"b\"}";
+    let rec = [json!({"id": 1, "name": "x"})];
+    let (ra, rb) = tokio::join!(
+        a.write_batch_idempotent(&rec, &scope, ta),
+        b.write_batch_idempotent(&rec, &scope, tb)
+    );
+    assert_eq!(
+        usize::from(ra.is_ok()) + usize::from(rb.is_ok()),
+        1,
+        "exactly one writer commits page 1: {ra:?} / {rb:?}"
+    );
+}

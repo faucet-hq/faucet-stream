@@ -3791,8 +3791,25 @@ impl CommitTokenDriver for BigQueryDriver {
         scope: &str,
         token: &str,
     ) -> Result<WriteReport, FaucetError> {
-        let n = self.write_idempotent(calls, records, scope, token).await?;
-        Ok(self.report(records.len(), n))
+        match self.write_idempotent(calls, records, scope, token).await {
+            Ok(n) => Ok(self.report(records.len(), n)),
+            Err(e) if e.to_string().contains(idempotent::WATERMARK_AHEAD_MARKER) => {
+                let stored = self.last_token(calls, scope).await?;
+                match faucet_core::check_watermark(stored.as_deref(), token) {
+                    faucet_core::WatermarkCheck::Committed => {
+                        tracing::warn!(
+                            scope,
+                            token,
+                            "BigQuery exactly-once: an earlier attempt of this page committed; \
+                             counting it written"
+                        );
+                        Ok(self.report(records.len(), records.len()))
+                    }
+                    _ => Err(faucet_core::watermark_ahead_error(scope, token)),
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
