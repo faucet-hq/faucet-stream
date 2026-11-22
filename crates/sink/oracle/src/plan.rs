@@ -161,19 +161,8 @@ pub(crate) fn clamp_fraction(s: &str) -> String {
 /// `DATE`/`TIMESTAMP` bind keeps only the wall-clock fields, so without this
 /// `…-08:00` and `…Z` values would land as inconsistent instants.
 pub(crate) fn utc_wall_time(s: &str) -> Option<String> {
-    const OFFSET_FORMATS: [&str; 4] = [
-        "%Y-%m-%dT%H:%M:%S%.f%#z",
-        "%Y-%m-%d %H:%M:%S%.f%#z",
-        "%Y-%m-%d %H:%M:%S%.f %#z",
-        "%Y-%m-%dT%H:%M%#z",
-    ];
-    let s = s.trim();
-    let dt = chrono::DateTime::parse_from_rfc3339(s).ok().or_else(|| {
-        OFFSET_FORMATS
-            .iter()
-            .find_map(|f| chrono::DateTime::parse_from_str(s, f).ok())
-    })?;
-    Some(dt.naive_utc().format("%Y-%m-%dT%H:%M:%S%.f").to_string())
+    faucet_core::fidelity::offset_instant_utc(s)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
 }
 
 /// Encode one record value as the text bound for a column of `kind`.

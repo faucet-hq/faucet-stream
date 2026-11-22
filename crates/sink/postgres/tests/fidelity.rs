@@ -373,3 +373,52 @@ async fn a_typed_double_column_preserves_negative_zero_where_jsonb_does_not() {
         "and so the sign is gone on the document path: {doc}"
     );
 }
+
+/// An offset-bearing instant bound for `timestamp` / `time` (no zone) lands
+/// as its UTC wall time — on the INSERT and the COPY paths — instead of with
+/// the offset dropped; a `timestamptz` keeps the instant as before.
+#[tokio::test]
+async fn offset_instants_land_as_utc_wall_time_in_zone_less_columns() {
+    let (_c, url) = start_postgres().await;
+    let pool = sqlx::PgPool::connect(&url).await.expect("pool");
+    sqlx::raw_sql(
+        "CREATE TABLE walls (id BIGINT PRIMARY KEY, at TIMESTAMP, t TIME, tz TIMESTAMPTZ);
+         CREATE TABLE walls_copy (id BIGINT, at TIMESTAMP, t TIME, tz TIMESTAMPTZ);",
+    )
+    .execute(&pool)
+    .await
+    .expect("create");
+    let record = json!({
+        "id": 1,
+        "at": "2026-09-18T12:00:00+02:00",
+        "t": "01:00:00+02:00",
+        "tz": "2026-09-18T12:00:00+02:00",
+    });
+    for (table, copy) in [("walls", false), ("walls_copy", true)] {
+        let mut cfg =
+            PostgresSinkConfig::new(&url, table).column_mapping(PostgresColumnMapping::AutoMap);
+        if copy {
+            cfg.write_method = faucet_sink_postgres::PostgresWriteMethod::Copy;
+        }
+        let sink = PostgresSink::new(cfg).await.expect("sink");
+        sink.write_batch(std::slice::from_ref(&record))
+            .await
+            .expect("write");
+        sink.flush().await.expect("flush");
+        let row: (String, String, String) = sqlx::query_as(&format!(
+            "SELECT at::text, t::text, (tz AT TIME ZONE 'UTC')::text FROM {table}"
+        ))
+        .fetch_one(&pool)
+        .await
+        .expect("read");
+        assert_eq!(
+            row,
+            (
+                "2026-09-18 10:00:00".to_string(),
+                "23:00:00".to_string(),
+                "2026-09-18 10:00:00".to_string()
+            ),
+            "{table}"
+        );
+    }
+}

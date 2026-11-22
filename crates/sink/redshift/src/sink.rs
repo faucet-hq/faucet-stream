@@ -461,18 +461,6 @@ impl RedshiftDriver {
         format!("{}{}.{}", self.config.copy_spec().staging_prefix, id, ext)
     }
 
-    /// Discover the destination table's column names in ordinal order. Used
-    /// by the `insert` path and the CSV `copy` path (both need the column
-    /// set/order).
-    async fn discover_columns(&self, calls: &CallSlot) -> Result<Vec<String>, FaucetError> {
-        Ok(self
-            .table_columns(calls)
-            .await?
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect())
-    }
-
     /// [`discover_typed_columns`](Self::discover_typed_columns), cached.
     async fn table_columns(&self, calls: &CallSlot) -> Result<Vec<(String, String)>, FaucetError> {
         let mut cached = self.typed_columns.lock().await;
@@ -568,7 +556,8 @@ impl RedshiftDriver {
         let iam_role = copy_cfg.iam_role.as_deref().ok_or_else(|| {
             FaucetError::Sink("redshift: iam_role is required for copy strategy".into())
         })?;
-        let table_columns = self.discover_columns(calls).await?;
+        let typed = self.table_columns(calls).await?;
+        let table_columns: Vec<String> = typed.iter().map(|(n, _)| n.clone()).collect();
         let ext = match copy_cfg.format {
             RedshiftCopyFormat::Jsonl => "jsonl",
             RedshiftCopyFormat::Csv => "csv",
@@ -583,7 +572,8 @@ impl RedshiftDriver {
         for chunk in chunks.iter().filter(|c| !c.is_empty()) {
             // A record sharing no column with the table would load as an
             // all-NULL row, so it is skipped, as on the INSERT path (#862 L-118).
-            let (records, skipped) = loadable_records(chunk, &table_columns)?;
+            let chunk = utc_wall_times(chunk, &typed);
+            let (records, skipped) = loadable_records(&chunk, &table_columns)?;
             if skipped > 0 {
                 tracing::warn!(
                     table = %self.config.table_name,
@@ -670,6 +660,7 @@ impl RedshiftDriver {
             return Ok(0);
         }
         let typed = self.table_columns(calls).await?;
+        let records = &*utc_wall_times(records, &typed);
         let table_columns: Vec<String> = typed.iter().map(|(n, _)| n.clone()).collect();
         let present: Vec<String> = columns_present(records, &table_columns)
             .into_iter()
@@ -893,6 +884,56 @@ fn binds_as_cast_text(sql_type: &str) -> bool {
         .any(|p| {
             base == *p || base.starts_with(&format!("{p} ")) || base.starts_with(&format!("{p}("))
         })
+}
+
+/// `records` with each offset-bearing string bound for a column without a
+/// zone (`timestamp`, `time`) replaced by its UTC wall time, which Redshift
+/// would otherwise store with the offset dropped. Fields match columns
+/// ignoring case, as the INSERT and COPY paths do. Borrowed when the table
+/// has no such column or no value needs it.
+fn utc_wall_times<'a>(
+    records: &'a [Value],
+    typed: &[(String, String)],
+) -> std::borrow::Cow<'a, [Value]> {
+    let naive: Vec<(&str, &str)> = typed
+        .iter()
+        .filter(|(_, t)| faucet_common_sql::naive_temporal(t).is_some())
+        .map(|(n, t)| (n.as_str(), t.as_str()))
+        .collect();
+    if naive.is_empty() {
+        return std::borrow::Cow::Borrowed(records);
+    }
+    let changes = |obj: &serde_json::Map<String, Value>| -> Vec<(String, String)> {
+        obj.iter()
+            .filter_map(|(k, v)| {
+                let (_, ty) = naive.iter().find(|(c, _)| c.eq_ignore_ascii_case(k))?;
+                let utc = faucet_common_sql::naive_temporal_text(ty, v.as_str()?)?;
+                Some((k.clone(), utc))
+            })
+            .collect()
+    };
+    if !records
+        .iter()
+        .filter_map(Value::as_object)
+        .any(|o| !changes(o).is_empty())
+    {
+        return std::borrow::Cow::Borrowed(records);
+    }
+    std::borrow::Cow::Owned(
+        records
+            .iter()
+            .map(|r| {
+                let Some(src) = r.as_object() else {
+                    return r.clone();
+                };
+                let mut obj = src.clone();
+                for (k, utc) in changes(src) {
+                    obj.insert(k, Value::String(utc));
+                }
+                Value::Object(obj)
+            })
+            .collect(),
+    )
 }
 
 /// The records of a COPY chunk that share a column with the table, and how

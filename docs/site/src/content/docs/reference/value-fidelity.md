@@ -28,6 +28,15 @@ produced it, and every sink reads the same rendering back.
 | Date, time of day | `YYYY-MM-DD`, `HH:MM:SS[.fff…]` | `"2026-02-28"`, `"12:30:00.5"` |
 | Binary — `BYTEA`, `BLOB`, `VARBINARY`, Arrow `Binary`, Avro `bytes` | standard **base64** with padding | `"AAEC/f7/"` |
 
+**Instants written into a column without a zone.** A `TIMESTAMP` / `TIME`
+column that has no zone would drop the offset of a value like
+`2026-09-18T12:00:00+02:00` and store `12:00:00`. The `postgres`, `redshift`,
+`oracle`, `duckdb` and `snowflake` sinks convert such a value to its UTC wall
+time (`2026-09-18 10:00:00`) before writing it; a zoned column
+(`TIMESTAMPTZ`) receives the instant unchanged. A `TIME` value with an offset
+is shifted to UTC and the day it crosses into is dropped (`01:00:00+02:00` →
+`23:00:00`).
+
 **Exception — MySQL `DATETIME`.** The `mysql` query source and the
 `mysql-cdc` source render a zone-less `DATETIME` as RFC 3339 at `+00:00`
 (`"2024-01-03T04:05:06.123456+00:00"`), not as a local date-time. The query

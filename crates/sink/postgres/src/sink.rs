@@ -118,7 +118,9 @@ pub(crate) fn pg_bind_text_with(
                 match v {
                     Value::Bool(b) => Some(b.to_string()),
                     Value::Number(n) => Some(n.to_string()),
-                    Value::String(s) => Some(s.clone()),
+                    Value::String(s) => Some(
+                        faucet_common_sql::naive_temporal_text(udt, s).unwrap_or_else(|| s.clone()),
+                    ),
                     // Arrays/objects have no scalar text form for a non-JSON
                     // column; bind their JSON text so the `::<type>` cast fails
                     // loudly rather than silently coercing.

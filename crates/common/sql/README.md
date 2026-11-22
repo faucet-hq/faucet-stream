@@ -119,6 +119,14 @@ engine.apply_plans(&mut Exec { conn: &mut tx }, &target, &plans).await?;
 The backend keeps transactions, bulk-load paths (`COPY`), overwrite swaps and
 catalog queries, and words its own errors per `StatementKind`.
 
+## Instants into columns without a zone
+
+`temporal::naive_temporal(sql_type)` recognises a zone-less `timestamp` /
+`time` type, and `naive_temporal_text(sql_type, text)` turns an offset-bearing
+value bound for one into its UTC wall time (`None` = bind it unchanged). The
+`postgres` and `redshift` sinks bind through it, so an instant from a zoned
+source is not stored with its offset dropped.
+
 ## Who uses what
 
 | Sink | Uses |

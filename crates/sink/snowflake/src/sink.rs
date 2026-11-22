@@ -935,8 +935,8 @@ fn table_columns(rows: Vec<Vec<Value>>) -> TableColumns {
 /// An ISO 8601 timestamp carrying an offset (`Z` or `±HH:MM`) as UTC wall
 /// time; `None` for anything else (offset-less values are left alone).
 fn utc_wall_time(s: &str) -> Option<String> {
-    let dt = chrono::DateTime::parse_from_rfc3339(s.trim()).ok()?;
-    Some(dt.naive_utc().format("%Y-%m-%dT%H:%M:%S%.f").to_string())
+    faucet_core::fidelity::offset_instant_utc(s)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.f").to_string())
 }
 
 /// `CREATE TABLE IF NOT EXISTS` for an auto-created target (#580).
