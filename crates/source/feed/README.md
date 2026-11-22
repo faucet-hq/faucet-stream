@@ -100,7 +100,7 @@ just `type: feed` validates.
 | `store.type: sqlite` | `config.path` | | Path of the store's database file. It must exist. |
 | `store.type: postgres` | `config.url` | | Connection URL of the database that holds the store. Use a `${env:…}` or secret reference for the password. |
 | `page_events` | integer | one page per run | Split a run into pages of this many events; each page is written and committed on its own. |
-| `include_metadata` | bool | `true` | Add `_feed: {seq, id, received_at, headers}` to every record. |
+| `include_metadata` | bool | `true` | Add `_feed: {seq, id, received_at, headers}` to every record. `_feed` is reserved: an event holding it is refused (see Records). |
 | `claim_ttl_secs` | integer | `60` under `faucet run`, `300` under `faucet serve` | How long the range claim lasts without a renewal. The source renews it every tenth of this so a `faucet run` that died leaves its claim for at most a minute. |
 | `max_events` | integer | `10000` | Most events one `faucet run` drain reads. |
 | `max_bytes` | integer | `67108864` | Most payload bytes one `faucet run` drain reads; a single larger event is still read. |
@@ -126,7 +126,7 @@ Each event becomes one record, by its stored content type:
 |---|---|
 | `application/json`, `*+json`: an object | the object |
 | `application/json`, `*+json`: any other value | `{"value": <the value>}` |
-| `application/x-www-form-urlencoded` | an object of string values |
+| `application/x-www-form-urlencoded` | an object of string values; a key sent more than once is an array of its values in the order sent (`tag=a&tag=b` → `{"tag": ["a", "b"]}`) |
 | `text/*` | `{"value": "<the text>"}` |
 | anything else | `{"value": "<base64>"}` |
 
@@ -140,6 +140,16 @@ With `include_metadata` (the default) the record also carries:
 `headers` the request headers the feed kept. An event whose payload is not
 what its content type says (invalid JSON, text that is not UTF-8) fails the
 run with a typed error; nothing is skipped.
+
+`_feed` is reserved for this metadata, whatever `include_metadata` says:
+`faucet serve` refuses an event that carries a top-level `_feed` field, and a
+stored event that holds one fails the run with a typed error rather than
+having the field overwritten or passed through as if it were metadata. A
+record forwarded to another feed must drop `_feed` first
+(`include_metadata: false`, or a `drop` transform).
+
+Every run decodes the stored bytes again, so a range replayed later is
+decoded by the rules of the running release.
 
 ## Resume and state
 

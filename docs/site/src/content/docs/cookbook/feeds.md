@@ -118,7 +118,10 @@ curl -s localhost:8080/v1/feeds/orders -H "Authorization: Bearer $TOKEN" | jq '.
 
 Each record carries a `_feed` object with the event's sequence number, id,
 arrival time and kept headers. Set `include_metadata: false` on the source to
-leave it out.
+leave it out. The name is reserved: a sender's event with a top-level `_feed`
+field is refused with `400`, so a record a delivery forwards to another feed
+(an `http` sink posting to a second server, say) must drop `_feed` first
+(`include_metadata: false` or a `drop` transform).
 
 ## Where feeds are defined
 
@@ -187,7 +190,11 @@ Senders `POST` to `/v1/feeds/{name}/events` (a tenant's feed:
 | form data, text, anything else the feed accepts | one event |
 
 JSON must parse and text must be UTF-8, or the request is refused with `400`,
-so a delivery can always decode what the feed holds. A request is all or
+so a delivery can always decode what the feed holds. A form becomes one
+record of strings; a key sent more than once (`tag=a&tag=b`) becomes an array
+of its values in the order sent, so that key's type depends on the request.
+Every delivery decodes the stored bytes, so a range replayed later is decoded
+the same way. A request is all or
 nothing: either every event in it is stored or none is. A body may be sent
 with `Content-Encoding: gzip`; every size limit applies to the expanded bytes.
 

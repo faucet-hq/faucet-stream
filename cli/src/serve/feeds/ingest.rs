@@ -204,13 +204,125 @@ fn depth(json: &[u8]) -> usize {
     deepest
 }
 
-fn parses(json: &[u8]) -> Result<(), String> {
+/// The key a delivery stores an event's metadata under; no event may carry it.
+const RESERVED_KEY: &str = faucet_source_feed::METADATA_KEY;
+
+/// Whether a JSON value is an object holding [`RESERVED_KEY`] at its top
+/// level, compared after unescaping and counting repeated keys.
+struct HoldsReserved;
+
+impl<'de> serde::de::DeserializeSeed<'de> for HoldsReserved {
+    type Value = bool;
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<bool, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for HoldsReserved {
+    type Value = bool;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<bool, A::Error> {
+        let mut found = false;
+        while let Some(key) = map.next_key::<String>()? {
+            found |= key == RESERVED_KEY;
+            map.next_value::<serde::de::IgnoredAny>()?;
+        }
+        Ok(found)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<bool, A::Error> {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(false)
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_unit<E>(self) -> Result<bool, E> {
+        Ok(false)
+    }
+}
+
+/// The events of a JSON body whose array elements are events: the place
+/// of the first event holding [`RESERVED_KEY`].
+struct FirstReserved;
+
+impl<'de> serde::de::Visitor<'de> for FirstReserved {
+    type Value = Option<usize>;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let (mut i, mut first) = (0, None);
+        while let Some(found) = seq.next_element_seed(HoldsReserved)? {
+            if found && first.is_none() {
+                first = Some(i);
+            }
+            i += 1;
+        }
+        Ok(first)
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+        Ok(HoldsReserved.visit_map(map)?.then_some(0))
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+}
+
+/// Parse `json` once: `Ok(Some(i))` names the first event (an array
+/// element when `elements_are_events`, else the value itself, `0`) holding
+/// the reserved metadata key.
+fn parses(json: &[u8], elements_are_events: bool) -> Result<Option<usize>, String> {
+    use serde::de::{DeserializeSeed, Deserializer};
     if depth(json) > MAX_JSON_DEPTH {
         return Err(format!("nested deeper than {MAX_JSON_DEPTH} levels"));
     }
-    serde_json::from_slice::<serde::de::IgnoredAny>(json)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    let mut de = serde_json::Deserializer::from_slice(json);
+    let found = if elements_are_events {
+        de.deserialize_any(FirstReserved)
+    } else {
+        HoldsReserved
+            .deserialize(&mut de)
+            .map(|found| found.then_some(0))
+    }
+    .and_then(|found| de.end().map(|()| found))
+    .map_err(|e| e.to_string())?;
+    Ok(found)
+}
+
+fn reserved(event: usize) -> Refusal {
+    Refusal::bad_request(format!(
+        "event {event}: the field \"{RESERVED_KEY}\" is reserved for the feed's metadata; \
+         rename it (a record taken from another feed must drop \"{RESERVED_KEY}\" first)"
+    ))
 }
 
 /// The elements of a JSON array, each as it was sent; `None` when `body`
@@ -278,15 +390,23 @@ pub fn split(content_type: &str, body: &[u8], max_event_bytes: u64) -> Result<Ve
             if line.is_empty() {
                 continue;
             }
-            parses(line)
-                .map_err(|e| Refusal::bad_request(format!("line {}: not JSON: {e}", n + 1)))?;
+            if parses(line, false)
+                .map_err(|e| Refusal::bad_request(format!("line {}: not JSON: {e}", n + 1)))?
+                .is_some()
+            {
+                return Err(reserved(pieces.len() + 1));
+            }
             pieces.push(Piece {
                 content_type: "application/json".into(),
                 payload: line.to_vec(),
             });
         }
     } else if is_json(&media) {
-        parses(body).map_err(|e| Refusal::bad_request(format!("the body is not JSON: {e}")))?;
+        if let Some(i) = parses(body, true)
+            .map_err(|e| Refusal::bad_request(format!("the body is not JSON: {e}")))?
+        {
+            return Err(reserved(i + 1));
+        }
         match array_elements(body) {
             Some(elements) => pieces.extend(elements.into_iter().map(|e| Piece {
                 content_type: media.clone(),
@@ -300,6 +420,11 @@ pub fn split(content_type: &str, body: &[u8], max_event_bytes: u64) -> Result<Ve
     } else {
         if media.starts_with("text/") && std::str::from_utf8(body).is_err() {
             return Err(Refusal::bad_request("the body is not UTF-8 text"));
+        }
+        if media == "application/x-www-form-urlencoded"
+            && url::form_urlencoded::parse(body).any(|(k, _)| k == RESERVED_KEY)
+        {
+            return Err(reserved(1));
         }
         pieces.push(Piece {
             content_type: content_type.trim().to_string(),
@@ -1631,6 +1756,54 @@ mod tests {
         assert_eq!(depth(br#"{"a": "[[[\"{", "b": [1, {"c": []}]}"#), 4);
         assert_eq!(array_elements(b"   "), None);
         assert_eq!(array_elements(b" {\"a\": []}"), None);
+    }
+
+    #[test]
+    fn an_event_holding_the_metadata_key_is_refused() {
+        for (content_type, body, event) in [
+            ("application/json", &br#"{"_feed": 1}"#[..], 1),
+            ("application/json", br#"{"\u005ffeed": 1}"#, 1),
+            (
+                "application/json",
+                br#"{"a": 1, "_feed": 2, "_feed": 3}"#,
+                1,
+            ),
+            (
+                "application/json",
+                br#"[{"a": 1}, 2, {"b": {"_feed": 1}, "_feed": 0}]"#,
+                3,
+            ),
+            ("application/json; charset=utf-8", br#"{"_feed": {}}"#, 1),
+            ("application/x-ndjson", b"{\"a\":1}\n\n{\"_feed\":1}\n", 2),
+            ("application/x-www-form-urlencoded", b"a=1&_feed=2", 1),
+            ("application/x-www-form-urlencoded", b"%5Ffeed=2", 1),
+            ("application/x-www-form-urlencoded", b"_fe%65d=2", 1),
+            (
+                "Application/X-WWW-Form-Urlencoded; charset=utf-8",
+                b"_feed=2",
+                1,
+            ),
+        ] {
+            let refusal = split(content_type, body, 1_000).unwrap_err();
+            assert_eq!(refusal.status, StatusCode::BAD_REQUEST, "{content_type}");
+            assert!(
+                refusal
+                    .message
+                    .starts_with(&format!("event {event}: the field \"_feed\"")),
+                "{content_type}: {}",
+                refusal.message
+            );
+        }
+        for (content_type, body) in [
+            ("application/json", &br#"{"a": {"_feed": 1}}"#[..]),
+            ("application/json", br#"["_feed", [{"_feed": 1}]]"#),
+            ("application/json", br#""_feed""#),
+            ("application/x-ndjson", b"[{\"_feed\": 1}]\n"),
+            ("application/x-www-form-urlencoded", b"a=_feed&x_feed=1"),
+            ("text/plain", b"_feed=1"),
+        ] {
+            assert!(split(content_type, body, 1_000).is_ok(), "{content_type}");
+        }
     }
 
     fn dedupe(header: Option<&str>, path: Option<&str>) -> DedupeSpec {

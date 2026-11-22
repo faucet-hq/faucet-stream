@@ -288,6 +288,45 @@ matrix:
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_stored_event_holding_the_metadata_key_fails_the_run_and_moves_nothing() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::create(dir.path()).await;
+    store
+        .store
+        .append(
+            &CallContext::new(),
+            &store.feed,
+            vec![NewEvent::new(
+                "application/json",
+                r#"{"n": 1, "_feed": "theirs"}"#,
+            )],
+        )
+        .await
+        .unwrap();
+    let cfg = write(
+        dir.path(),
+        "faucet.yaml",
+        &format!(
+            r#"version: 1
+name: orders_archive
+pipeline:
+  source:{SOURCE}
+  sink:
+    type: file
+    config: {{ path: ./out/orders.jsonl, if_exists: append }}
+"#
+        ),
+    );
+    faucet(dir.path())
+        .arg("run")
+        .arg(&cfg)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("reserved for the feed's metadata"));
+    assert_eq!(store.position().await, (1, false), "nothing moved");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_missing_delivery_is_an_error_that_names_it() {
     let dir = TempDir::new().unwrap();
     let _store = Store::create(dir.path()).await;

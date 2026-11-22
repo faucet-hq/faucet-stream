@@ -39,7 +39,7 @@ Durations are whole seconds as a number, or text with a unit: `90s`, `15m`,
 | `auth.tokens` | `managed` | | Write-only feed tokens issued through the API, stored hashed. |
 | `auth.signature` | object | | An HMAC signature over the request body (below). |
 | `auth.allowed_addresses` | list of strings | `[]` (any) | Sender addresses or CIDR ranges that may push. |
-| `accept` | list of strings | `application/json`, `application/x-ndjson`, `application/x-www-form-urlencoded`, `text/plain` | Accepted request content types. |
+| `accept` | list of strings | `application/json`, `application/x-ndjson`, `application/x-www-form-urlencoded`, `text/plain` | Accepted request content types. A form's repeated key is delivered as an array of its values in the order sent. An event (JSON object, array element, NDJSON line or form) with a top-level `_feed` field is refused with `400`: the key is reserved for the delivery's metadata. |
 | `max_event_bytes` | size | `1MiB` | Largest single event. |
 | `max_request_bytes` | size | `10MiB` | Largest request body, after any gzip expansion. Capped by the server's `--feeds-max-request-bytes`. Must be at least `max_event_bytes`. |
 | `dedupe` | object | | Store a retried event once (below). |

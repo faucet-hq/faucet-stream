@@ -357,7 +357,10 @@ async fn pushed_events_are_stored_then_delivered_by_a_run() {
     // Text and a form are one event each.
     for (content_type, body) in [
         ("text/plain; charset=utf-8", "plain words"),
-        ("application/x-www-form-urlencoded", "id=8&name=a+b"),
+        (
+            "application/x-www-form-urlencoded",
+            "id=8&name=a+b&tag=x&tag=y&tag=&empty=",
+        ),
     ] {
         let a = srv
             .send(
@@ -369,6 +372,29 @@ async fn pushed_events_are_stored_then_delivered_by_a_run() {
             )
             .await;
         assert_eq!(a.status, 202, "{content_type}: {}", a.body);
+    }
+    assert_eq!(srv.watermark("orders", &uid).await, 8);
+
+    // An event may not carry the metadata key, however it is spelled.
+    for (content_type, body) in [
+        ("application/json", r#"[{"id": 9}, {"\u005ffeed": 1}]"#),
+        ("application/x-www-form-urlencoded", "id=9&%5Ffeed=x"),
+    ] {
+        let refused = srv
+            .send(
+                srv.client
+                    .post(srv.url("/v1/feeds/orders/events"))
+                    .bearer_auth(&token)
+                    .header("content-type", content_type)
+                    .body(body),
+            )
+            .await;
+        assert_eq!(refused.status, 400, "{content_type}: {}", refused.body);
+        assert!(
+            refused.body.to_string().contains("reserved"),
+            "{}",
+            refused.body
+        );
     }
     assert_eq!(srv.watermark("orders", &uid).await, 8);
 
@@ -396,6 +422,8 @@ async fn pushed_events_are_stored_then_delivered_by_a_run() {
     assert_eq!(got[4]["_feed"]["headers"]["x-request-id"], "req-7");
     assert_eq!(got[6]["value"], "plain words");
     assert_eq!(got[7]["name"], "a b");
+    assert_eq!(got[7]["tag"], json!(["x", "y", ""]));
+    assert_eq!(got[7]["empty"], "");
 
     // The token's use is recorded, off the request's path.
     let mut used = None;
