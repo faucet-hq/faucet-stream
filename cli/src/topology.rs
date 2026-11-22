@@ -2092,17 +2092,17 @@ async fn post_run_observability(cfg: &PipelineConfig, ctx: PostRun<'_>) -> Vec<(
         let node_failed_by_profile = profile_failures.iter().any(|(id, _)| id == row);
 
         // ── Notifications (#280) ─────────────────────────────────────────────
+        // Delivered in the background, in order per sink node.
         #[cfg(feature = "notify")]
         if let Some(notifier) = &notifier {
             use crate::notify::NotifyEvent;
+            let mut events = Vec::new();
             match (&node.error, node_failed_by_profile) {
                 (None, false) => {
-                    notifier
-                        .emit(crate::executor::keep_sla_open(
-                            NotifyEvent::run_success(pipeline_name, row, node.records as u64),
-                            !violations.is_empty(),
-                        ))
-                        .await;
+                    events.push(crate::executor::keep_sla_open(
+                        NotifyEvent::run_success(pipeline_name, row, node.records as u64),
+                        !violations.is_empty(),
+                    ));
                 }
                 (None, true) => {
                     let msg = profile_failures
@@ -2110,46 +2110,43 @@ async fn post_run_observability(cfg: &PipelineConfig, ctx: PostRun<'_>) -> Vec<(
                         .find(|(id, _)| id == row)
                         .map(|(_, m)| m.clone())
                         .unwrap_or_default();
-                    notifier
-                        .emit(NotifyEvent::run_failure(
-                            pipeline_name,
-                            row,
-                            "profile_drift",
-                            msg,
-                        ))
-                        .await;
+                    events.push(NotifyEvent::run_failure(
+                        pipeline_name,
+                        row,
+                        "profile_drift",
+                        msg,
+                    ));
                 }
                 (Some(msg), _) => {
-                    notifier
-                        .emit(NotifyEvent::run_failure(pipeline_name, row, "sink", msg))
-                        .await;
+                    events.push(NotifyEvent::run_failure(pipeline_name, row, "sink", msg));
                 }
             }
             for v in &violations {
-                notifier
-                    .emit(NotifyEvent::sla_breach(
-                        pipeline_name,
-                        row,
-                        v.kind(),
-                        v.to_string(),
-                    ))
-                    .await;
+                events.push(NotifyEvent::sla_breach(
+                    pipeline_name,
+                    row,
+                    v.kind(),
+                    v.to_string(),
+                ));
             }
             if let (Some(o), Some(spec)) = (&profile_outcome, cfg.profiling.as_ref())
                 && spec.on_drift != faucet_core::OnProfileDrift::Warn
             {
                 for d in &o.drift {
-                    notifier
-                        .emit(NotifyEvent::profile_drift(
-                            pipeline_name,
-                            row,
-                            &d.column,
-                            d.metric.as_str(),
-                            d.to_string(),
-                        ))
-                        .await;
+                    events.push(NotifyEvent::profile_drift(
+                        pipeline_name,
+                        row,
+                        &d.column,
+                        d.metric.as_str(),
+                        d.to_string(),
+                    ));
                 }
             }
+            crate::notify::dispatch(
+                notifier,
+                (None, pipeline_name.to_string(), row.to_string()),
+                events,
+            );
         }
         #[cfg(not(feature = "notify"))]
         let _ = (&violations, node_failed_by_profile);

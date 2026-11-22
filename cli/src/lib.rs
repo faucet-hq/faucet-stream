@@ -254,8 +254,18 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
 /// integration tests can drive the exact same code path as [`run_main`] with a
 /// programmatically-built `Cli` (and a registry installed via
 /// [`PluginRegistry::install`]).
+///
+/// Notifications are delivered in the background; this waits for the pending
+/// ones (up to 30 s, 3 s after a Ctrl-C) before returning, on every outcome.
 pub async fn run_command(cli: Cli) -> CliResult<()> {
-    Box::pin(dispatch(cli)).await
+    let result = Box::pin(dispatch(cli)).await;
+    #[cfg(feature = "notify")]
+    notify::flush(match &result {
+        Err(CliError::Cancelled) => notify::queue::INTERRUPTED_FLUSH_TIMEOUT,
+        _ => notify::queue::FLUSH_TIMEOUT,
+    })
+    .await;
+    result
 }
 
 async fn dispatch(cli: Cli) -> CliResult<()> {
@@ -421,6 +431,16 @@ pub async fn run_from_yaml_str(yaml: &str) -> CliResult<executor::RunSummary> {
 
 /// [`run_from_yaml_str`] over a subset of the config's matrix rows (#741).
 pub async fn run_from_yaml_str_selected(
+    yaml: &str,
+    selection: Option<&select::SelectionRequest>,
+) -> CliResult<executor::RunSummary> {
+    let result = Box::pin(run_yaml_str(yaml, selection)).await;
+    #[cfg(feature = "notify")]
+    notify::flush(notify::queue::FLUSH_TIMEOUT).await;
+    result
+}
+
+async fn run_yaml_str(
     yaml: &str,
     selection: Option<&select::SelectionRequest>,
 ) -> CliResult<executor::RunSummary> {

@@ -220,7 +220,7 @@ async fn end_to_end_run_notifies_on_success() {
     .await
     .unwrap();
 
-    // The notify emit is awaited inside the run, so by process exit it landed.
+    // `faucet run` waits for pending notifications before it exits.
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
@@ -358,6 +358,11 @@ notifications:
     .await
     .unwrap();
     assert!(summary.had_failures(), "{summary:?}");
+    // Delivery is in the background: wait for it.
+    assert_eq!(
+        faucet_cli::notify::flush(std::time::Duration::from_secs(10)).await,
+        0
+    );
 
     let events: Vec<Value> = server
         .received_requests()
@@ -484,6 +489,11 @@ notifications:
         .await
         .expect("run");
     assert!(!summary.had_failures(), "pipeline should succeed");
+    // Delivery is in the background: wait for it.
+    assert_eq!(
+        faucet_cli::notify::flush(std::time::Duration::from_secs(10)).await,
+        0
+    );
 
     let reqs = server.received_requests().await.unwrap();
     assert_eq!(reqs.len(), 1, "exactly one run_success callback");
@@ -502,4 +512,37 @@ notifications:
     // Static metadata merged.
     assert_eq!(body["tenant"], "acme");
     assert_eq!(body["details"]["records_written"], 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_faucet_run_still_delivers_its_failure_notification() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(300)))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = format!(
+        "version: 1\nname: notif_fail\npipeline:\n  source:\n    type: csv\n    config:\n      path: \"{}\"\n  sink:\n    type: jsonl\n    config:\n      path: \"{}\"\nnotifications:\n  - name: hook\n    on: [run_failure]\n    channel:\n      type: webhook\n      config:\n        url: \"{}/hook\"\n",
+        dir.path().join("missing.csv").display(),
+        dir.path().join("out.jsonl").display(),
+        server.uri()
+    );
+    let cfg_path = dir.path().join("p.yaml");
+    std::fs::write(&cfg_path, cfg).unwrap();
+    tokio::task::spawn_blocking(move || {
+        Command::cargo_bin("faucet")
+            .unwrap()
+            .args(["run"])
+            .arg(&cfg_path)
+            .assert()
+            .failure();
+    })
+    .await
+    .unwrap();
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1, "the failure was delivered before exit");
+    let body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert_eq!(body["event"], "run_failure");
 }

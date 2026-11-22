@@ -4,3 +4,4 @@
 # fails when an emitted metric is on no dashboard and not listed here, and
 # when a listed metric is charted or no longer emitted. Chart a metric unless
 # it genuinely has no place on a dashboard.
+faucet_notifications_pending: a gauge of batches waiting in the background queue; read it with the dropped counter (reason="queue_full"/"deadline") already charted

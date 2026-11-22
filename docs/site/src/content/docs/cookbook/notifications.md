@@ -13,11 +13,18 @@ prebuilt binaries; from crates.io, `cargo install faucet-cli --features notify`
 (or `--features full`). With no
 block, nothing changes.
 
-:::note[Delivery never fails a run]
-Each event is delivered with a short bounded
-retry; a channel outage is logged, counted
-(`faucet_notifications_dropped_total`), and swallowed — the pipeline is never
-blocked or failed by a notification. This is the same log-and-continue
+:::note[Delivery never fails or holds a run]
+A run's events are delivered in the background, in order per pipeline row (a
+failure always reaches the channel before the success that resolves it), so a
+run — and its `faucet serve` slot — finishes as soon as its data is written.
+Each event is delivered with a short bounded retry; a channel outage is
+logged, counted (`faucet_notifications_dropped_total`), and swallowed. One run's
+events get 120 seconds in total; what is left after that is dropped
+(`reason="deadline"`). At most 16 runs' events wait per pipeline row and 1,024
+in all; more are dropped (`reason="queue_full"`), so one broken channel cannot
+hold up the others. `faucet run` and the other one-shot commands wait up to 30
+seconds at exit for pending deliveries (3 seconds after Ctrl-C); a process that
+is killed loses what was still pending. This is the same log-and-continue
 contract as lineage and SLA monitoring.
 :::
 
@@ -237,7 +244,8 @@ gate a deploy.
 | Metric | Labels | Meaning |
 |--------|--------|---------|
 | `faucet_notifications_sent_total` | `channel`, `event`, `outcome` | Deliveries attempted (`outcome` = `ok`/`error`). |
-| `faucet_notifications_dropped_total` | `channel`, `reason` | Not delivered (`reason` = `coalesced`/`channel_error`). |
+| `faucet_notifications_dropped_total` | `channel`, `reason` | Not delivered (`reason` = `coalesced`/`channel_error`, or `queue_full`/`deadline` with `channel="*"`). |
+| `faucet_notifications_pending` | — | Runs' notification batches waiting or being delivered in the background (gauge). |
 | `faucet_notification_dispatch_duration_seconds` | `channel` | Per-delivery latency. |
 
 ## Relationship to Prometheus alerting

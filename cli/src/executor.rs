@@ -1619,14 +1619,20 @@ async fn run_expanded_unredacted(
                 nodes_with_any_failure.insert(outcome.row_id.clone());
                 #[cfg(feature = "notify")]
                 if let Some(notifier) = &opts.notifier {
-                    notifier
-                        .emit(crate::notify::NotifyEvent::run_failure(
+                    crate::notify::dispatch(
+                        notifier,
+                        (
+                            opts.state_scope.namespace.clone(),
+                            opts.pipeline_name.clone(),
+                            outcome.row_id.clone(),
+                        ),
+                        vec![crate::notify::NotifyEvent::run_failure(
                             opts.pipeline_name.clone(),
                             outcome.row_id.clone(),
                             "overwrite_aborted",
                             msg.clone(),
-                        ))
-                        .await;
+                        )],
+                    );
                 }
             }
         }
@@ -3799,7 +3805,8 @@ async fn run_one_invocation(
     // ── Notifications (#280) ─────────────────────────────────────────────────
     // Fan run success/failure, SLA breach, circuit-open, contract-abort, and
     // DLQ-threshold out to the configured channels. Same root/real-run scoping
-    // as SLA; delivery is fire-and-forget and never fails the run.
+    // as SLA. The events are delivered in the background, in order per row:
+    // a slow channel never holds the run, and never fails it.
     #[cfg(feature = "notify")]
     if let Some(notifier) = &opts.notifier
         && is_notifiable_root
@@ -3810,49 +3817,42 @@ async fn run_one_invocation(
         // Closed once here, so every event from this invocation reports the same
         // terminal timestamp and duration.
         let run_ctx = notify_run.clone().finish(invocation_started);
+        let mut events = Vec::new();
         match &result {
             Ok(r) => {
-                notifier
-                    .emit(
-                        keep_sla_open(
-                            NotifyEvent::run_success(
-                                pipeline.clone(),
-                                row.clone(),
-                                r.records_written as u64,
-                            ),
-                            !sla_violations.is_empty(),
-                        )
-                        .with_run(run_ctx.clone()),
+                events.push(
+                    keep_sla_open(
+                        NotifyEvent::run_success(
+                            pipeline.clone(),
+                            row.clone(),
+                            r.records_written as u64,
+                        ),
+                        !sla_violations.is_empty(),
                     )
-                    .await;
+                    .with_run(run_ctx.clone()),
+                );
                 if let Some(dlq) = &r.dlq
                     && dlq.records_dlq > 0
                 {
-                    notifier
-                        .emit(
-                            NotifyEvent::dlq_threshold(
-                                pipeline.clone(),
-                                row.clone(),
-                                dlq.records_dlq as u64,
-                            )
-                            .with_run(run_ctx.clone()),
+                    events.push(
+                        NotifyEvent::dlq_threshold(
+                            pipeline.clone(),
+                            row.clone(),
+                            dlq.records_dlq as u64,
                         )
-                        .await;
+                        .with_run(run_ctx.clone()),
+                    );
                 }
             }
             Err(e) => {
-                notifier
-                    .emit(error_event(&pipeline, &row, e).with_run(run_ctx.clone()))
-                    .await;
+                events.push(error_event(&pipeline, &row, e).with_run(run_ctx.clone()));
             }
         }
         for v in &sla_violations {
-            notifier
-                .emit(
-                    NotifyEvent::sla_breach(pipeline.clone(), row.clone(), v.kind(), v.to_string())
-                        .with_run(run_ctx.clone()),
-                )
-                .await;
+            events.push(
+                NotifyEvent::sla_breach(pipeline.clone(), row.clone(), v.kind(), v.to_string())
+                    .with_run(run_ctx.clone()),
+            );
         }
         // Profile drift (#708): one event per finding under `notify` / `fail`
         // (`warn` stays log + metric only).
@@ -3860,20 +3860,23 @@ async fn run_one_invocation(
             && spec.on_drift != faucet_core::OnProfileDrift::Warn
         {
             for d in &o.drift {
-                notifier
-                    .emit(
-                        NotifyEvent::profile_drift(
-                            pipeline.clone(),
-                            row.clone(),
-                            &d.column,
-                            d.metric.as_str(),
-                            d.to_string(),
-                        )
-                        .with_run(run_ctx.clone()),
+                events.push(
+                    NotifyEvent::profile_drift(
+                        pipeline.clone(),
+                        row.clone(),
+                        &d.column,
+                        d.metric.as_str(),
+                        d.to_string(),
                     )
-                    .await;
+                    .with_run(run_ctx.clone()),
+                );
             }
         }
+        crate::notify::dispatch(
+            notifier,
+            (opts.state_scope.namespace.clone(), pipeline, row),
+            events,
+        );
     }
 
     // ── Data Movement Catalog (#279) ─────────────────────────────────────────
