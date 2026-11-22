@@ -11,7 +11,7 @@ Reach for it when you want to tap a live feed — market-data tickers, chat/even
 
 ## Feature highlights
 
-- **Native streaming** — `stream_pages` yields a `StreamPage` every `batch_size` records, so the sink receives data continuously throughout the run. Peak memory is `O(batch_size)` no matter how long the feed runs.
+- **Native streaming** — `stream_pages` yields a `StreamPage` every `batch_size` records, or after 5 s with records buffered, and every page carries a flush-only bookmark, so the sink is flushed page by page throughout the run. Peak memory is `O(batch_size)` no matter how long the feed runs.
 - **Subscription frames** — send any number of `subscribe_messages` (in order) immediately after every connect *and* every reconnect, so subscribe-on-open APIs work without manual steps.
 - **Automatic reconnect** — opt-in `reconnect` with jittered exponential backoff from `reconnect_backoff` and an optional cap on *consecutive* failures (`reconnect_max_attempts`). The idle clock spans reconnect gaps, so a long outage still trips `idle_timeout`.
 - **Three message formats** — `json` (parse each frame into a JSON value), `raw_string` (UTF-8 string), or `binary` (base64-encoded string) — covering text and binary frames alike.
@@ -96,7 +96,7 @@ This connects to the Binance trade stream, captures the first 100 trade messages
 | `max_messages` | int | *(unset)* | Stop after this many messages. |
 | `idle_timeout` | int (seconds) | *(unset)* | Stop after this long with no inbound frame. The idle clock keeps ticking across reconnect gaps, so it also caps a connection outage. Reset by **any** inbound frame — data, ping/pong, or a frame dropped by `on_parse_error: skip` — so a live server streaming skippable frames does not trip it. |
 
-> **At least one of `max_messages` / `idle_timeout` must be set** — a source with neither would never stop on its own and is rejected at config-load time. The source installs no signal handler: Ctrl-C reaches the host process as usual, and `faucet run` / `schedule` / `serve` cancel the run cooperatively. On a cancel the source stops reading, emits the messages it has buffered since the last page (also mid-reconnect-wait) and ends, so they are written before the run stops. Topology-mode graphs still stop at a page boundary, and a run killed outright (a second Ctrl-C, `SIGKILL`) loses that buffer — a live feed cannot replay it, so a smaller `batch_size` bounds the loss.
+> **At least one of `max_messages` / `idle_timeout` must be set** — a source with neither would never stop on its own and is rejected at config-load time. The source installs no signal handler: Ctrl-C reaches the host process as usual, and `faucet run` / `schedule` / `serve` cancel the run cooperatively. On a cancel the source stops reading, emits the messages it has buffered since the last page (also mid-reconnect-wait) and ends, so they are written before the run stops. Topology-mode graphs still stop at a page boundary, and a run killed outright (a second Ctrl-C, `SIGKILL`) loses that buffer — a live feed cannot replay it, so a smaller `batch_size` bounds the loss; since the sink is flushed after every page, that loss is at most the page being built (at most 5 s of messages) plus the page in flight.
 
 ### Batching
 
@@ -241,11 +241,11 @@ source:
 
 ## Streaming & batching
 
-The source overrides `Source::stream_pages`: it connects, sends the subscribe frames, then reads frames in a loop, decoding each into a record and buffering until the buffer reaches `batch_size` — at which point it yields a `StreamPage` to the pipeline. Memory is bounded at one page regardless of total volume or run length.
+The source overrides `Source::stream_pages`: it connects, sends the subscribe frames, then reads frames in a loop, decoding each into a record and buffering until the buffer reaches `batch_size` — at which point it yields a `StreamPage` to the pipeline. Memory is bounded at one page regardless of total volume or run length. A quiet feed with records buffered yields a partial page after 5 s. Every page carries the flush-only bookmark `{"received": n}` (messages received so far), so the pipeline flushes the sink after each page; a sink that commits on every flush (Iceberg, Delta, the file family) then makes one commit per page, so raise `batch_size` for those and expect small commits on a slow feed.
 
 `batch_size: 0` is the **no-batching sentinel**: the entire run window is buffered and emitted as a single page. Because a live feed has no natural end, only use `0` together with `max_messages` (a bounded window) — otherwise the run never emits.
 
-There is **no resumable bookmark / state**: a live feed has no replayable offset, so on reconnect the source simply re-subscribes to the live stream from the current moment. The run is a tap on "now," not a replay of history.
+There is **no resumable position**: a live feed has no replayable offset, so on reconnect the source simply re-subscribes to the live stream from the current moment. With a `state:` block the flush bookmark is stored, but the source ignores it on the next run (`SourceDriver::resume_from` does nothing). Because the row's state key then holds a value owned by `websocket`, switching that row to another source kind later needs `faucet state reset` for the row first; otherwise the run refuses the stored state as incompatible. The run is a tap on "now," not a replay of history.
 
 ### Termination
 
@@ -347,7 +347,8 @@ the run's cancellation token so a cancelled run yields what it buffered;
 `check` only probes TCP reachability — and `WebsocketSource` wraps it in a
 `DriverSource`, which hands the run's call context to every handshake (op
 label `connect`). Reads have side effects, which the driver adds to the
-derived capabilities. The public type and config are unchanged.
+derived capabilities. `resume_from` ignores the stored flush bookmark. The
+public type and config are unchanged.
 
 ## License
 

@@ -74,6 +74,11 @@ confirms arrive should keep them in a `faucet_core::driver::RowOutcomes`: when
 the request or group then fails as a whole, `fail_undecided` fails only the
 rows still open, and `into_rows` never reports an undecided row as delivered.
 
+A live source with no resume position (a push feed, a socket) should still tag
+each page with an informational bookmark such as `{"received": n}`, so the
+pipeline flushes the sink page by page, and ignore it in `apply_start_bookmark` /
+`resume_from`. A page without a bookmark is only flushed at the end of the run.
+
 ### A sink driver
 
 The family-neutral contract is one write primitive plus optional groups. A

@@ -165,6 +165,13 @@ and the [stream-pages architecture note](https://github.com/faucet-hq/faucet-str
 flow while the receive window is open, and each sender is answered once its page is
 written).
 
+`grpc` (server-streaming), `websocket` and `webhook` have no position to resume from,
+so each page carries a flush-only bookmark (`{"received": n}`): the pipeline flushes
+the sink after every page, and with a `state:` block stores the value, which the
+source ignores on the next run. A quiet `grpc` or `websocket` feed cuts a partial page
+after 5 s, so a sink that commits per flush (Iceberg, Delta, the file family) commits
+at most that often; raise `batch_size` for those.
+
 **Sources that intentionally keep the buffered default:** `grpc` unary mode (a single
 response — no paging primitive) and `webhook` with `ack: on_receive` (it collects
 POSTs over a window and emits them when it closes). S3/GCS/Azure fall back to buffered for the JSON-array format only
