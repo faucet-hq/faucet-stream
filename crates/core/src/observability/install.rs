@@ -751,22 +751,22 @@ mod tests {
         .build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
-            metrics::counter!("faucet_test_idle_total").increment(1);
-            metrics::histogram!("faucet_test_idle_seconds").record(1.0);
-            metrics::gauge!("faucet_test_idle_gauge").set(1.0);
+            metrics::counter!("idle_test_total").increment(1);
+            metrics::histogram!("idle_test_seconds").record(1.0);
+            metrics::gauge!("idle_test_gauge").set(1.0);
         });
         let before = handle.render();
-        assert!(before.contains("faucet_test_idle_total"), "{before}");
+        assert!(before.contains("idle_test_total"), "{before}");
         #[allow(clippy::disallowed_methods)] // waits past the idle timeout; no runtime here
         std::thread::sleep(std::time::Duration::from_millis(400));
         let after = handle.render();
-        assert!(!after.contains("faucet_test_idle_total"), "{after}");
-        assert!(!after.contains("faucet_test_idle_seconds"), "{after}");
-        assert!(after.contains("faucet_test_idle_gauge 1"), "{after}");
+        assert!(!after.contains("idle_test_total"), "{after}");
+        assert!(!after.contains("idle_test_seconds"), "{after}");
+        assert!(after.contains("idle_test_gauge 1"), "{after}");
         metrics::with_local_recorder(&recorder, || {
-            metrics::counter!("faucet_test_idle_total").increment(1);
+            metrics::counter!("idle_test_total").increment(1);
         });
-        assert!(handle.render().contains("faucet_test_idle_total 1"));
+        assert!(handle.render().contains("idle_test_total 1"));
     }
 
     #[test]
