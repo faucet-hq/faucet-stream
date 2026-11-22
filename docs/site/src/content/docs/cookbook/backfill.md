@@ -209,8 +209,11 @@ Unit runs are named `{name}-backfill-{range_hash}-{unit}` and labelled
 field is the hash). Follow one backfill's units with
 `GET /v1/runs?label=backfill:<range-hash>`, which lists only that backfill's
 runs; add `&label=backfill_unit:<unit>` for one unit. The pipeline `name` is
-rewritten per unit so state keys stay namespaced, and delivery is forced to
-at-least-once. Deterministic idempotency keys (`backfill:{hash}:{unit}`) make
+rewritten per unit so state keys stay namespaced, delivery is forced to
+at-least-once, and the config's `sla:` and `profiling:` blocks (top level and
+per row) are dropped from each unit, as on the CLI. A row with `complete_for`
+cleanup is refused with `422`: each unit reads one window, so the cleanup would
+delete every in-scope row outside it. Deterministic idempotency keys (`backfill:{hash}:{unit}`) make
 re-POSTing the same body replay-safe: already-submitted units replay,
 unsubmitted ones proceed. With a `state:` block the range is recorded, and a
 later POST of it is refused with `409` unless it sets `"resume": true`

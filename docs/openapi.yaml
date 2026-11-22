@@ -1978,7 +1978,7 @@ paths:
         "401": { description: Missing or invalid bearer token }
         "403": { description: Principal's role lacks the required permission }
         "409": { description: A stateful config's range was submitted before and neither `resume` nor `restart` is set }
-        "422": { description: "`resume` and `restart` both set, or a `callback` was supplied" }
+        "422": { description: "`resume` and `restart` both set, a `callback` was supplied, or a root row declares `complete_for` cleanup (a unit reads one window)" }
   /v1/dlq/inspect:
     post:
       summary: Inspect a dead-letter-queue location (read-only)

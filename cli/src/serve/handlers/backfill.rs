@@ -189,6 +189,26 @@ pub async fn submit_backfill(
     )
     .await?;
     loaded.require_matrix()?;
+    // A unit reads one window, so a `complete_for` cleanup would delete every
+    // in-scope destination row outside it.
+    let sweeping: Vec<&str> = loaded
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.role, crate::expand::NodeRole::Root))
+        .filter(|n| n.cleanup_scope.is_some())
+        .map(|n| n.id.as_str())
+        .collect();
+    if !sweeping.is_empty() {
+        return Err(ServeError::Unprocessable {
+            message: format!(
+                "row(s) {} declare `complete_for` cleanup: a backfill unit reads one window, so \
+                 the cleanup would delete every in-scope destination row outside it — remove \
+                 `complete_for` from the config you backfill with",
+                sweeping.join(", ")
+            ),
+            details: None,
+        });
+    }
     let unscoped: Vec<&str> = loaded
         .nodes
         .iter()
@@ -524,6 +544,16 @@ fn rewrite_unit_doc(
     if let Some(map) = d.as_object_mut() {
         map.insert("name".into(), Value::String(unit_name.to_string()));
         map.insert("delivery".into(), Value::String("at_least_once".into()));
+        // SLA and profiling baselines describe the forward sync; one window
+        // is not a run of it.
+        map.remove("sla");
+        map.remove("profiling");
+        if let Some(Value::Array(rows)) = map.get_mut("matrix") {
+            for row in rows.iter_mut().filter_map(Value::as_object_mut) {
+                row.remove("sla");
+                row.remove("profiling");
+            }
+        }
     }
     crate::yaml::to_string(&d)
         .map_err(|e| crate::error::CliError::Internal(format!("unit config render: {e}")))
@@ -574,6 +604,33 @@ mod tests {
         );
         // The rewritten document is itself a loadable pipeline config.
         crate::config::parse_with_extension(&out, "yaml").expect("unit doc parses");
+    }
+
+    #[test]
+    fn rewrite_drops_sla_and_profiling_from_the_config_and_its_rows() {
+        let utc: chrono_tz::Tz = "UTC".parse().unwrap();
+        let unit = crate::backfill::plan::BackfillUnit {
+            id: "20260601T000000Z".into(),
+            start: parse_boundary("2026-06-01T00:00:00Z", utc).unwrap(),
+            end: parse_boundary("2026-06-02T00:00:00Z", utc).unwrap(),
+        };
+        let doc = json!({
+            "version": 1,
+            "name": "orders",
+            "sla": {"min_rows_per_run": 100},
+            "profiling": {"min_history": 2},
+            "pipeline": {
+                "source": {"type": "rest", "config": {"url": "https://x/o?s=${backfill.start}"}},
+                "sink": {"type": "jsonl", "config": {"path": "./out.jsonl"}}
+            },
+            "matrix": [{"id": "a", "sla": {"min_rows_per_run": 5}, "profiling": {}}]
+        });
+        let out = rewrite_unit_doc(&doc, &unit, "u").unwrap();
+        let back: Value = crate::yaml::from_str(&out).unwrap();
+        assert!(back.get("sla").is_none() && back.get("profiling").is_none());
+        assert!(back["matrix"][0].get("sla").is_none());
+        assert!(back["matrix"][0].get("profiling").is_none());
+        assert_eq!(back["matrix"][0]["id"], "a");
     }
 
     #[test]

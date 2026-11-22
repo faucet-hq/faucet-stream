@@ -753,3 +753,36 @@ async fn submitted_labels_are_checked() {
     assert!(resp.text().await.unwrap().contains("set by the server"));
     server.abort();
 }
+
+/// A unit reads one window, so a `complete_for` cleanup would delete every
+/// in-scope row outside it: the backfill is refused, naming the row.
+#[cfg(feature = "sink-sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn backfill_refuses_a_row_with_complete_for_cleanup() {
+    let (url, client, server) = boot().await;
+    let sweeping = r#"
+version: 1
+name: sweep
+pipeline:
+  source:
+    type: sqlite
+    config: { database_url: "sqlite::memory:", query: "SELECT 1 AS id, 'eu' AS region, '${backfill.start}' AS s" }
+    complete_for: { scope: { region: eu }, on_missing: delete }
+  sink:
+    type: sqlite
+    config: { database_url: "sqlite::memory:", table_name: t, column_mapping: auto_map, write_mode: upsert, key: [id] }
+"#;
+    let resp = client
+        .post(format!("{url}/v1/backfill"))
+        .json(&json!({ "config": sweeping, "from": "2026-06-01", "to": "2026-06-02" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 422);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("complete_for") && body.contains("row-0"),
+        "{body}"
+    );
+    server.abort();
+}
