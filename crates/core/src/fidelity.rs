@@ -560,6 +560,84 @@ pub fn from_str(text: &str) -> Result<Value, serde_json::Error> {
     serde_json::from_str(&rewritten)
 }
 
+/// [`from_str`] for JSON text from a writer that spells non-finite floats as
+/// bare `NaN`, `Infinity` or `-Infinity` (Python's `json` module does). Valid
+/// JSON parses as [`from_str`] does; otherwise each such token in a value
+/// position, outside a string, becomes `null` and is counted with
+/// [`record_non_finite`]. When nothing is rewritten, or the rewritten text
+/// still does not parse, the original error is returned.
+pub fn from_str_allow_non_finite(text: &str) -> Result<Value, serde_json::Error> {
+    let first = match from_str(text) {
+        Ok(v) => return Ok(v),
+        Err(e) => e,
+    };
+    let (rewritten, count) = rewrite_non_finite(text);
+    if count == 0 {
+        return Err(first);
+    }
+    match from_str(&rewritten) {
+        Ok(v) => {
+            for _ in 0..count {
+                record_non_finite();
+            }
+            Ok(v)
+        }
+        Err(_) => Err(first),
+    }
+}
+
+fn rewrite_non_finite(text: &str) -> (String, usize) {
+    const TOKENS: [&str; 3] = ["-Infinity", "Infinity", "NaN"];
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let (mut i, mut last, mut count) = (0, 0, 0);
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            match b {
+                b'\\' => i += 1,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        let before_ok = i == 0
+            || matches!(
+                bytes[i - 1],
+                b':' | b',' | b'[' | b' ' | b'\t' | b'\n' | b'\r'
+            );
+        let token = TOKENS.iter().find(|t| {
+            let end = i + t.len();
+            before_ok
+                && bytes[i..].starts_with(t.as_bytes())
+                && (end == bytes.len()
+                    || matches!(
+                        bytes[end],
+                        b',' | b']' | b'}' | b' ' | b'\t' | b'\n' | b'\r'
+                    ))
+        });
+        match token {
+            Some(t) => {
+                out.push_str(&text[last..i]);
+                out.push_str("null");
+                i += t.len();
+                last = i;
+                count += 1;
+            }
+            None => i += 1,
+        }
+    }
+    out.push_str(&text[last..]);
+    (out, count)
+}
+
 /// [`from_str`] over bytes, for a body that should be UTF-8.
 pub fn from_slice(bytes: &[u8]) -> Result<Value, serde_json::Error> {
     match std::str::from_utf8(bytes) {
@@ -661,6 +739,33 @@ pub fn unscoped_non_finite() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bare_non_finite_tokens_become_counted_nulls() {
+        let counter = NonFiniteCounter::new();
+        let v = counter
+            .scope(async {
+                from_str_allow_non_finite(
+                    r#"{"a":NaN,"b":[Infinity,-Infinity,[NaN,1]],"s":"NaN \" Infinity","n":-1}"#,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"a": null, "b": [null, null, [null, 1]], "s": "NaN \" Infinity", "n": -1})
+        );
+        assert_eq!(counter.count(), 4);
+        let valid = counter
+            .scope(async { from_str_allow_non_finite("[1,2]") })
+            .await;
+        assert_eq!(valid.unwrap(), serde_json::json!([1, 2]));
+        assert_eq!(counter.count(), 4);
+        assert!(from_str_allow_non_finite("[NaNx]").is_err());
+        assert!(from_str_allow_non_finite(r#"{"a":NaN"#).is_err());
+        assert!(from_str_allow_non_finite("[x1]").is_err());
+        assert_eq!(counter.count(), 4);
+    }
 
     #[test]
     fn offset_instants_become_utc_wall_time() {
