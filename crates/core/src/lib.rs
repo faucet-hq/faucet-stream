@@ -229,9 +229,9 @@ pub use profiling::{
     ProfilingSpec, RunProfile, detect_drift,
 };
 pub use replication::{
-    BindFormat, BindTarget, BindValueType, IncrementalFilter, OnMissingKey, ReplicationBind,
-    ReplicationKey, ReplicationMethod, format_bookmark, format_instant, json_gt, parse_instant,
-    set_body_pointer,
+    BindFormat, BindTarget, BindValueType, IncrementalFilter, OnMissingKey, PassEnd,
+    ReplicationBind, ReplicationKey, ReplicationMethod, ResumeRules, Truncation,
+    bookmark_after_pass, format_bookmark, format_instant, json_gt, parse_instant, set_body_pointer,
 };
 pub use resilience::{
     BackoffFrom, BackoffKind, CircuitBreaker, CircuitBreakerConfig, DEFAULT_MAX_WAIT_SECS,
