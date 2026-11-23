@@ -2594,6 +2594,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[cfg(feature = "transform-cast")]
+    #[test]
+    fn a_number_beyond_f64_does_not_cast_to_int() {
+        if let Ok(v) = serde_json::from_str::<Value>("1e400") {
+            assert!(cast_value(&v, CastType::Int).is_err());
+        }
+    }
+
     /// Test-only wrapper that shadows [`super::apply_all`] and unwraps, so the
     /// many existing success-path tests need no changes now that `apply_all`
     /// returns `Result`. Collision tests call `super::apply_all` for the

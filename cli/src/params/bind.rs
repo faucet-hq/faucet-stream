@@ -1156,6 +1156,7 @@ pub(crate) fn assembles_directive(baseline: &str, out: &str) -> bool {
 /// the SQL and URL rules a `${param.*}` splice follows, if it may not.
 /// `scalar` is the text holding `token`; `sql` says it is SQL text and `url`
 /// that it is a URL.
+#[cfg(feature = "triggers")]
 pub(crate) fn embedded_splice_refusal(
     value: &str,
     scalar: &str,

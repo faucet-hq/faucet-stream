@@ -605,6 +605,19 @@ pub fn json_schema_base_type(fragment: &Value) -> Option<SqlBaseType> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_non_object_record_is_kept_as_is_when_columns_are_folded() {
+        use super::*;
+        use serde_json::json;
+        let dest = json!({"type": "object", "properties": {"id": {"type": "integer"}}});
+        let schema = infer_page_schema_matching(
+            &dest,
+            &[json!(5), json!({"ID": 1})],
+            ColumnMatching::CaseInsensitive,
+        );
+        assert!(schema["properties"].get("id").is_some(), "{schema}");
+    }
+
+    #[test]
     fn numeric_text_matches_exact_number_renderings_only() {
         for ok in [
             "0",

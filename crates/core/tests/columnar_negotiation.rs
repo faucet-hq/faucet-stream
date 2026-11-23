@@ -1148,3 +1148,94 @@ async fn a_failed_dlq_flush_on_the_columnar_path_keeps_the_bookmark_back() {
     sink.assert_columnar();
     assert!(store.puts.lock().unwrap().is_empty());
 }
+
+/// A columnar sink that reports a fixed destination schema.
+struct SchemaColumnarSink;
+
+#[async_trait]
+impl Sink for SchemaColumnarSink {
+    async fn write_batch(&self, _records: &[Value]) -> Result<usize, FaucetError> {
+        Err(FaucetError::Sink("value path must not be used".into()))
+    }
+    fn supports_columnar(&self) -> bool {
+        true
+    }
+    async fn write_batch_columnar(
+        &self,
+        batch: &arrow::array::RecordBatch,
+    ) -> Result<usize, FaucetError> {
+        Ok(batch.num_rows())
+    }
+    async fn current_schema(&self) -> Result<Option<Value>, FaucetError> {
+        Ok(Some(json!({
+            "type": "object",
+            "properties": {"id": {"type": "integer"}, "email": {"type": ["string", "null"]}}
+        })))
+    }
+}
+
+/// A drift `fail` on the columnar path writes the page's quarantined rows to
+/// the DLQ before the run stops.
+#[cfg(feature = "quality")]
+#[tokio::test]
+async fn a_drift_failure_on_the_columnar_path_keeps_the_quarantined_rows() {
+    use faucet_core::dlq::DlqConfig;
+    use faucet_core::drift::{SchemaDriftPolicy, SchemaDriftSpec};
+    use faucet_core::quality::{CompiledQuality, OnFailure, QualitySpec, RecordCheck};
+
+    struct CapturingDlq(Arc<std::sync::Mutex<Vec<Value>>>);
+    #[async_trait]
+    impl Sink for CapturingDlq {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.0.lock().unwrap().extend_from_slice(records);
+            Ok(records.len())
+        }
+    }
+
+    let source = ColumnarOnlySource {
+        rows: vec![
+            json!({"id": 1, "email": null, "extra": "x"}),
+            json!({"id": 2, "email": "a@example.com", "extra": "y"}),
+        ],
+    };
+    let quality = QualitySpec {
+        record: vec![RecordCheck::NotNull {
+            field: "email".into(),
+            treat_missing_as_null: true,
+            on_failure: OnFailure::Quarantine,
+        }],
+        batch: vec![],
+    };
+    let drift: SchemaDriftSpec = serde_json::from_value(json!({"on_drift": "fail"})).unwrap();
+    let dlq_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let err = Pipeline::new(&source, &SchemaColumnarSink)
+        .with_quality(Arc::new(CompiledQuality::compile(&quality).unwrap()))
+        .with_schema_drift(SchemaDriftPolicy::compile(&drift))
+        .with_dlq(DlqConfig::new(Arc::new(CapturingDlq(Arc::clone(
+            &dlq_seen,
+        )))))
+        .run()
+        .await
+        .expect_err("drift fail stops the run");
+    assert!(err.to_string().contains("extra"), "{err}");
+    assert_eq!(dlq_seen.lock().unwrap().len(), 1);
+}
+
+/// A cancel before the first batch stops the columnar path at once.
+#[tokio::test]
+async fn a_cancelled_columnar_run_writes_nothing() {
+    let source = ColumnarOnlySource {
+        rows: vec![json!({"id": 1})],
+    };
+    let rows = Arc::new(AtomicUsize::new(0));
+    let sink = ColumnarOnlySink::new(Arc::clone(&rows), Arc::new(AtomicUsize::new(0)));
+    let cancel = faucet_core::CancellationToken::new();
+    cancel.cancel();
+    let result = Pipeline::new(&source, &sink)
+        .with_cancel(cancel)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(result.records_written, 0);
+    assert_eq!(rows.load(Ordering::SeqCst), 0);
+}

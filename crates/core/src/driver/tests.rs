@@ -2001,3 +2001,12 @@ fn row_outcomes_never_report_an_undecided_row_as_delivered() {
         Err(FaucetError::Sink(m)) if m == "broker publish: no outcome was recorded for this message; treating it as not delivered"
     ));
 }
+
+#[test]
+fn a_schema_driver_matches_columns_exactly_by_default() {
+    use crate::Sink as _;
+    assert_eq!(
+        DriverSink::new(Full::default()).column_matching(),
+        crate::ColumnMatching::Exact
+    );
+}
