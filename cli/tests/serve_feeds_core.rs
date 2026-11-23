@@ -1434,6 +1434,14 @@ async fn a_feed_whose_store_changed_is_blocked_until_its_new_store_is_adopted() 
     let pos = srv.delivered("orders", "lake", 2).await;
     assert_ne!(pos.status.health, Health::Held, "the old bookmark is gone");
     assert_eq!(ids(&out), vec![1, 2, 1, 2, 3]);
+
+    // Deleting the feed forgets which store held it.
+    let binding = format!("feed_store:{uid}");
+    assert!(srv.state.history().meta_get(&binding).await.unwrap().is_some());
+    service::delete(&srv.state, &admin(), None, "orders")
+        .await
+        .unwrap();
+    assert_eq!(srv.state.history().meta_get(&binding).await.unwrap(), None);
 }
 
 /// A `--feeds` file feed whose store changed fails the server's start,
