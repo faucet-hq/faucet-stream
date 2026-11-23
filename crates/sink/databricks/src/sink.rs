@@ -1079,6 +1079,10 @@ impl SchemaDriver for DatabricksDriver {
         Ok((!cols.is_empty()).then(|| sql::schema_from_columns(&cols)))
     }
 
+    fn column_matching(&self) -> faucet_core::ColumnMatching {
+        faucet_core::ColumnMatching::CaseInsensitive
+    }
+
     fn evolvable(&self) -> bool {
         true
     }
@@ -1209,6 +1213,10 @@ mod tests {
         assert_eq!(s.connector_name(), "databricks");
         assert!(s.supports_idempotent_writes());
         assert!(s.supports_schema_evolution());
+        assert_eq!(
+            s.column_matching(),
+            faucet_core::ColumnMatching::CaseInsensitive
+        );
         assert!(s.supports_staged_load());
         assert!(!s.dedups_by_key());
         assert!(!s.is_overwrite());

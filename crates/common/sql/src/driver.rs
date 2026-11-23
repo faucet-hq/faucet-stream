@@ -971,6 +971,10 @@ impl<D: SqlDriver> SchemaDriver for SqlSinkDriver<D> {
             .await
     }
 
+    fn column_matching(&self) -> faucet_core::ColumnMatching {
+        self.driver.engine().dialect().column_matching().into()
+    }
+
     fn evolvable(&self) -> bool {
         self.driver.evolution().is_some()
     }

@@ -52,6 +52,7 @@ impl SqliteOptions {
 #[derive(Debug, Clone)]
 pub struct SqliteFeedStore {
     pool: SqlitePool,
+    store_id: i64,
 }
 
 impl SqliteFeedStore {
@@ -71,10 +72,13 @@ impl SqliteFeedStore {
             .connect_with(connect)
             .await
             .map_err(|e| backend(Dialect::Sqlite, e))?;
-        let store = Self { pool };
-        if let Err(e) = store.migrate().await {
-            store.pool.close().await;
-            return Err(e);
+        let mut store = Self { pool, store_id: 0 };
+        match store.migrate().await {
+            Ok(id) => store.store_id = id,
+            Err(e) => {
+                store.pool.close().await;
+                return Err(e);
+            }
         }
         Ok(store)
     }

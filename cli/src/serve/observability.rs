@@ -25,8 +25,19 @@ pub fn install(
     format: crate::cli::LogFormat,
     otel: Option<&faucet_core::OtelConfig>,
 ) -> (Option<PrometheusHandle>, LogHub) {
+    install_with(level, format, otel, None)
+}
+
+/// [`install`] with an idle timeout for counter and histogram series
+/// (`--metrics-idle-timeout-secs`).
+pub fn install_with(
+    level: &str,
+    format: crate::cli::LogFormat,
+    otel: Option<&faucet_core::OtelConfig>,
+    idle_timeout: Option<std::time::Duration>,
+) -> (Option<PrometheusHandle>, LogHub) {
     crate::set_build_version();
-    let handle = install_recorder(otel);
+    let handle = install_recorder(otel, idle_timeout);
     // Register faucet_build_info into whatever recorder is now global.
     faucet_core::register_build_info();
 
@@ -42,10 +53,13 @@ pub fn install(
 
 /// The Prometheus recorder `/metrics` renders — fanned out to the OTLP
 /// exporter when `otel` exports metrics.
-fn install_recorder(otel: Option<&faucet_core::OtelConfig>) -> Option<PrometheusHandle> {
+fn install_recorder(
+    otel: Option<&faucet_core::OtelConfig>,
+    idle_timeout: Option<std::time::Duration>,
+) -> Option<PrometheusHandle> {
     #[cfg(feature = "otel")]
     if let Some(otel) = otel.filter(|o| o.exports(faucet_core::OtelSignal::Metrics)) {
-        let recorder = bucketed_builder().build_recorder();
+        let recorder = bucketed_builder(idle_timeout).build_recorder();
         let handle = recorder.handle();
         return match faucet_core::observability::install_prometheus_with_otel_metrics(
             recorder, otel,
@@ -63,7 +77,7 @@ fn install_recorder(otel: Option<&faucet_core::OtelConfig>) -> Option<Prometheus
         };
     }
     let _ = otel;
-    match bucketed_builder().install_recorder() {
+    match bucketed_builder(idle_timeout).install_recorder() {
         Ok(h) => Some(h),
         Err(e) => {
             tracing::warn!("Prometheus recorder already installed or failed: {e}");
@@ -74,9 +88,10 @@ fn install_recorder(otel: Option<&faucet_core::OtelConfig>) -> Option<Prometheus
 
 /// A builder with faucet's default histogram buckets, so `/metrics` exposes
 /// `_bucket` series rather than summaries.
-fn bucketed_builder() -> PrometheusBuilder {
-    faucet_core::observability::with_default_buckets(PrometheusBuilder::new())
-        .expect("faucet's default histogram buckets are non-empty")
+fn bucketed_builder(idle_timeout: Option<std::time::Duration>) -> PrometheusBuilder {
+    let builder = faucet_core::observability::with_default_buckets(PrometheusBuilder::new())
+        .expect("faucet's default histogram buckets are non-empty");
+    faucet_core::observability::with_idle_timeout(builder, idle_timeout)
 }
 
 /// OTLP traces through the trace-layer slot at the bottom of the serve

@@ -1111,6 +1111,14 @@ refused: the reference stays unresolved in the persisted body and resolves on
 the executing instance. Non-clustered servers store no config body and are
 unaffected.
 
+A template keeps its newest 20 versions; an older one is deleted when a new
+version is registered, unless something still names it: the launched
+(`stable`) and `previous` versions, every channel, and every version a
+schedule, a trigger, a feed delivery or a pending or approved change request
+pins by number (including a sink or overlay version a source template's
+schedule names). A channel pin (`stable`, `prod`) follows its pointer and keeps
+whatever the pointer names.
+
 ## Hosting templates in a repo or bucket (sync)
 
 *(requires the `templates-sync` build feature; S3 / GCS / Azure Blob origins
@@ -1143,11 +1151,16 @@ origins:
 A template under an `<owner>/` directory of an origin (a Template Hub
 catalog's layout) is its owner's: it registers only when it reads nothing of
 the server's (`${env:}`, `${file:}`, secret directives), references no other
-part of the composed config (`${sources.*}`, `${sinks.*}`, `${vars.*}`) and
-names no connector that runs a program — otherwise the pull reports and skips
-it. List the owners (or `owner/name` ids, or `"*"`) you have reviewed under the
-origin's `trust:`. The `faucet-hq` namespace of `faucet-hq/template-hub` at
-`main` needs no entry.
+part of the composed config (`${sources.*}`, `${sinks.*}`, `${vars.*}`),
+names no connector that runs a program, and names nothing of the machine it
+runs on in what its author wrote (a local path, a local or private network
+address, a `file:` URL, a listener, a setting that turns off verification, or
+the machine's own credentials) — otherwise the pull reports and skips it. A
+run of such a template is checked again when it is triggered, and refused
+with `403` if it breaks the rule (a version synced by an earlier release, or a
+`trust:` edited since). List the owners (or `owner/name` ids, or `"*"`) you
+have reviewed under the origin's `trust:`. The `faucet-hq` namespace of
+`faucet-hq/template-hub` at `main` needs no entry.
 
 ```bash
 faucet serve --history sqlite:./faucet.db --templates-sync sync.yaml

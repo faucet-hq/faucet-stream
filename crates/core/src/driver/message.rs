@@ -21,8 +21,7 @@ use crate::traits::RowOutcome;
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 /// One message to publish.
@@ -335,6 +334,118 @@ fn fail_open(outcomes: &mut [RowOutcome], err: impl Fn() -> FaucetError) {
     }
 }
 
+/// Per-row outcomes of a publish whose rows are decided over several attempts
+/// or as confirms arrive.
+///
+/// A row is *undecided* until it is confirmed or failed, so a request or group
+/// that fails as a whole can fail only the rows still open and keep the ones
+/// the backend already settled. A row nobody decided is never reported as
+/// delivered.
+#[derive(Debug, Default)]
+pub struct RowOutcomes {
+    decided: BTreeMap<usize, RowOutcome>,
+}
+
+impl RowOutcomes {
+    /// No row decided.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `outcome` for `row`, replacing any earlier decision.
+    pub fn decide(&mut self, row: usize, outcome: RowOutcome) {
+        self.decided.insert(row, outcome);
+    }
+
+    /// Record `row` as delivered.
+    pub fn confirm(&mut self, row: usize) {
+        self.decide(row, Ok(()));
+    }
+
+    /// Record `row` as failed with `err`.
+    pub fn fail(&mut self, row: usize, err: FaucetError) {
+        self.decide(row, Err(err));
+    }
+
+    /// Withdraw the decision for `row`, so it is open again (it is about to
+    /// be sent once more).
+    pub fn reopen(&mut self, row: usize) {
+        self.decided.remove(&row);
+    }
+
+    /// Whether `row` has an outcome.
+    pub fn is_decided(&self, row: usize) -> bool {
+        self.decided.contains_key(&row)
+    }
+
+    /// Whether any row has an outcome.
+    pub fn has_decisions(&self) -> bool {
+        !self.decided.is_empty()
+    }
+
+    /// The outcome recorded for `row`, if any.
+    pub fn get(&self, row: usize) -> Option<&RowOutcome> {
+        self.decided.get(&row)
+    }
+
+    /// Fail every listed row that is still undecided with `cause`.
+    ///
+    /// [`FaucetError`] is not `Clone`, so each row gets its own error built
+    /// from `cause`: a [`FaucetError::Cancelled`] or [`FaucetError::Timeout`]
+    /// keeps its type and fields (retry classes and poison policies key on
+    /// them); anything else becomes `Sink("<connector> publish: <cause>")`.
+    pub fn fail_undecided(
+        &mut self,
+        rows: impl IntoIterator<Item = usize>,
+        cause: &FaucetError,
+        connector: &str,
+    ) {
+        for row in rows {
+            self.decided
+                .entry(row)
+                .or_insert_with(|| Err(copy_cause(connector, cause)));
+        }
+    }
+
+    /// One outcome per row `0..n`. A row nobody decided is a failure.
+    pub fn into_rows(mut self, n: usize, connector: &str) -> Vec<RowOutcome> {
+        (0..n)
+            .map(|row| {
+                self.decided
+                    .remove(&row)
+                    .unwrap_or_else(|| Err(undecided(connector)))
+            })
+            .collect()
+    }
+
+    /// The decided rows, by row index.
+    pub fn into_map(self) -> BTreeMap<usize, RowOutcome> {
+        self.decided
+    }
+}
+
+/// The error an undecided row gets from [`RowOutcomes::into_rows`].
+fn undecided(connector: &str) -> FaucetError {
+    FaucetError::Sink(format!(
+        "{connector} publish: no outcome was recorded for this message; treating it as not delivered"
+    ))
+}
+
+/// The per-row copy of a whole-request failure (see
+/// [`RowOutcomes::fail_undecided`]).
+fn copy_cause(connector: &str, cause: &FaucetError) -> FaucetError {
+    match cause {
+        FaucetError::Cancelled { operation } => FaucetError::Cancelled {
+            operation: operation.clone(),
+        },
+        FaucetError::Timeout { operation, after } => FaucetError::Timeout {
+            operation: operation.clone(),
+            after: *after,
+        },
+        other => FaucetError::Sink(format!("{connector} publish: {other}")),
+    }
+}
+
 #[async_trait]
 impl<D: MessageDriver> SinkDriver for MessageSinkDriver<D> {
     fn connector_name(&self) -> &'static str {
@@ -534,31 +645,21 @@ pub trait MessageConsumer: Send + Sync {
 /// requested (or the stream is polled to its end) — that is, only once the
 /// pipeline has written and flushed them. A run that fails before then
 /// acknowledges nothing it did not write, and the broker redelivers it.
+/// Acknowledgements belong to the stream that read the page: a dropped stream
+/// acknowledges nothing, and another read never acknowledges its pages.
 pub struct MessageSourceDriver<C> {
     consumer: C,
-    pending: Mutex<Vec<AckToken>>,
 }
 
 impl<C: MessageConsumer> MessageSourceDriver<C> {
     /// The source driver over `consumer`.
     pub fn new(consumer: C) -> Self {
-        Self {
-            consumer,
-            pending: Mutex::new(Vec::new()),
-        }
+        Self { consumer }
     }
 
     /// The consumer.
     pub fn consumer(&self) -> &C {
         &self.consumer
-    }
-
-    async fn ack_pending(&self, calls: &CallSlot) -> Result<(), FaucetError> {
-        let tokens = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()));
-        if tokens.is_empty() {
-            return Ok(());
-        }
-        self.consumer.ack(calls, tokens).await
     }
 }
 
@@ -653,9 +754,10 @@ impl<C: MessageConsumer> MessageSourceDriver<C> {
         Box::pin(async_stream::try_stream! {
             let mut consumed = 0usize;
             let mut idle = 0u32;
+            let mut pending: Vec<AckToken> = Vec::new();
             loop {
-                if ack {
-                    self.ack_pending(calls).await?;
+                if !pending.is_empty() {
+                    self.consumer.ack(calls, std::mem::take(&mut pending)).await?;
                 }
                 let room = match limit {
                     Some(max) if consumed >= max => break,
@@ -679,7 +781,7 @@ impl<C: MessageConsumer> MessageSourceDriver<C> {
                 }
                 consumed += records.len();
                 if ack {
-                    *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = tokens;
+                    pending = tokens;
                 }
                 yield StreamPage {
                     records,

@@ -8,6 +8,42 @@ use serde_json::Value;
 
 // ── SQL Utilities ───────────────────────────────────────────────────────────
 
+mod positional;
+pub use positional::{CONTEXT_MARK, SqlLexing, check_no_context_mark, order_positional_bindings};
+
+/// Refuse a result whose columns repeat a name: a record keeps one value per
+/// field, so one of the columns would vanish. `connector` is the friendly
+/// label the error starts with (`"Redshift"`). Call it once per result, from
+/// the column metadata, before the first row is decoded.
+pub fn check_unique_columns<I, S>(connector: &str, names: I) -> Result<(), FaucetError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        let name = name.as_ref();
+        if !seen.insert(name.to_string()) {
+            return Err(duplicate_column_error(connector, name));
+        }
+    }
+    Ok(())
+}
+
+/// The error [`check_unique_columns`] returns for a repeated `name`.
+pub fn duplicate_column_error(connector: &str, name: &str) -> FaucetError {
+    if name.is_empty() {
+        return FaucetError::Source(format!(
+            "{connector} query returns two columns named an empty name (unaliased \
+             expressions); alias them (`COUNT(*) AS n`) so neither is lost"
+        ));
+    }
+    FaucetError::Source(format!(
+        "{connector} query returns two columns named {name:?}; alias them \
+         (`SELECT a.{name} AS a_{name}, b.{name} AS b_{name} …`) so neither is lost"
+    ))
+}
+
 /// Quote a SQL identifier to prevent SQL injection.
 ///
 /// Wraps the name in double quotes and doubles any embedded double-quotes

@@ -8,21 +8,30 @@ pub const DESCRIPTOR: ConnectorDescriptor = ConnectorDescriptor::new("oracle", c
     .with_host_identity(faucet_common_oracle::host_identity);
 
 fn capabilities(config: &Value) -> Capabilities {
-    Capabilities::builder()
-        .write_modes([
+    let json = !config.is_null() && tag(config, "column_mapping") == Some("json_column");
+    let modes: &[WriteMode] = if json {
+        &[WriteMode::Append, WriteMode::Overwrite]
+    } else {
+        &[
             WriteMode::Append,
             WriteMode::Upsert,
             WriteMode::Delete,
             WriteMode::Overwrite,
-        ])
+        ]
+    };
+    Capabilities::builder()
+        .write_modes(modes.iter().copied())
         .idempotent_writes(true)
-        .keyed_upsert(true)
+        .keyed_upsert(!json)
         .keyed_dedup(!config.is_null() && dedups_by_key(config))
-        .schema_evolution(true)
-        .schema_report(SchemaReport::Reported)
+        .schema_evolution(!json)
+        .schema_report(if json {
+            SchemaReport::Schemaless
+        } else {
+            SchemaReport::Reported
+        })
         .declared_types(
-            (config.is_null() || tag(config, "column_mapping") != Some("json_column"))
-                && faucet_core::capabilities::config::bool_field(config, "create_table", true),
+            !json && faucet_core::capabilities::config::bool_field(config, "create_table", true),
         )
         .build()
 }
@@ -44,5 +53,22 @@ mod tests {
         let kind = DESCRIPTOR.capabilities(&Value::Null);
         assert!(!kind.keyed_dedup() && kind.idempotent_writes());
         assert_eq!(DESCRIPTOR.kind(), "oracle");
+    }
+
+    #[test]
+    fn a_json_column_config_reports_no_schema_and_no_keyed_modes() {
+        let json = DESCRIPTOR.capabilities(&json!({
+            "table": "t",
+            "column_mapping": {"type": "json_column", "column": "DOC"}
+        }));
+        assert_eq!(json.schema_report(), SchemaReport::Schemaless);
+        assert!(!json.schema_evolution() && !json.keyed_upsert() && !json.declared_types());
+        assert_eq!(
+            json.write_modes(),
+            &[WriteMode::Append, WriteMode::Overwrite]
+        );
+        assert!(json.overwrite());
+        let kind = DESCRIPTOR.capabilities(&Value::Null);
+        assert!(kind.keyed_upsert() && kind.schema_evolution());
     }
 }

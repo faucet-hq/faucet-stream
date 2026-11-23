@@ -59,7 +59,7 @@ The full example is
 | `catch_up` | Default `true`: after a gap (no server running, or the server fell behind), run the latest missed tick once. `false` skips missed ticks. Either way missed ticks are counted. |
 | `overlap` | What a tick does while a run from an earlier tick is still going: `skip` it (default), `queue` it until that run ends, or `forbid` (record the tick as failed). |
 | `paused` | Start paused. |
-| `template.id`, `version` | A registered template and a version selector (`stable` by default, resolved at each tick; a number pins it, written as `3` or `"3"` in the file and the API alike). |
+| `template.id`, `version` | A registered template and a version selector (`stable` by default, resolved at each tick; a number pins it, written as `3` or `"3"` in the file and the API alike). A pinned version is never pruned while the schedule exists; a tick whose pinned version was deleted by hand fails naming it. |
 | `template.params` | Param values. `${schedule.tick}`, `${schedule.name}` and `${schedule.fired_at}` are filled in at each tick. |
 | `template.sink`, `sink_version` | The sink template a source template runs with. |
 | `template.overlay`, `overlay_version` | A deployment overlay. |
@@ -73,7 +73,10 @@ vault key (`--vault-key`) and never shown again: responses carry
 stored value. A value is sealed to the schedule's stable id, its tenant and
 its template, so it opens for that schedule only: an edit that changes the
 template is refused with `422` naming the secret params to supply again. A
-server without a vault key refuses a schedule with a secret param.
+server without a vault key refuses a schedule with a secret param. A
+`--schedules` file is the operator's own file and is not sealed, but its
+secret params are shown the same way (`{"$sealed": true}`, every param when
+the template cannot be read) and their values are scrubbed from the logs.
 
 ### At most every 5 minutes
 

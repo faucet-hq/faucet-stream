@@ -74,6 +74,80 @@ pub fn masked(spec: &ScheduleSpec) -> ScheduleSpec {
     out
 }
 
+/// The params a template version declares `secret: true`, for an operator
+/// file's definition (a `--schedules` or `--feeds` file holds them as
+/// written, not sealed). Template versions never change, so the answer is
+/// remembered per resolved version; resolving `version` is one history read.
+pub async fn declared_secret_params(
+    state: &ServerState,
+    id: &str,
+    version: Option<&str>,
+) -> Result<Vec<String>, String> {
+    use crate::serve::history::templates::VersionSelector;
+    use std::sync::{Mutex, OnceLock};
+    type Known = std::collections::HashMap<(String, u32), Vec<String>>;
+    static KNOWN: OnceLock<Mutex<Known>> = OnceLock::new();
+    let known = KNOWN.get_or_init(Default::default);
+    let selector: VersionSelector = match version {
+        Some(v) => serde_json::from_value(Value::String(v.to_string()))
+            .map_err(|e| format!("template version '{v}': {e}"))?,
+        None => VersionSelector::default(),
+    };
+    let history = state.history();
+    let resolved = crate::templates::resolve_version(&history, id, selector)
+        .await
+        .map_err(|e| e.to_string())?;
+    let key = (id.to_string(), resolved);
+    if let Some(found) = known
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
+        return Ok(found.clone());
+    }
+    let record = history
+        .template_get(id, Some(resolved))
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("template {id} version {resolved} is gone"))?;
+    let names: Vec<String> = record
+        .params
+        .iter()
+        .filter(|(_, p)| p.secret)
+        .map(|(k, _)| k.clone())
+        .collect();
+    let mut held = known
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held.len() >= 4096 {
+        held.clear();
+    }
+    held.insert(key, names.clone());
+    Ok(names)
+}
+
+/// Show the values of `secret` (an operator file's params, held as written)
+/// as the keep marker, and scrub them from the logs. `None` (the template
+/// could not be read): every param is shown as the marker, and none is
+/// scrubbed (a plain word would blank out of every log line).
+pub fn mask_declared(params: &mut BTreeMap<String, Value>, secret: Option<&[String]>) {
+    for (k, v) in params.iter_mut() {
+        if is_keep_marker(v) {
+            continue;
+        }
+        match secret {
+            Some(names) if names.iter().any(|n| n == k) => {
+                if let Value::String(text) = v {
+                    crate::secrets::registry::register_server(text);
+                }
+                *v = json!({ SEALED: true });
+            }
+            Some(_) => {}
+            None => *v = json!({ SEALED: true }),
+        }
+    }
+}
+
 /// Replace every sealed value among `params` with the keep marker.
 pub fn mask_params(params: &mut BTreeMap<String, Value>) {
     for v in params.values_mut() {
@@ -253,6 +327,28 @@ mod tests {
         assert!(!is_sealed(&json!({"$sealed": true})));
         assert!(is_keep_marker(&json!({"$sealed": true})));
         assert!(!is_keep_marker(&json!({"$sealed": true, "x": 1})));
+        let mut literal: BTreeMap<String, Value> = serde_json::from_value(json!({
+            "token": "file-literal-token-value", "region": "eu", "kept": {"$sealed": true}
+        }))
+        .unwrap();
+        mask_declared(
+            &mut literal,
+            Some(&["token".to_string(), "kept".to_string()]),
+        );
+        assert_eq!(
+            Value::Object(literal.clone().into_iter().collect()),
+            json!({"token": {"$sealed": true}, "region": "eu", "kept": {"$sealed": true}})
+        );
+        assert!(
+            !crate::secrets::registry::redact("x file-literal-token-value")
+                .contains("file-literal-token-value")
+        );
+        mask_declared(&mut literal, None);
+        assert_eq!(
+            literal["region"],
+            json!({"$sealed": true}),
+            "unknown: everything"
+        );
         let m = masked(&spec(json!({"token": {"$sealed": "abc"}, "region": "eu"})));
         assert_eq!(m.template.params["token"], json!({"$sealed": true}));
         assert_eq!(m.template.params["region"], json!("eu"));

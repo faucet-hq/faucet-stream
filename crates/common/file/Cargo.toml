@@ -16,7 +16,7 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "fs"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "fs", "time"] }
 futures.workspace = true
 csv = { workspace = true, optional = true }
 arrow = { workspace = true, optional = true }

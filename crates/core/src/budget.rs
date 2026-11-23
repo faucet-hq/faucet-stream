@@ -1,5 +1,7 @@
-//! Run budgets (#703): hard ceilings on what one invocation may move, so an
-//! approved change (or any run) cannot exceed what was agreed.
+//! Run budgets (#703): hard ceilings on what one run may move, so an
+//! approved change (or any run) cannot exceed what was agreed. Every part of
+//! a run (matrix rows, fan-out children, shards, topology sink nodes, the
+//! DLQ) counts against one [`BudgetState`].
 //!
 //! A [`BudgetSpec`] is a top-level `budget:` block or the budget on a change
 //! request: `max_records`, `max_bytes` (estimated serialized bytes, see
@@ -31,7 +33,7 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -39,15 +41,16 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetSpec {
-    /// Most records the sink may accept. A page that would cross it is
-    /// refused whole and the run fails with `budget_exceeded`.
+    /// Most records the run's destinations may accept, all rows together. A
+    /// page that would cross it is refused whole and the run fails with
+    /// `budget_exceeded`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_records: Option<u64>,
     /// Most estimated serialized bytes the sink may accept (same estimate as
     /// usage accounting). Refused whole at the page that would cross it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u64>,
-    /// Longest an invocation may run. Past it the run is cancelled
+    /// Longest the run may take, measured from its start. Past it the run is cancelled
     /// cooperatively (stops at the next page boundary, flushes) and fails
     /// with `budget_exceeded`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -203,15 +206,116 @@ impl BudgetVerdict {
     }
 }
 
-/// The shared state of one invocation's budget, readable after the run.
-#[derive(Debug, Default)]
+/// What a [`BudgetLedger`] granted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BudgetGrant {
+    /// Records granted by this call (at most what was asked).
+    pub records: u64,
+    /// Estimated bytes granted by this call.
+    pub bytes: u64,
+    /// Records granted across the whole run, this call included.
+    pub total_records: u64,
+    /// Bytes granted across the whole run, this call included.
+    pub total_bytes: u64,
+}
+
+impl BudgetGrant {
+    /// A grant of `records` / `bytes`, the run having been granted
+    /// `total_records` / `total_bytes` in all.
+    pub fn new(records: u64, bytes: u64, total_records: u64, total_bytes: u64) -> Self {
+        Self {
+            records,
+            bytes,
+            total_records,
+            total_bytes,
+        }
+    }
+}
+
+/// A run ledger shared by processes that execute parts of one run (the
+/// shards of a sharded run on several replicas): it hands out allowance
+/// against the run's ceilings, so no two parts can both spend the last of it.
+/// Implementations must grant atomically and never past a ceiling.
+#[async_trait]
+pub trait BudgetLedger: Send + Sync {
+    /// Grant up to `records` / `bytes` more against the run's ceilings.
+    async fn grant(&self, records: u64, bytes: u64) -> Result<BudgetGrant, FaucetError>;
+
+    /// Return allowance granted but not spent, so other parts can use it.
+    async fn give_back(&self, records: u64, bytes: u64) -> Result<(), FaucetError>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct Counters {
+    records: u64,
+    bytes: u64,
+    reserved_records: u64,
+    reserved_bytes: u64,
+    granted_records: u64,
+    granted_bytes: u64,
+}
+
+/// The budget of one run: what its destinations have accepted, what pages in
+/// flight have reserved, the verdict once a ceiling is crossed, and the run's
+/// deadline. Every invocation of a run (matrix rows, fan-out children,
+/// topology sink nodes, the DLQ) shares one, so the ceilings and the clock
+/// cover the whole run. Optionally backed by a [`BudgetLedger`] when parts of
+/// the run execute elsewhere.
+#[derive(Default)]
 pub struct BudgetState {
-    records: AtomicU64,
-    bytes: AtomicU64,
+    counters: Mutex<Counters>,
     verdict: Mutex<Option<BudgetVerdict>>,
+    deadline: Option<std::time::SystemTime>,
+    max_duration_secs: Option<u64>,
+    stop: CancellationToken,
+    // The ledger only hands out allowance; the counters it feeds are behind
+    // their own lock, so a panic inside it leaves nothing half-updated.
+    ledger: std::panic::AssertUnwindSafe<Option<Arc<dyn BudgetLedger>>>,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+/// Why a page could not be reserved.
+enum ReserveError {
+    /// The run's budget is spent.
+    Over(BudgetVerdict),
+    /// The run's ledger could not be reached.
+    Ledger(FaucetError),
+}
+
+impl std::fmt::Debug for BudgetState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BudgetState")
+            .field("records", &self.records())
+            .field("bytes", &self.bytes())
+            .field("verdict", &self.verdict())
+            .field("deadline", &self.deadline)
+            .field("ledger", &self.ledger.is_some())
+            .finish()
+    }
 }
 
 impl BudgetState {
+    /// The budget of a run that started at `started`: the duration ceiling
+    /// of `spec` is measured from it.
+    pub fn for_run(spec: &BudgetSpec, started: std::time::SystemTime) -> Self {
+        Self {
+            deadline: spec
+                .max_duration_secs
+                .map(|s| started + std::time::Duration::from_secs(s)),
+            max_duration_secs: spec.max_duration_secs,
+            ..Self::default()
+        }
+    }
+
+    /// Draw the records / bytes allowance from `ledger` (in chunks) instead
+    /// of counting against the ceilings locally.
+    #[must_use]
+    pub fn with_ledger(mut self, ledger: Arc<dyn BudgetLedger>) -> Self {
+        self.ledger = std::panic::AssertUnwindSafe(Some(ledger));
+        self
+    }
+
     /// The verdict, if a ceiling was crossed.
     pub fn verdict(&self) -> Option<BudgetVerdict> {
         self.verdict
@@ -220,21 +324,248 @@ impl BudgetState {
             .clone()
     }
 
+    /// When the run's duration ceiling ends it, if one is set.
+    pub fn deadline(&self) -> Option<std::time::SystemTime> {
+        self.deadline
+    }
+
+    /// Cancelled when the run's budget is spent: every invocation of the run
+    /// stops at its next page boundary.
+    pub fn stopped(&self) -> &CancellationToken {
+        &self.stop
+    }
+
     fn set_verdict(&self, v: BudgetVerdict) {
-        let mut g = self.verdict.lock().unwrap_or_else(|e| e.into_inner());
-        if g.is_none() {
-            *g = Some(v);
+        {
+            let mut g = self.verdict.lock().unwrap_or_else(|e| e.into_inner());
+            if g.is_none() {
+                *g = Some(v);
+            }
+        }
+        self.stop.cancel();
+    }
+
+    fn counters(&self) -> std::sync::MutexGuard<'_, Counters> {
+        self.counters.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Records the destinations have accepted so far.
+    pub fn records(&self) -> u64 {
+        self.counters().records
+    }
+
+    /// Estimated bytes the destinations have accepted so far.
+    pub fn bytes(&self) -> u64 {
+        self.counters().bytes
+    }
+
+    /// Reserve `records` / `bytes` for a page about to be written. The check
+    /// and the reservation happen under one lock, so concurrent invocations
+    /// cannot both pass and overshoot. A refusal records the run's verdict.
+    async fn reserve(
+        &self,
+        spec: &BudgetSpec,
+        records: u64,
+        bytes: u64,
+    ) -> Result<(), ReserveError> {
+        if let Some(v) = self.verdict() {
+            return Err(ReserveError::Over(v));
+        }
+        loop {
+            let shortfall = {
+                let mut c = self.counters();
+                let want_r = c.records + c.reserved_records + records;
+                let want_b = c.records_bytes_total() + bytes;
+                let (limit_r, limit_b) = match &*self.ledger {
+                    Some(_) => (
+                        spec.max_records.map(|_| c.granted_records),
+                        spec.max_bytes.map(|_| c.granted_bytes),
+                    ),
+                    None => (spec.max_records, spec.max_bytes),
+                };
+                let short_r = limit_r.map_or(0, |l| want_r.saturating_sub(l));
+                let short_b = limit_b.map_or(0, |l| want_b.saturating_sub(l));
+                if short_r == 0 && short_b == 0 {
+                    c.reserved_records += records;
+                    c.reserved_bytes += bytes;
+                    return Ok(());
+                }
+                if self.ledger.is_none() {
+                    let v = if short_r > 0 {
+                        BudgetVerdict {
+                            kind: BudgetKind::Records,
+                            limit: limit_r.unwrap_or_default(),
+                            actual: want_r,
+                        }
+                    } else {
+                        BudgetVerdict {
+                            kind: BudgetKind::Bytes,
+                            limit: limit_b.unwrap_or_default(),
+                            actual: want_b,
+                        }
+                    };
+                    drop(c);
+                    self.set_verdict(v.clone());
+                    return Err(ReserveError::Over(v));
+                }
+                (short_r, short_b)
+            };
+            let ledger = self.ledger.as_ref().expect("checked above");
+            let chunk = |short: u64, max: Option<u64>| match max {
+                Some(m) => short.max(m / 64),
+                None => 0,
+            };
+            let want_r = chunk(shortfall.0, spec.max_records);
+            let want_b = chunk(shortfall.1, spec.max_bytes);
+            let grant = ledger
+                .grant(want_r, want_b)
+                .await
+                .map_err(ReserveError::Ledger)?;
+            {
+                let mut c = self.counters();
+                c.granted_records += grant.records;
+                c.granted_bytes += grant.bytes;
+            }
+            if (shortfall.0 > 0 && grant.records < shortfall.0)
+                || (shortfall.1 > 0 && grant.bytes < shortfall.1)
+            {
+                let v = if shortfall.0 > 0 && grant.records < shortfall.0 {
+                    BudgetVerdict {
+                        kind: BudgetKind::Records,
+                        limit: spec.max_records.unwrap_or_default(),
+                        actual: grant.total_records + (shortfall.0 - grant.records),
+                    }
+                } else {
+                    BudgetVerdict {
+                        kind: BudgetKind::Bytes,
+                        limit: spec.max_bytes.unwrap_or_default(),
+                        actual: grant.total_bytes + (shortfall.1 - grant.bytes),
+                    }
+                };
+                self.set_verdict(v.clone());
+                return Err(ReserveError::Over(v));
+            }
         }
     }
 
-    /// Records the sink has accepted so far.
-    pub fn records(&self) -> u64 {
-        self.records.load(Ordering::Relaxed)
+    /// Turn a reservation into what the destination accepted; the rest is
+    /// released.
+    fn settle(&self, reserved: (u64, u64), accepted: (u64, u64)) {
+        let mut c = self.counters();
+        c.reserved_records = c.reserved_records.saturating_sub(reserved.0);
+        c.reserved_bytes = c.reserved_bytes.saturating_sub(reserved.1);
+        c.records += accepted.0;
+        c.bytes += accepted.1;
     }
 
-    /// Estimated bytes the sink has accepted so far.
-    pub fn bytes(&self) -> u64 {
-        self.bytes.load(Ordering::Relaxed)
+    /// Return the allowance a [`BudgetLedger`] granted this process but it
+    /// did not spend. Call once when this process's part of the run ends;
+    /// later calls do nothing. Without a ledger it does nothing.
+    pub async fn close(&self) {
+        let Some(ledger) = &*self.ledger else {
+            return;
+        };
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (r, b) = {
+            let c = self.counters();
+            (
+                c.granted_records
+                    .saturating_sub(c.records + c.reserved_records),
+                c.granted_bytes.saturating_sub(c.bytes + c.reserved_bytes),
+            )
+        };
+        if (r > 0 || b > 0)
+            && let Err(e) = ledger.give_back(r, b).await
+        {
+            tracing::warn!(error = %e, "could not return unspent run budget to the ledger");
+        }
+    }
+}
+
+impl Counters {
+    fn records_bytes_total(&self) -> u64 {
+        self.bytes + self.reserved_bytes
+    }
+}
+
+/// Whether one invocation was refused or stopped by its run's budget. The
+/// run's verdict is shared; this flag decides which invocations it fails —
+/// one that finished before the budget was spent stays a success.
+#[derive(Debug, Default)]
+pub struct BudgetStop {
+    state: Mutex<(bool, bool)>,
+}
+
+impl BudgetStop {
+    /// Mark the invocation stopped by the budget, unless it already finished.
+    fn stop(&self) -> bool {
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if g.0 {
+            return false;
+        }
+        g.1 = true;
+        true
+    }
+
+    /// The invocation has finished: report whether the budget stopped it.
+    pub fn finish(&self) -> bool {
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        g.0 = true;
+        g.1
+    }
+
+    /// Whether the budget stopped (or refused a page of) the invocation.
+    pub fn was_stopped(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).1
+    }
+}
+
+/// One invocation's view of its run's budget, kept after the governed sink
+/// is handed to the pipeline: turns a partial `Ok` into the budget failure
+/// when, and only when, the budget stopped this invocation.
+#[derive(Debug, Clone)]
+pub struct BudgetHandle {
+    state: Arc<BudgetState>,
+    stop: Arc<BudgetStop>,
+}
+
+impl BudgetHandle {
+    /// A handle on `state` for the invocation flagged by `stop`.
+    pub fn new(state: Arc<BudgetState>, stop: Arc<BudgetStop>) -> Self {
+        Self { state, stop }
+    }
+
+    /// The run's budget state.
+    pub fn state(&self) -> &Arc<BudgetState> {
+        &self.state
+    }
+
+    /// The verdict, when the budget stopped this invocation.
+    pub fn stopped(&self) -> Option<BudgetVerdict> {
+        self.stop
+            .was_stopped()
+            .then(|| self.state.verdict())
+            .flatten()
+    }
+
+    /// Mark the invocation's pipeline finished, at the moment it returns:
+    /// the run's verdict when the budget stopped it (refused one of its pages,
+    /// or cancelled it while it ran), else `None`. Later budget stops no
+    /// longer touch it. Idempotent.
+    pub fn end(&self) -> Option<BudgetVerdict> {
+        self.stop.finish().then(|| self.state.verdict()).flatten()
+    }
+
+    /// Mark the invocation finished; an `Ok` it reached only because the
+    /// budget stopped it becomes the budget failure.
+    pub fn finish<T>(&self, result: Result<T, FaucetError>) -> Result<T, FaucetError> {
+        let stopped = self.stop.finish();
+        match (&result, self.state.verdict()) {
+            (Ok(_), Some(v)) if stopped => Err(v.error()),
+            _ => result,
+        }
     }
 }
 
@@ -244,72 +575,142 @@ pub struct BudgetSink {
     spec: BudgetSpec,
     state: Arc<BudgetState>,
     cancel: CancellationToken,
-    /// Rows of a page already admitted whole by `admit_page` and not yet
-    /// written, so its sub-batches are not checked again one by one.
-    prepaid: AtomicU64,
+    stop: Arc<BudgetStop>,
+    /// Records / bytes of a page admitted whole by `admit_page` and not yet
+    /// written, so its sub-batches draw on that reservation.
+    prepaid: Mutex<(u64, u64)>,
+}
+
+/// A page's reservation: settled with what was accepted, released if the
+/// write fails, panics or is cancelled.
+struct Reservation<'a> {
+    state: &'a BudgetState,
+    reserved: (u64, u64),
+}
+
+impl Reservation<'_> {
+    fn settle(mut self, accepted: (u64, u64)) {
+        self.state.settle(self.reserved, accepted);
+        self.reserved = (0, 0);
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if self.reserved != (0, 0) {
+            self.state.settle(self.reserved, (0, 0));
+        }
+    }
 }
 
 impl BudgetSink {
-    /// Wrap `inner`. `cancel` is the run's cooperative token; the duration
-    /// ceiling (when set) cancels it from a timer task that is aborted when
-    /// the returned guard drops. Returns the sink, the readable state, and
-    /// the guard the caller keeps alive for the run.
+    /// Wrap `inner` as a run of its own. `cancel` is the run's cooperative
+    /// token; the duration ceiling (when set) cancels it from a timer task
+    /// that is aborted when the returned guard drops. Returns the sink, the
+    /// readable state, and the guard the caller keeps alive for the run.
     pub fn wrap(
         inner: Box<dyn Sink>,
         spec: BudgetSpec,
         cancel: CancellationToken,
     ) -> (Self, Arc<BudgetState>, BudgetTimer) {
-        let state = Arc::new(BudgetState::default());
-        let timer = BudgetTimer::start(spec.max_duration_secs, Arc::clone(&state), cancel.clone());
+        let state = Arc::new(BudgetState::for_run(&spec, std::time::SystemTime::now()));
+        let stop = Arc::new(BudgetStop::default());
+        let timer = BudgetTimer::start(
+            state.deadline,
+            state.max_duration_secs,
+            Arc::clone(&state),
+            cancel.clone(),
+            None,
+        );
         (
-            Self {
-                inner,
-                spec,
-                state: Arc::clone(&state),
-                cancel,
-                prepaid: AtomicU64::new(0),
-            },
+            Self::with_stop(inner, spec, Arc::clone(&state), cancel, stop),
             state,
             timer,
         )
     }
 
-    /// Wrap `inner` counting against an existing `state` — the main sink and
-    /// the DLQ of one run share it (#870). No duration timer is started; the
-    /// caller owns one ([`BudgetTimer::start_for`]).
+    /// Wrap `inner` counting against an existing `state` — the destinations
+    /// of one run share it (#870). No duration timer is started; the caller
+    /// owns one ([`BudgetTimer::start_run`]).
     pub fn wrap_shared(
         inner: Box<dyn Sink>,
         spec: BudgetSpec,
         state: Arc<BudgetState>,
         cancel: CancellationToken,
     ) -> Self {
+        Self::with_stop(inner, spec, state, cancel, Arc::new(BudgetStop::default()))
+    }
+
+    /// [`Self::wrap_shared`], flagging `stop` when this sink refuses a page.
+    pub fn with_stop(
+        inner: Box<dyn Sink>,
+        spec: BudgetSpec,
+        state: Arc<BudgetState>,
+        cancel: CancellationToken,
+        stop: Arc<BudgetStop>,
+    ) -> Self {
         Self {
             inner,
             spec,
             state,
             cancel,
-            prepaid: AtomicU64::new(0),
+            stop,
+            prepaid: Mutex::new((0, 0)),
         }
     }
 
-    /// Check a page against the records / bytes ceilings before it is
-    /// written; on a crossing, record the verdict and refuse the page.
-    fn admit(&self, records: &[Value]) -> Result<u64, FaucetError> {
+    fn refused(&self, v: BudgetVerdict) -> FaucetError {
+        self.stop.stop();
+        self.cancel.cancel();
+        v.error()
+    }
+
+    fn reserve_failed(&self, e: ReserveError) -> FaucetError {
+        match e {
+            ReserveError::Over(v) => self.refused(v),
+            ReserveError::Ledger(e) => e,
+        }
+    }
+
+    /// Reserve a page against the records / bytes ceilings before it is
+    /// written; a page that would cross one is refused whole.
+    async fn admit(&self, records: &[Value]) -> Result<(Reservation<'_>, u64), FaucetError> {
         let n = records.len() as u64;
         let bytes = self.page_bytes(records);
         if let Some(v) = self.state.verdict() {
             // Already over: refuse everything after the verdict, so a page
             // can't slip in between the cancel and the flush.
-            return Err(v.error());
+            return Err(self.refused(v));
         }
-        let prepaid = self.prepaid.load(Ordering::Relaxed);
-        if prepaid >= n && n > 0 {
-            self.prepaid.store(prepaid - n, Ordering::Relaxed);
-            return Ok(bytes);
+        let from_prepaid = {
+            let mut p = self.prepaid.lock().unwrap_or_else(|e| e.into_inner());
+            let r = p.0.min(n);
+            let b = p.1.min(bytes);
+            p.0 -= r;
+            p.1 -= b;
+            (r, b)
+        };
+        let extra = (n - from_prepaid.0, bytes - from_prepaid.1);
+        if extra != (0, 0)
+            && let Err(e) = self.state.reserve(&self.spec, extra.0, extra.1).await
+        {
+            self.state.settle(from_prepaid, (0, 0));
+            return Err(self.reserve_failed(e));
         }
-        self.prepaid.store(0, Ordering::Relaxed);
-        self.check_ceilings(n, bytes)?;
-        Ok(bytes)
+        Ok((
+            Reservation {
+                state: &self.state,
+                reserved: (n, bytes),
+            },
+            bytes,
+        ))
+    }
+
+    fn release_prepaid(&self) {
+        let left = std::mem::take(&mut *self.prepaid.lock().unwrap_or_else(|e| e.into_inner()));
+        if left != (0, 0) {
+            self.state.settle(left, (0, 0));
+        }
     }
 
     fn page_bytes(&self, records: &[Value]) -> u64 {
@@ -320,78 +721,102 @@ impl BudgetSink {
         }
     }
 
-    fn check_ceilings(&self, n: u64, bytes: u64) -> Result<(), FaucetError> {
-        if let Some(max) = self.spec.max_records {
-            let would = self.state.records() + n;
-            if would > max {
-                return Err(self.refuse(BudgetKind::Records, max, would));
-            }
+    fn bytes_for(&self, accepted: u64, offered: u64, bytes: u64) -> u64 {
+        if accepted >= offered {
+            bytes
+        } else if offered == 0 {
+            0
+        } else {
+            ((u128::from(bytes) * u128::from(accepted)) / u128::from(offered)) as u64
         }
-        if let Some(max) = self.spec.max_bytes {
-            let would = self.state.bytes() + bytes;
-            if would > max {
-                return Err(self.refuse(BudgetKind::Bytes, max, would));
-            }
-        }
-        Ok(())
     }
 
-    fn refuse(&self, kind: BudgetKind, limit: u64, actual: u64) -> FaucetError {
-        let v = BudgetVerdict {
-            kind,
-            limit,
-            actual,
-        };
-        self.state.set_verdict(v.clone());
-        self.cancel.cancel();
-        v.error()
-    }
-
-    fn account(&self, accepted: u64, bytes: u64) {
-        self.state.records.fetch_add(accepted, Ordering::Relaxed);
-        self.state.bytes.fetch_add(bytes, Ordering::Relaxed);
+    fn finish_write<T>(&self, r: Result<T, FaucetError>) -> Result<T, FaucetError> {
+        if r.is_err() {
+            self.release_prepaid();
+        }
+        r
     }
 }
 
-/// Aborts the duration timer on drop.
-pub struct BudgetTimer(Option<tokio::task::JoinHandle<()>>);
+/// Aborts the budget's timer and stop watcher on drop.
+pub struct BudgetTimer(Vec<tokio::task::JoinHandle<()>>);
 
 impl BudgetTimer {
-    /// Start the duration ceiling's timer for `state`: when it fires it records
-    /// the verdict and cancels `cancel`. A `None` ceiling starts nothing.
+    /// Start the duration ceiling's timer for `state`, `max_duration_secs`
+    /// from now: when it fires it records the verdict and cancels `cancel`.
+    /// A `None` ceiling starts nothing.
     pub fn start_for(
         max_duration_secs: Option<u64>,
         state: Arc<BudgetState>,
         cancel: CancellationToken,
     ) -> Self {
-        Self::start(max_duration_secs, state, cancel)
+        let deadline = max_duration_secs
+            .map(|s| std::time::SystemTime::now() + std::time::Duration::from_secs(s));
+        Self::start(deadline, max_duration_secs, state, cancel, None)
+    }
+
+    /// Start one invocation's watch over its run's budget: at the run's
+    /// deadline record the duration verdict, and whenever the run's budget
+    /// is spent (here or in another invocation) cancel `cancel` so this
+    /// invocation stops at its next page boundary, flagging `stop`. An
+    /// invocation that starts after the deadline is stopped at once.
+    pub fn start_run(
+        state: Arc<BudgetState>,
+        cancel: CancellationToken,
+        stop: Arc<BudgetStop>,
+    ) -> Self {
+        Self::start(
+            state.deadline,
+            state.max_duration_secs,
+            Arc::clone(&state),
+            cancel,
+            Some(stop),
+        )
     }
 
     #[allow(clippy::disallowed_methods)] // the duration budget's own timer
     fn start(
-        max_duration_secs: Option<u64>,
+        deadline: Option<std::time::SystemTime>,
+        limit: Option<u64>,
         state: Arc<BudgetState>,
         cancel: CancellationToken,
+        stop: Option<Arc<BudgetStop>>,
     ) -> Self {
-        let Some(secs) = max_duration_secs else {
-            return Self(None);
-        };
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-            state.set_verdict(BudgetVerdict {
-                kind: BudgetKind::Duration,
-                limit: secs,
-                actual: secs,
-            });
-            cancel.cancel();
-        });
-        Self(Some(handle))
+        let mut handles = Vec::new();
+        if let Some(deadline) = deadline {
+            let state = Arc::clone(&state);
+            let cancel = cancel.clone();
+            handles.push(tokio::spawn(async move {
+                let wait = deadline
+                    .duration_since(std::time::SystemTime::now())
+                    .unwrap_or_default();
+                tokio::time::sleep(wait).await;
+                let secs = limit.unwrap_or_default();
+                state.set_verdict(BudgetVerdict {
+                    kind: BudgetKind::Duration,
+                    limit: secs,
+                    actual: secs,
+                });
+                cancel.cancel();
+            }));
+        }
+        if let Some(stop) = stop {
+            let state = Arc::clone(&state);
+            handles.push(tokio::spawn(async move {
+                state.stop.cancelled().await;
+                if stop.stop() {
+                    cancel.cancel();
+                }
+            }));
+        }
+        Self(handles)
     }
 }
 
 impl Drop for BudgetTimer {
     fn drop(&mut self) {
-        if let Some(h) = self.0.take() {
+        for h in self.0.drain(..) {
             h.abort();
         }
     }
@@ -408,40 +833,52 @@ impl Sink for BudgetSink {
 
     async fn admit_page(&self, records: &[Value]) -> Result<(), FaucetError> {
         if let Some(v) = self.state.verdict() {
-            return Err(v.error());
+            return Err(self.refused(v));
         }
-        self.check_ceilings(records.len() as u64, self.page_bytes(records))?;
-        self.inner.admit_page(records).await?;
-        self.prepaid.store(records.len() as u64, Ordering::Relaxed);
+        self.release_prepaid();
+        let (n, bytes) = (records.len() as u64, self.page_bytes(records));
+        if let Err(e) = self.state.reserve(&self.spec, n, bytes).await {
+            return Err(self.reserve_failed(e));
+        }
+        if let Err(e) = self.inner.admit_page(records).await {
+            self.state.settle((n, bytes), (0, 0));
+            return Err(e);
+        }
+        *self.prepaid.lock().unwrap_or_else(|e| e.into_inner()) = (n, bytes);
         Ok(())
     }
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
-        let bytes = self.admit(records)?;
-        let n = self.inner.write_batch(records).await?;
-        self.account(n as u64, bytes);
+        let (res, bytes) = self.admit(records).await?;
+        let n = self.finish_write(self.inner.write_batch(records).await)?;
+        res.settle((
+            n as u64,
+            self.bytes_for(n as u64, records.len() as u64, bytes),
+        ));
         Ok(n)
     }
     async fn write_batch_reported(
         &self,
         records: &[Value],
     ) -> Result<crate::accounting::WriteReport, FaucetError> {
-        let bytes = self.admit(records)?;
-        let r = self.inner.write_batch_reported(records).await?;
-        self.account(r.accepted as u64, bytes);
+        let (res, bytes) = self.admit(records).await?;
+        let r = self.finish_write(self.inner.write_batch_reported(records).await)?;
+        let a = r.accepted as u64;
+        res.settle((a, self.bytes_for(a, records.len() as u64, bytes)));
         Ok(r)
     }
     async fn write_governed(
         &self,
         page: &crate::governance::GovernedPage<'_>,
     ) -> Result<crate::accounting::WriteReport, FaucetError> {
-        let bytes = self.admit(page.records())?;
-        let r = self.inner.write_governed(page).await?;
-        self.account(r.accepted as u64, bytes);
+        let (res, bytes) = self.admit(page.records()).await?;
+        let r = self.finish_write(self.inner.write_governed(page).await)?;
+        let a = r.accepted as u64;
+        res.settle((a, self.bytes_for(a, page.len() as u64, bytes)));
         Ok(r)
     }
     async fn write_batch_partial(&self, records: &[Value]) -> Result<Vec<RowOutcome>, FaucetError> {
-        self.admit(records)?;
-        let outcomes = self.inner.write_batch_partial(records).await?;
+        let (res, _) = self.admit(records).await?;
+        let outcomes = self.finish_write(self.inner.write_batch_partial(records).await)?;
         let ok = outcomes.iter().filter(|o| o.is_ok()).count() as u64;
         let bytes = if self.spec.max_bytes.is_some() {
             records
@@ -453,7 +890,7 @@ impl Sink for BudgetSink {
         } else {
             0
         };
-        self.account(ok, bytes);
+        res.settle((ok, bytes));
         Ok(outcomes)
     }
     #[allow(deprecated)] // drives the 1.x lifecycle hook until faucet-core 2.0 (RFC 0014)
@@ -463,12 +900,16 @@ impl Sink for BudgetSink {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
-        let bytes = self.admit(records)?;
-        let n = self
-            .inner
-            .write_batch_idempotent(records, scope, token)
-            .await?;
-        self.account(n as u64, bytes);
+        let (res, bytes) = self.admit(records).await?;
+        let n = self.finish_write(
+            self.inner
+                .write_batch_idempotent(records, scope, token)
+                .await,
+        )?;
+        res.settle((
+            n as u64,
+            self.bytes_for(n as u64, records.len() as u64, bytes),
+        ));
         Ok(n)
     }
 
@@ -479,12 +920,14 @@ impl Sink for BudgetSink {
         scope: &str,
         token: &str,
     ) -> Result<crate::accounting::WriteReport, FaucetError> {
-        let bytes = self.admit(records)?;
-        let r = self
-            .inner
-            .write_batch_idempotent_reported(records, scope, token)
-            .await?;
-        self.account(r.accepted as u64, bytes);
+        let (res, bytes) = self.admit(records).await?;
+        let r = self.finish_write(
+            self.inner
+                .write_batch_idempotent_reported(records, scope, token)
+                .await,
+        )?;
+        let a = r.accepted as u64;
+        res.settle((a, self.bytes_for(a, records.len() as u64, bytes)));
         Ok(r)
     }
     #[cfg(feature = "arrow")]
@@ -497,11 +940,17 @@ impl Sink for BudgetSink {
         let n = batch.num_rows() as u64;
         let bytes = crate::columnar::batch_slice_bytes(batch);
         if let Some(v) = self.state.verdict() {
-            return Err(v.error());
+            return Err(self.refused(v));
         }
-        self.check_ceilings(n, bytes)?;
+        if let Err(e) = self.state.reserve(&self.spec, n, bytes).await {
+            return Err(self.reserve_failed(e));
+        }
+        let res = Reservation {
+            state: &self.state,
+            reserved: (n, bytes),
+        };
         let written = self.inner.write_batch_columnar(batch).await?;
-        self.account(written as u64, bytes);
+        res.settle((written as u64, self.bytes_for(written as u64, n, bytes)));
         Ok(written)
     }
 }
@@ -887,7 +1336,7 @@ mod tests {
             BudgetSpec::default(),
             CancellationToken::new(),
         );
-        assert!(t.0.is_none());
+        assert!(t.0.is_empty());
         assert!(st.verdict().is_none());
     }
 
@@ -1047,5 +1496,268 @@ mod tests {
             + crate::usage::estimate_json_bytes(&records[2]);
         assert_eq!(state.bytes(), accepted);
         assert!(state.bytes() < estimate_page_bytes(&records));
+    }
+
+    fn records_spec(max: u64) -> BudgetSpec {
+        BudgetSpec {
+            max_records: Some(max),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_invocations_never_overshoot_the_run() {
+        let state = Arc::new(BudgetState::for_run(
+            &records_spec(100),
+            std::time::SystemTime::now(),
+        ));
+        let landed = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let sink = BudgetSink::wrap_shared(
+                Box::new(SharedCount(Arc::clone(&landed))),
+                records_spec(100),
+                Arc::clone(&state),
+                CancellationToken::new(),
+            );
+            tasks.push(tokio::spawn(async move {
+                let mut ok = 0;
+                for _ in 0..10 {
+                    if sink.write_batch(&page(3)).await.is_ok() {
+                        ok += 3;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                ok
+            }));
+        }
+        let mut accepted = 0;
+        for t in tasks {
+            accepted += t.await.unwrap();
+        }
+        assert!(accepted <= 100, "{accepted}");
+        assert_eq!(landed.load(Ordering::Relaxed), accepted);
+        assert_eq!(state.records(), accepted as u64);
+        assert!(state.verdict().is_some());
+    }
+
+    struct FailsOnce(AtomicUsize);
+    #[async_trait]
+    impl Sink for FailsOnce {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Err(FaucetError::Sink("transient".into()));
+            }
+            Ok(records.len())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_gives_its_reservation_back() {
+        let (sink, state, _t) = BudgetSink::wrap(
+            Box::new(FailsOnce(AtomicUsize::new(0))),
+            records_spec(4),
+            CancellationToken::new(),
+        );
+        assert!(sink.write_batch(&page(4)).await.is_err());
+        assert_eq!(state.records(), 0);
+        assert_eq!(
+            sink.write_batch(&page(4)).await.unwrap(),
+            4,
+            "the retry fits"
+        );
+        assert_eq!(state.records(), 4);
+        assert!(state.verdict().is_none());
+        // A page admitted whole and then failed releases its prepaid rows.
+        let (sink, state, _t) = BudgetSink::wrap(
+            Box::new(FailsOnce(AtomicUsize::new(0))),
+            records_spec(4),
+            CancellationToken::new(),
+        );
+        sink.admit_page(&page(4)).await.unwrap();
+        assert!(sink.write_batch(&page(2)).await.is_err());
+        sink.admit_page(&page(4)).await.unwrap();
+        assert_eq!(sink.write_batch(&page(4)).await.unwrap(), 4);
+        assert_eq!(state.records(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_byte_refusal_reserves_no_records() {
+        let spec = BudgetSpec {
+            max_records: Some(10),
+            max_bytes: Some(1),
+            ..Default::default()
+        };
+        let (sink, state, _t) = BudgetSink::wrap(
+            Box::new(CountingSink(AtomicUsize::new(0))),
+            spec,
+            CancellationToken::new(),
+        );
+        let e = sink.write_batch(&page(1)).await.unwrap_err();
+        assert!(e.to_string().contains("max_bytes"), "{e}");
+        assert_eq!(state.counters().reserved_records, 0);
+        assert_eq!(state.records(), 0);
+    }
+
+    #[derive(Default)]
+    struct Ledger {
+        granted: Mutex<u64>,
+        returned: Mutex<Vec<u64>>,
+        calls: AtomicUsize,
+        max: u64,
+    }
+    #[async_trait]
+    impl BudgetLedger for Ledger {
+        async fn grant(&self, records: u64, _bytes: u64) -> Result<BudgetGrant, FaucetError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut g = self.granted.lock().unwrap();
+            let r = records.min(self.max - *g);
+            *g += r;
+            Ok(BudgetGrant::new(r, 0, *g, 0))
+        }
+        async fn give_back(&self, records: u64, _bytes: u64) -> Result<(), FaucetError> {
+            *self.granted.lock().unwrap() -= records;
+            self.returned.lock().unwrap().push(records);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ledger_backed_budget_draws_in_chunks_and_gives_back_once() {
+        let ledger = Arc::new(Ledger {
+            max: 640,
+            ..Default::default()
+        });
+        let state = Arc::new(
+            BudgetState::for_run(&records_spec(640), std::time::SystemTime::now())
+                .with_ledger(ledger.clone()),
+        );
+        let sink = BudgetSink::wrap_shared(
+            Box::new(CountingSink(AtomicUsize::new(0))),
+            records_spec(640),
+            Arc::clone(&state),
+            CancellationToken::new(),
+        );
+        for _ in 0..5 {
+            sink.write_batch(&page(2)).await.unwrap();
+        }
+        assert_eq!(ledger.calls.load(Ordering::Relaxed), 1, "one chunk of 10");
+        assert_eq!(*ledger.granted.lock().unwrap(), 10);
+        sink.write_batch(&page(1)).await.unwrap();
+        assert_eq!(ledger.calls.load(Ordering::Relaxed), 2);
+        state.close().await;
+        state.close().await;
+        assert_eq!(*ledger.returned.lock().unwrap(), vec![9]);
+        assert_eq!(*ledger.granted.lock().unwrap(), 11);
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_ledger_refuses_the_page() {
+        let ledger = Arc::new(Ledger {
+            max: 3,
+            ..Default::default()
+        });
+        let state = Arc::new(
+            BudgetState::for_run(&records_spec(3), std::time::SystemTime::now())
+                .with_ledger(ledger),
+        );
+        let sink = BudgetSink::wrap_shared(
+            Box::new(CountingSink(AtomicUsize::new(0))),
+            records_spec(3),
+            Arc::clone(&state),
+            CancellationToken::new(),
+        );
+        sink.write_batch(&page(2)).await.unwrap();
+        let e = sink.write_batch(&page(2)).await.unwrap_err();
+        assert!(e.to_string().contains("max_records"), "{e}");
+        assert_eq!(state.verdict().unwrap().actual, 4);
+        assert!(state.stopped().is_cancelled());
+    }
+
+    struct Unreachable;
+    #[async_trait]
+    impl BudgetLedger for Unreachable {
+        async fn grant(&self, _: u64, _: u64) -> Result<BudgetGrant, FaucetError> {
+            Err(FaucetError::State("history unavailable".into()))
+        }
+        async fn give_back(&self, _: u64, _: u64) -> Result<(), FaucetError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_ledger_fails_the_write_without_a_verdict() {
+        let state = Arc::new(
+            BudgetState::for_run(&records_spec(3), std::time::SystemTime::now())
+                .with_ledger(Arc::new(Unreachable)),
+        );
+        let sink = BudgetSink::wrap_shared(
+            Box::new(CountingSink(AtomicUsize::new(0))),
+            records_spec(3),
+            Arc::clone(&state),
+            CancellationToken::new(),
+        );
+        let e = sink.write_batch(&page(1)).await.unwrap_err();
+        assert!(e.to_string().contains("history unavailable"), "{e}");
+        assert!(state.verdict().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_invocation_starting_after_the_run_deadline_is_stopped_at_once() {
+        let spec = BudgetSpec {
+            max_duration_secs: Some(1),
+            ..Default::default()
+        };
+        let started = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
+        let state = Arc::new(BudgetState::for_run(&spec, started));
+        let cancel = CancellationToken::new();
+        let stop = Arc::new(BudgetStop::default());
+        let _t = BudgetTimer::start_run(Arc::clone(&state), cancel.clone(), Arc::clone(&stop));
+        tokio::time::timeout(std::time::Duration::from_secs(5), cancel.cancelled())
+            .await
+            .unwrap();
+        assert_eq!(state.verdict().unwrap().kind, BudgetKind::Duration);
+        assert_eq!(state.verdict().unwrap().limit, 1);
+        assert!(stop.finish());
+    }
+
+    #[tokio::test]
+    async fn a_spent_run_stops_every_running_invocation_but_not_a_finished_one() {
+        let state = Arc::new(BudgetState::for_run(
+            &records_spec(5),
+            std::time::SystemTime::now(),
+        ));
+        let finished = Arc::new(BudgetStop::default());
+        let _f = BudgetTimer::start_run(
+            Arc::clone(&state),
+            CancellationToken::new(),
+            Arc::clone(&finished),
+        );
+        assert!(
+            !finished.finish(),
+            "it completed before the budget was spent"
+        );
+        let running_cancel = CancellationToken::new();
+        let running = Arc::new(BudgetStop::default());
+        let _r = BudgetTimer::start_run(
+            Arc::clone(&state),
+            running_cancel.clone(),
+            Arc::clone(&running),
+        );
+        let sink = BudgetSink::wrap_shared(
+            Box::new(CountingSink(AtomicUsize::new(0))),
+            records_spec(5),
+            Arc::clone(&state),
+            CancellationToken::new(),
+        );
+        assert!(sink.write_batch(&page(6)).await.is_err());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            running_cancel.cancelled(),
+        )
+        .await
+        .unwrap();
+        assert!(running.finish());
+        assert!(!finished.was_stopped());
     }
 }

@@ -42,9 +42,32 @@ fn wrapped(value: Value) -> Map<String, Value> {
     record
 }
 
+/// A URL-encoded form as an object: a key sent once maps to its string, a
+/// key sent more than once to an array of its strings in arrival order.
+/// Names are literal (`tag[]` is the key `tag[]`).
+pub(crate) fn form_record(payload: &[u8]) -> Map<String, Value> {
+    let mut record = Map::new();
+    for (k, v) in url::form_urlencoded::parse(payload) {
+        let v = Value::String(v.into_owned());
+        match record.get_mut(k.as_ref()) {
+            None => {
+                record.insert(k.into_owned(), v);
+            }
+            Some(Value::Array(values)) => values.push(v),
+            Some(first) => {
+                let first = std::mem::take(first);
+                record.insert(k.into_owned(), Value::Array(vec![first, v]));
+            }
+        }
+    }
+    record
+}
+
 /// One event's `payload` (already opened when it was sealed) as a record:
 /// a JSON object as it is; any other JSON value, text and bytes (base64)
-/// under `value`; a URL-encoded form as an object of strings.
+/// under `value`; a URL-encoded form as an object of strings (an array of
+/// strings for a repeated key). A payload holding a top-level `_feed` field
+/// is refused: that key is reserved for the feed's metadata.
 pub(crate) fn record(
     feed: &FeedUid,
     event: &StoredEvent,
@@ -65,15 +88,18 @@ pub(crate) fn record(
                 other => wrapped(other),
             }
         }
-        Kind::Form => url::form_urlencoded::parse(payload)
-            .map(|(k, v)| (k.into_owned(), Value::String(v.into_owned())))
-            .collect(),
+        Kind::Form => form_record(payload),
         Kind::Text => match std::str::from_utf8(payload) {
             Ok(text) => wrapped(Value::String(text.to_string())),
             Err(e) => return Err(undecodable(e.to_string())),
         },
         Kind::Bytes => wrapped(fidelity::binary(payload)),
     };
+    if record.contains_key(METADATA_KEY) {
+        return Err(undecodable(format!(
+            "the payload has a field named \"{METADATA_KEY}\", which is reserved for the feed's metadata"
+        )));
+    }
     if include_metadata {
         record.insert(METADATA_KEY.to_string(), metadata(event));
     }
@@ -199,6 +225,56 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_form_key_keeps_every_value_in_order() {
+        let form = "application/x-www-form-urlencoded";
+        assert_eq!(
+            decode(
+                form,
+                b"tag=a&x=1&tag=b+c&tag=%26&x=&solo=s&tag[]=1&a[b]=2&bare"
+            )
+            .unwrap(),
+            json!({
+                "tag": ["a", "b c", "&"],
+                "x": ["1", ""],
+                "solo": "s",
+                "tag[]": "1",
+                "a[b]": "2",
+                "bare": ""
+            })
+        );
+        assert_eq!(decode(form, b"a=&a=x").unwrap(), json!({"a": ["", "x"]}));
+        assert_eq!(decode(form, b"k=1").unwrap(), json!({"k": "1"}));
+    }
+
+    #[test]
+    fn a_stored_payload_holding_the_metadata_key_is_refused() {
+        for (content_type, payload) in [
+            ("application/json", &br#"{"_feed": 1, "id": 2}"#[..]),
+            ("application/json", br#"{"\u005ffeed": 1}"#),
+            ("application/x-www-form-urlencoded", b"a=1&%5Ffeed=x"),
+        ] {
+            for include_metadata in [false, true] {
+                let e = event(content_type, payload);
+                let err = record(
+                    &FeedUid::new("orders").unwrap(),
+                    &e,
+                    &e.payload,
+                    include_metadata,
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(&err, FeedSourceError::Undecodable { reason, .. } if reason.contains("reserved")),
+                    "{content_type}: {err}"
+                );
+            }
+        }
+        assert_eq!(
+            decode("application/json", br#"{"a": {"_feed": 1}}"#).unwrap(),
+            json!({"a": {"_feed": 1}})
+        );
+    }
+
+    #[test]
     fn a_payload_that_contradicts_its_type_is_a_typed_error() {
         let err = decode("application/json", b"{not json").unwrap_err();
         assert!(
@@ -211,7 +287,7 @@ mod tests {
 
     #[test]
     fn metadata_is_added_under_its_key() {
-        let e = event("application/json", br#"{"id": 1, "_feed": "theirs"}"#);
+        let e = event("application/json", br#"{"id": 1}"#);
         let out = record(&FeedUid::new("orders").unwrap(), &e, &e.payload, true).unwrap();
         assert_eq!(
             out,

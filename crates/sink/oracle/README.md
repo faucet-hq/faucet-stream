@@ -78,6 +78,10 @@ A target that **other** tables reference through an enabled foreign key is refus
 
 `current_schema()` reads `ALL_TAB_COLS` (`NUMBER(p,0)` → integer, `NUMBER(1,0)` → boolean-or-integer, other numerics → number, everything else → string; text, `CLOB` and `JSON` columns — where objects and arrays land as JSON text — also accept object and array fields, so nested data is not reported as drift). `evolve_schema` adds columns (`ALTER TABLE … ADD`), widens integer columns to `NUMBER`, and relaxes `NOT NULL`; each step is idempotent. Oracle cannot change a text column's type in place, so other widenings are reported as errors.
 
+Field names are matched to columns as the write path matches them: the exact name, else the field's upper-case form when it names an all-upper-case column, so `id` against an unquoted `ID` column is not reported as drift.
+
+In `json_column` mode each record lands whole in one column, so there is no per-field schema: `current_schema()` is `None`, the sink declares a schemaless report and no schema evolution, and a `schema:` drift policy has nothing to compare — `on_drift: evolve` and keyed write modes are refused at load time, and `ignore` / `warn` / `quarantine` leave records untouched.
+
 ## Dead-letter queue
 
 In `append` / `overwrite` mode, `write_batch_partial` executes array DML in batch-error mode: rows the server rejects, and rows whose values cannot be encoded for their column, are returned as per-row errors while the rest commit. In `upsert` / `delete` mode, rows missing a key are returned as per-row errors and the rest of the page is applied atomically. Connection-level failures fail the page.
@@ -103,7 +107,7 @@ sink.write_batch(&[json!({"ID": 1, "NAME": "a"})]).await?;
 
 ## Capabilities
 
-Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent (exactly-once) writes, keyed upsert and schema evolution with a reported schema. Keyed dedup needs `write_mode: upsert|delete` with a `key`. `faucet list --json` prints the declaration.
+Declares write modes `append` / `upsert` / `delete` / `overwrite`, idempotent (exactly-once) writes, keyed upsert and schema evolution with a reported schema; in `json_column` mode only `append` / `overwrite`, no keyed upsert, no evolution and a schemaless report. Keyed dedup needs `write_mode: upsert|delete` with a `key`. `faucet list --json` prints the declaration.
 
 ## Timeouts, cancellation and retries
 

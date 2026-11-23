@@ -52,6 +52,7 @@ pub mod engine;
 pub mod mapping;
 pub mod overwrite;
 pub mod statement;
+pub mod temporal;
 
 pub use dialect::{SqlDialect, TableTarget};
 pub use driver::{InsertPath, SqlDriver, SqlEvolution, SqlFuture, SqlLayout, SqlSinkDriver};
@@ -65,3 +66,4 @@ pub use overwrite::{
     missing_overwrite_staging_error, referenced_overwrite_error,
 };
 pub use statement::{Param, Statement, StatementKind};
+pub use temporal::{NaiveTemporal, naive_temporal, naive_temporal_text};

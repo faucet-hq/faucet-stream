@@ -29,14 +29,16 @@ mod config;
 mod encode;
 mod layout;
 mod local;
+mod lock;
 mod options;
 #[cfg(feature = "file-format-parquet")]
 mod parquet;
 mod remote;
+mod scratch;
 mod sink;
 mod writer;
 
-pub use backend::{Area, PartStream, StorageBackend};
+pub use backend::{Area, PartStream, SideCreate, StorageBackend};
 pub use config::WriteConfig;
 pub use layout::{
     BODY_SUFFIX, NameTemplate, PART_WIDTH, SCRATCH_ROLES, SWAP_PREFIX, SWAP_RUN_SEPARATOR,
@@ -44,6 +46,8 @@ pub use layout::{
     is_unfinished_output_path, upload_scratch_key,
 };
 pub use local::LocalBackend;
+#[doc(hidden)]
+pub use lock::{LockTimings, set_lock_timings};
 pub use options::{
     DEFAULT_ROW_GROUP_SIZE, FileWriteMode, IfExists, JsonLinesOptions, PART_TOKEN, ParquetCodec,
     ParquetField, ParquetOptions, ParquetType, validate_parquet,

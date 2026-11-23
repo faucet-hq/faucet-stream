@@ -48,6 +48,61 @@ fn rec(id: &str, status: RunStatus, submitted: chrono::DateTime<Utc>) -> RunReco
 
 /// `insert_new` claims an id once: a second insert of the same id is refused
 /// and leaves the first record in place.
+/// The run budget ledger of a sharded run: concurrent grants from two
+/// connections never pass the ceiling, given-back allowance is granted
+/// again, and the row goes with its run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_budget_grants_never_pass_the_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = std::sync::Arc::new(store(&dir, "budget.db").await);
+    let b =
+        std::sync::Arc::new(store_with(&dir, "budget.db", Duration::from_secs(3600), "b").await);
+    let mut tasks = Vec::new();
+    for i in 0..8 {
+        let h = if i % 2 == 0 { a.clone() } else { b.clone() };
+        tasks.push(tokio::spawn(async move {
+            let mut got = 0;
+            for _ in 0..10 {
+                got += h
+                    .budget_grant("run", (7, 100), (Some(100), None))
+                    .await
+                    .unwrap()
+                    .records;
+            }
+            got
+        }));
+    }
+    let mut total = 0;
+    for t in tasks {
+        total += t.await.unwrap();
+    }
+    assert_eq!(total, 100);
+    assert_eq!(a.budget_spent("run").await.unwrap(), Some((100, 8_000)));
+    let g = a
+        .budget_grant("run", (5, 0), (Some(100), None))
+        .await
+        .unwrap();
+    assert_eq!((g.records, g.total_records), (0, 100));
+    a.budget_give_back("run", 30, 8_000).await.unwrap();
+    let g = a
+        .budget_grant("run", (50, 10), (Some(100), Some(5)))
+        .await
+        .unwrap();
+    assert_eq!((g.records, g.bytes, g.total_records), (30, 5, 100));
+    assert_eq!(a.budget_spent("other").await.unwrap(), None);
+
+    a.upsert(&rec("run", RunStatus::Completed, Utc::now()))
+        .await
+        .unwrap();
+    assert_eq!(a.delete("run").await.unwrap(), DeleteOutcome::Deleted);
+    assert_eq!(a.budget_spent("run").await.unwrap(), None);
+    a.budget_grant("orphan", (1, 0), (Some(5), None))
+        .await
+        .unwrap();
+    a.purge_expired(Duration::from_secs(3600)).await.unwrap();
+    assert_eq!(a.budget_spent("orphan").await.unwrap(), None);
+}
+
 #[tokio::test]
 async fn insert_new_claims_an_id_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -481,6 +536,7 @@ async fn server_with_sqlite_history_persists_runs() {
         preview_default_rows: 500,
         preview_max_rows: 5_000,
         lease_ttl_secs: 30,
+        metrics_idle_timeout_secs: 86_400,
         probe_timeout_secs: 5,
         env_file: None,
         no_env_file: true,
@@ -865,6 +921,7 @@ async fn membership_heartbeat_and_liveness() {
         state_format: faucet_core::state_version::STATE_FORMAT,
         pools: faucet_cli::serve::pools::default_only(),
         capabilities: vec!["policy_pin".into()],
+        clock_offset_ms: Some(-42),
     };
     a.heartbeat_instance(&beat(1)).await.unwrap();
     b.heartbeat_instance(&beat(0)).await.unwrap();
@@ -876,6 +933,10 @@ async fn membership_heartbeat_and_liveness() {
     assert!(
         live.iter().all(|m| m.has("policy_pin")),
         "capabilities round-trip"
+    );
+    assert!(
+        live.iter().all(|m| m.clock_offset_ms == Some(-42)),
+        "clock offset round-trips"
     );
     // A zero-window liveness query sees nobody (all heartbeats are "old").
     let none = a.live_instances(std::time::Duration::ZERO).await.unwrap();
@@ -982,7 +1043,7 @@ mod templates {
     };
     use faucet_cli::serve::load::ConfigFormat;
 
-    fn draft(id: &str, description: Option<&str>) -> TemplateDraft {
+    pub(super) fn draft(id: &str, description: Option<&str>) -> TemplateDraft {
         TemplateDraft {
             id: TemplateId::parse(id).unwrap(),
             name: Some(id.to_string()),
@@ -1077,6 +1138,32 @@ mod templates {
         assert_eq!(
             (st.stable, st.previous, st.newest),
             (Some(3), Some(1), Some(3))
+        );
+
+        // A conditional launch moves the live version only from the one it
+        // expects; a mismatch writes nothing.
+        let raced = s
+            .template_launch_expecting("orders", 2, None, None, Some(Some(1)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                raced,
+                faucet_cli::serve::history::HistoryError::LaunchRaced {
+                    expected: Some(1),
+                    found: Some(3),
+                    ..
+                }
+            ),
+            "{raced:?}"
+        );
+        assert_eq!(s.template_launches("orders").await.unwrap().len(), 2);
+        assert_eq!(
+            s.template_launch_expecting("orders", 3, None, None, Some(Some(1)))
+                .await
+                .unwrap(),
+            None,
+            "the expected-but-already-live version is a no-op, not a race"
         );
 
         // The log is append-only and newest-first, with provenance.
@@ -2719,4 +2806,330 @@ async fn schedules_round_trip_through_sqlite() {
     h.tenant_upsert(&tenant).await.unwrap();
     assert!(h.tenant_delete("acme").await.unwrap());
     assert!(h.schedule_get("acme-nightly").await.unwrap().is_none());
+}
+
+/// Leases and expiry use the database's clock: a lease the database still
+/// sees as live is never reclaimed, whatever this process's clock says, and a
+/// lease its owner wrote on its own clock (a member that does not advertise
+/// database-clock leases) gets one extra lease TTL before it counts as expired.
+#[tokio::test]
+async fn leases_and_expiry_follow_the_database_clock() {
+    use faucet_cli::serve::history::sql::fmt_ts;
+    use sqlx::Connection as _;
+    let dir = tempfile::tempdir().unwrap();
+    let ttl = Duration::from_secs(30);
+    let h = store_with(&dir, "dbclock.db", ttl, "inst-a").await;
+    let db = h.db_now().await.unwrap();
+    assert!((db - Utc::now()).num_seconds().abs() < 5, "{db}");
+    h.heartbeat_instance(&InstanceHeartbeat {
+        started_at: Utc::now(),
+        listen: None,
+        max_concurrent: 1,
+        in_flight: 0,
+        state_format: faucet_core::state_version::STATE_FORMAT,
+        pools: faucet_cli::serve::pools::default_only(),
+        capabilities: faucet_cli::serve::history::INSTANCE_CAPABILITIES
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect(),
+        clock_offset_ms: Some(0),
+    })
+    .await
+    .unwrap();
+    for id in ["new-owner", "old-owner"] {
+        let mut r = rec(id, RunStatus::Running, Utc::now());
+        r.config_body = Some("version: 1".into());
+        h.upsert(&r).await.unwrap();
+    }
+    let url = format!("sqlite:{}", dir.path().join("dbclock.db").display());
+    let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+    let set = |id: &'static str, owner: &'static str, lease: chrono::DateTime<Utc>| {
+        (
+            "UPDATE faucet_serve_runs SET owner = ?, lease_expires_at = ? WHERE run_id = ?",
+            owner,
+            fmt_ts(lease),
+            id,
+        )
+    };
+    let secs = ChronoDuration::seconds;
+    for (sql, owner, lease, id) in [
+        set("new-owner", "inst-a", db + secs(3600)),
+        set("old-owner", "inst-old", db - secs(1)),
+    ] {
+        sqlx::query(sql)
+            .bind(owner)
+            .bind(lease)
+            .bind(id)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    let rep = h.reclaim_orphans(3).await.unwrap();
+    assert_eq!(
+        (rep.requeued, rep.failed),
+        (0, 0),
+        "a database-clock lease still live, and an old owner inside its grace"
+    );
+    for (sql, owner, lease, id) in [
+        set("new-owner", "inst-a", db - secs(1)),
+        set("old-owner", "inst-old", db - secs(31)),
+    ] {
+        sqlx::query(sql)
+            .bind(owner)
+            .bind(lease)
+            .bind(id)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    let rep = h.reclaim_orphans(3).await.unwrap();
+    assert_eq!((rep.requeued, rep.failed), (2, 0));
+
+    // Idempotency claims expire on the database's clock too.
+    let window = Duration::from_secs(60);
+    assert!(matches!(
+        h.claim_idempotency("k", "fp", "run-1", window)
+            .await
+            .unwrap(),
+        Claim::Fresh
+    ));
+    let age = |s: i64| fmt_ts(db - secs(s));
+    sqlx::query("UPDATE faucet_serve_idem SET claimed_at = ? WHERE key = 'k'")
+        .bind(age(30))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert!(matches!(
+        h.claim_idempotency("k", "fp", "run-2", window).await.unwrap(),
+        Claim::Replay(r) if r == "run-1"
+    ));
+    sqlx::query("UPDATE faucet_serve_idem SET claimed_at = ? WHERE key = 'k'")
+        .bind(age(120))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert!(matches!(
+        h.claim_idempotency("k", "fp", "run-3", window)
+            .await
+            .unwrap(),
+        Claim::Fresh
+    ));
+}
+
+/// A v9 database (no run-budget ledger, no clock-offset column) migrates to
+/// v10: both are added, a member's clock offset round-trips, and the database
+/// stays readable by v9 binaries.
+#[tokio::test]
+async fn a_v9_database_gains_the_v10_table_and_column() {
+    use sqlx::Connection as _;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v9.db");
+    let url = format!("sqlite:{}?mode=rwc", path.display());
+    {
+        let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        for stmt in [
+            "CREATE TABLE faucet_serve_schema (id TEXT PRIMARY KEY, version TEXT NOT NULL)",
+            "INSERT INTO faucet_serve_schema VALUES ('schema', '9'), ('min_readable', '6')",
+            "CREATE TABLE faucet_serve_instance_caps (instance_id TEXT PRIMARY KEY, \
+             state_format TEXT NOT NULL, pools TEXT, capabilities TEXT)",
+            "INSERT INTO faucet_serve_instance_caps VALUES ('old', '1', NULL, 'policy_pin')",
+        ] {
+            sqlx::query(stmt).execute(&mut conn).await.unwrap();
+        }
+        conn.close().await.unwrap();
+    }
+    let store = SqliteHistory::connect(
+        &format!("sqlite:{}", path.display()),
+        Duration::from_secs(60),
+        Duration::from_secs(30),
+        "i1".into(),
+    )
+    .await
+    .expect("a v9 database migrates");
+    store
+        .heartbeat_instance(&InstanceHeartbeat {
+            started_at: Utc::now(),
+            listen: None,
+            max_concurrent: 1,
+            in_flight: 0,
+            state_format: faucet_core::state_version::STATE_FORMAT,
+            pools: faucet_cli::serve::pools::default_only(),
+            capabilities: vec!["db_clock_leases".into()],
+            clock_offset_ms: Some(250),
+        })
+        .await
+        .unwrap();
+    let live = store.live_instances(Duration::from_secs(60)).await.unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].clock_offset_ms, Some(250));
+    let mut conn = sqlx::SqliteConnection::connect(&url).await.unwrap();
+    let (version,): (String,) =
+        sqlx::query_as("SELECT version FROM faucet_serve_schema WHERE id='schema'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(version, "10");
+    let (readable,): (String,) =
+        sqlx::query_as("SELECT version FROM faucet_serve_schema WHERE id='min_readable'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!(readable, "6", "v9 binaries keep reading it");
+    let old: Option<String> = sqlx::query_scalar(
+        "SELECT clock_offset_ms FROM faucet_serve_instance_caps WHERE instance_id='old'",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(old, None, "an old member's row reads as not reported");
+    let budgets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM faucet_serve_run_budgets")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(budgets, 0);
+}
+
+/// A claimed run starts only while this instance owns it and it is running.
+#[tokio::test]
+async fn start_owned_is_fenced_on_owner_and_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = store_with(&dir, "start.db", Duration::from_secs(30), "inst-a").await;
+    let b = store_with(&dir, "start.db", Duration::from_secs(30), "inst-b").await;
+    let mut r = rec("r", RunStatus::Running, Utc::now());
+    a.upsert(&r).await.unwrap();
+    r.started_at = Some(Utc::now());
+    assert!(a.start_owned(&r).await.unwrap());
+    assert!(!b.start_owned(&r).await.unwrap(), "a peer's run");
+    b.upsert(&r).await.unwrap();
+    assert!(!a.start_owned(&r).await.unwrap(), "reclaimed by a peer");
+    let mut pending = rec("p", RunStatus::Pending, Utc::now());
+    a.upsert(&pending).await.unwrap();
+    pending.status = RunStatus::Running;
+    assert!(
+        !a.start_owned(&pending).await.unwrap(),
+        "requeued, not claimed"
+    );
+    assert_eq!(
+        a.get("p").await.unwrap().unwrap().status,
+        RunStatus::Pending
+    );
+}
+
+/// A split is one transaction: the flip and every shard row, or nothing.
+#[tokio::test]
+async fn coordinate_shards_is_one_fenced_transaction() {
+    use faucet_cli::serve::history::{CoordinateOutcome, ShardInsert};
+    let dir = tempfile::tempdir().unwrap();
+    let a = store_with(&dir, "split.db", Duration::from_secs(30), "inst-a").await;
+    let b = store_with(&dir, "split.db", Duration::from_secs(30), "inst-b").await;
+    let shard = |id: &str| ShardInsert {
+        shard_id: id.into(),
+        descriptor: serde_json::json!({ "id": id }),
+        size_estimate: Some(1),
+    };
+    let many: Vec<ShardInsert> = (0..1201).map(|i| shard(&i.to_string())).collect();
+    let mut r = rec("r", RunStatus::Running, Utc::now());
+    a.upsert(&r).await.unwrap();
+    r.status = RunStatus::Sharded;
+
+    // A repeated shard id rolls the whole split back.
+    let dup = [shard("0"), shard("0")];
+    assert!(a.coordinate_shards(&r, &dup).await.is_err());
+    assert_eq!(
+        a.get("r").await.unwrap().unwrap().status,
+        RunStatus::Running
+    );
+    assert_eq!(a.shard_progress("r").await.unwrap().total, 0);
+
+    assert_eq!(
+        b.coordinate_shards(&r, &many).await.unwrap(),
+        CoordinateOutcome::NotOwner
+    );
+    assert_eq!(
+        a.coordinate_shards(&r, &many).await.unwrap(),
+        CoordinateOutcome::Sharded { inserted: 1201 },
+        "more rows than one insert statement takes"
+    );
+    assert_eq!(
+        a.get("r").await.unwrap().unwrap().status,
+        RunStatus::Sharded
+    );
+    assert_eq!(a.shard_progress("r").await.unwrap().total, 1201);
+    assert_eq!(
+        a.coordinate_shards(&r, &[shard("x")]).await.unwrap(),
+        CoordinateOutcome::Sharded { inserted: 0 },
+        "a lost answer to this instance's own split"
+    );
+    assert_eq!(
+        b.coordinate_shards(&r, &[shard("x")]).await.unwrap(),
+        CoordinateOutcome::NotOwner
+    );
+    assert_eq!(a.shard_progress("r").await.unwrap().total, 1201);
+
+    let mut c = rec("c", RunStatus::Running, Utc::now());
+    a.upsert(&c).await.unwrap();
+    a.request_cancel("c").await.unwrap();
+    c.status = RunStatus::Sharded;
+    assert_eq!(
+        a.coordinate_shards(&c, &[shard("0")]).await.unwrap(),
+        CoordinateOutcome::CancelRequested
+    );
+    assert_eq!(a.shard_progress("c").await.unwrap().total, 0);
+
+    // A cancel flagged after the split: the sweep cancels the pending shards.
+    a.request_cancel("r").await.unwrap();
+    let mut s2 = rec("s2", RunStatus::Running, Utc::now());
+    a.upsert(&s2).await.unwrap();
+    s2.status = RunStatus::Sharded;
+    a.coordinate_shards(&s2, &[shard("0"), shard("1")])
+        .await
+        .unwrap();
+    assert_eq!(a.cancel_flagged_shards().await.unwrap(), 0);
+    let mut conn = {
+        use sqlx::Connection as _;
+        sqlx::SqliteConnection::connect(&format!(
+            "sqlite:{}",
+            dir.path().join("split.db").display()
+        ))
+        .await
+        .unwrap()
+    };
+    sqlx::query("UPDATE faucet_serve_runs SET cancel_requested = 'x' WHERE run_id = 's2'")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(a.cancel_flagged_shards().await.unwrap(), 2);
+    assert_eq!(a.shard_progress("s2").await.unwrap().cancelled, 2);
+}
+
+/// Pruning keeps a version a stored schedule pins, on a SQL history.
+#[tokio::test]
+async fn pruning_keeps_a_schedule_pinned_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(&dir, "pins.db").await;
+    let schedule: faucet_cli::serve::history::schedules::ScheduleRecord =
+        serde_json::from_value(serde_json::json!({
+            "id": "s1",
+            "spec": {
+                "name": "nightly",
+                "cron": "0 3 * * *",
+                "template": {"id": "orders", "version": "2"}
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "created_by": "u",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "updated_by": "u",
+            "revision": 1
+        }))
+        .unwrap();
+    assert!(s.schedule_insert(&schedule).await.unwrap());
+    let retain = faucet_cli::serve::history::templates::VERSION_RETAIN as u32;
+    for _ in 0..retain + 3 {
+        s.template_register(&templates::draft("orders", None))
+            .await
+            .unwrap();
+    }
+    let kept = s.template_versions("orders").await.unwrap();
+    assert!(kept.contains(&2), "{kept:?}");
+    assert!(!kept.contains(&1) && !kept.contains(&3), "{kept:?}");
 }

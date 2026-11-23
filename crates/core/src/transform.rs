@@ -1988,17 +1988,18 @@ fn cast_value(v: &Value, target: CastType) -> Result<Value, String> {
                     {
                         Ok(Value::Number((f as i64).into()))
                     }
-                    Some(f) => Err(format!(
-                        "float '{f}' is not a whole number representable as i64"
-                    )),
-                    None => Err(format!("number '{n}' is not representable as i64")),
+                    Some(_) => Err(
+                        "a number with a fractional part, or outside the i64 range, is not representable as i64"
+                            .to_owned(),
+                    ),
+                    None => Err("a number is not representable as i64".to_owned()),
                 }
             }
             Value::String(s) => s
                 .trim()
                 .parse::<i64>()
                 .map(|i| Value::Number(i.into()))
-                .map_err(|e| format!("'{s}' is not an integer: {e}")),
+                .map_err(|e| format!("{} is not an integer: {e}", describe_value(v))),
             Value::Bool(b) => Ok(Value::Number(i64::from(*b).into())),
             Value::Null => Err("null cannot be cast to int".to_owned()),
             Value::Array(_) | Value::Object(_) => {
@@ -2009,13 +2010,13 @@ fn cast_value(v: &Value, target: CastType) -> Result<Value, String> {
             Value::Number(n) => n
                 .as_f64()
                 .and_then(|f| serde_json::Number::from_f64(f).map(Value::Number))
-                .ok_or_else(|| format!("number '{n}' is not representable as f64")),
+                .ok_or_else(|| "a number is not representable as f64".to_owned()),
             Value::String(s) => s
                 .trim()
                 .parse::<f64>()
                 .ok()
                 .and_then(|f| serde_json::Number::from_f64(f).map(Value::Number))
-                .ok_or_else(|| format!("'{s}' is not a float")),
+                .ok_or_else(|| format!("{} is not a float", describe_value(v))),
             Value::Bool(b) => serde_json::Number::from_f64(if *b { 1.0 } else { 0.0 })
                 .map(Value::Number)
                 .ok_or_else(|| "could not encode bool as f64".to_owned()),
@@ -2031,16 +2032,16 @@ fn cast_value(v: &Value, target: CastType) -> Result<Value, String> {
                     match i {
                         0 => Ok(Value::Bool(false)),
                         1 => Ok(Value::Bool(true)),
-                        _ => Err(format!("integer {i} is not 0 or 1")),
+                        _ => Err("the integer is not 0 or 1".to_owned()),
                     }
                 } else {
-                    Err(format!("number '{n}' is not 0 or 1"))
+                    Err("the number is not 0 or 1".to_owned())
                 }
             }
             Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
                 "true" | "1" | "yes" | "y" => Ok(Value::Bool(true)),
                 "false" | "0" | "no" | "n" => Ok(Value::Bool(false)),
-                other => Err(format!("'{other}' is not a recognised boolean")),
+                _ => Err(format!("{} is not a recognised boolean", describe_value(v))),
             },
             Value::Null => Err("null cannot be cast to bool".to_owned()),
             Value::Array(_) | Value::Object(_) => {
@@ -2059,12 +2060,31 @@ fn cast_value(v: &Value, target: CastType) -> Result<Value, String> {
         CastType::Timestamp => match v {
             Value::String(s) => chrono::DateTime::parse_from_rfc3339(s)
                 .map(|dt| Value::String(dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)))
-                .map_err(|e| format!("'{s}' is not a valid RFC 3339 timestamp: {e}")),
+                .map_err(|e| {
+                    format!(
+                        "{} is not a valid RFC 3339 timestamp: {e}",
+                        describe_value(v)
+                    )
+                }),
             other => Err(format!(
                 "cannot cast {} to timestamp (expected RFC 3339 string)",
                 value_type_name(other)
             )),
         },
+    }
+}
+
+/// Names a value's kind (and a string's length) without quoting it, for error text.
+#[cfg(any(feature = "transform-cast", feature = "transform-lookup"))]
+fn describe_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => format!("a string of {} characters", s.chars().count()),
+        Value::Number(n) if n.is_i64() || n.is_u64() => "an integer".to_owned(),
+        Value::Number(_) => "a number".to_owned(),
+        Value::Bool(_) => "a boolean".to_owned(),
+        Value::Null => "null".to_owned(),
+        Value::Array(_) => "an array".to_owned(),
+        Value::Object(_) => "an object".to_owned(),
     }
 }
 
@@ -2399,9 +2419,11 @@ fn lookup_field(
             }
             LookupOnMissing::Keep => {}
             LookupOnMissing::Error => {
+                let found = map
+                    .get(on_record)
+                    .map_or_else(|| "a missing field".to_owned(), describe_value);
                 return Err(FaucetError::Transform(format!(
-                    "lookup: no reference row for {on_record}={:?}",
-                    key.unwrap_or_default()
+                    "lookup: no reference row for {on_record} ({found})"
                 )));
             }
         },
@@ -5611,6 +5633,116 @@ mod tests {
                 }]),
             );
             assert_eq!(out["s"], "");
+        }
+    }
+
+    #[cfg(feature = "transform-cast")]
+    #[test]
+    fn cast_errors_never_quote_the_value() {
+        let sentinels = [
+            json!("SENTINEL-pii@example.com"),
+            json!("4111111111111111"),
+            json!(4_111_111_111_111_111_u64),
+            json!(4_111_111_111_111_111.5),
+            json!(18_446_744_073_709_551_615_u64),
+            json!(-4_111_111_111_111_111_i64),
+            json!(true),
+            json!(null),
+            json!(["SENTINEL-pii@example.com"]),
+            json!({"SENTINEL": "SENTINEL-pii@example.com"}),
+        ];
+        let targets = [
+            CastType::Int,
+            CastType::Float,
+            CastType::Bool,
+            CastType::String,
+            CastType::Timestamp,
+        ];
+        let mut failures = 0;
+        for value in &sentinels {
+            for target in targets {
+                let Err(err) = super::apply_all(
+                    json!({ "f": value }),
+                    &compiled(&cast_specs("f", target, CastOnError::Error)),
+                ) else {
+                    continue;
+                };
+                failures += 1;
+                let text = err.to_string();
+                for needle in [
+                    "SENTINEL",
+                    "pii@example.com",
+                    "4111111111111111",
+                    "18446744073709551615",
+                ] {
+                    assert!(!text.contains(needle), "{target:?} on {value}: {text}");
+                }
+            }
+        }
+        assert!(failures >= 30, "only {failures} failing branches exercised");
+    }
+
+    #[cfg(feature = "transform-cast")]
+    #[test]
+    fn describe_value_names_the_kind_only() {
+        assert_eq!(describe_value(&json!("héllo")), "a string of 5 characters");
+        assert_eq!(describe_value(&json!(7)), "an integer");
+        assert_eq!(describe_value(&json!(u64::MAX)), "an integer");
+        assert_eq!(describe_value(&json!(1.5)), "a number");
+        assert_eq!(describe_value(&json!(false)), "a boolean");
+        assert_eq!(describe_value(&json!(null)), "null");
+        assert_eq!(describe_value(&json!([1])), "an array");
+        assert_eq!(describe_value(&json!({"a": 1})), "an object");
+    }
+
+    #[cfg(feature = "transform-lookup")]
+    #[test]
+    fn lookup_error_names_the_field_not_the_key() {
+        let c = compile(&RecordTransform::Lookup {
+            reference: Vec::new(),
+            on_record: "email".into(),
+            on_ref: "email".into(),
+            add: vec![("x".into(), "y".into())],
+            on_missing: LookupOnMissing::Error,
+        })
+        .unwrap();
+        let err = super::apply_all(
+            json!({"email": "SENTINEL-pii@example.com"}),
+            std::slice::from_ref(&c),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!err.contains("SENTINEL"), "{err}");
+        assert!(err.contains("email (a string of 24 characters)"), "{err}");
+        let err = super::apply_all(json!({}), std::slice::from_ref(&c))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("a missing field"), "{err}");
+    }
+
+    #[cfg(feature = "transform-json-parse")]
+    #[test]
+    fn json_parse_errors_never_quote_the_document() {
+        let bad = [
+            r#"{"a": SENTINEL-pii@example.com}"#,
+            r#"{"a": "SENTINEL-pii@example.com\q"}"#,
+            r#"{"a": -SENTINEL}"#,
+            r#"{"a": 1.SENTINEL}"#,
+            r#"{SENTINEL: 1}"#,
+            r#"{"a": "SENTINEL-pii@example.com"#,
+            r#"["SENTINEL-pii@example.com",]"#,
+            "\"SENTINEL\u{0001}\"",
+            r#"{"a": 1} SENTINEL"#,
+        ];
+        for doc in bad {
+            let err = super::apply_all(
+                json!({ "payload": doc }),
+                &compiled(&json_parse_spec("payload", JsonParseOnError::Error)),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(!err.contains("SENTINEL"), "{doc}: {err}");
+            assert!(err.contains("payload"), "{err}");
         }
     }
 }

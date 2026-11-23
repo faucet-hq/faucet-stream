@@ -145,7 +145,11 @@ Step by step:
 4. **Complete / fail** — the run is marked `completed` or `failed`. The attempt
    count is incremented.
 5. **Failover** — if the owner's lease expires (the instance crashed or stopped
-   heartbeating), a survivor's next lease tick calls `reclaim_orphans`:
+   heartbeating), a survivor's next lease tick calls `reclaim_orphans`.
+   Leases are written and compared on the history database's clock, so a
+   replica whose clock runs ahead never reclaims a live peer's run; keep NTP
+   on all the same, since run timestamps, timeouts and schedule ticks use each
+   replica's own clock (`/readyz` shows each member's `clock_offset_ms`).
    - If `attempt_count < --cluster-max-attempts` → requeued back to `pending`.
    - If `attempt_count >= --cluster-max-attempts` → marked `failed` (poisoned).
 
@@ -158,7 +162,9 @@ the request:
   no coordination needed.
 - **Running on the same instance**: the local cancel token fires immediately;
   flush-completing cancel behaviour (page boundary + sink flush) applies as
-  normal.
+  normal. The cancel is also recorded in the database, so a sharded run's
+  shards on other replicas stop too, and a run being split into shards when
+  the cancel arrives is not split: a cancel takes effect at any point.
 - **Running on a peer instance**: the cancel flag is written to the DB. The
   peer's claim loop picks it up on its next `pending_cancellations` poll (latency
   ≈ `--cluster-poll-secs`, default 2 s) and fires the local cancel token.
@@ -209,6 +215,7 @@ a node that loses its DB connection may report stale counts.
 | `faucet_serve_runs_claimed_total` | counter | Total runs claimed (transitioned from `pending` to `running`) by this instance. |
 | `faucet_serve_runs_reclaimed_total{outcome="requeued"}` | counter | Orphaned runs requeued by this instance after a peer's lease expired. |
 | `faucet_serve_runs_reclaimed_total{outcome="failed"}` | counter | Orphaned runs poisoned after reaching `--cluster-max-attempts`. |
+| `faucet_serve_clock_offset_seconds` | gauge | This replica's clock minus the history database's, measured at each membership heartbeat. Alert `FaucetServeClockSkew` fires above 10 s. |
 | `faucet_serve_runs_pending{pool}` | gauge | Unclaimed cluster runs per execution pool, from the shared history (every member reports the same value). |
 | `faucet_serve_runs_total{status="failed",reason="pool_unavailable"}` | counter | Runs failed by `--pool-wait-timeout-secs`. |
 
@@ -467,8 +474,13 @@ loaded (`faucet validate` reports it too), and every planner caps its shard
 list there.
 
 When a sharded run is submitted, the instance that claims it acts as an
-(ephemeral) **coordinator**: it enumerates the shards and inserts them into the
-shared `faucet_serve_shards` table (idempotently — no leader election). Every
+(ephemeral) **coordinator**: it plans the shards, then marks the run `sharded`
+and inserts every shard row into the shared `faucet_serve_shards` table in one
+transaction, only while it still owns the run (no leader election). A replica
+that lost the run meanwhile writes nothing, so two coordinators never mix two
+shard plans, and a crash before the commit leaves the run `running` for reclaim
+to hand to another replica. Likewise a replica that lost a run's lease while it
+loaded the run's config hands the run over and does not start it. Every
 instance's claim loop then pulls shard rows up to its free capacity, narrows its
 source to that shard, and runs it. The parent run is marked `sharded` and is
 finalized to `completed`/`failed` once every shard is terminal.

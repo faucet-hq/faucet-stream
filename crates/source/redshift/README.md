@@ -60,7 +60,10 @@ are never read.
 ## Type decoding
 
 Integers, floats, booleans, JSON and text map to JSON natively; `NUMERIC` is an
-exact decimal string, timestamps/dates/times are ISO strings, `TIMETZ` keeps its
+exact decimal string, `TIMESTAMPTZ` is RFC 3339 in UTC with six fraction digits
+(`2026-09-18T12:34:56.000000Z`), `TIMESTAMP` and `TIME` carry six fraction
+digits and no offset (the Data API backend spells them the same way), dates are
+`YYYY-MM-DD`, `TIMETZ` keeps its
 offset, `INTERVAL` is an ISO 8601 duration (`P1Y2DT3H1.5S`) and `VARBYTE` is
 base64, and `oid` / `reg*` values are numbers. Any other type is emitted as
 its text form when the server sends it as text, or when its wire form *is* its
@@ -83,6 +86,8 @@ replication:
   column: updated_at
   initial_value: "2026-01-01T00:00:00Z"
 ```
+
+A query that returns two columns with one name (a join's `id`) is refused with `Redshift query returns two columns named "id"`: a record keeps one value per name, so one column would be lost. Alias them (`SELECT a.id AS a_id, b.id AS b_id …`).
 
 ## Redshift Data API
 

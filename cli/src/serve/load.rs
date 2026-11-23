@@ -1963,6 +1963,35 @@ pub fn caller_refusal_target(message: &str) -> Option<&'static str> {
 /// caller-supplied value carries it too. Also recorded under the canonical
 /// spelling of an aliased key (`replication:` → `mirror:`, a row's
 /// `discover:` → `fan_out:`), as the parsed config serialises it.
+/// Who wrote the sink `attributes` of a body loaded with `origin`: a caller's
+/// body is untrusted throughout, a trusted body only where a caller-chosen
+/// value (`caller`: the document and its caller pointers) lies, unless the
+/// server trusts caller attributes.
+fn attribute_trust(
+    origin: BodyOrigin,
+    references: &crate::serve::references::ServeReferencePolicy,
+    caller: Option<(&Value, &crate::params::CallerFields)>,
+) -> crate::config::AttributeTrust {
+    use crate::config::AttributeTrust;
+    if references.trusts_caller_attributes() {
+        return AttributeTrust::Trusted;
+    }
+    if matches!(origin, BodyOrigin::Caller { .. }) {
+        return AttributeTrust::Untrusted;
+    }
+    match caller {
+        Some((doc, fields)) => {
+            let fields = propagate_caller_fields(doc, fields);
+            if fields.is_empty() {
+                AttributeTrust::Trusted
+            } else {
+                AttributeTrust::CallerFields(fields.iter().map(|(p, _)| p.clone()).collect())
+            }
+        }
+        None => AttributeTrust::Trusted,
+    }
+}
+
 fn propagate_caller_fields(
     doc: &Value,
     fields: &crate::params::CallerFields,
@@ -2988,6 +3017,13 @@ pub async fn load_submission_inputs(
         message: e.to_string(),
         details: None,
     })?;
+    cfg.attribute_trust = attribute_trust(
+        origin,
+        references,
+        caller_doc
+            .as_ref()
+            .zip(param_fields.as_ref().or(caller_params.map(|c| c.fields))),
+    );
 
     if origin.confines_sql() {
         confine_sql(&mut cfg);

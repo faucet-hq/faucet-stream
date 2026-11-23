@@ -26,6 +26,8 @@ pub(crate) struct GovernanceSpecs<'a> {
     pub contract: Option<&'a Arc<crate::contract::CompiledContract>>,
     pub schema_drift: Option<&'a crate::drift::SchemaDriftPolicy>,
     pub pipeline: &'a str,
+    /// The pipeline name DLQ envelopes carry (`pipeline` labels metrics).
+    pub envelope_pipeline: &'a str,
     pub row: &'a str,
     /// Only read by the masking/quality/contract label builders, so it is
     /// dead under a build with none of those features.
@@ -112,6 +114,11 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
     use crate::dlq::{DlqReason, build_envelope};
 
     let pipeline_name = specs.pipeline;
+    #[cfg_attr(
+        not(any(feature = "quality", feature = "contract")),
+        allow(unused_variables)
+    )]
+    let envelope_pipeline = specs.envelope_pipeline;
     let row = specs.row;
     let sink_name = specs.sink_name;
 
@@ -155,7 +162,7 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
                         &err,
                         DlqReason::Quality,
                         sink_name,
-                        pipeline_name,
+                        envelope_pipeline,
                         row,
                         qr.page_index,
                     )
@@ -210,7 +217,7 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
                         &err,
                         DlqReason::Contract,
                         sink_name,
-                        pipeline_name,
+                        envelope_pipeline,
                         row,
                         page_index,
                     )
@@ -234,58 +241,67 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
 
     // ── Schema-drift pass ───────────────────────────────────────────────────
     let mut drift_envelopes: Vec<Value> = Vec::new();
-    let (records, drift_abort): (Vec<Value>, Option<FaucetError>) =
-        if let Some(policy) = specs.schema_drift.filter(|_| !records.is_empty()) {
-            // Re-ask while the sink reports none: a target the sink creates on
-            // the first page has a schema from the second page on, and a
-            // cached `None` would leave drift inert for the rest of a first
-            // run (#862 M-054).
-            if !matches!(state.dest_schema_cache, Some(Some(_))) {
-                state.dest_schema_cache = Some(sink.current_schema().await?);
-            }
-            let dest = state.dest_schema_cache.as_ref().and_then(|o| o.as_ref());
-            match dest {
-                None => {
-                    if !state.warned_drift_inert {
-                        tracing::info!(
-                            connector = sink_name,
-                            "schema-drift: sink reports no destination schema yet; \
+    let (records, drift_abort): (Vec<Value>, Option<FaucetError>) = if let Some(policy) =
+        specs.schema_drift.filter(|_| !records.is_empty())
+    {
+        // Re-ask while the sink reports none: a target the sink creates on
+        // the first page has a schema from the second page on, and a
+        // cached `None` would leave drift inert for the rest of a first
+        // run (#862 M-054).
+        if !matches!(state.dest_schema_cache, Some(Some(_))) {
+            state.dest_schema_cache = Some(sink.current_schema().await?);
+        }
+        let dest = state.dest_schema_cache.as_ref().and_then(|o| o.as_ref());
+        match dest {
+            None => {
+                if !state.warned_drift_inert {
+                    tracing::info!(
+                        connector = sink_name,
+                        "schema-drift: sink reports no destination schema yet; \
                              drift handling is inert until it does"
-                        );
-                        state.warned_drift_inert = true;
-                    }
-                    (records, None)
+                    );
+                    state.warned_drift_inert = true;
                 }
-                Some(dest) => {
-                    let inferred = crate::drift::infer_page_schema(dest, &records);
-                    let diff = crate::drift::diff_schema(dest, &inferred, policy.allow_widening);
-                    if diff.is_empty() {
-                        (records, None)
-                    } else {
-                        // The cache may be replaced inside the evolve arm; `dest`
-                        // borrows it, so re-clone before the call to drop the borrow.
-                        let dest_owned = dest.clone();
-                        apply_drift_policy(
-                            policy,
-                            &diff,
-                            &dest_owned,
-                            records,
-                            &page_indices,
-                            sink,
-                            sink_name,
-                            pipeline_name,
-                            row,
-                            &mut state.dest_schema_cache,
-                            &mut drift_envelopes,
-                            &mut state.warned_drift,
-                        )
-                        .await?
-                    }
+                (records, None)
+            }
+            Some(dest) => {
+                let matching = sink.column_matching();
+                let inferred = crate::drift::infer_page_schema_matching(dest, &records, matching);
+                let diff = crate::drift::diff_schema_matching(
+                    dest,
+                    &inferred,
+                    policy.allow_widening,
+                    matching,
+                );
+                if diff.is_empty() {
+                    (records, None)
+                } else {
+                    // The cache may be replaced inside the evolve arm; `dest`
+                    // borrows it, so re-clone before the call to drop the borrow.
+                    let dest_owned = dest.clone();
+                    apply_drift_policy(
+                        policy,
+                        &diff,
+                        &dest_owned,
+                        matching,
+                        records,
+                        &page_indices,
+                        sink,
+                        sink_name,
+                        pipeline_name,
+                        envelope_pipeline,
+                        row,
+                        &mut state.dest_schema_cache,
+                        &mut drift_envelopes,
+                        &mut state.warned_drift,
+                    )
+                    .await?
                 }
             }
-        } else {
-            (records, None)
-        };
+        }
+    } else {
+        (records, None)
+    };
 
     // Merge quality + contract + drift envelopes so the caller writes one batch.
     let mut envelopes = quality_envelopes;
@@ -356,11 +372,13 @@ async fn apply_drift_policy<Si: Sink + ?Sized>(
     policy: &crate::drift::SchemaDriftPolicy,
     diff: &crate::drift::SchemaDiff,
     dest: &Value,
+    matching: crate::ColumnMatching,
     records: Vec<Value>,
     page_indices: &[usize],
     sink: &Si,
     sink_name: &str,
     pipeline_name: &str,
+    envelope_pipeline: &str,
     row: &str,
     dest_schema_cache: &mut Option<Option<Value>>,
     drift_envelopes: &mut Vec<Value>,
@@ -430,18 +448,18 @@ async fn apply_drift_policy<Si: Sink + ?Sized>(
             }),
         )),
         OnDrift::Ignore => {
-            // Drop fields not present in the destination schema.
-            let allowed: std::collections::HashSet<String> = dest
-                .get("properties")
-                .and_then(|p| p.as_object())
-                .map(|m| m.keys().cloned().collect())
-                .unwrap_or_default();
+            // Drop fields that address no destination column under the sink's
+            // matching rule; a case variant of a column is kept for the write
+            // path to map.
+            let columns = crate::drift::destination_columns(dest);
             let trimmed = records
                 .into_iter()
                 .map(|r| match r {
                     Value::Object(map) => Value::Object(
                         map.into_iter()
-                            .filter(|(k, _)| allowed.contains(k))
+                            .filter(|(k, _)| {
+                                crate::columns::column_for_field(k, &columns, matching).is_some()
+                            })
                             .collect(),
                     ),
                     other => other,
@@ -450,8 +468,16 @@ async fn apply_drift_policy<Si: Sink + ?Sized>(
             Ok((trimmed, None))
         }
         OnDrift::Quarantine => {
-            let (kept, env) =
-                quarantine_drift_rows(diff, records, page_indices, sink_name, pipeline_name, row);
+            let (kept, env) = quarantine_drift_rows(
+                diff,
+                dest,
+                matching,
+                records,
+                page_indices,
+                sink_name,
+                envelope_pipeline,
+                row,
+            );
             drift_envelopes.extend(env);
             Ok((kept, None))
         }
@@ -519,10 +545,12 @@ async fn apply_drift_policy<Si: Sink + ?Sized>(
                         };
                         let (kept, env) = quarantine_drift_rows(
                             &incompat_only,
+                            dest,
+                            matching,
                             records,
                             page_indices,
                             sink_name,
-                            pipeline_name,
+                            envelope_pipeline,
                             row,
                         );
                         drift_envelopes.extend(env);
@@ -543,8 +571,11 @@ async fn apply_drift_policy<Si: Sink + ?Sized>(
 /// column absent from the page). All four buckets must be covered: a widening or
 /// droppable-required column written to a *non-evolved* destination is exactly
 /// the silent corruption `quarantine` exists to prevent.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn quarantine_drift_rows(
     diff: &crate::drift::SchemaDiff,
+    dest: &Value,
+    matching: crate::ColumnMatching,
     records: Vec<Value>,
     page_indices: &[usize],
     sink_name: &str,
@@ -567,12 +598,22 @@ pub(crate) fn quarantine_drift_rows(
     // Required destination columns that taint a row by their ABSENCE.
     let required_cols: std::collections::HashSet<&str> =
         diff.droppable_required.iter().map(|s| s.as_str()).collect();
+    let columns = crate::drift::destination_columns(dest);
     let mut kept = Vec::new();
     let mut envelopes = Vec::new();
     for (idx, rec) in records.into_iter().enumerate() {
         let exhibits = rec
             .as_object()
             .map(|m| {
+                // Judge the record as the destination sees it: each written
+                // field under its column's spelling, shadowed twins dropped.
+                let canonical;
+                let m = if matching == crate::ColumnMatching::Exact {
+                    m
+                } else {
+                    canonical = crate::columns::canonical_record(m, &columns, matching);
+                    &canonical
+                };
                 m.keys().any(|k| present_cols.contains(k.as_str()))
                     || typed_cols.iter().any(|(name, dest)| {
                         m.get(*name)
@@ -639,10 +680,12 @@ mod tests {
                 &policy,
                 &diff,
                 &dest,
+                crate::ColumnMatching::Exact,
                 page.clone(),
                 &[0],
                 &Null,
                 "null",
+                "p",
                 "p",
                 "",
                 &mut cache,
@@ -655,5 +698,103 @@ mod tests {
             assert!(abort.is_none());
             assert!(warned, "the warning latch is set once and stays set");
         }
+    }
+
+    fn policy(on_drift: crate::drift::OnDrift) -> crate::drift::SchemaDriftPolicy {
+        crate::drift::SchemaDriftPolicy::compile(&crate::drift::SchemaDriftSpec {
+            on_drift,
+            allow_type_widening: true,
+            on_incompatible: crate::drift::OnIncompatible::Fail,
+            relax_nullability_on_missing: false,
+        })
+    }
+
+    async fn run_drift(
+        on_drift: crate::drift::OnDrift,
+        dest: &Value,
+        page: Vec<Value>,
+        m: crate::ColumnMatching,
+    ) -> (Vec<Value>, Vec<Value>) {
+        let inferred = crate::drift::infer_page_schema_matching(dest, &page, m);
+        let diff = crate::drift::diff_schema_matching(dest, &inferred, true, m);
+        let indices: Vec<usize> = (0..page.len()).collect();
+        let mut envelopes = Vec::new();
+        let (out, abort) = apply_drift_policy(
+            &policy(on_drift),
+            &diff,
+            dest,
+            m,
+            page,
+            &indices,
+            &Null,
+            "null",
+            "p",
+            "p",
+            "",
+            &mut None,
+            &mut envelopes,
+            &mut false,
+        )
+        .await
+        .unwrap();
+        assert!(abort.is_none());
+        (out, envelopes)
+    }
+
+    #[tokio::test]
+    async fn ignore_keeps_a_case_variant_of_a_column() {
+        let dest = json!({"type": "object", "properties": {
+            "id": {"type": "integer"}, "Email": {"type": ["string", "null"]}
+        }});
+        let page = vec![json!({"id": 1, "email": "a@x", "junk": true})];
+        let (out, _) = run_drift(
+            crate::drift::OnDrift::Ignore,
+            &dest,
+            page.clone(),
+            crate::ColumnMatching::CaseInsensitive,
+        )
+        .await;
+        assert_eq!(out, vec![json!({"id": 1, "email": "a@x"})]);
+        let (out, _) = run_drift(
+            crate::drift::OnDrift::Ignore,
+            &dest,
+            page,
+            crate::ColumnMatching::Exact,
+        )
+        .await;
+        assert_eq!(out, vec![json!({"id": 1})]);
+    }
+
+    #[tokio::test]
+    async fn quarantine_judges_rows_through_the_matching_rule() {
+        let dest = json!({"type": "object", "properties": {
+            "ID": {"type": "integer"}, "EMAIL": {"type": "string"}
+        }});
+        let page = vec![
+            json!({"id": 1, "email": "a@x"}),
+            json!({"id": 2}),
+            json!({"id": 3, "email": "c@x", "extra": 1}),
+        ];
+        let (kept, env) = run_drift(
+            crate::drift::OnDrift::Quarantine,
+            &dest,
+            page,
+            crate::ColumnMatching::UpperFold,
+        )
+        .await;
+        assert_eq!(
+            kept,
+            vec![json!({"id": 1, "email": "a@x"}), json!({"id": 2})]
+        );
+        assert_eq!(env.len(), 1, "only the row with a field no column takes");
+        let (kept, env) = run_drift(
+            crate::drift::OnDrift::Quarantine,
+            &dest,
+            vec![json!({"id": 4})],
+            crate::ColumnMatching::UpperFold,
+        )
+        .await;
+        assert!(kept.is_empty(), "a page without the required EMAIL");
+        assert_eq!(env.len(), 1);
     }
 }

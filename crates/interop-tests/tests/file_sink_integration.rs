@@ -40,6 +40,16 @@ fn sink(v: Value) -> FileSink {
     FileSink::new(serde_json::from_value(v).unwrap()).unwrap()
 }
 
+/// The entries a reader sees: without the writer's lock side files and the
+/// scratch directories of live writers.
+fn visible(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| !n.ends_with(".commits") && !n.contains(".scratch-"))
+        .collect()
+}
+
 fn p(dir: &Path, rel: &str) -> String {
     format!("{}/{rel}", dir.display())
 }
@@ -162,7 +172,7 @@ async fn parquet_rollover_and_schema_widening() {
     }));
     let (_server, src) = rest(7).await;
     Pipeline::new(&src, &rolled).run().await.unwrap();
-    assert_eq!(std::fs::read_dir(dir.path().join("r")).unwrap().count(), 3);
+    assert_eq!(visible(&dir.path().join("r")).len(), 3);
 }
 
 /// A source that stalls forever after its first page, like a run that is
@@ -208,7 +218,20 @@ async fn a_killed_run_leaves_no_final_file_and_a_resumed_run_completes_it() {
     // A hard kill never runs destructors.
     std::mem::forget(s);
     assert!(!Path::new(&out).exists(), "no final file after a kill");
-    assert!(Path::new(&format!("{out}.faucet-tmp")).exists());
+    let scratch: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".faucet-overwrite-k.jsonl.scratch-")
+        })
+        .map(|e| e.path().join("k.jsonl.faucet-tmp"))
+        .collect();
+    assert!(
+        scratch.len() == 1 && scratch[0].exists(),
+        "the killed run's rows stay in its scratch file: {scratch:?}"
+    );
 
     let (_server, src) = rest(3).await;
     Pipeline::new(&src, &sink(json!({ "path": out })))
@@ -230,13 +253,10 @@ async fn overwrite_run_replaces_atomically_and_a_failed_one_changes_nothing() {
     });
     let (_s1, src) = rest(5).await;
     Pipeline::new(&src, &sink(cfg.clone())).run().await.unwrap();
-    assert_eq!(std::fs::read_dir(dir.path().join("o")).unwrap().count(), 3);
+    assert_eq!(visible(&dir.path().join("o")).len(), 3);
     let (_s2, src) = rest(3).await;
     Pipeline::new(&src, &sink(cfg.clone())).run().await.unwrap();
-    let names: Vec<String> = std::fs::read_dir(dir.path().join("o"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .collect();
+    let names = visible(&dir.path().join("o"));
     assert_eq!(names.len(), 2, "{names:?}");
     let before = faucet_source_file::read_records(p(dir.path(), "o/"))
         .await
@@ -259,7 +279,7 @@ async fn overwrite_run_replaces_atomically_and_a_failed_one_changes_nothing() {
         .await
         .unwrap();
     assert_eq!(after, before);
-    assert_eq!(std::fs::read_dir(dir.path().join("o")).unwrap().count(), 2);
+    assert_eq!(visible(&dir.path().join("o")).len(), 2);
 }
 
 #[tokio::test]

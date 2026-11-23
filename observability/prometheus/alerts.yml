@@ -299,6 +299,19 @@ groups:
             fail, this instance cancels its own runs before their leases
             expire, and /readyz is reporting 503 until the database answers.
 
+      - alert: FaucetServeClockSkew
+        expr: abs(faucet_serve_clock_offset_seconds) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "faucet serve instance's clock is {{ $value }}s off the history database's"
+          description: >
+            This replica's clock differs from the run-history database's by
+            more than 10 seconds. Leases and failover use the database's clock
+            and are unaffected, but run timestamps, timeouts and schedule ticks
+            use this one. Check NTP on the replica (and on the database host).
+
       - alert: FaucetServePoolStarved
         expr: min by (pool) (faucet_serve_runs_pending) > 0
         for: 15m
@@ -490,6 +503,33 @@ groups:
             A delivery's bookmark and the feed store disagree (the store was
             probably restored from a backup). Nothing is delivered or skipped
             until an admin recovers the delivery.
+
+      - alert: FaucetFeedMaintenanceBehind
+        expr: faucet_feed_maintenance_behind == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "feed {{ $labels.feed }}'s retention is not keeping up"
+          description: >-
+            For 15 minutes every retention pass ran out of time with expired
+            events or dedupe keys still to remove, so the feed's store keeps
+            growing past retention.max_age and the dedupe window. Look at the
+            feed store's load, or lower the feed's rate.
+
+      - alert: FaucetFeedStoreMoved
+        expr: faucet_feed_store_moved == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "feed {{ $labels.feed }} names another feed store than the one holding its events"
+          description: >-
+            The feed's definition (or the --feed-store mapping of its store
+            name) now points to a different store than the one its events are
+            in. Senders get 503 and nothing is delivered. Point it back, or
+            adopt the new store (faucet feed adopt-store), which starts the
+            feed empty there.
 
       - alert: FaucetFeedDeliveryLagging
         expr: faucet_feed_oldest_undelivered_seconds > 600

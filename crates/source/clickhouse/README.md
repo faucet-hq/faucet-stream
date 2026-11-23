@@ -108,6 +108,8 @@ pass the same values as `{key}` tokens through `fetch_with_context`.
 
 Not supported in v1.
 
+A query that returns two columns with one name (a join's `id`) is refused with `ClickHouse query returns two columns named "id"`: a record keeps one value per name, so one column would be lost. Alias them (`SELECT a.id AS a_id, b.id AS b_id …`).
+
 ## Capabilities
 
 A plain query source: no exactly-once, discovery or sharding. `faucet list --json` prints the declaration.

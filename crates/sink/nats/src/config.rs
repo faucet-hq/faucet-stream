@@ -28,6 +28,18 @@ pub struct NatsSinkConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_field: Option<String>,
 
+    /// NATS subject patterns (`*` = one token, `>` = the remaining tokens)
+    /// that a subject taken from [`subject_field`](Self::subject_field) must
+    /// match. Empty (the default) leaves ordinary subjects open. Subjects
+    /// whose first token starts with `$` (`$JS.API…`, `$KV…`, `$SYS…`) or that
+    /// start with `_INBOX.` belong to the server and are refused per row
+    /// unless a pattern names that space literally (`$KV.cache.>`); `*` or
+    /// `>` alone never opens it. A malformed record subject (whitespace, an
+    /// empty token, a wildcard token) is always refused. The fixed
+    /// [`subject`](Self::subject) is not checked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_subjects: Vec<String>,
+
     /// Records per publish batch: the client is flushed (core NATS) or the
     /// acks awaited (JetStream) after every `batch_size` records. Defaults to
     /// [`DEFAULT_BATCH_SIZE`]. `0` publishes the whole page handed by the
@@ -64,6 +76,7 @@ impl NatsSinkConfig {
             connection: NatsConnectionConfig::default(),
             subject: subject.into(),
             subject_field: None,
+            allowed_subjects: Vec::new(),
             batch_size: DEFAULT_BATCH_SIZE,
             jetstream: false,
             publish_timeout_secs: default_publish_timeout_secs(),
@@ -84,6 +97,18 @@ impl NatsSinkConfig {
             return Err(FaucetError::Config(
                 "nats sink: `subject_field` must not be empty when set".into(),
             ));
+        }
+        if !self.allowed_subjects.is_empty() && self.subject_field.is_none() {
+            return Err(FaucetError::Config(
+                "nats sink: `allowed_subjects` only applies with `subject_field`".into(),
+            ));
+        }
+        for pattern in &self.allowed_subjects {
+            if let Some(problem) = crate::subject::pattern_problem(pattern) {
+                return Err(FaucetError::Config(format!(
+                    "nats sink: allowed_subjects entry '{pattern}' is not a valid subject pattern: {problem}"
+                )));
+            }
         }
         faucet_core::validate_batch_size(self.batch_size)?;
         if self.publish_timeout_secs == 0 {
@@ -125,6 +150,19 @@ mod tests {
         c.jetstream = true;
         assert_eq!(c.batch_atomicity(), faucet_core::BatchAtomicity::PerRow);
         c.publish_timeout_secs = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_checks_allowed_subjects() {
+        let mut c = NatsSinkConfig::new("x");
+        c.allowed_subjects = vec!["orders.>".into()];
+        assert!(c.validate().is_err(), "needs subject_field");
+        c.subject_field = Some("topic".into());
+        assert!(c.validate().is_ok());
+        c.allowed_subjects = vec!["orders.>.x".into()];
+        assert!(c.validate().is_err());
+        c.allowed_subjects = vec!["".into()];
         assert!(c.validate().is_err());
     }
 

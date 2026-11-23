@@ -543,6 +543,77 @@ where
     );
 }
 
+/// **Check 28.** A sink whose [`Sink::column_matching`] is not `Exact` writes a
+/// field spelled the way its rule folds onto an existing column into that
+/// column, and the schema-drift pass resolves the field the same way: under
+/// `on_drift: ignore` the field is kept and its value lands. The destination
+/// must already have the columns `id` and `existing_column`; `field_spelling`
+/// is a spelling of `existing_column` the rule maps onto it (`email` for
+/// `Email` under a case-insensitive rule); `read_value(id)` returns the
+/// value `existing_column` holds for the row `id`. An `Exact` sink passes
+/// trivially: its fields address columns by their exact name.
+pub async fn assert_drift_resolves_like_writes<S, F, Fut>(
+    sink: &S,
+    existing_column: &str,
+    field_spelling: &str,
+    read_value: F,
+) where
+    S: Sink + ?Sized,
+    F: Fn(i64) -> Fut,
+    Fut: Future<Output = Option<Value>>,
+{
+    let label = sink.connector_name();
+    let matching = sink.column_matching();
+    if matching == faucet_core::ColumnMatching::Exact {
+        return;
+    }
+    let schema = sink
+        .current_schema()
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] current_schema errored: {e}"))
+        .unwrap_or_else(|| panic!("[{label}] reports no schema for an existing table"));
+    let columns: Vec<String> = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|p| p.keys().cloned().collect())
+        .unwrap_or_default();
+    assert_eq!(
+        faucet_core::column_for_field(field_spelling, &columns, matching),
+        Some(existing_column),
+        "[{label}] `{field_spelling}` must resolve to `{existing_column}` under {matching:?} \
+         (columns {columns:?})"
+    );
+    let policy = faucet_core::SchemaDriftPolicy::compile(&faucet_core::SchemaDriftSpec {
+        on_drift: faucet_core::OnDrift::Ignore,
+        allow_type_widening: true,
+        on_incompatible: faucet_core::OnIncompatible::Fail,
+        relax_nullability_on_missing: false,
+    });
+    let mut record = serde_json::Map::new();
+    record.insert("id".into(), Value::from(9_271));
+    record.insert(field_spelling.into(), Value::from("drift-resolves"));
+    let governed = faucet_core::governance::Governance::new()
+        .with_schema_drift(policy)
+        .govern(vec![Value::Object(record)], sink)
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] governing a page errored: {e}"));
+    assert_eq!(
+        governed.page.records()[0].get(field_spelling),
+        Some(&Value::from("drift-resolves")),
+        "[{label}] on_drift: ignore stripped `{field_spelling}`, which the sink writes into \
+         `{existing_column}`"
+    );
+    sink.write_governed(&governed.page)
+        .await
+        .unwrap_or_else(|e| panic!("[{label}] write errored: {e}"));
+    flush(sink, "the drift-resolution write").await;
+    assert_eq!(
+        read_value(9_271).await,
+        Some(Value::from("drift-resolves")),
+        "[{label}] `{field_spelling}` did not land in `{existing_column}`"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -158,6 +158,12 @@ pub struct DemuxOutcome {
     pub new_tables: BTreeSet<String>,
     /// Tables whose pipeline went away before or during the cycle.
     pub dead: BTreeSet<String>,
+    /// Tables that opened without a committed position and whose last known
+    /// position (the snapshot join point) is older than where the stream
+    /// starts for the others, with the reason: they are not streamed and must
+    /// be snapshotted again (rewinding the shared stream for them would replay
+    /// every table and may start before what the server still retains).
+    pub resnapshot: BTreeMap<String, String>,
     /// The stream position the cycle started from.
     pub started_at: Option<Value>,
 }
@@ -170,6 +176,69 @@ struct FeedState {
     last_sent_at: Instant,
 }
 
+/// Give every opened feed without a position its `committed` position when
+/// that is not older than where the stream starts for the others (it rewinds
+/// nothing); drop the rest from the cycle and list them for a new snapshot.
+fn settle_missing_positions(
+    source: &dyn Source,
+    states: Vec<FeedState>,
+    floors: &[Value],
+    committed: &BTreeMap<String, Value>,
+    outcome: &mut DemuxOutcome,
+) -> Vec<FeedState> {
+    let others: Vec<Value> = states
+        .iter()
+        .filter_map(|s| s.position.clone())
+        .chain(floors.iter().cloned())
+        .collect();
+    let start = if others.is_empty() {
+        None
+    } else {
+        source.position_min(&others)
+    };
+    let mut kept = Vec::with_capacity(states.len());
+    for mut st in states {
+        if st.position.is_some() {
+            kept.push(st);
+            continue;
+        }
+        let join = committed.get(&st.table);
+        let usable = join.filter(|join| {
+            others.is_empty()
+                || start
+                    .as_ref()
+                    .is_some_and(|s| source.position_le(s, join) == Some(true))
+        });
+        match usable {
+            Some(join) => {
+                tracing::warn!(
+                    table = %st.table,
+                    "mirror: table '{}' has no committed position in its state key; resuming it \
+                     from its last known position (its snapshot join point) — changes since then \
+                     are applied again",
+                    st.table
+                );
+                st.position = Some(join.clone());
+                kept.push(st);
+            }
+            None => {
+                let reason = if join.is_some() {
+                    "the table's state key holds no position and its last known position is \
+                     older than the stream's other tables; the table must be snapshotted again"
+                } else {
+                    "no committed position; the table must be snapshotted again"
+                };
+                tracing::warn!(table = %st.table, "mirror: {reason}");
+                outcome.dead.insert(st.table.clone());
+                outcome
+                    .resnapshot
+                    .insert(st.table.clone(), reason.to_string());
+            }
+        }
+    }
+    kept
+}
+
 /// Run one cycle of the shared stream: wait for every table pipeline to open
 /// (reporting its committed position), resume the source from the earliest
 /// one — never past a `floor` (the join position of a table still
@@ -180,6 +249,10 @@ struct FeedState {
 /// feed whose pipeline never opens holds the stream at it, because the
 /// source may confirm the start position to its server (postgres-cdc lets
 /// the server recycle WAL before it) and the table resumes from there later.
+/// A feed that opens without a position (its state key is gone) resumes from
+/// its `committed` position when that is not older than the other start
+/// positions; otherwise it is not streamed and is listed in
+/// [`DemuxOutcome::resnapshot`].
 pub async fn run_demux(
     source: Arc<dyn Source>,
     feeds: Vec<TableFeed>,
@@ -214,6 +287,11 @@ pub async fn run_demux(
         }
     }
     if states.is_empty() || cancel.is_cancelled() {
+        return Ok(outcome);
+    }
+    let mut states =
+        settle_missing_positions(source.as_ref(), states, &floors, &committed, &mut outcome);
+    if states.is_empty() {
         return Ok(outcome);
     }
 
@@ -658,6 +736,88 @@ mod tests {
         a.await.unwrap();
     }
 
+    async fn demux_with_lost_b(
+        committed_b: Option<u64>,
+        a_at: Option<u64>,
+    ) -> (DemuxOutcome, Vec<u64>, Vec<u64>) {
+        let src = script((1..=8).map(|bm| page(bm, &["a", "b"])).collect());
+        let mut feeds = Vec::new();
+        let mut a = None;
+        if let Some(at) = a_at {
+            let (fa, ca) = channel("a", src.clone());
+            feeds.push(fa);
+            a = Some(tokio::spawn(consume(ca, Some(at))));
+        }
+        let (fb, cb) = channel("b", src.clone());
+        feeds.push(fb);
+        let b = tokio::spawn(consume(cb, None));
+        let committed: BTreeMap<String, Value> = committed_b
+            .map(|c| [("b".to_string(), json!(c))].into())
+            .unwrap_or_default();
+        let out = run_demux(
+            src.clone(),
+            feeds,
+            router(&["a", "b"], false),
+            vec![],
+            committed,
+            CancellationToken::new(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let values = |ps: Vec<StreamPage>| {
+            ps.iter()
+                .flat_map(|p| p.records.iter().map(|r| r["v"].as_u64().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let a = match a {
+            Some(a) => values(a.await.unwrap()),
+            None => Vec::new(),
+        };
+        (out, a, values(b.await.unwrap()))
+    }
+
+    /// A table whose state key lost its position resumes from its last known
+    /// position when that rewinds nothing for the others.
+    #[tokio::test]
+    async fn a_table_without_a_position_resumes_from_a_newer_join_point() {
+        let (out, a, b) = demux_with_lost_b(Some(6), Some(5)).await;
+        assert_eq!(out.started_at, Some(json!(5)));
+        assert_eq!(a, vec![6, 7, 8]);
+        assert_eq!(b, vec![7, 8], "b is filtered at its join point");
+        assert!(out.resnapshot.is_empty() && out.dead.is_empty());
+    }
+
+    /// An older join point would rewind the shared stream for every table:
+    /// the table goes back to snapshot instead, and the stream starts where
+    /// the others are.
+    #[tokio::test]
+    async fn a_table_whose_join_point_is_older_goes_back_to_snapshot() {
+        let (out, a, b) = demux_with_lost_b(Some(2), Some(5)).await;
+        assert_eq!(out.started_at, Some(json!(5)), "nothing rewinds");
+        assert_eq!(a, vec![6, 7, 8]);
+        assert!(b.is_empty(), "b is not streamed");
+        assert!(out.dead.contains("b"));
+        assert!(out.resnapshot["b"].contains("older"));
+    }
+
+    #[tokio::test]
+    async fn a_table_with_no_known_position_goes_back_to_snapshot() {
+        let (out, a, b) = demux_with_lost_b(None, Some(5)).await;
+        assert_eq!(out.started_at, Some(json!(5)));
+        assert_eq!(a, vec![6, 7, 8]);
+        assert!(b.is_empty());
+        assert!(out.resnapshot["b"].contains("no committed position"));
+    }
+
+    #[tokio::test]
+    async fn a_lone_table_without_a_position_resumes_from_its_join_point() {
+        let (out, _, b) = demux_with_lost_b(Some(2), None).await;
+        assert_eq!(out.started_at, Some(json!(2)));
+        assert_eq!(b, vec![3, 4, 5, 6, 7, 8]);
+        assert!(out.resnapshot.is_empty());
+    }
+
     #[tokio::test]
     async fn floors_hold_the_resume_point_back() {
         let src = script(vec![page(1, &["a"]), page(2, &["a"]), page(3, &["a"])]);
@@ -719,7 +879,7 @@ mod tests {
         let (fa, ca) = channel("a", src.clone());
         let (fb, cb) = channel("b", src.clone());
         drop(cb);
-        let a = tokio::spawn(consume(ca, None));
+        let a = tokio::spawn(consume(ca, Some(0)));
         let out = run_demux(
             src.clone(),
             vec![fa, fb],
@@ -732,7 +892,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out.dead, BTreeSet::from(["b".to_string()]));
-        assert_eq!(out.started_at, None, "no table reported a position");
+        assert_eq!(out.started_at, Some(json!(0)));
         assert_eq!(a.await.unwrap().len(), 1);
     }
 

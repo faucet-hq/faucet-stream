@@ -89,6 +89,28 @@ never hands a sink a retry policy, so a connector retries a write inside
 gate still decides whether a whole page is replayed. A sink's call context
 also never carries the run's cancel token, so a cancelled run still flushes.
 
+## Update — non-idempotent calls
+
+Between "retry everything" and "never retry" sits a third tier, for a call that
+must not be repeated once the backend may have acted on it but is safe to
+repeat when it provably did not:
+
+| Method | Retry rule |
+|---|---|
+| `CallContext::call` | Idempotent: every classified failure is retried. |
+| `call` on a context marked `non_idempotent()` | Only explicit declines (`RateLimited`, an HTTP `429`; a `503` with `Retry-After` becomes `RateLimited`) and failures to connect are retried. An attempt timeout, a connection lost after sending, and any other status return at once. |
+| `CallContext::call_once` | Never retried. |
+
+A layered context can never switch the mode off (`inherit` ORs it). The first
+user is the OAuth2 refresh-token grant: an IdP that rotates refresh tokens
+revokes the old one when it answers, so resending after a lost reply would be
+rejected, or with reuse detection revoke the grant. Its closure maps only an
+explicit decline (`429`, `503` with `Retry-After`, `temporarily_unavailable`)
+to `RateLimited`; a timeout after sending fails the refresh with a message that
+the token may already have rotated. The HTTP sink's hand-written POST retry
+rule and the REST async-job submit are the obvious next users; moving the
+HTTP sink onto this mode drops its documented `5xx` retry for `POST`/`PATCH`.
+
 ## Related
 
 - [Retries](../architecture/retries.md) · [resilience](../architecture/resilience.md) · [recovery](../architecture/recovery.md)

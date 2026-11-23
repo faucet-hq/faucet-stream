@@ -59,7 +59,7 @@ pub fn dataset_like(id: &str) -> String {
 /// in `faucet_serve_schema`. A database stamped with a newer version is
 /// refused at startup instead of being written by code that does not know
 /// its columns.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// The oldest binary schema version that can still read a database this
 /// binary writes, kept as the `min_readable` row of `faucet_serve_schema`.
@@ -84,6 +84,7 @@ pub const ADDED_COLUMNS: &[(u32, &str, &str)] = &[
     (7, "faucet_serve_instance_caps", "pools"),
     (8, "faucet_serve_runs", "submitted_by"),
     (9, "faucet_serve_instance_caps", "capabilities"),
+    (10, "faucet_serve_instance_caps", "clock_offset_ms"),
 ];
 
 /// The columns of a `faucet_serve_log_ship` row, in [`decode_log_ship`] order.
@@ -779,6 +780,15 @@ pub const DDL: &[&str] = &[
         run_id TEXT PRIMARY KEY,\
         stored_at TEXT NOT NULL,\
         sealed TEXT NOT NULL)",
+    // The run-scoped budget ledger of a sharded run (v10): what the run's
+    // shards, on any replica, have been granted against its ceilings.
+    "CREATE TABLE IF NOT EXISTS faucet_serve_run_budgets (\
+        run_id TEXT PRIMARY KEY,\
+        records BIGINT NOT NULL,\
+        bytes BIGINT NOT NULL,\
+        last_records BIGINT NOT NULL,\
+        last_bytes BIGINT NOT NULL,\
+        updated_at TEXT NOT NULL)",
     // Data-flow policy versions (#1043): the server-managed policy and each
     // tenant's, append-only; the newest version of a scope is in force.
     "CREATE TABLE IF NOT EXISTS faucet_policy_versions (\
@@ -890,7 +900,18 @@ pub struct Stmts {
     /// Request cancellation of an in-flight run owned by another instance.
     pub request_cancel: String,
     pub cancel_pending_shards: String,
-    pub cancel_requeued_shards: String,
+    /// Cancel the pending shards of every `sharded` run whose cancel was
+    /// requested. Param: finished_at.
+    pub cancel_flagged_pending_shards: String,
+    /// Start a claimed run, owner-fenced. Params: body, lease, run_id, owner.
+    pub start_owned: String,
+    /// The owner-fenced `running` → `sharded` flip of a split. Params: body,
+    /// run_id, owner.
+    pub coordinate_flip: String,
+    /// What a split that wrote nothing found. Param: run_id.
+    pub coordination_state: String,
+    /// Whether a run has shard rows. Param: run_id.
+    pub shards_exist: String,
     pub trigger_edge_init: String,
     pub trigger_edge_rise: String,
     pub trigger_edge_rearm: String,
@@ -1098,6 +1119,20 @@ pub struct Stmts {
     pub run_secrets_put: String,
     pub run_secrets_get: String,
     pub run_secrets_delete: String,
+    /// Create a run's budget ledger row at zero. Params: run_id, updated_at.
+    pub budget_init: String,
+    /// Grant up to the wanted records / bytes, capped at the ceilings, in
+    /// one statement; returns the totals and this grant. Params: run_id,
+    /// want records, max records, want bytes, max bytes, updated_at.
+    pub budget_grant: String,
+    /// Return unspent allowance. Params: run_id, records, bytes, updated_at.
+    pub budget_give_back: String,
+    /// A run's granted totals. Param: run_id.
+    pub budget_spent: String,
+    /// Drop a run's ledger row. Param: run_id.
+    pub budget_delete: String,
+    /// Drop ledger rows whose run is gone.
+    pub purge_orphan_budgets: String,
     /// Store one policy version unless it exists (#1043). Params: scope,
     /// padded version, created_at, body.
     pub policy_version_insert: String,
@@ -1256,6 +1291,13 @@ pub struct Stmts {
     pub meta_insert_new: String,
     /// Replace a setting holding an expected value. Params: value, updated_at, key, expected.
     pub meta_replace: String,
+    /// Remove one server setting. Param: key.
+    pub meta_delete: String,
+    /// The database's own clock, in epoch microseconds (`now_us`). Leases and
+    /// expiry decisions read it so every replica compares against one clock.
+    pub db_now: String,
+    /// Every member's advertised capabilities (`instance_id`, `capabilities`).
+    pub instance_capabilities: String,
     /// The dialect these statements were built for. Needed by the one query that
     /// cannot be a fixed string: the local-output listing pushes its filter and
     /// `LIMIT` into SQL (#587), so the placeholder style has to be known at call
@@ -1579,6 +1621,23 @@ impl Stmts {
         )
     }
 
+    /// A multi-row shard insert of `rows` rows (binds per row: run_id,
+    /// shard_id, descriptor, size_estimate). No `ON CONFLICT`: a split inserts
+    /// into a run with no shard rows, so a conflict is a broken invariant.
+    pub fn insert_shards_query(&self, rows: usize) -> String {
+        let values: Vec<String> = (0..rows)
+            .map(|r| {
+                let p: Vec<String> = (1..=4).map(|c| self.placeholder(r * 4 + c)).collect();
+                format!("({},'pending','0')", p.join(","))
+            })
+            .collect();
+        format!(
+            "INSERT INTO faucet_serve_shards \
+             (run_id, shard_id, descriptor, size_estimate, status, attempt) VALUES {}",
+            values.join(",")
+        )
+    }
+
     /// `select_orphans` without this instance's own runs except `forgotten`
     /// ids (binds: now, owner, ids…).
     pub fn peer_orphans_query(&self, forgotten: usize) -> String {
@@ -1648,7 +1707,7 @@ impl Stmts {
                 AND finished_at IS NOT NULL AND finished_at < $1"
                 .into(),
             purge_idem: "DELETE FROM faucet_serve_idem WHERE claimed_at < $1".into(),
-            select_orphans: "SELECT body FROM faucet_serve_runs \
+            select_orphans: "SELECT body, owner, lease_expires_at FROM faucet_serve_runs \
                 WHERE status IN ('queued','running') \
                 AND (lease_expires_at IS NULL OR lease_expires_at < $1)"
                 .into(),
@@ -1690,7 +1749,7 @@ impl Stmts {
                 SET owner = $1, status = 'running', lease_expires_at = $2, body = $3 \
                 WHERE run_id = $4 AND status = 'pending'"
                 .into(),
-            reclaim_select: "SELECT body FROM faucet_serve_runs \
+            reclaim_select: "SELECT body, owner, lease_expires_at FROM faucet_serve_runs \
                 WHERE status = 'running' \
                 AND (lease_expires_at IS NULL OR lease_expires_at < $1)"
                 .into(),
@@ -1750,11 +1809,23 @@ impl Stmts {
             trigger_edge_current: "SELECT ordinal FROM faucet_serve_trigger_edges \
                 WHERE trigger_name = $1 AND armed = '0'"
                 .into(),
-            cancel_requeued_shards: "UPDATE faucet_serve_shards \
+            cancel_flagged_pending_shards: "UPDATE faucet_serve_shards \
                 SET status = 'cancelled', finished_at = $1 \
                 WHERE status = 'pending' AND run_id IN \
-                (SELECT run_id FROM faucet_serve_runs WHERE cancel_requested IS NOT NULL)"
+                (SELECT run_id FROM faucet_serve_runs \
+                WHERE status = 'sharded' AND cancel_requested IS NOT NULL)"
                 .into(),
+            start_owned: "UPDATE faucet_serve_runs SET body = $1, lease_expires_at = $2 \
+                WHERE run_id = $3 AND owner = $4 AND status = 'running'"
+                .into(),
+            coordinate_flip: "UPDATE faucet_serve_runs SET status = 'sharded', body = $1 \
+                WHERE run_id = $2 AND owner = $3 AND status = 'running' \
+                AND cancel_requested IS NULL"
+                .into(),
+            coordination_state: "SELECT owner, status, cancel_requested FROM faucet_serve_runs \
+                WHERE run_id = $1"
+                .into(),
+            shards_exist: "SELECT run_id FROM faucet_serve_shards WHERE run_id = $1 LIMIT 1".into(),
             pending_cancellations: "SELECT run_id FROM faucet_serve_runs \
                 WHERE status = 'running' AND owner = $1 AND cancel_requested IS NOT NULL"
                 .into(),
@@ -1765,13 +1836,14 @@ impl Stmts {
                 last_heartbeat = excluded.last_heartbeat, listen = excluded.listen, \
                 max_concurrent = excluded.max_concurrent, in_flight = excluded.in_flight"
                 .into(),
-            heartbeat_caps: "INSERT INTO faucet_serve_instance_caps (instance_id, state_format, pools, capabilities) \
-                VALUES ($1,$2,$3,$4) ON CONFLICT (instance_id) DO UPDATE SET \
+            heartbeat_caps: "INSERT INTO faucet_serve_instance_caps \
+                (instance_id, state_format, pools, capabilities, clock_offset_ms) \
+                VALUES ($1,$2,$3,$4,$5) ON CONFLICT (instance_id) DO UPDATE SET \
                 state_format = excluded.state_format, pools = excluded.pools, \
-                capabilities = excluded.capabilities"
+                capabilities = excluded.capabilities, clock_offset_ms = excluded.clock_offset_ms"
                 .into(),
             live_instances: "SELECT i.instance_id, i.started_at, i.last_heartbeat, i.listen, \
-                i.max_concurrent, i.in_flight, c.state_format, c.pools, c.capabilities \
+                i.max_concurrent, i.in_flight, c.state_format, c.pools, c.capabilities, c.clock_offset_ms \
                 FROM faucet_serve_instances i \
                 LEFT JOIN faucet_serve_instance_caps c ON c.instance_id = i.instance_id \
                 WHERE i.last_heartbeat >= $1"
@@ -1797,7 +1869,8 @@ impl Stmts {
             renew_shard_leases: "UPDATE faucet_serve_shards SET lease_expires_at = $1 \
                 WHERE owner = $2 AND status = 'running'"
                 .into(),
-            reclaim_shards_select: "SELECT run_id, shard_id, attempt FROM faucet_serve_shards \
+            reclaim_shards_select: "SELECT run_id, shard_id, attempt, owner, lease_expires_at \
+                FROM faucet_serve_shards \
                 WHERE status = 'running' \
                 AND (lease_expires_at IS NULL OR lease_expires_at < $1)"
                 .into(),
@@ -2075,6 +2148,28 @@ impl Stmts {
                 .into(),
             run_secrets_get: "SELECT sealed FROM faucet_serve_run_secrets WHERE run_id=$1".into(),
             run_secrets_delete: "DELETE FROM faucet_serve_run_secrets WHERE run_id=$1".into(),
+            budget_init: "INSERT INTO faucet_serve_run_budgets \
+                (run_id, records, bytes, last_records, last_bytes, updated_at) \
+                VALUES ($1,0,0,0,0,$2) ON CONFLICT (run_id) DO NOTHING"
+                .into(),
+            budget_grant: "UPDATE faucet_serve_run_budgets SET \
+                last_records = GREATEST(LEAST($2, $3 - records), 0), \
+                records = GREATEST(LEAST(records + $2, $3), records), \
+                last_bytes = GREATEST(LEAST($4, $5 - bytes), 0), \
+                bytes = GREATEST(LEAST(bytes + $4, $5), bytes), \
+                updated_at = $6 \
+                WHERE run_id=$1 RETURNING records, bytes, last_records, last_bytes"
+                .into(),
+            budget_give_back: "UPDATE faucet_serve_run_budgets SET \
+                records = GREATEST(records - $2, 0), bytes = GREATEST(bytes - $3, 0), \
+                updated_at = $4 WHERE run_id=$1"
+                .into(),
+            budget_spent: "SELECT records, bytes FROM faucet_serve_run_budgets WHERE run_id=$1"
+                .into(),
+            budget_delete: "DELETE FROM faucet_serve_run_budgets WHERE run_id=$1".into(),
+            purge_orphan_budgets: "DELETE FROM faucet_serve_run_budgets WHERE run_id NOT IN \
+                (SELECT run_id FROM faucet_serve_runs)"
+                .into(),
             policy_version_insert: "INSERT INTO faucet_policy_versions \
                 (scope, version, created_at, body) VALUES ($1,$2,$3,$4) \
                 ON CONFLICT (scope, version) DO NOTHING"
@@ -2288,6 +2383,11 @@ impl Stmts {
             meta_replace: "UPDATE faucet_serve_meta SET value=$1, updated_at=$2 \
                 WHERE key=$3 AND value=$4"
                 .into(),
+            meta_delete: "DELETE FROM faucet_serve_meta WHERE key=$1".into(),
+            db_now: "SELECT CAST(extract(epoch FROM clock_timestamp()) * 1000000 AS BIGINT) AS now_us"
+                .into(),
+            instance_capabilities: "SELECT instance_id, capabilities FROM faucet_serve_instance_caps"
+                .into(),
             dialect: Dialect::Postgres,
         }
     }
@@ -2339,7 +2439,7 @@ impl Stmts {
                 AND finished_at IS NOT NULL AND finished_at < ?"
                 .into(),
             purge_idem: "DELETE FROM faucet_serve_idem WHERE claimed_at < ?".into(),
-            select_orphans: "SELECT body FROM faucet_serve_runs \
+            select_orphans: "SELECT body, owner, lease_expires_at FROM faucet_serve_runs \
                 WHERE status IN ('queued','running') \
                 AND (lease_expires_at IS NULL OR lease_expires_at < ?)"
                 .into(),
@@ -2381,7 +2481,7 @@ impl Stmts {
                 SET owner = ?, status = 'running', lease_expires_at = ?, body = ? \
                 WHERE run_id = ? AND status = 'pending'"
                 .into(),
-            reclaim_select: "SELECT body FROM faucet_serve_runs \
+            reclaim_select: "SELECT body, owner, lease_expires_at FROM faucet_serve_runs \
                 WHERE status = 'running' \
                 AND (lease_expires_at IS NULL OR lease_expires_at < ?)"
                 .into(),
@@ -2435,11 +2535,23 @@ impl Stmts {
             trigger_edge_current: "SELECT ordinal FROM faucet_serve_trigger_edges \
                 WHERE trigger_name = ? AND armed = '0'"
                 .into(),
-            cancel_requeued_shards: "UPDATE faucet_serve_shards \
+            cancel_flagged_pending_shards: "UPDATE faucet_serve_shards \
                 SET status = 'cancelled', finished_at = ? \
                 WHERE status = 'pending' AND run_id IN \
-                (SELECT run_id FROM faucet_serve_runs WHERE cancel_requested IS NOT NULL)"
+                (SELECT run_id FROM faucet_serve_runs \
+                WHERE status = 'sharded' AND cancel_requested IS NOT NULL)"
                 .into(),
+            start_owned: "UPDATE faucet_serve_runs SET body = ?, lease_expires_at = ? \
+                WHERE run_id = ? AND owner = ? AND status = 'running'"
+                .into(),
+            coordinate_flip: "UPDATE faucet_serve_runs SET status = 'sharded', body = ? \
+                WHERE run_id = ? AND owner = ? AND status = 'running' \
+                AND cancel_requested IS NULL"
+                .into(),
+            coordination_state: "SELECT owner, status, cancel_requested FROM faucet_serve_runs \
+                WHERE run_id = ?"
+                .into(),
+            shards_exist: "SELECT run_id FROM faucet_serve_shards WHERE run_id = ? LIMIT 1".into(),
             pending_cancellations: "SELECT run_id FROM faucet_serve_runs \
                 WHERE status = 'running' AND owner = ? AND cancel_requested IS NOT NULL"
                 .into(),
@@ -2450,13 +2562,14 @@ impl Stmts {
                 last_heartbeat = excluded.last_heartbeat, listen = excluded.listen, \
                 max_concurrent = excluded.max_concurrent, in_flight = excluded.in_flight"
                 .into(),
-            heartbeat_caps: "INSERT INTO faucet_serve_instance_caps (instance_id, state_format, pools, capabilities) \
-                VALUES (?,?,?,?) ON CONFLICT (instance_id) DO UPDATE SET \
+            heartbeat_caps: "INSERT INTO faucet_serve_instance_caps \
+                (instance_id, state_format, pools, capabilities, clock_offset_ms) \
+                VALUES (?,?,?,?,?) ON CONFLICT (instance_id) DO UPDATE SET \
                 state_format = excluded.state_format, pools = excluded.pools, \
-                capabilities = excluded.capabilities"
+                capabilities = excluded.capabilities, clock_offset_ms = excluded.clock_offset_ms"
                 .into(),
             live_instances: "SELECT i.instance_id, i.started_at, i.last_heartbeat, i.listen, \
-                i.max_concurrent, i.in_flight, c.state_format, c.pools, c.capabilities \
+                i.max_concurrent, i.in_flight, c.state_format, c.pools, c.capabilities, c.clock_offset_ms \
                 FROM faucet_serve_instances i \
                 LEFT JOIN faucet_serve_instance_caps c ON c.instance_id = i.instance_id \
                 WHERE i.last_heartbeat >= ?"
@@ -2482,7 +2595,8 @@ impl Stmts {
             renew_shard_leases: "UPDATE faucet_serve_shards SET lease_expires_at = ? \
                 WHERE owner = ? AND status = 'running'"
                 .into(),
-            reclaim_shards_select: "SELECT run_id, shard_id, attempt FROM faucet_serve_shards \
+            reclaim_shards_select: "SELECT run_id, shard_id, attempt, owner, lease_expires_at \
+                FROM faucet_serve_shards \
                 WHERE status = 'running' \
                 AND (lease_expires_at IS NULL OR lease_expires_at < ?)"
                 .into(),
@@ -2758,6 +2872,28 @@ impl Stmts {
                 .into(),
             run_secrets_get: "SELECT sealed FROM faucet_serve_run_secrets WHERE run_id=?".into(),
             run_secrets_delete: "DELETE FROM faucet_serve_run_secrets WHERE run_id=?".into(),
+            budget_init: "INSERT INTO faucet_serve_run_budgets \
+                (run_id, records, bytes, last_records, last_bytes, updated_at) \
+                VALUES (?1,0,0,0,0,?2) ON CONFLICT (run_id) DO NOTHING"
+                .into(),
+            budget_grant: "UPDATE faucet_serve_run_budgets SET \
+                last_records = MAX(MIN(?2, ?3 - records), 0), \
+                records = MAX(MIN(records + ?2, ?3), records), \
+                last_bytes = MAX(MIN(?4, ?5 - bytes), 0), \
+                bytes = MAX(MIN(bytes + ?4, ?5), bytes), \
+                updated_at = ?6 \
+                WHERE run_id=?1 RETURNING records, bytes, last_records, last_bytes"
+                .into(),
+            budget_give_back: "UPDATE faucet_serve_run_budgets SET \
+                records = MAX(records - ?2, 0), bytes = MAX(bytes - ?3, 0), \
+                updated_at = ?4 WHERE run_id=?1"
+                .into(),
+            budget_spent: "SELECT records, bytes FROM faucet_serve_run_budgets WHERE run_id=?"
+                .into(),
+            budget_delete: "DELETE FROM faucet_serve_run_budgets WHERE run_id=?".into(),
+            purge_orphan_budgets: "DELETE FROM faucet_serve_run_budgets WHERE run_id NOT IN \
+                (SELECT run_id FROM faucet_serve_runs)"
+                .into(),
             policy_version_insert: "INSERT INTO faucet_policy_versions \
                 (scope, version, created_at, body) VALUES (?,?,?,?) \
                 ON CONFLICT (scope, version) DO NOTHING"
@@ -2970,6 +3106,10 @@ impl Stmts {
             meta_replace: "UPDATE faucet_serve_meta SET value=?, updated_at=? \
                 WHERE key=? AND value=?"
                 .into(),
+            meta_delete: "DELETE FROM faucet_serve_meta WHERE key=?".into(),
+            db_now: "SELECT CAST(unixepoch('subsec') * 1000000 AS INTEGER) AS now_us".into(),
+            instance_capabilities: "SELECT instance_id, capabilities FROM faucet_serve_instance_caps"
+                .into(),
             dialect: Dialect::Sqlite,
         }
     }
@@ -3020,6 +3160,75 @@ pub async fn retry_backoff(attempt: usize) {
 /// Fixed-width RFC3339 (nanoseconds + `Z`) — lexicographically sortable.
 pub fn fmt_ts(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+}
+
+/// A database clock reading (epoch microseconds) as a UTC instant.
+pub fn from_epoch_micros(us: i64) -> Result<DateTime<Utc>, HistoryError> {
+    DateTime::from_timestamp_micros(us)
+        .ok_or_else(|| HistoryError::Backend(format!("database clock out of range: {us}")))
+}
+
+/// Whether a member's comma-joined capability list holds `cap`.
+pub fn advertises(capabilities: Option<&str>, cap: &str) -> bool {
+    capabilities.is_some_and(|c| c.split(',').any(|x| x == cap))
+}
+
+/// The time a lease held by `owner` must be older than to count as expired.
+/// In a cluster (some member advertises database-clock leases), a lease an
+/// owner wrote on its own clock (it does not advertise them: a release before
+/// them, or a member gone from the membership) gets one extra lease `grace`,
+/// for that clock's skew from the database's. A single server advertises
+/// nothing and its previous incarnation shared its clock: no grace.
+pub fn reclaim_before(
+    owner: Option<&str>,
+    db_clock_owners: &std::collections::HashSet<String>,
+    now: DateTime<Utc>,
+    grace: Duration,
+) -> String {
+    let cut = match owner {
+        Some(o) if !db_clock_owners.is_empty() && !db_clock_owners.contains(o) => {
+            now - chrono::Duration::from_std(grace).unwrap_or_else(|_| chrono::Duration::days(1))
+        }
+        _ => now,
+    };
+    expired_by(cut)
+}
+
+/// The bound a stored lease must sort below to have expired at `now`: a lease
+/// that ends at `now` has expired. (The database clock reads at millisecond
+/// precision on SQLite, so a lease written and checked within one
+/// millisecond compares equal.)
+pub fn expired_by(now: DateTime<Utc>) -> String {
+    fmt_ts(now + chrono::Duration::microseconds(1))
+}
+
+/// Whether a row's stored lease (`None`: never stamped) is older than `before`.
+pub fn lease_older_than(lease: Option<&str>, before: &str) -> bool {
+    lease.is_none_or(|l| l < before)
+}
+
+/// Shard rows per insert statement of a split (4 binds each: well under both
+/// backends' bind limits).
+pub const SHARD_INSERT_CHUNK: usize = 500;
+
+/// What a split that wrote nothing found: this instance's own earlier split
+/// (its answer lost, e.g. a dropped connection after the commit), a cancel,
+/// or another owner.
+pub fn coordination_outcome(
+    owner: Option<&str>,
+    status: &str,
+    cancel_requested: bool,
+    has_shards: bool,
+    me: &str,
+) -> super::CoordinateOutcome {
+    use super::CoordinateOutcome;
+    if status == "sharded" && owner == Some(me) && has_shards {
+        CoordinateOutcome::Sharded { inserted: 0 }
+    } else if status == "running" && owner == Some(me) && cancel_requested {
+        CoordinateOutcome::CancelRequested
+    } else {
+        CoordinateOutcome::NotOwner
+    }
 }
 
 /// The `faucet_serve_schema` row recording where the next run-label backfill
@@ -3339,9 +3548,50 @@ macro_rules! impl_sql_history {
             /// How far ahead each upsert / heartbeat pushes a run's lease.
             lease_ttl: std::time::Duration,
             stmts: $crate::serve::history::sql::Stmts,
+            /// Template versions the server's own files pin.
+            file_pins: std::sync::RwLock<Vec<$crate::serve::history::templates::Pin>>,
         }
 
         impl $name {
+            /// The database's clock: every lease write and expiry decision
+            /// reads it once, before any transaction it then opens.
+            async fn read_db_now(
+                &self,
+            ) -> Result<chrono::DateTime<chrono::Utc>, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let row = sqlx::query(&self.stmts.db_now)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let us: i64 = row.try_get("now_us").map_err(backend)?;
+                $crate::serve::history::sql::from_epoch_micros(us)
+            }
+
+            /// The members that write their leases on the database's clock.
+            async fn db_clock_owners(
+                &self,
+            ) -> Result<std::collections::HashSet<String>, $crate::serve::history::HistoryError>
+            {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let rows = sqlx::query(&self.stmts.instance_capabilities)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let mut out = std::collections::HashSet::new();
+                for r in &rows {
+                    let caps: Option<String> = r.try_get("capabilities").map_err(backend)?;
+                    if $crate::serve::history::sql::advertises(
+                        caps.as_deref(),
+                        $crate::serve::history::CAP_DB_CLOCK,
+                    ) {
+                        out.insert(r.try_get::<String, _>("instance_id").map_err(backend)?);
+                    }
+                }
+                Ok(out)
+            }
+
             /// Fail non-terminal runs whose lease expired; with `peers`, not
             /// this instance's own runs except the forgotten ones (#1050).
             async fn recover_orphans_where(
@@ -3353,6 +3603,8 @@ macro_rules! impl_sql_history {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let now = chrono::Utc::now();
+                let db_now = self.read_db_now().await?;
+                let db_clock = self.db_clock_owners().await?;
                 // Only non-terminal runs whose lease has expired (the owning
                 // instance is presumed dead). A live instance heartbeats its
                 // runs' leases into the future, so this never fails another
@@ -3361,7 +3613,7 @@ macro_rules! impl_sql_history {
                     Some(f) => self.stmts.peer_orphans_query(f.len()),
                     None => self.stmts.select_orphans.clone(),
                 };
-                let mut q = sqlx::query(&stmt).bind(sql::fmt_ts(now));
+                let mut q = sqlx::query(&stmt).bind(sql::expired_by(db_now));
                 if let Some(f) = peers {
                     q = q.bind(&self.instance_id);
                     for id in f {
@@ -3372,6 +3624,13 @@ macro_rules! impl_sql_history {
                 let mut count = 0usize;
                 for r in &rows {
                     let body: String = r.try_get("body").map_err(backend)?;
+                    let owner: Option<String> = r.try_get("owner").map_err(backend)?;
+                    let held: Option<String> = r.try_get("lease_expires_at").map_err(backend)?;
+                    let before =
+                        sql::reclaim_before(owner.as_deref(), &db_clock, db_now, self.lease_ttl);
+                    if !sql::lease_older_than(held.as_deref(), &before) {
+                        continue;
+                    }
                     let mut rec = match sql::decode_body(&body) {
                         Ok(rec) => rec,
                         Err(e) => {
@@ -3389,7 +3648,7 @@ macro_rules! impl_sql_history {
                     {
                         rec.elapsed_secs = (now - started).to_std().ok().map(|d| d.as_secs_f64());
                     }
-                    let lease = sql::fmt_ts(chrono::Utc::now() + self.lease_ttl);
+                    let lease = sql::fmt_ts(db_now + self.lease_ttl);
                     let failed = sqlx::query(&self.stmts.fail_orphan)
                         .bind(rec.status.as_str())
                         .bind(rec.finished_at.map(sql::fmt_ts))
@@ -3397,7 +3656,7 @@ macro_rules! impl_sql_history {
                         .bind(&lease)
                         .bind(sql::encode_body(&rec)?)
                         .bind(&rec.run_id)
-                        .bind(sql::fmt_ts(now))
+                        .bind(&before)
                         .execute(&self.pool)
                         .await
                         .map_err(backend)?
@@ -3422,6 +3681,7 @@ macro_rules! impl_sql_history {
                     instance_id,
                     lease_ttl,
                     stmts,
+                    file_pins: std::sync::RwLock::new(Vec::new()),
                 }
             }
 
@@ -3529,6 +3789,22 @@ macro_rules! impl_sql_history {
 
         #[async_trait::async_trait]
         impl $crate::serve::history::RunHistory for $name {
+            async fn db_now(
+                &self,
+            ) -> Result<chrono::DateTime<chrono::Utc>, $crate::serve::history::HistoryError> {
+                self.read_db_now().await
+            }
+
+            fn set_file_pins(&self, pins: Vec<$crate::serve::history::templates::Pin>) {
+                if let Ok(mut p) = self.file_pins.write() {
+                    *p = pins;
+                }
+            }
+
+            fn file_pins(&self) -> Vec<$crate::serve::history::templates::Pin> {
+                self.file_pins.read().map(|p| p.clone()).unwrap_or_default()
+            }
+
             async fn claim_idempotency(
                 &self,
                 key: &str,
@@ -3540,7 +3816,7 @@ macro_rules! impl_sql_history {
                 use $crate::serve::history::Claim;
                 use $crate::serve::history::sql;
 
-                let now = chrono::Utc::now();
+                let now = self.read_db_now().await?;
                 let now_s = sql::fmt_ts(now);
                 let backend = $crate::serve::history::sql::classify_backend_error;
 
@@ -3617,7 +3893,7 @@ macro_rules! impl_sql_history {
                 // The owner/lease are SQL-column-only (never in the record body),
                 // so the heartbeat can extend a lease without a body read-modify-
                 // write race (#146 H7).
-                let lease = sql::fmt_ts(chrono::Utc::now() + self.lease_ttl);
+                let lease = sql::fmt_ts(self.read_db_now().await? + self.lease_ttl);
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
                 // Labels never change after submit: they are written with the
@@ -3692,7 +3968,7 @@ macro_rules! impl_sql_history {
                 let body = sql::encode_body(rec)?;
                 let submitted = sql::fmt_ts(rec.submitted_at);
                 let finished = rec.finished_at.map(sql::fmt_ts);
-                let lease = sql::fmt_ts(chrono::Utc::now() + self.lease_ttl);
+                let lease = sql::fmt_ts(self.read_db_now().await? + self.lease_ttl);
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
                 let done = sqlx::query(&self.stmts.insert_new)
@@ -3968,6 +4244,11 @@ macro_rules! impl_sql_history {
                             .execute(&self.pool)
                             .await
                             .map_err(backend)?;
+                        sqlx::query(&self.stmts.budget_delete)
+                            .bind(id)
+                            .execute(&self.pool)
+                            .await
+                            .map_err(backend)?;
                         Ok(DeleteOutcome::Deleted)
                     }
                 }
@@ -4004,16 +4285,18 @@ macro_rules! impl_sql_history {
                     .await
                     .map_err(backend)?;
                 tx.commit().await.map_err(backend)?;
-                // Drop expired idempotency claims too (best-effort).
+                // Drop expired idempotency claims too (best-effort), on the
+                // database's clock like the claims themselves.
+                let db_now = self.read_db_now().await.unwrap_or(now);
                 let _ = sqlx::query(&self.stmts.purge_idem)
-                    .bind(sql::threshold(now, self.idem_retention))
+                    .bind(sql::threshold(db_now, self.idem_retention))
                     .execute(&self.pool)
                     .await;
                 // Drop membership rows that have not heartbeated within the
                 // run-retention window (far longer than the lease, so this never
                 // prunes a live member — that's `live_instances(ttl)`'s job).
                 let _ = sqlx::query(&self.stmts.prune_instances)
-                    .bind(sql::threshold(now, retain_for))
+                    .bind(sql::threshold(db_now, retain_for))
                     .execute(&self.pool)
                     .await;
                 let _ = sqlx::query(&self.stmts.prune_instance_caps)
@@ -4026,6 +4309,9 @@ macro_rules! impl_sql_history {
                     .execute(&self.pool)
                     .await;
                 let _ = sqlx::query(&self.stmts.purge_orphan_tenant_runs)
+                    .execute(&self.pool)
+                    .await;
+                let _ = sqlx::query(&self.stmts.purge_orphan_budgets)
                     .execute(&self.pool)
                     .await;
                 // Drop audit records older than the run-retention window (#205).
@@ -4056,7 +4342,7 @@ macro_rules! impl_sql_history {
             ) -> Result<usize, $crate::serve::history::HistoryError> {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
-                let new_lease = sql::fmt_ts(chrono::Utc::now() + self.lease_ttl);
+                let new_lease = sql::fmt_ts(self.read_db_now().await? + self.lease_ttl);
                 let stmt = self.stmts.renew_leases_except_query(skip.len());
                 let mut q = sqlx::query(&stmt).bind(new_lease).bind(&self.instance_id);
                 for id in skip {
@@ -4126,7 +4412,7 @@ macro_rules! impl_sql_history {
             async fn renew_leases(&self) -> Result<usize, $crate::serve::history::HistoryError> {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
-                let new_lease = sql::fmt_ts(chrono::Utc::now() + self.lease_ttl);
+                let new_lease = sql::fmt_ts(self.read_db_now().await? + self.lease_ttl);
                 let renewed = sqlx::query(&self.stmts.renew_leases)
                     .bind(&new_lease)
                     .bind(&self.instance_id)
@@ -4150,8 +4436,7 @@ macro_rules! impl_sql_history {
                 if limit == 0 {
                     return Ok(Vec::new());
                 }
-                let now = chrono::Utc::now();
-                let lease = sql::fmt_ts(now + self.lease_ttl);
+                let lease = sql::fmt_ts(self.read_db_now().await? + self.lease_ttl);
 
                 // 1. Candidate pending runs (oldest first), with their bodies.
                 //    The window looks past `limit` so a few records this
@@ -4235,9 +4520,11 @@ macro_rules! impl_sql_history {
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let now = chrono::Utc::now();
                 let now_s = sql::fmt_ts(now);
+                let db_now = self.read_db_now().await?;
+                let db_clock = self.db_clock_owners().await?;
 
                 let rows = sqlx::query(&self.stmts.reclaim_select)
-                    .bind(&now_s)
+                    .bind(sql::expired_by(db_now))
                     .fetch_all(&self.pool)
                     .await
                     .map_err(backend)?;
@@ -4245,6 +4532,13 @@ macro_rules! impl_sql_history {
                 let mut report = ReclaimReport::default();
                 for row in &rows {
                     let body: String = row.try_get("body").map_err(backend)?;
+                    let owner: Option<String> = row.try_get("owner").map_err(backend)?;
+                    let held: Option<String> = row.try_get("lease_expires_at").map_err(backend)?;
+                    let before =
+                        sql::reclaim_before(owner.as_deref(), &db_clock, db_now, self.lease_ttl);
+                    if !sql::lease_older_than(held.as_deref(), &before) {
+                        continue;
+                    }
                     // A record this binary cannot read is left for an instance
                     // that can, rather than stopping every other reclaim.
                     let mut rec = match sql::decode_body(&body) {
@@ -4266,7 +4560,7 @@ macro_rules! impl_sql_history {
                         let n = sqlx::query(&self.stmts.reclaim_requeue)
                             .bind(&new_body)
                             .bind(&rec.run_id)
-                            .bind(&now_s)
+                            .bind(&before)
                             .execute(&self.pool)
                             .await
                             .map_err(backend)?
@@ -4294,7 +4588,7 @@ macro_rules! impl_sql_history {
                             .bind(&now_s)
                             .bind(&new_body)
                             .bind(&rec.run_id)
-                            .bind(&now_s)
+                            .bind(&before)
                             .execute(&self.pool)
                             .await
                             .map_err(backend)?
@@ -4341,7 +4635,7 @@ macro_rules! impl_sql_history {
                 }
                 let body = sql::encode_body(&rec)?;
                 let finished = rec.finished_at.map(sql::fmt_ts);
-                let lease = sql::fmt_ts(chrono::Utc::now() + self.lease_ttl);
+                let lease = sql::fmt_ts(self.read_db_now().await? + self.lease_ttl);
                 let n = sqlx::query(&self.stmts.finalize_owned)
                     .bind(rec.status.as_str())
                     .bind(finished.as_deref())
@@ -4522,6 +4816,118 @@ macro_rules! impl_sql_history {
                 Ok(())
             }
 
+            async fn start_owned(
+                &self,
+                rec: &$crate::serve::history::RunRecord,
+            ) -> Result<bool, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let lease = sql::fmt_ts(self.read_db_now().await? + self.lease_ttl);
+                let n = sqlx::query(&self.stmts.start_owned)
+                    .bind(sql::encode_body(rec)?)
+                    .bind(&lease)
+                    .bind(&rec.run_id)
+                    .bind(&self.instance_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(sql::classify_backend_error)?
+                    .rows_affected();
+                Ok(n == 1)
+            }
+
+            async fn coordinate_shards(
+                &self,
+                sharded: &$crate::serve::history::RunRecord,
+                shards: &[$crate::serve::history::ShardInsert],
+            ) -> Result<$crate::serve::history::CoordinateOutcome, $crate::serve::history::HistoryError>
+            {
+                use sqlx::Row as _;
+                use $crate::serve::history::{CoordinateOutcome, HistoryError, sql};
+                let backend = sql::classify_backend_error;
+                let run_id = &sharded.run_id;
+                let body = sql::encode_body(sharded)?;
+                let mut rows = Vec::with_capacity(shards.len());
+                for s in shards {
+                    let descriptor = serde_json::to_string(&s.descriptor).map_err(|e| {
+                        HistoryError::Backend(format!("encode shard descriptor: {e}"))
+                    })?;
+                    rows.push((s.shard_id.as_str(), descriptor, s.size_estimate.map(|n| n.to_string())));
+                }
+                let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
+                let has_shards = sqlx::query(&self.stmts.shards_exist)
+                    .bind(run_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(backend)?
+                    .is_some();
+                let flipped = if has_shards {
+                    0
+                } else {
+                    sqlx::query(&self.stmts.coordinate_flip)
+                        .bind(&body)
+                        .bind(run_id)
+                        .bind(&self.instance_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(backend)?
+                        .rows_affected()
+                };
+                if flipped != 1 {
+                    let row = sqlx::query(&self.stmts.coordination_state)
+                        .bind(run_id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(backend)?;
+                    tx.rollback().await.map_err(backend)?;
+                    let Some(row) = row else {
+                        return Ok(CoordinateOutcome::NotOwner);
+                    };
+                    let owner: Option<String> = row.try_get("owner").map_err(backend)?;
+                    let status: String = row.try_get("status").map_err(backend)?;
+                    let cancel: Option<String> = row.try_get("cancel_requested").map_err(backend)?;
+                    return Ok(sql::coordination_outcome(
+                        owner.as_deref(),
+                        &status,
+                        cancel.is_some(),
+                        has_shards,
+                        &self.instance_id,
+                    ));
+                }
+                for chunk in rows.chunks(sql::SHARD_INSERT_CHUNK) {
+                    let stmt = self.stmts.insert_shards_query(chunk.len());
+                    let mut q = sqlx::query(&stmt);
+                    for (shard_id, descriptor, size) in chunk {
+                        q = q.bind(run_id).bind(*shard_id).bind(descriptor).bind(size.as_deref());
+                    }
+                    if let Err(e) = q.execute(&mut *tx).await {
+                        let _ = tx.rollback().await;
+                        if e.as_database_error().is_some_and(|d| d.is_unique_violation()) {
+                            return Err(HistoryError::Backend(format!(
+                                "run {run_id}: a shard id is repeated in its split ({e}); nothing \
+                                 was written"
+                            )));
+                        }
+                        return Err(backend(e));
+                    }
+                }
+                tx.commit().await.map_err(backend)?;
+                Ok(CoordinateOutcome::Sharded {
+                    inserted: shards.len(),
+                })
+            }
+
+            async fn cancel_flagged_shards(
+                &self,
+            ) -> Result<usize, $crate::serve::history::HistoryError> {
+                use $crate::serve::history::sql;
+                let n = sqlx::query(&self.stmts.cancel_flagged_pending_shards)
+                    .bind(sql::fmt_ts(chrono::Utc::now()))
+                    .execute(&self.pool)
+                    .await
+                    .map_err(sql::classify_backend_error)?
+                    .rows_affected();
+                Ok(n as usize)
+            }
+
             async fn pending_cancellations(
                 &self,
             ) -> Result<Vec<String>, $crate::serve::history::HistoryError> {
@@ -4545,7 +4951,7 @@ macro_rules! impl_sql_history {
             ) -> Result<(), $crate::serve::history::HistoryError> {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
-                let now = sql::fmt_ts(chrono::Utc::now());
+                let now = sql::fmt_ts(self.read_db_now().await?);
                 sqlx::query(&self.stmts.heartbeat_instance)
                     .bind(&self.instance_id)
                     .bind(sql::fmt_ts(beat.started_at))
@@ -4561,6 +4967,7 @@ macro_rules! impl_sql_history {
                     .bind(beat.state_format.to_string())
                     .bind($crate::serve::pools::encode(&beat.pools))
                     .bind(beat.capabilities.join(","))
+                    .bind(beat.clock_offset_ms.map(|ms| ms.to_string()))
                     .execute(&self.pool)
                     .await
                     .map_err(backend)?;
@@ -4576,7 +4983,7 @@ macro_rules! impl_sql_history {
                 use $crate::serve::history::InstanceRecord;
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
-                let now = chrono::Utc::now();
+                let now = self.read_db_now().await?;
                 let rows = sqlx::query(&self.stmts.live_instances)
                     .bind(sql::threshold(now, ttl))
                     .fetch_all(&self.pool)
@@ -4596,6 +5003,7 @@ macro_rules! impl_sql_history {
                     let fmt: Option<String> = r.try_get("state_format").map_err(backend)?;
                     let pools: Option<String> = r.try_get("pools").map_err(backend)?;
                     let caps: Option<String> = r.try_get("capabilities").map_err(backend)?;
+                    let offset: Option<String> = r.try_get("clock_offset_ms").map_err(backend)?;
                     out.push(InstanceRecord {
                         instance_id: r.try_get("instance_id").map_err(backend)?,
                         started_at: parse_dt(&started),
@@ -4611,6 +5019,7 @@ macro_rules! impl_sql_history {
                                 .map(str::to_string)
                                 .collect()
                         }),
+                        clock_offset_ms: offset.and_then(|s| s.parse().ok()),
                     });
                 }
                 Ok(out)
@@ -4661,7 +5070,7 @@ macro_rules! impl_sql_history {
                 if limit == 0 {
                     return Ok(Vec::new());
                 }
-                let lease = sql::fmt_ts(chrono::Utc::now() + self.lease_ttl);
+                let lease = sql::fmt_ts(self.read_db_now().await? + self.lease_ttl);
 
                 // 1. Candidate pending shards (largest estimated size first),
                 //    joined to their parent run body.
@@ -4731,7 +5140,7 @@ macro_rules! impl_sql_history {
             ) -> Result<usize, $crate::serve::history::HistoryError> {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
-                let lease = sql::fmt_ts(chrono::Utc::now() + self.lease_ttl);
+                let lease = sql::fmt_ts(self.read_db_now().await? + self.lease_ttl);
                 let n = sqlx::query(&self.stmts.renew_shard_leases)
                     .bind(&lease)
                     .bind(&self.instance_id)
@@ -4752,15 +5161,24 @@ macro_rules! impl_sql_history {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let now_s = sql::fmt_ts(chrono::Utc::now());
+                let db_now = self.read_db_now().await?;
+                let db_clock = self.db_clock_owners().await?;
 
                 let rows = sqlx::query(&self.stmts.reclaim_shards_select)
-                    .bind(&now_s)
+                    .bind(sql::expired_by(db_now))
                     .fetch_all(&self.pool)
                     .await
                     .map_err(backend)?;
 
                 let mut report = ReclaimReport::default();
                 for row in &rows {
+                    let owner: Option<String> = row.try_get("owner").map_err(backend)?;
+                    let held: Option<String> = row.try_get("lease_expires_at").map_err(backend)?;
+                    let before =
+                        sql::reclaim_before(owner.as_deref(), &db_clock, db_now, self.lease_ttl);
+                    if !sql::lease_older_than(held.as_deref(), &before) {
+                        continue;
+                    }
                     let run_id: String = row.try_get("run_id").map_err(backend)?;
                     let shard_id: String = row.try_get("shard_id").map_err(backend)?;
                     let attempt_s: String = row.try_get("attempt").map_err(backend)?;
@@ -4771,7 +5189,7 @@ macro_rules! impl_sql_history {
                             .bind(&next)
                             .bind(&run_id)
                             .bind(&shard_id)
-                            .bind(&now_s)
+                            .bind(&before)
                             .execute(&self.pool)
                             .await
                             .map_err(backend)?
@@ -4784,7 +5202,7 @@ macro_rules! impl_sql_history {
                             .bind(&now_s)
                             .bind(&run_id)
                             .bind(&shard_id)
-                            .bind(&now_s)
+                            .bind(&before)
                             .execute(&self.pool)
                             .await
                             .map_err(backend)?
@@ -4795,7 +5213,7 @@ macro_rules! impl_sql_history {
                     }
                 }
                 if report.requeued > 0 {
-                    sqlx::query(&self.stmts.cancel_requeued_shards)
+                    sqlx::query(&self.stmts.cancel_flagged_pending_shards)
                         .bind(&now_s)
                         .execute(&self.pool)
                         .await
@@ -5308,7 +5726,7 @@ macro_rules! impl_sql_history {
                 ttl: std::time::Duration,
             ) -> Result<bool, $crate::serve::history::HistoryError> {
                 use $crate::serve::history::sql;
-                let now = chrono::Utc::now();
+                let now = self.read_db_now().await?;
                 let until = now + chrono::Duration::from_std(ttl).unwrap_or_default();
                 let res = sqlx::query(&self.stmts.log_ship_claim)
                     .bind(&self.instance_id)
@@ -5430,7 +5848,7 @@ macro_rules! impl_sql_history {
                     .bind(run_id)
                     .bind(&self.instance_id)
                     .bind(sql::pad_seq(through))
-                    .bind(sql::fmt_ts(chrono::Utc::now()))
+                    .bind(sql::fmt_ts(self.read_db_now().await?))
                     .execute(&self.pool)
                     .await
                     .map_err(sql::classify_backend_error)?;
@@ -5457,7 +5875,7 @@ macro_rules! impl_sql_history {
             ) -> Result<Option<u64>, $crate::serve::history::HistoryError> {
                 use sqlx::Row as _;
                 use $crate::serve::history::sql;
-                let live = chrono::Utc::now()
+                let live = self.read_db_now().await?
                     - chrono::Duration::from_std(stale_after).unwrap_or_default();
                 let r = sqlx::query(&self.stmts.log_writer_floor)
                     .bind(run_id)
@@ -6647,6 +7065,82 @@ macro_rules! impl_sql_history {
                 Ok(done.rows_affected())
             }
 
+            async fn budget_grant(
+                &self,
+                run_id: &str,
+                want: (u64, u64),
+                max: (Option<u64>, Option<u64>),
+            ) -> Result<faucet_core::BudgetGrant, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+                let now = $crate::serve::history::sql::fmt_ts(chrono::Utc::now());
+                sqlx::query(&self.stmts.budget_init)
+                    .bind(run_id)
+                    .bind(&now)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let row = sqlx::query(&self.stmts.budget_grant)
+                    .bind(run_id)
+                    .bind(clamp(want.0))
+                    .bind(max.0.map_or(i64::MAX, clamp))
+                    .bind(clamp(want.1))
+                    .bind(max.1.map_or(i64::MAX, clamp))
+                    .bind(&now)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                let get = |c: &str| -> Result<u64, $crate::serve::history::HistoryError> {
+                    Ok(row.try_get::<i64, _>(c).map_err(backend)?.max(0) as u64)
+                };
+                Ok(faucet_core::BudgetGrant::new(
+                    get("last_records")?,
+                    get("last_bytes")?,
+                    get("records")?,
+                    get("bytes")?,
+                ))
+            }
+
+            async fn budget_give_back(
+                &self,
+                run_id: &str,
+                records: u64,
+                bytes: u64,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let clamp = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+                sqlx::query(&self.stmts.budget_give_back)
+                    .bind(run_id)
+                    .bind(clamp(records))
+                    .bind(clamp(bytes))
+                    .bind($crate::serve::history::sql::fmt_ts(chrono::Utc::now()))
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
+            }
+
+            async fn budget_spent(
+                &self,
+                run_id: &str,
+            ) -> Result<Option<(u64, u64)>, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let row = sqlx::query(&self.stmts.budget_spent)
+                    .bind(run_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                row.map(|r| {
+                    Ok((
+                        r.try_get::<i64, _>("records").map_err(backend)?.max(0) as u64,
+                        r.try_get::<i64, _>("bytes").map_err(backend)?.max(0) as u64,
+                    ))
+                })
+                .transpose()
+            }
+
             async fn run_secrets_delete(
                 &self,
                 run_id: &str,
@@ -7424,6 +7918,19 @@ macro_rules! impl_sql_history {
                 Ok(done.rows_affected() == 1)
             }
 
+            async fn meta_delete(
+                &self,
+                key: &str,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                sqlx::query(&self.stmts.meta_delete)
+                    .bind(key)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
+            }
+
             async fn meta_put(
                 &self,
                 key: &str,
@@ -7481,12 +7988,13 @@ macro_rules! impl_sql_history {
                 Ok(result.rows_affected() > 0)
             }
 
-            async fn template_launch(
+            async fn template_launch_expecting(
                 &self,
                 id: &str,
                 version: u32,
                 launched_by: Option<&str>,
                 evidence: Option<&$crate::serve::history::templates::EvidenceClaim>,
+                expect_stable: Option<Option<u32>>,
             ) -> Result<Option<u32>, $crate::serve::history::HistoryError> {
                 use sqlx::Row as _;
                 use $crate::serve::history::HistoryError;
@@ -7547,6 +8055,16 @@ macro_rules! impl_sql_history {
                     };
                     if newest.as_deref() == Some(version.to_string().as_str()) {
                         return Ok(None);
+                    }
+                    if let Some(expected) = expect_stable {
+                        let found = newest.as_deref().and_then(|v| v.parse::<u32>().ok());
+                        if found != expected {
+                            return Err(HistoryError::LaunchRaced {
+                                id: id.to_string(),
+                                expected,
+                                found,
+                            });
+                        }
                     }
                     if let Some(claim) = evidence {
                         let rows = sqlx::query(&self.stmts.template_select_tests_version)
@@ -7953,6 +8471,60 @@ pub(crate) use impl_sql_history;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn database_clock_readings_and_owner_keyed_lease_thresholds() {
+        use chrono::TimeZone as _;
+        let t = super::from_epoch_micros(1_700_000_000_123_456).unwrap();
+        assert_eq!(
+            super::fmt_ts(t),
+            "2023-11-14T22:13:20.123456000Z",
+            "a reading renders in the stored lease format"
+        );
+        assert!(super::from_epoch_micros(i64::MAX).is_err());
+        assert!(super::advertises(
+            Some("policy_pin,db_clock_leases"),
+            "db_clock_leases"
+        ));
+        assert!(!super::advertises(
+            Some("db_clock_leases_v2"),
+            "db_clock_leases"
+        ));
+        assert!(!super::advertises(None, "db_clock_leases"));
+
+        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 30).unwrap();
+        let grace = std::time::Duration::from_secs(30);
+        let fresh: std::collections::HashSet<String> = ["new".to_string()].into();
+        assert_eq!(
+            super::reclaim_before(Some("new"), &fresh, now, grace),
+            super::expired_by(now)
+        );
+        assert_eq!(
+            super::reclaim_before(None, &fresh, now, grace),
+            super::expired_by(now)
+        );
+        let old = super::reclaim_before(Some("old"), &fresh, now, grace);
+        assert_eq!(old, super::expired_by(now - chrono::Duration::seconds(30)));
+        assert!(
+            super::lease_older_than(Some(&super::fmt_ts(now)), &super::expired_by(now)),
+            "a lease ending now has expired"
+        );
+        let single = std::collections::HashSet::new();
+        assert_eq!(
+            super::reclaim_before(Some("old"), &single, now, grace),
+            super::expired_by(now),
+            "a single server has no members on another clock"
+        );
+        assert!(super::lease_older_than(None, &old));
+        assert!(super::lease_older_than(
+            Some("2025-12-31T23:59:59.000000000Z"),
+            &old
+        ));
+        assert!(!super::lease_older_than(
+            Some("2026-01-01T00:00:00.001000000Z"),
+            &old
+        ));
+    }
+
     #[test]
     fn a_pool_is_saturated_only_when_full_and_nothing_is_idle() {
         assert!(super::saturated(16, 0, 16));

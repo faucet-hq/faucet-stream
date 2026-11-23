@@ -196,6 +196,9 @@ async fn report(cfg: PipelineConfig, args: ValidateArgs) -> CliResult<()> {
         for w in &auth_warnings {
             println!("auth: WARNING — {w}");
         }
+        if let Some(notice) = crate::budget::run_scope_notice(&cfg) {
+            println!("WARNING — {notice}");
+        }
     }
     if crate::topology::is_topology(&cfg) {
         // Config-level checks only: building the connectors would connect to

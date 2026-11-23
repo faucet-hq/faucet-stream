@@ -118,7 +118,10 @@ curl -s localhost:8080/v1/feeds/orders -H "Authorization: Bearer $TOKEN" | jq '.
 
 Each record carries a `_feed` object with the event's sequence number, id,
 arrival time and kept headers. Set `include_metadata: false` on the source to
-leave it out.
+leave it out. The name is reserved: a sender's event with a top-level `_feed`
+field is refused with `400`, so a record a delivery forwards to another feed
+(an `http` sink posting to a second server, say) must drop `_feed` first
+(`include_metadata: false` or a `drop` transform).
 
 ## Where feeds are defined
 
@@ -187,7 +190,11 @@ Senders `POST` to `/v1/feeds/{name}/events` (a tenant's feed:
 | form data, text, anything else the feed accepts | one event |
 
 JSON must parse and text must be UTF-8, or the request is refused with `400`,
-so a delivery can always decode what the feed holds. A request is all or
+so a delivery can always decode what the feed holds. A form becomes one
+record of strings; a key sent more than once (`tag=a&tag=b`) becomes an array
+of its values in the order sent, so that key's type depends on the request.
+Every delivery decodes the stored bytes, so a range replayed later is decoded
+the same way. A request is all or
 nothing: either every event in it is stored or none is. A body may be sent
 with `Content-Encoding: gzip`; every size limit applies to the expanded bytes.
 
@@ -291,9 +298,15 @@ A file sink that replaces its output on every run is refused for it; use
 - **`failing`.** After three failed runs in a row the delivery is reported as
   `failing`. It keeps retrying, with a back-off that starts at 5 seconds and
   doubles to a minute.
-- **`stalled`.** When runs of a **single event** have failed `retries` times
-  (default 5), the delivery stalls: no more runs start, and the feed keeps
-  everything it has not delivered. A stall always names one event.
+- **`stalled`.** When runs of a **single event** with other events waiting
+  behind it have failed `retries` times in a row (default 5) over at least 10
+  minutes, the delivery stalls: no more runs start, and the feed keeps
+  everything it has not delivered. A stall always names one event. A
+  destination outage shorter than 10 minutes never stalls a delivery, however
+  busy the feed; it shows `failing` and recovers by itself. An event that is
+  the only one pending holds nothing back, so it keeps being retried (about
+  once a minute, `failing`) until it is delivered or another event arrives
+  behind it.
 
 A refusal that passes with time (the run queue is full, a tenant's run limit,
 the server is draining) backs off and is not counted. A refusal a retry cannot
@@ -368,6 +381,15 @@ curl -sX POST localhost:8080/v1/feeds/orders/deliveries/archive/recover -H "Auth
 ```
 
 Resume does not clear a hold; only recover does.
+
+A feed stays in the physical feed store that first held it. If its `store:`
+(or the `--feed-store` mapping of that name) comes to point at another
+database, the feed is blocked with status `store_moved` rather than started
+empty there, and a server whose `--feeds` file holds such a feed does not
+start. Point it back, or run `faucet feed adopt-store <feed>` (or
+`adopt-store --all` after a store was recreated) to start it empty in the new
+store; the events in the old one are not delivered. See the
+[reference](/faucet-stream/reference/feeds/#moving-a-feeds-store).
 
 ## Retention and a full feed
 
@@ -464,7 +486,7 @@ limits, its budget and its state namespace.
 |---|---|
 | `max_feeds` | Most feeds the tenant may have. |
 | `max_feed_events_per_sec` | Most events a second its feeds accept together, per server (`429` past it). |
-| `max_feed_bytes` | Most bytes its feeds may hold together; past it they refuse new events (`503`). |
+| `max_feed_bytes` | Most bytes its feeds may hold together in one feed store, including delivered events kept for replay (`retention.max_age`); past it they refuse new events (`503 full`, feed status `over_quota`) until retention removes old events. Lower `retention.max_age` to free room sooner. |
 
 `--tenant-delivery-min-interval-secs` (default 10) is the shortest gap between
 two runs of a tenant feed's delivery, whatever its `flush.min_interval` says.

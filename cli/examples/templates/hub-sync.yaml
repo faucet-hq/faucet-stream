@@ -17,6 +17,12 @@
 #
 # `paths` reads both catalog directories as one origin (source and sink names
 # share the registry's id namespace, so a stem may appear in only one of them).
+#
+# Community namespaces (every owner but `faucet-hq`) register only when they
+# name nothing of this machine: no local path, local or private network
+# address, `file:` URL or program, and no use of this machine's own
+# credentials; a run of one is checked again when it is triggered. List an
+# owner under `trust:` after reviewing its templates to lift that.
 version: 1
 origins:
   - name: hub

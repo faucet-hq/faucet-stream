@@ -122,7 +122,9 @@ impl CompactDecoder {
         })?;
         match std::mem::replace(&mut self.state, State::Names) {
             State::Names => {
-                self.state = State::Types(strings(value, "names")?);
+                let names = strings(value, "names")?;
+                faucet_core::util::check_unique_columns("ClickHouse", &names)?;
+                self.state = State::Types(names);
                 Ok(None)
             }
             State::Types(names) => {
@@ -195,6 +197,16 @@ mod tests {
 
     fn decode(lines: &[&str]) -> Result<Vec<Value>, FaucetError> {
         CompactDecoder::decode_all(&lines.join("\n"))
+    }
+
+    #[test]
+    fn a_header_naming_one_column_twice_is_refused() {
+        let err = decode(&[r#"["id","id"]"#, r#"["Int64","Int64"]"#, "[1,2]"]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ClickHouse query returns two columns named \"id\""),
+            "{err}"
+        );
     }
 
     #[test]

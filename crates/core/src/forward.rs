@@ -833,6 +833,14 @@ macro_rules! forward_sink {
                 self.$inner.current_schema()
             }
         });
+        $crate::__faucet_forward_filter!(column_matching [$($skip)*] {
+            fn column_matching(&self) -> $crate::ColumnMatching
+            {
+                #[allow(unused_imports)]
+                use $crate::Sink as _;
+                self.$inner.column_matching()
+            }
+        });
         $crate::__faucet_forward_filter!(supports_schema_evolution [$($skip)*] {
             fn supports_schema_evolution(&self) -> bool
             {
@@ -1241,6 +1249,7 @@ macro_rules! __faucet_forward_filter {
     (dedups_by_key [dedups_by_key $($rest:ident)*] $item:tt) => {};
     (supported_write_modes [supported_write_modes $($rest:ident)*] $item:tt) => {};
     (current_schema [current_schema $($rest:ident)*] $item:tt) => {};
+    (column_matching [column_matching $($rest:ident)*] $item:tt) => {};
     (supports_schema_evolution [supports_schema_evolution $($rest:ident)*] $item:tt) => {};
     (evolve_schema [evolve_schema $($rest:ident)*] $item:tt) => {};
     (supports_cleanup [supports_cleanup $($rest:ident)*] $item:tt) => {};
@@ -1331,6 +1340,7 @@ macro_rules! __faucet_forward_known {
     (@sink [dedups_by_key $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [supported_write_modes $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [current_schema $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
+    (@sink [column_matching $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [supports_schema_evolution $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [evolve_schema $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };
     (@sink [supports_cleanup $($rest:ident)*]) => { $crate::__faucet_forward_known!(@sink [$($rest)*]); };

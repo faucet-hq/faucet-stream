@@ -109,6 +109,7 @@ async fn from_path_routes_to_per_record_topic() {
         &brokers,
         KafkaSinkTopic::FromPath {
             path: "$.dest".into(),
+            allow_internal_topics: false,
         },
     ))
     .await

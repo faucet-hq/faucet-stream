@@ -284,6 +284,48 @@ async fn conformance_cleanup_scoped() {
     .await;
 }
 
+/// Check 28: a field folding onto an existing column survives
+/// `on_drift: ignore` and lands in it (SQL Server's default collation).
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_drift_resolves_like_writes() {
+    let container =
+        faucet_conformance::containers::start(|| MssqlServer::default().with_accept_eula()).await;
+    let port = container
+        .get_host_port_ipv4(1433)
+        .await
+        .expect("mssql host port");
+    let cfg = conn_cfg(port);
+    let pool = build_pool(&cfg, 4).await.expect("pool");
+    exec(
+        &pool,
+        "CREATE TABLE dbo.d (id BIGINT PRIMARY KEY, Email NVARCHAR(200))",
+    )
+    .await;
+    let mut scfg = MssqlSinkConfig::new(cfg.connection_url.clone().unwrap(), "dbo.d");
+    scfg.connection.tls = cfg.tls.clone();
+    scfg.column_mapping = MssqlColumnMapping::AutoColumns {
+        on_unknown_field: OnUnknownField::Error,
+    };
+    let sink = MssqlSink::new(scfg).await.expect("sink");
+    faucet_conformance::assert_drift_resolves_like_writes(&sink, "Email", "email", |id| {
+        let pool = pool.clone();
+        async move {
+            let mut conn = pool.get().await.expect("checkout");
+            let rows = conn
+                .query("SELECT Email FROM dbo.d WHERE id = @P1", &[&id])
+                .await
+                .expect("select")
+                .into_first_result()
+                .await
+                .expect("rows");
+            rows.first()
+                .and_then(|r| r.get::<&str, _>(0))
+                .map(|v| serde_json::Value::from(v.to_string()))
+        }
+    })
+    .await;
+}
+
 async fn mssql_text(pool: &MssqlPool, sql: String) -> Vec<(String, String)> {
     let mut conn = pool.get().await.expect("checkout");
     let rows = conn

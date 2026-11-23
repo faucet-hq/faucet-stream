@@ -12,6 +12,7 @@
 //! | `POST /v1/feeds/{name}/tokens`, `DELETE …/tokens/{id}` | `FeedWrite` | `feed.token_create`, `feed.token_revoke` |
 //! | `DELETE /v1/feeds/{name}` | `FeedAdmin` | `feed.delete` |
 //! | `POST …/deliveries/{delivery}/{replay,skip,recover}` | `FeedAdmin` | `feed.replay`, `feed.skip`, `feed.recover` |
+//! | `POST /v1/feeds/{name}/adopt-store` | `FeedAdmin` | `feed.adopt_store` |
 //! | `GET /v1/feeds/{name}/events/{seq}` (the payload) | `FeedAdmin` | `feed.events_read` |
 //!
 //! The ingest routes (`POST /v1/feeds/{name}/events` and the tenant form)
@@ -131,21 +132,24 @@ fn in_flight(runs: Vec<(String, Option<String>)>) -> Response {
 pub async fn list(
     State(state): State<ServerState>,
     Extension(actor): Extension<AuthContext>,
-    Query(q): Query<Scope>,
-    Query(page): Query<PageQuery>,
+    Query(q): Query<ListQuery>,
 ) -> Result<Json<FeedList>, ServeError> {
     let page = service::Page {
-        after: page.after,
-        limit: page.limit,
+        after: q.after,
+        limit: q.limit,
     };
     service::overview(&state, &actor, q.tenant.as_deref(), page)
         .await
         .map(Json)
 }
 
-/// Where a page of `GET /v1/feeds` starts and how long it is.
+/// `GET /v1/feeds`: the tenant whose feeds are meant (a tenant principal's
+/// own is implied), where the page starts and how long it is.
 #[derive(Debug, Default, Deserialize)]
-pub struct PageQuery {
+#[serde(deny_unknown_fields)]
+pub struct ListQuery {
+    #[serde(default)]
+    pub tenant: Option<String>,
     #[serde(default)]
     pub after: Option<String>,
     #[serde(default)]
@@ -542,6 +546,35 @@ pub async fn recover(
     )
     .await;
     moved.map(Json)
+}
+
+/// Start a feed whose events are in another feed store empty in the store
+/// its definition names.
+pub async fn adopt_store(
+    State(state): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(q): Query<Scope>,
+) -> Result<Json<service::Adopted>, ServeError> {
+    let adopted = service::adopt_store(&state, &actor, q.tenant.as_deref(), &name).await;
+    let detail = match &adopted {
+        Ok(a) => format!(
+            "now in store '{}' (id {}); its events in store '{}' (id {}) are abandoned",
+            a.store, a.store_id, a.abandoned_store, a.abandoned_store_id
+        ),
+        Err(_) => String::new(),
+    };
+    audit(
+        &state,
+        &actor,
+        &q,
+        "feed.adopt_store",
+        label(&actor, &q, &name),
+        detail,
+        &adopted,
+    )
+    .await;
+    adopted.map(Json)
 }
 
 pub async fn tokens(

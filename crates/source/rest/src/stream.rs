@@ -8,8 +8,8 @@ use crate::extract;
 use crate::pagination::{PaginationState, PaginationStyle};
 use async_trait::async_trait;
 use faucet_core::replication::{
-    BindTarget, OnMissingKey, ReplicationKey, ReplicationMethod, max_replication_value_path,
-    max_value,
+    BindTarget, OnMissingKey, PassEnd, ReplicationKey, ReplicationMethod, ResumeRules, Truncation,
+    bookmark_after_pass, max_replication_value_path, max_value,
 };
 use faucet_core::schema;
 use faucet_core::{AuthSpec, Credential, CredentialPlacement, FaucetError, SharedAuthProvider};
@@ -796,10 +796,121 @@ impl RestStream {
 
 #[async_trait]
 impl faucet_core::Source for RestStream {
-    faucet_core::forward_source!(inner);
+    faucet_core::forward_source!(inner; except state_schema, migrate_state);
+
+    fn state_schema(&self) -> u32 {
+        crate::requests_bookmark::STATE_SCHEMA
+    }
+
+    fn migrate_state(&self, from: u32, data: Value) -> Result<Value, FaucetError> {
+        crate::requests_bookmark::migrate_state(from, data)
+    }
 }
 
 impl RestDriver {
+    /// What this source's pass bookmark means, for [`bookmark_after_pass`].
+    fn resume_rules(&self, windowed: bool) -> ResumeRules {
+        ResumeRules::new()
+            .incremental(
+                self.config.replication_method == ReplicationMethod::Incremental
+                    && self.config.replication_key.is_some(),
+            )
+            .cursor_bookmark(self.config.persist_cursor)
+            .windowed(windowed)
+            .ordered(self.config.assume_ordered)
+            .pushes_bookmark(self.config.replication_bind.is_some())
+    }
+
+    /// The bookmark a read starts from: the stored one (for a `requests:`
+    /// entry, that entry's), else `start_replication_value`.
+    async fn entry_start(&self, entry: Option<&str>) -> Option<Value> {
+        let stored = self.runtime_start.lock().await.clone();
+        let start = match stored.as_ref().map(crate::requests_bookmark::Stored::parse) {
+            None => None,
+            Some(crate::requests_bookmark::Stored::Shared(v)) => Some(v),
+            Some(crate::requests_bookmark::Stored::PerEntry(map)) => {
+                let id =
+                    entry
+                        .map(str::to_owned)
+                        .or_else(|| match self.config.partitions.as_slice() {
+                            [only] => Some(crate::requests_bookmark::entry_id(only)),
+                            _ => None,
+                        });
+                let found = id.as_ref().and_then(|id| map.get(id).cloned());
+                if found.is_none() {
+                    tracing::warn!(
+                        "rest: the stored bookmark holds per-entry positions, but none matches \
+                         this `requests:` entry (a new entry, or one whose values render \
+                         differently each run); it starts from start_replication_value"
+                    );
+                }
+                found
+            }
+        };
+        start.or_else(|| self.config.start_replication_value.clone())
+    }
+
+    /// The bookmark to store once every `requests:` entry finished: one entry
+    /// keeps the plain bookmark; several keep one per entry, carrying forward
+    /// the stored position of an entry that produced none this run.
+    async fn consolidate_entries(&self, ids: &[String], last: Vec<Option<Value>>) -> Option<Value> {
+        if let [_] = ids {
+            return last.into_iter().next().flatten();
+        }
+        let mut entries: std::collections::BTreeMap<String, Value> = Default::default();
+        for (id, bm) in ids.iter().zip(last) {
+            let bm = match bm {
+                Some(bm) => Some(bm),
+                None => self.entry_start(Some(id)).await,
+            };
+            if let Some(bm) = bm {
+                let merged = value_max(entries.remove(id), bm).expect("value_max keeps a value");
+                entries.insert(id.clone(), merged);
+            }
+        }
+        (!entries.is_empty()).then(|| crate::requests_bookmark::render(entries))
+    }
+
+    /// Read every `requests:` entry (with `context` merged in) through the
+    /// buffered path, each from its own start.
+    async fn fetch_entries(
+        &self,
+        context: &HashMap<String, Value>,
+    ) -> Result<Vec<(String, Vec<Value>)>, FaucetError> {
+        let mut out = Vec::with_capacity(self.config.partitions.len());
+        for partition in &self.config.partitions {
+            let mut merged = context.clone();
+            merged.extend(partition.iter().map(|(k, v)| (k.clone(), v.clone())));
+            let id = crate::requests_bookmark::entry_id(partition);
+            let records = self
+                .fetch_partition(Some(&merged), None, Some(id.clone()))
+                .await?;
+            out.push((id, records));
+        }
+        Ok(out)
+    }
+
+    /// The error for a pass that ended early and cannot keep its bookmark.
+    fn pass_refusal(&self, truncation: Truncation) -> FaucetError {
+        match truncation {
+            Truncation::Cycle => FaucetError::Source(format!(
+                "rest: {} pagination repeated an earlier cursor or next link (not the one just \
+                 used), so the pass went round a loop and the pages behind it were never \
+                 read; stopping rather than ending the run with rows missing. When the feed \
+                 is sorted by the replication key, assume_ordered together with a \
+                 replication_bind keeps the bookmark of the pages read",
+                self.config.pagination.style_name()
+            )),
+            _ => FaucetError::Source(format!(
+                "rest: max_pages ({}) cut an incremental pass short, so its bookmark cannot \
+                 advance and every run would re-read the same pages. Raise or remove \
+                 max_pages, set persist_cursor, or set assume_ordered together with a \
+                 replication_bind when the feed is sorted by the replication key",
+                self.config.max_pages.unwrap_or_default()
+            )),
+        }
+    }
+
     pub fn new(mut config: RestStreamConfig) -> Result<Self, FaucetError> {
         // Derive OData request defaults (paging, `$.value`, query sugar, Prefer)
         // before validation so the checks see the effective request shape.
@@ -1114,7 +1225,7 @@ impl RestDriver {
 
     pub async fn fetch_all(&self) -> Result<Vec<Value>, FaucetError> {
         if self.config.partitions.is_empty() {
-            self.fetch_partition(None, None).await
+            self.fetch_partition(None, None, None).await
         } else if let Some(concurrency) = self.config.partition_concurrency {
             // Bounded, order-preserving concurrency: each partition future
             // starts only when a slot frees, so more `requests:` than permits
@@ -1122,7 +1233,13 @@ impl RestDriver {
             use futures::{StreamExt, TryStreamExt};
             let partitions = &self.config.partitions;
             let results: Vec<Vec<Value>> = futures::stream::iter(0..partitions.len())
-                .map(|i| self.fetch_partition(Some(&partitions[i]), None))
+                .map(|i| {
+                    self.fetch_partition(
+                        Some(&partitions[i]),
+                        None,
+                        Some(crate::requests_bookmark::entry_id(&partitions[i])),
+                    )
+                })
                 .buffered(concurrency.max(1))
                 .try_collect()
                 .await?;
@@ -1130,7 +1247,8 @@ impl RestDriver {
         } else {
             let mut all_records = Vec::new();
             for ctx in &self.config.partitions {
-                let records = self.fetch_partition(Some(ctx), None).await?;
+                let entry = Some(crate::requests_bookmark::entry_id(ctx));
+                let records = self.fetch_partition(Some(ctx), None, entry).await?;
                 all_records.extend(records);
             }
             Ok(all_records)
@@ -1153,7 +1271,7 @@ impl RestDriver {
             0 => None,
             n => Some(n),
         };
-        let records = self.fetch_partition(None, limit).await?;
+        let records = self.fetch_partition(None, limit, None).await?;
         Ok(schema::infer_schema(&records))
     }
 
@@ -1166,7 +1284,7 @@ impl RestDriver {
     pub fn stream_pages(
         &self,
     ) -> Pin<Box<dyn Stream<Item = Result<Vec<Value>, FaucetError>> + Send + '_>> {
-        let mut inner = self.stream_pages_inner(None, None, faucet_core::DEFAULT_BATCH_SIZE);
+        let mut inner = self.stream_pages_inner(None, None, faucet_core::DEFAULT_BATCH_SIZE, None);
         Box::pin(async_stream::try_stream! {
             loop {
                 let page = std::future::poll_fn(|cx| inner.as_mut().poll_next(cx)).await;
@@ -1347,8 +1465,9 @@ impl RestDriver {
         context: Option<&HashMap<String, Value>>,
         range_filter: Option<String>,
         csv_page_size: usize,
+        entry: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + '_>> {
-        let inner = self.stream_pages_unrouted(context, range_filter, csv_page_size);
+        let inner = self.stream_pages_unrouted(context, range_filter, csv_page_size, entry);
         let Some(route) = self.config.records_route.as_ref() else {
             return inner;
         };
@@ -1374,6 +1493,8 @@ impl RestDriver {
         // `0` is the house "no batching" sentinel. Ignored by the HTTP-paged
         // paths, which chunk on upstream page boundaries.
         csv_page_size: usize,
+        // The `requests:` entry this stream reads, for its own start bookmark.
+        entry: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + '_>> {
         // Clone the context into an owned map so it can live inside the
         // `async_stream` generator without borrowing from the caller.
@@ -1564,12 +1685,8 @@ impl RestDriver {
             // A runtime override (applied via `Source::apply_start_bookmark` —
             // typically by the pipeline reading from a `StateStore`) takes
             // precedence over the static config value.
-            let effective_start: Option<Value> = {
-                let guard = self.runtime_start.lock().await;
-                guard
-                    .clone()
-                    .or_else(|| self.config.start_replication_value.clone())
-            };
+            let effective_start: Option<Value> = self.entry_start(entry.as_deref()).await;
+            let replication_bind = self.resolved_bind(effective_start.as_ref())?;
 
 
             // #527: build the pass plan. Without a `window:` block this is a
@@ -1611,18 +1728,19 @@ impl RestDriver {
             for pass in passes {
                 // The window bounds every request of this pass carries — local to
                 // this stream, so concurrent partitions never see each other's.
-                let pass_window_binds: Vec<ResolvedBind> = match &pass {
-                    Some(w) => self
-                        .config
-                        .window
-                        .as_ref()
-                        .expect("a window pass implies a `window:` block")
-                        .render_binds(w)?
-                        .into_iter()
-                        .map(|(bind, rendered)| ResolvedBind::window(bind, rendered))
-                        .collect(),
-                    None => Vec::new(),
-                };
+                let mut pass_window_binds: Vec<ResolvedBind> =
+                    replication_bind.iter().cloned().collect();
+                if let Some(w) = &pass {
+                    pass_window_binds.extend(
+                        self.config
+                            .window
+                            .as_ref()
+                            .expect("a window pass implies a `window:` block")
+                            .render_binds(w)?
+                            .into_iter()
+                            .map(|(bind, rendered)| ResolvedBind::window(bind, rendered)),
+                    );
+                }
 
                 // The bookmark this pass persists on its final page: the window's
                 // end (a half-open boundary, so resume neither gaps nor overlaps)
@@ -1640,15 +1758,14 @@ impl RestDriver {
                 if self.config.persist_cursor
                     && let Some(seed) = effective_start.as_ref()
                 {
-                    state.next_token =
-                        Some(crate::pagination::value_to_param_string(seed));
+                    state.seed_cursor(crate::pagination::value_to_param_string(seed));
                 }
                 let mut pages_fetched = 0usize;
                 let mut running_max: Option<Value> = effective_start.clone();
                 // #547: the terminal cursor to persist as this run's bookmark.
                 let mut running_cursor: Option<Value> = effective_start.clone();
                 let mut bookmark_emitted = false;
-                let mut truncated = false;
+                let mut end = PassEnd::Complete;
 
                 loop {
                     if let Some(max) = self.config.max_pages
@@ -1658,7 +1775,7 @@ impl RestDriver {
                             max_pages = max,
                             "max_pages reached before the feed signalled its last page"
                         );
-                        truncated = true;
+                        end = PassEnd::Truncated(Truncation::MaxPages { max });
                         self.truncated_passes
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         break;
@@ -1795,6 +1912,13 @@ impl RestDriver {
                         .advance(&body, &resp_headers, &mut state, raw_count)?;
                     pages_fetched += 1;
 
+                    if state.cycle {
+                        end = PassEnd::Truncated(Truncation::Cycle);
+                        self.truncated_passes
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        yield faucet_core::StreamPage { records, bookmark: None };
+                        break;
+                    }
                     if has_next {
                         // Intermediate page — yield without bookmark so the
                         // pipeline does not persist a partial checkpoint.
@@ -1856,18 +1980,9 @@ impl RestDriver {
                 // window bookmark would claim the unread pages, so none is kept,
                 // and a windowed sweep stops here rather than letting a later
                 // window's end skip past the rest of this one.
-                let pass_bookmark = pass_bookmark_after(
-                    TruncatedPass {
-                        persist_cursor: self.config.persist_cursor,
-                        truncated,
-                        windowed,
-                        incremental: self.config.replication_method
-                            == ReplicationMethod::Incremental
-                            && self.config.replication_key.is_some(),
-                        assume_ordered: self.config.assume_ordered,
-                        pushes_bookmark: self.config.replication_bind.is_some(),
-                        max_pages: self.config.max_pages.unwrap_or_default(),
-                    },
+                let pass_bookmark = bookmark_after_pass(
+                    end,
+                    self.resume_rules(windowed),
                     if self.config.persist_cursor {
                         running_cursor.clone()
                     } else if windowed {
@@ -1875,14 +1990,15 @@ impl RestDriver {
                     } else {
                         running_max.clone()
                     },
-                )?;
+                )
+                .map_err(|t| self.pass_refusal(t))?;
                 if !bookmark_emitted && pass_bookmark.is_some() {
                     yield faucet_core::StreamPage {
                         records: Vec::new(),
                         bookmark: pass_bookmark,
                     };
                 }
-                if truncated && windowed {
+                if end != PassEnd::Complete && windowed {
                     break;
                 }
             }
@@ -1898,10 +2014,12 @@ impl RestDriver {
         &self,
         context: Option<&HashMap<String, Value>>,
         max_records: Option<usize>,
+        entry: Option<String>,
     ) -> Result<Vec<Value>, FaucetError> {
         let mut all_records = Vec::new();
         let mut pages_fetched = 0usize;
-        let mut pages = self.stream_pages_inner(context, None, faucet_core::DEFAULT_BATCH_SIZE);
+        let mut pages =
+            self.stream_pages_inner(context, None, faucet_core::DEFAULT_BATCH_SIZE, entry);
 
         // Poll the stream without requiring StreamExt (avoids extra dependency).
         loop {
@@ -2067,22 +2185,17 @@ impl RestDriver {
     /// Resolve the server-side push-down binding for this run:
     /// `(target, name, rendered-value)`. Returns `None` when no `replication_bind`
     /// is configured or there is no bookmark yet (first run — a full pull).
-    async fn resolved_bind(&self) -> Result<Option<ResolvedBind>, FaucetError> {
+    fn resolved_bind(&self, bookmark: Option<&Value>) -> Result<Option<ResolvedBind>, FaucetError> {
         let Some(bind) = &self.config.replication_bind else {
             return Ok(None);
         };
-        let bookmark = {
-            let guard = self.runtime_start.lock().await;
-            guard.clone()
-        }
-        .or_else(|| self.config.start_replication_value.clone());
         match bookmark {
             Some(bm) => Ok(Some(ResolvedBind {
                 target: bind.into,
                 name: bind.name.clone(),
                 path: bind.path.clone(),
                 value_type: bind.value_type,
-                rendered: bind.render(&bm)?,
+                rendered: bind.render(bm)?,
             })),
             None => Ok(None),
         }
@@ -2263,12 +2376,7 @@ impl RestDriver {
         &self,
         job: &crate::async_job::AsyncJobConfig,
     ) -> Result<Option<Value>, FaucetError> {
-        let start = {
-            let guard = self.runtime_start.lock().await;
-            guard
-                .clone()
-                .or_else(|| self.config.start_replication_value.clone())
-        };
+        let start = self.entry_start(None).await;
         // Template mode (#768) always renders — `initial` when there is no
         // bookmark — so the placeholder never reaches the server verbatim.
         if let Some(inc) = job
@@ -2674,11 +2782,7 @@ impl RestDriver {
         // #513 server-side push-down + #527 window slicing: the outgoing request
         // carries the bookmark binding (0 or 1) plus the current window's rendered
         // lower/upper bounds (0 or 2). They apply at the same four placement sites.
-        let mut binds: Vec<ResolvedBind> = Vec::new();
-        if let Some(b) = self.resolved_bind().await? {
-            binds.push(b);
-        }
-        binds.extend(window_binds.iter().cloned());
+        let binds: Vec<ResolvedBind> = window_binds.to_vec();
 
         let query_btree: std::collections::BTreeMap<String, String> =
             params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -3316,74 +3420,53 @@ fn records_path_resolves(body: &Value, path: &str) -> bool {
     parent != "$" && !parent.is_empty() && matches(parent)
 }
 
-/// Keep the larger of two bookmark values when consolidating per-partition
-/// bookmarks in [`Source::stream_pages`] (#535). Numbers compare numerically,
-/// strings lexicographically (the usual timestamp/id bookmark shapes); any
-/// other or heterogeneous pair prefers the newer value.
-/// How a pass's page loop ended, for [`pass_bookmark_after`].
-#[derive(Debug, Clone, Copy, Default)]
-struct TruncatedPass {
-    persist_cursor: bool,
-    truncated: bool,
-    windowed: bool,
-    incremental: bool,
-    assume_ordered: bool,
-    /// The bookmark reaches the next run's first request (`replication_bind`),
-    /// so resuming after it actually skips the pages already read.
-    pushes_bookmark: bool,
-    max_pages: usize,
-}
-
-/// The bookmark a pass may persist once its page loop has ended. A pass that
-/// `max_pages` cut short keeps only a cursor bookmark, which names the next
-/// unread page. An incremental or windowed pass cut short fails instead: its
-/// record-derived or window bookmark would skip the unread pages, and keeping
-/// none would re-read the same pages every run while each run looked green
-/// (#862 M-079) — unless the feed is declared `assume_ordered` and the
-/// bookmark is pushed to the server (`replication_bind`): then the largest key
-/// read is a safe resume point. Without the push-down the next run starts at
-/// page 1 again, so an ordered pass would stall just the same.
-fn pass_bookmark_after(
-    pass: TruncatedPass,
-    bookmark: Option<Value>,
-) -> Result<Option<Value>, FaucetError> {
-    if !pass.truncated || pass.persist_cursor {
-        return Ok(bookmark);
-    }
-    if pass.incremental && pass.assume_ordered && pass.pushes_bookmark && !pass.windowed {
-        return Ok(bookmark);
-    }
-    if pass.incremental || pass.windowed {
-        return Err(FaucetError::Source(format!(
-            "rest: max_pages ({}) cut an incremental pass short, so its bookmark cannot \
-             advance and every run would re-read the same pages. Raise or remove \
-             max_pages, set persist_cursor, or set assume_ordered together with a \
-             replication_bind when the feed is sorted by the replication key",
-            pass.max_pages
-        )));
-    }
-    Ok(None)
-}
-
-/// A `requests:` run that `max_pages` cut short cannot consolidate the
-/// per-entry bookmarks, so an incremental pass fails rather than persisting
-/// nothing and re-reading the same pages every run; `assume_ordered` does not
-/// apply across entries.
+/// An OData key-range run with a range cut short cannot persist the largest
+/// range bookmark (the truncated range's unread rows may sort below it), so an
+/// incremental read fails rather than skipping them or re-reading the same
+/// pages every run; `assume_ordered` orders rows within one range, not across
+/// ranges.
 fn partitioned_truncation(config: &RestStreamConfig) -> Result<(), FaucetError> {
     let incremental = config.replication_method == ReplicationMethod::Incremental
         && config.replication_key.is_some();
-    if incremental && !config.persist_cursor {
+    if incremental {
         return Err(FaucetError::Source(format!(
-            "rest: max_pages ({}) cut a `requests:` entry's incremental pass short; the \
-             per-entry bookmarks cannot be consolidated, so the run fails rather than \
-             re-reading the same pages every run (assume_ordered does not apply to \
-             `requests:`). Raise or remove max_pages",
+            "rest: a key range's incremental pass stopped before its last page (max_pages \
+             ({}) or a pagination loop); the ranges' bookmarks cannot be consolidated, so the \
+             run fails rather than skipping that range's unread rows. Raise or remove \
+             max_pages",
             config.max_pages.unwrap_or_default()
         )));
     }
     Ok(())
 }
 
+type TaggedPages<'a> =
+    Pin<Box<dyn Stream<Item = Result<(usize, faucet_core::StreamPage), FaucetError>> + Send + 'a>>;
+
+/// Merge per-entry (or per-range) page streams, tagging each page with its
+/// stream's index: one stream at a time when `concurrency` is 1, else up to
+/// `concurrency` polled at once with pages interleaved.
+fn merge_tagged<'a>(
+    streams: Vec<faucet_core::driver::PageStream<'a>>,
+    concurrency: usize,
+) -> TaggedPages<'a> {
+    use futures::StreamExt as _;
+    let tagged: Vec<_> = streams
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| s.map(move |page| page.map(|p| (i, p))))
+        .collect();
+    if concurrency <= 1 {
+        Box::pin(futures::stream::iter(tagged).flatten())
+    } else {
+        Box::pin(futures::stream::iter(tagged).flatten_unordered(Some(concurrency)))
+    }
+}
+
+/// Keep the larger of two bookmark values when consolidating per-partition
+/// bookmarks in [`Source::stream_pages`] (#535). Numbers compare numerically,
+/// strings lexicographically (the usual timestamp/id bookmark shapes); any
+/// other or heterogeneous pair prefers the newer value.
 fn value_max(current: Option<Value>, candidate: Value) -> Option<Value> {
     Some(match current {
         None => candidate,
@@ -3401,6 +3484,21 @@ impl SourceDriver for RestDriver {
         _calls: &CallSlot,
         context: &HashMap<String, Value>,
     ) -> Option<Result<(Vec<Value>, Option<Value>), FaucetError>> {
+        if self.config.partitions.len() > 1 {
+            let entries = match self.fetch_entries(context).await {
+                Ok(entries) => entries,
+                Err(e) => return Some(Err(e)),
+            };
+            let mut ids = Vec::with_capacity(entries.len());
+            let mut last = Vec::with_capacity(entries.len());
+            let mut records = Vec::new();
+            for (id, rows) in entries {
+                last.push(self.page_replication_max(&rows, false));
+                ids.push(id);
+                records.extend(rows);
+            }
+            return Some(Ok((records, self.consolidate_entries(&ids, last).await)));
+        }
         Some(self.fetch_with_context(context).await.map(|records| {
             let bookmark = self.page_replication_max(&records, false);
             (records, bookmark)
@@ -3466,8 +3564,8 @@ impl SourceDriver for RestDriver {
     fn state_key(&self) -> Option<String> {
         // A source is only made resumable (executor wraps it + persists the
         // bookmark) when it reports a state key. Incremental replication (#630)
-        // is meaningless without persistence, so opt in automatically when
-        // replicating incrementally — otherwise `replication_method: incremental`
+        // and `persist_cursor` are meaningless without persistence, so opt in
+        // automatically for either — otherwise `replication_method: incremental`
         // + a `state:` block would silently full-refresh every run. The CLI
         // executor overrides the concrete key per invocation (StateKeyOverride);
         // the fallback below matters for library callers driving `Pipeline`
@@ -3476,11 +3574,12 @@ impl SourceDriver for RestDriver {
         // resume from each other's bookmark. FNV-1a from core keeps the derived
         // key stable across Rust releases.
         self.config.state_key.clone().or_else(|| {
-            (self.config.replication_method == ReplicationMethod::Incremental
-                && (self.config.replication_key.is_some()
-                    || self.config.async_job.as_ref().is_some_and(|j| {
-                        j.inject_mode() == crate::async_job::InjectMode::Template
-                    })))
+            (self.config.persist_cursor
+                || (self.config.replication_method == ReplicationMethod::Incremental
+                    && (self.config.replication_key.is_some()
+                        || self.config.async_job.as_ref().is_some_and(|j| {
+                            j.inject_mode() == crate::async_job::InjectMode::Template
+                        }))))
             .then(|| {
                 format!(
                     "rest:{:016x}",
@@ -3519,7 +3618,7 @@ impl SourceDriver for RestDriver {
         // (the pipeline drives this method). Any parent `context` is merged into
         // each partition context, exactly as `fetch_with_context` does.
         if self.config.partitions.is_empty() {
-            return self.stream_pages_inner(Some(context), None, batch_size);
+            return self.stream_pages_inner(Some(context), None, batch_size, None);
         }
         let contexts: Vec<HashMap<String, Value>> = self
             .config
@@ -3537,74 +3636,36 @@ impl SourceDriver for RestDriver {
         // object-store `concurrency` in #619). `1`, `0` and `None` all mean
         // "one at a time", which is the pre-#624 behaviour.
         let concurrency = self.config.partition_concurrency.unwrap_or(1).max(1);
+        let ids: Vec<String> = self
+            .config
+            .partitions
+            .iter()
+            .map(crate::requests_bookmark::entry_id)
+            .collect();
         Box::pin(async_stream::try_stream! {
-            // Per-partition streams each emit their own final bookmark; we
-            // suppress those and emit a single consolidated (max) bookmark after
-            // the last partition, so the persisted state is the global high-water
-            // mark rather than whichever partition happened to finish last.
-            let mut max_bookmark: Option<Value> = None;
-            let truncated_before = self
-                .truncated_passes
-                .load(std::sync::atomic::Ordering::SeqCst);
-            if concurrency <= 1 {
-                for ctx in &contexts {
-                    let mut inner = self.stream_pages_inner(Some(ctx), None, batch_size);
-                    loop {
-                        let page = std::future::poll_fn(|cx| inner.as_mut().poll_next(cx)).await;
-                        match page {
-                            Some(Ok(p)) => {
-                                if let Some(bm) = p.bookmark {
-                                    max_bookmark = value_max(max_bookmark.take(), bm);
-                                    yield faucet_core::StreamPage { records: p.records, bookmark: None };
-                                } else {
-                                    yield p;
-                                }
-                            }
-                            Some(Err(e)) => Err(e)?,
-                            None => break,
-                        }
-                    }
-                }
-            } else {
-                // Interleaved, not ordered: `flatten_unordered` polls up to
-                // `concurrency` partition streams at once, so pages arrive as
-                // each partition produces them. Partitions are disjoint by
-                // construction and the consolidated bookmark is a max over all
-                // of them, so interleaving changes throughput, not the
-                // persisted position — but a downstream that assumed
-                // partition-at-a-time page order no longer gets it.
-                use futures::StreamExt as _;
-                // Built eagerly into a `Vec` rather than mapped lazily: a
-                // closure returning a borrow-capturing stream is not
-                // higher-ranked enough for the combinator, and forcing it
-                // here costs one allocation per partition.
-                let mut inners = Vec::with_capacity(contexts.len());
-                for ctx in &contexts {
-                    inners.push(self.stream_pages_inner(Some(ctx), None, batch_size));
-                }
-                let mut merged =
-                    futures::stream::iter(inners).flatten_unordered(Some(concurrency));
-                while let Some(page) = merged.next().await {
-                    let p = page?;
-                    if let Some(bm) = p.bookmark {
-                        max_bookmark = value_max(max_bookmark.take(), bm);
-                        yield faucet_core::StreamPage { records: p.records, bookmark: None };
-                    } else {
-                        yield p;
-                    }
+            use futures::StreamExt as _;
+            // Each entry reads from its own start and decides its own bookmark
+            // (`bookmark_after_pass`); the bookmarks are held back and stored
+            // together once every entry finished, so a crash mid-run persists
+            // nothing new. `partition_concurrency` interleaves the entries'
+            // pages (#624); the persisted position does not depend on order.
+            let mut streams = Vec::with_capacity(contexts.len());
+            for (ctx, id) in contexts.iter().zip(&ids) {
+                streams.push(self.stream_pages_inner(Some(ctx), None, batch_size, Some(id.clone())));
+            }
+            let mut last: Vec<Option<Value>> = vec![None; streams.len()];
+            let mut merged = merge_tagged(streams, concurrency);
+            while let Some(page) = merged.next().await {
+                let (i, p) = page?;
+                if let Some(bm) = p.bookmark {
+                    last[i] = Some(bm);
+                    yield faucet_core::StreamPage { records: p.records, bookmark: None };
+                } else {
+                    yield p;
                 }
             }
-            let truncated_after = self
-                .truncated_passes
-                .load(std::sync::atomic::Ordering::SeqCst);
-            if truncated_after != truncated_before {
-                partitioned_truncation(&self.config)?;
-                tracing::warn!(
-                    "a partition stopped at max_pages; persisting no consolidated bookmark so its \
-                     unread pages are read on the next run"
-                );
-            } else if max_bookmark.is_some() {
-                yield faucet_core::StreamPage { records: Vec::new(), bookmark: max_bookmark };
+            if let Some(bookmark) = self.consolidate_entries(&ids, last).await {
+                yield faucet_core::StreamPage { records: Vec::new(), bookmark: Some(bookmark) };
             }
         })
     }
@@ -3955,14 +4016,12 @@ impl RestDriver {
             RestDriver::fetch_all(self).await
         } else if self.config.partitions.is_empty() {
             // Parent context, no partitions — use context directly as partition context
-            self.fetch_partition(Some(context), None).await
+            self.fetch_partition(Some(context), None, None).await
         } else {
             // Both parent context and partitions — merge context into each partition
             let mut all_records = Vec::new();
-            for partition in &self.config.partitions {
-                let mut merged = context.clone();
-                merged.extend(partition.iter().map(|(k, v)| (k.clone(), v.clone())));
-                all_records.extend(self.fetch_partition(Some(&merged), None).await?);
+            for (_, records) in self.fetch_entries(context).await? {
+                all_records.extend(records);
             }
             Ok(all_records)
         }
@@ -4153,7 +4212,7 @@ impl RestDriver {
             });
         }
         self.client
-            .json(resp)
+            .json_value(resp)
             .await
             .map_err(|e| FaucetError::Source(format!("rest: OData key-bounds body: {e}")))
     }
@@ -4163,9 +4222,9 @@ impl RestDriver {
     /// [`faucet_core::shard::plan_pk_shards`] primitive (i128-width math — a
     /// full-range i64 key cannot overflow — and unbounded first/last ranges so
     /// rows inserted outside `[MIN, MAX]` mid-run are still read), and page each
-    /// range's `$filter` concurrently, bounded by `partition.workers`. Ranges are
-    /// intra-run only — never bookmarked; every run re-tiles. An empty entity
-    /// yields nothing.
+    /// range's `$filter` concurrently, bounded by `partition.workers`. Every run
+    /// re-tiles; an incremental read persists the largest range bookmark once
+    /// every range finished. An empty entity yields nothing.
     fn stream_key_range_partitions<'a>(
         &'a self,
         context: &'a HashMap<String, Value>,
@@ -4195,15 +4254,37 @@ impl RestDriver {
                 .filter_map(faucet_core::shard::PkShardBounds::from_spec)
                 .map(|bounds| {
                     let filter = crate::odata::key_range_filter(&bounds);
-                    self.stream_pages_inner(Some(&parent), filter, batch_size)
+                    self.stream_pages_inner(Some(&parent), filter, batch_size, None)
                 })
                 .collect();
-            let mut merged = futures::stream::iter(streams).flatten_unordered(workers);
+            // Ranges are disjoint slices of one entity under one replication
+            // clock: once every range finished, the largest range bookmark is
+            // the high-water mark. A truncated range read only part of its
+            // slice, so its max could skip rows: an incremental read fails and
+            // a full refresh persists nothing.
+            let truncated_before = self
+                .truncated_passes
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let mut max_bookmark: Option<Value> = None;
+            let mut merged = merge_tagged(streams, workers);
             while let Some(page) = merged.next().await {
-                // Partitioning is a full-table intra-run read: suppress per-range
-                // bookmarks so no partial high-water mark is persisted.
-                let page = page?;
+                let (_, page) = page?;
+                if let Some(bm) = page.bookmark {
+                    max_bookmark = value_max(max_bookmark.take(), bm);
+                }
                 yield faucet_core::StreamPage { records: page.records, bookmark: None };
+            }
+            let truncated_after = self
+                .truncated_passes
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if truncated_after != truncated_before {
+                partitioned_truncation(&self.config)?;
+                tracing::warn!(
+                    "a key range stopped before its last page; persisting no bookmark so its \
+                     unread pages are read on the next run"
+                );
+            } else if max_bookmark.is_some() {
+                yield faucet_core::StreamPage { records: Vec::new(), bookmark: max_bookmark };
             }
         })
     }
@@ -4238,8 +4319,17 @@ impl RestDriver {
                 let resp = self.discover_get_json(&url, "discovery list").await?;
                 names.extend(crate::discovery::dataset_names_unsorted(&resp, list));
                 match crate::discovery::next_list_url_from(&resp, list, base, Some(&url)) {
-                    Some(next) if !seen.contains(&next) => url = next,
-                    _ => break,
+                    Some(next) if next == url => break,
+                    Some(next) if seen.contains(&next) => {
+                        return Err(FaucetError::Source(format!(
+                            "rest discovery: `list` paging returned an earlier page's link \
+                             ({}) again, so the listing went round a loop and some datasets \
+                             were never listed",
+                            crate::pagination::token_digest(&next)
+                        )));
+                    }
+                    Some(next) => url = next,
+                    None => break,
                 }
             }
             names.sort();
@@ -4385,53 +4475,42 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("max_pages (2)"), "{err}");
-        assert!(partitioned_truncation(&incremental.persist_cursor(true)).is_ok());
     }
 
     #[test]
     fn a_truncated_incremental_pass_fails_unless_ordered() {
         let bm = Some(json!(5));
-        let cut = TruncatedPass {
-            truncated: true,
-            incremental: true,
-            max_pages: 3,
-            ..TruncatedPass::default()
-        };
-        let err = pass_bookmark_after(cut, bm.clone())
+        let cut = RestStreamConfig::new("http://x", "/r")
+            .max_pages(3)
+            .replication_method(ReplicationMethod::Incremental)
+            .replication_key("updated_at");
+        let max = PassEnd::Truncated(Truncation::MaxPages { max: 3 });
+        let driver = RestDriver::new(cut.clone()).unwrap();
+        let err = bookmark_after_pass(max, driver.resume_rules(false), bm.clone())
+            .map_err(|t| driver.pass_refusal(t))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("max_pages (3)"), "{err}");
-        let unpushed = TruncatedPass {
-            assume_ordered: true,
-            ..cut
-        };
-        let err = pass_bookmark_after(unpushed, bm.clone())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("replication_bind"), "{err}");
-        let ordered = TruncatedPass {
-            pushes_bookmark: true,
-            ..unpushed
-        };
-        assert_eq!(pass_bookmark_after(ordered, bm.clone()).unwrap(), bm);
-        let windowed = TruncatedPass {
-            windowed: true,
-            ..ordered
-        };
-        assert!(pass_bookmark_after(windowed, bm.clone()).is_err());
-        let cursor = TruncatedPass {
-            persist_cursor: true,
-            ..windowed
-        };
-        assert_eq!(pass_bookmark_after(cursor, bm.clone()).unwrap(), bm);
-        let full = TruncatedPass {
-            truncated: true,
-            ..TruncatedPass::default()
-        };
-        assert_eq!(pass_bookmark_after(full, bm.clone()).unwrap(), None);
+        assert!(
+            err.contains("max_pages (3)") && err.contains("replication_bind"),
+            "{err}"
+        );
+        let ordered = RestDriver::new(
+            cut.clone()
+                .assume_ordered(true)
+                .replication_bind(serde_json::from_value(json!({"name": "since"})).unwrap()),
+        )
+        .unwrap();
         assert_eq!(
-            pass_bookmark_after(TruncatedPass::default(), bm.clone()).unwrap(),
+            bookmark_after_pass(max, ordered.resume_rules(false), bm.clone()).unwrap(),
             bm
+        );
+        assert!(bookmark_after_pass(max, ordered.resume_rules(true), bm.clone()).is_err());
+        let err = ordered.pass_refusal(Truncation::Cycle).to_string();
+        assert!(err.contains("None pagination repeated an earlier"), "{err}");
+        let full = RestDriver::new(RestStreamConfig::new("http://x", "/r")).unwrap();
+        assert_eq!(
+            bookmark_after_pass(max, full.resume_rules(false), bm.clone()).unwrap(),
+            None
         );
     }
 
@@ -5000,6 +5079,19 @@ mod tests {
         cfg2.state_key = Some("mykey".into());
         let ex = RestStream::new(cfg2).unwrap();
         assert_eq!(ex.state_key().as_deref(), Some("mykey"));
+    }
+
+    #[test]
+    fn a_persisted_cursor_opts_into_a_state_key() {
+        use faucet_core::Source;
+        let cfg = RestStreamConfig::new("https://api.example.com", "/x")
+            .pagination(PaginationStyle::Cursor {
+                next_token_path: "$.next".into(),
+                param_name: "cursor".into(),
+            })
+            .persist_cursor(true);
+        let key = RestStream::new(cfg).unwrap().state_key();
+        assert!(key.is_some_and(|k| k.starts_with("rest:")));
     }
 
     fn template_job() -> crate::async_job::AsyncJobConfig {

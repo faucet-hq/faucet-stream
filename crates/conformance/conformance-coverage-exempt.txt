@@ -93,3 +93,10 @@ faucet-sink-bigquery cleanup: no emulator; the single-statement delete is pinned
 # created table's column types back; the typed DDL is pinned by
 # tests/declared_types.rs against a tables.get / jobs.query fake.
 faucet-sink-bigquery declared_types: no emulator; the typed CREATE TABLE is pinned by tests/declared_types.rs against a statement fake
+
+# Check 28 (column matching): the warehouse is a wiremock fake, which would
+# decide itself whether a case variant "lands". The write paths' folding is
+# pinned by unit tests instead (BigQuery `canonical_records`, Databricks
+# `build_matrix`), and the drift side by faucet-core's drift tests.
+faucet-sink-bigquery drift_resolution: no emulator; payload canonicalisation pinned by idempotent.rs unit tests
+faucet-sink-databricks drift_resolution: no emulator; case-insensitive matrix pinned by sql.rs unit tests

@@ -232,7 +232,7 @@ The fingerprint covers the whole row, so no key column is needed. When more than
 
 ## Column types
 
-Columns are converted to JSON in order of likelihood; an unsupported or `NULL` column becomes `null`:
+Columns are converted to JSON in order of likelihood. Only SQL `NULL` becomes `null`: a value of a type the source cannot decode (`GEOMETRY`, for one) fails the read naming the column — convert it in the query (`ST_AsText(g)`, `CAST(c AS CHAR)`).
 
 | MySQL type | JSON shape |
 |------------|------------|
@@ -246,6 +246,7 @@ Columns are converted to JSON in order of likelihood; an unsupported or `NULL` c
 | `tinyint(1)`, `boolean` | number `0` / `1` (MySQL stores `BOOLEAN` as `TINYINT(1)` and reports no separate type) |
 | `datetime`, `timestamp` | string (RFC 3339 / ISO-8601) |
 | `date` | string (ISO-8601) |
+| zero or invalid `date` / `datetime` / `timestamp` (`0000-00-00`, allowed without `NO_ZERO_DATE`) | string, MySQL's own text: `"0000-00-00"`, `"0000-00-00 00:00:00"`, as `mysql-cdc` spells a zero `DATE` / `DATETIME` |
 | `time` | string `[-]HH:MM:SS[.fff]` — a duration: the sign and hours of 24 and more are kept (`-01:30:00`, `838:59:59`) |
 | `decimal`, `numeric` | string, exact and never in exponent form (`0.0000001000`) |
 | `blob`, `binary`, `varbinary` | string (base64) |
@@ -257,7 +258,7 @@ flag, reads the flagged columns' character sets with one zero-row probe
 (`CHARSET(MAX(col))` over the query `LIMIT 0`). A query with duplicate column
 names cannot be probed; there such text columns are still base64-encoded —
 alias the columns.
-| other / `NULL` | `null` |
+| `NULL` | `null` |
 
 ## Capabilities
 
@@ -375,7 +376,7 @@ let result = pipeline.run().await?;
 
 ## How it works
 
-`MysqlSource::new` validates `batch_size`, then builds one `MySqlPool` (`MySqlPoolOptions::max_connections`) and stores it on the struct — every subsequent fetch reuses the pool rather than reconnecting. `stream_pages` opens a sqlx cursor with `Query::fetch` and pulls rows incrementally via `TryStreamExt::try_next`, flushing a `StreamPage` each time the buffer reaches `batch_size`. Each row is turned into a JSON object keyed by column name (`row_to_json`), and per-column decoding (`mysql_value_to_json`) probes the likely sqlx types in order, falling back to `Null`. A connection failure at construction surfaces as `FaucetError::Config`, a query failure as `FaucetError::Source`, each with the underlying sqlx error attached. Throughput is dominated by row width and network round-trips; benchmark with your own schema and `batch_size`.
+`MysqlSource::new` validates `batch_size`, then builds one `MySqlPool` (`MySqlPoolOptions::max_connections`) and stores it on the struct — every subsequent fetch reuses the pool rather than reconnecting. `stream_pages` opens a sqlx cursor with `Query::fetch` and pulls rows incrementally via `TryStreamExt::try_next`, flushing a `StreamPage` each time the buffer reaches `batch_size`. Each row is turned into a JSON object keyed by column name (`row_to_json`), and per-column decoding (`mysql_value_to_json`) probes the likely sqlx types in order; a non-NULL value no probe accepts fails the read. A connection failure at construction surfaces as `FaucetError::Config`, a query failure as `FaucetError::Source`, each with the underlying sqlx error attached. Throughput is dominated by row width and network round-trips; benchmark with your own schema and `batch_size`.
 
 ## Lineage dataset URI
 
@@ -394,7 +395,8 @@ This crate has no optional Cargo features of its own. Enable it in the CLI / umb
 | `FaucetError::Source: MySQL query failed: ...` | SQL syntax error, missing table/column, or insufficient privileges. Run the query directly against MySQL to confirm. |
 | TLS handshake / certificate error | The server requires TLS the client can't negotiate. Adjust the server's TLS settings or supply the right host; `tls-rustls` is built in, so no extra dependency is needed. |
 | A `DECIMAL` or `DATETIME` column arrives as a string | Intentional — `DECIMAL` is stringified to preserve exact precision and temporal types use ISO-8601. Cast downstream if you need a number. |
-| A column comes back as `null` unexpectedly | The column type isn't in the decode list, or the value is genuinely `NULL`. Wrap the column in `CAST(... AS CHAR)` in the query to force a string. |
+| `MySQL query returns two columns named "id"` | The query selects two columns with one name (a join's `id`). A record keeps one value per name, so the query is refused rather than dropping a column. Alias them: `SELECT a.id AS a_id, b.id AS b_id …`. |
+| `MySQL column c has type T which the source cannot decode` | The column type isn't in the decode list. Convert it in the query (`ST_AsText(c)`, `CAST(c AS CHAR)`). |
 | Run holds many connections open | `max_connections` is high relative to the workload. Lower it; the default of `10` is plenty for a single streaming query. |
 | `${parent.field}` shows up literally in the SQL | The row isn't a matrix child of that parent (no `parent:` set), so the token was never resolved. Check the matrix wiring. |
 | Need change-data-capture, not a snapshot | This source only runs point-in-time queries. Use [`faucet-source-mysql-cdc`](https://crates.io/crates/faucet-source-mysql-cdc) for binlog replication. |

@@ -1656,6 +1656,34 @@ async fn execute(
         record_metric(change.kind, "executed");
         return Ok(change);
     }
+    // Likewise a feed change whose write carries this change's id.
+    #[cfg(feature = "feeds")]
+    if change.kind == ChangeKind::Feed
+        && let Some(p) = crate::serve::feeds::service::already_applied(state, &change).await?
+    {
+        crate::serve::feeds::service::audit_approved(
+            state,
+            &requester,
+            &p,
+            "an approved change request (recovered after an interrupted execution)",
+        )
+        .await;
+        change.status = ChangeStatus::Executed;
+        change.deferred = false;
+        change.touch();
+        save(state, &change).await?;
+        record_metric(change.kind, "executed");
+        crate::serve::audit::write(
+            state,
+            &audit_as(actor, &change),
+            "change.executed",
+            None,
+            Some(change.id.clone()),
+            "ok",
+        )
+        .await;
+        return Ok(change);
+    }
     // Re-plan against the world as it is now. A planning failure (the
     // template is gone, the config no longer loads) fails the request.
     let fresh = match plan_for(
@@ -1675,6 +1703,27 @@ async fn execute(
         }
         Err(e) => return finish_refused(state, actor, change, e).await,
     };
+    #[cfg(feature = "templates")]
+    if change.kind == ChangeKind::TemplateLaunch
+        && let Some(done) = launch_already_applied(&change, &fresh)
+    {
+        change.status = ChangeStatus::Executed;
+        change.deferred = false;
+        change.template = Some(done);
+        change.touch();
+        save(state, &change).await?;
+        record_metric(change.kind, "executed");
+        crate::serve::audit::write(
+            state,
+            &audit_as(actor, &change),
+            "change.executed",
+            None,
+            Some(change.id.clone()),
+            "ok",
+        )
+        .await;
+        return Ok(change);
+    }
     if let Some(before) = &change.plan
         && before.material != fresh.material
     {
@@ -1774,21 +1823,40 @@ async fn execute(
                 Ok(b) => b,
                 Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
             };
-            let target = body
-                .version
-                .unwrap_or_else(crate::serve::history::templates::VersionSelector::newest);
-            crate::templates::launch(&state.history(), &body.id, target, Some(&change.requester))
-                .await
-                .map(|o| {
-                    (
-                        None,
-                        Some(TemplateOutcome {
-                            id: body.id.clone(),
-                            version: o.version,
-                        }),
-                    )
-                })
-                .map_err(template_err)
+            let Some(version) = planned_version(&fresh, "target_version") else {
+                return Err(ServeError::Internal(
+                    "template_launch plan carries no target version".into(),
+                ));
+            };
+            let stable_before = planned_stable_before(&fresh);
+            match crate::templates::launch_expecting(
+                &state.history(),
+                &body.id,
+                crate::serve::history::templates::VersionSelector::Pinned(version),
+                Some(stable_before),
+                Some(&change.requester),
+            )
+            .await
+            {
+                Ok(o) => Ok((
+                    None,
+                    Some(TemplateOutcome {
+                        id: body.id.clone(),
+                        version: o.version,
+                    }),
+                )),
+                Err(crate::error::CliError::TemplateLaunchRaced {
+                    expected, found, ..
+                }) => {
+                    let why = format!(
+                        "the template's live version changed since approval ({} → {})",
+                        crate::error::live_label(expected),
+                        crate::error::live_label(found)
+                    );
+                    return finish_invalidated(state, actor, change, why, Some(fresh)).await;
+                }
+                Err(e) => Err(template_err(e)),
+            }
         }
         #[cfg(feature = "templates")]
         ChangeKind::TemplateDelete => {
@@ -1837,7 +1905,7 @@ async fn execute(
                     Ok(p) => p,
                     Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
                 };
-            crate::serve::feeds::service::apply(state, &requester, p, true)
+            crate::serve::feeds::service::apply(state, &requester, p, true, Some(&change.id))
                 .await
                 .map(|_| (None, None))
         }
@@ -1984,6 +2052,31 @@ async fn finish_refused(
     )
     .await;
     Ok(change)
+}
+
+/// The live version a planned launch saw (`None`: nothing launched yet).
+#[cfg(feature = "templates")]
+fn planned_stable_before(plan: &ChangePlan) -> Option<u32> {
+    planned_version(plan, "stable_before")
+}
+
+/// The approved launch whose target is already live: an execution interrupted
+/// after its launch write (the re-plan now sees the target as `stable_before`).
+#[cfg(feature = "templates")]
+fn launch_already_applied(change: &ChangeRequest, fresh: &ChangePlan) -> Option<TemplateOutcome> {
+    let approved = change.plan.as_ref()?;
+    let target = planned_version(approved, "target_version")?;
+    if planned_stable_before(approved) == Some(target)
+        || planned_stable_before(fresh) != Some(target)
+        || planned_version(fresh, "target_version") != Some(target)
+    {
+        return None;
+    }
+    let id = fresh.summary.get("template")?.as_str()?.to_string();
+    Some(TemplateOutcome {
+        id,
+        version: target,
+    })
 }
 
 /// The version a planned `template_*` change targets, from its summary.
@@ -3215,6 +3308,160 @@ mod tests {
         assert!(matches!(e, ServeError::Internal(_)));
         let e = store_err(HistoryError::Unreachable("refused".into()));
         assert!(matches!(e, ServeError::Unavailable(_)));
+    }
+
+    #[cfg(feature = "templates")]
+    #[tokio::test]
+    async fn an_approved_launch_launches_only_the_reviewed_version() {
+        use crate::serve::history::templates::VersionSelector;
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::serve::test_support::test_state();
+        let new = |kind, payload| NewChange {
+            kind,
+            payload,
+            reason: None,
+            budget: None,
+            trusted_config: false,
+            caller_params: Default::default(),
+        };
+        for _ in 0..3 {
+            let reg = create(
+                &state,
+                &actor("bob"),
+                new(
+                    ChangeKind::TemplateRegister,
+                    json!({"id": "tpl", "config": crate::templates::bundle::smoke(&csv_yaml(dir.path(), "tpl", ""))}),
+                ),
+            )
+            .await
+            .unwrap();
+            let reg = approve(&state, &actor("alice"), &reg.id, None)
+                .await
+                .unwrap();
+            assert_eq!(reg.status, ChangeStatus::Executed, "{:?}", reg.error);
+        }
+        let store = state.history();
+        let pinned = |v: u32| {
+            new(
+                ChangeKind::TemplateLaunch,
+                json!({"id": "tpl", "version": v}),
+            )
+        };
+
+        // Launched before the approval executed (an interrupted execution):
+        // the reviewed version is live, so the change is executed.
+        let first = create(&state, &actor("bob"), pinned(1)).await.unwrap();
+        crate::templates::launch(&store, "tpl", VersionSelector::Pinned(1), None)
+            .await
+            .unwrap();
+        let first = approve(&state, &actor("alice"), &first.id, None)
+            .await
+            .unwrap();
+        assert_eq!(first.status, ChangeStatus::Executed, "{:?}", first.error);
+        assert_eq!(first.template.as_ref().unwrap().version, 1);
+        assert_eq!(store.template_launches("tpl").await.unwrap().len(), 1);
+
+        // Launched meanwhile by someone else: the reviewed version is live.
+        let second = create(&state, &actor("bob"), pinned(2)).await.unwrap();
+        crate::templates::launch(&store, "tpl", VersionSelector::Pinned(2), None)
+            .await
+            .unwrap();
+        let second = approve(&state, &actor("alice"), &second.id, None)
+            .await
+            .unwrap();
+        assert_eq!(second.status, ChangeStatus::Executed, "{:?}", second.error);
+        assert_eq!(store.template_launches("tpl").await.unwrap().len(), 2);
+
+        // The live version moved to another one: invalidated, nothing launched.
+        let moved = create(&state, &actor("bob"), pinned(1)).await.unwrap();
+        crate::templates::launch(&store, "tpl", VersionSelector::Pinned(3), None)
+            .await
+            .unwrap();
+        let moved = approve(&state, &actor("alice"), &moved.id, None)
+            .await
+            .unwrap();
+        assert_eq!(moved.status, ChangeStatus::Invalidated, "{:?}", moved.error);
+        assert_eq!(
+            store.template_state("tpl").await.unwrap().stable,
+            Some(3),
+            "the stale launch wrote nothing"
+        );
+        assert!(launch_already_applied(&moved, moved.plan.as_ref().unwrap()).is_none());
+    }
+
+    #[cfg(feature = "templates")]
+    #[tokio::test]
+    async fn a_conditional_launch_refuses_a_moved_live_version() {
+        use crate::serve::history::templates::VersionSelector;
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::serve::test_support::test_state();
+        let store = state.history();
+        for _ in 0..3 {
+            let reg = create(
+                &state,
+                &actor("bob"),
+                NewChange {
+                    kind: ChangeKind::TemplateRegister,
+                    payload: json!({"id": "tpl", "config": crate::templates::bundle::smoke(&csv_yaml(dir.path(), "tpl", ""))}),
+                    reason: None,
+                    budget: None,
+                    trusted_config: false,
+                    caller_params: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+            approve(&state, &actor("alice"), &reg.id, None)
+                .await
+                .unwrap();
+        }
+        crate::templates::launch(&store, "tpl", VersionSelector::Pinned(3), None)
+            .await
+            .unwrap();
+        let err = crate::templates::launch_expecting(
+            &store,
+            "tpl",
+            VersionSelector::Pinned(2),
+            Some(Some(1)),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::error::CliError::TemplateLaunchRaced {
+                    expected: Some(1),
+                    found: Some(3),
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("v1 → v3"), "{err}");
+        let ok = crate::templates::launch_expecting(
+            &store,
+            "tpl",
+            VersionSelector::Pinned(2),
+            Some(Some(3)),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok.version, 2);
+        assert_eq!(ok.replaced, Some(3));
+        let raced = store
+            .template_launch_expecting("tpl", 1, None, None, Some(None))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            raced,
+            HistoryError::LaunchRaced { found: Some(2), .. }
+        ));
+        assert_eq!(
+            ServeError::from(raced).status(),
+            axum::http::StatusCode::CONFLICT
+        );
     }
 
     #[cfg(feature = "templates")]

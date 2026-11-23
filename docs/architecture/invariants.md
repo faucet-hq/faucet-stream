@@ -20,9 +20,10 @@ bookmark only *after* both `write_batch*` and `flush()` have returned `Ok`. The
 ordering is always: **write → flush → checkpoint**. The state store is never
 ahead of the sink.
 
-**Where.** `run_stream` in `crates/core/src/pipeline.rs`, in all three write
-paths (DLQ, exactly-once, default). Each ends with
-`… sink.flush()? … store.put(key, bookmark)?`.
+**Where.** The checkpoint core (`crates/core/src/checkpoint.rs`,
+`Checkpointer::page`), called by every write path of `run_stream` (DLQ,
+exactly-once, default), the Arrow loop and the native byte loop. The order is
+main-sink flush → DLQ flush → `store.put(key, bookmark)`.
 
 **If violated.** A crash after the checkpoint but before the write would skip
 records permanently — silent data loss. This is the single most important rule
@@ -130,10 +131,18 @@ See [schema](./schema.md), [contracts](./contracts.md), [quality](./quality.md).
 ## I7 — Every early exit flushes the sinks
 
 **Guarantee.** A source error, a propagated write/flush/state error, a DLQ-budget
-abort, a circuit-breaker trip, or a cancellation all funnel through a single
-inner future that performs a best-effort final `flush()` before returning.
+abort, a circuit-breaker trip, or a cancellation all funnel through one place
+that performs a best-effort final `flush()` — the DLQ first, then the main sink —
+before returning.
 
-**Where.** The `loop_result` inner future + trailing flush in `run_stream`.
+**Where.** The checkpoint core (`crates/core/src/checkpoint.rs`: `unwind` on an
+error exit, `finish` at the end of a run), used by the row loop (`run_stream`),
+the Arrow loop and the native byte loop.
+
+**Exception.** The native byte path does not flush the main sink on an error
+exit: a native load session can hold a partly fed object, and finishing it would
+load a truncated object. Nothing is lost, because the bookmark has not advanced
+past it.
 
 **If violated.** A buffered sink that only commits on flush (Parquet writes its
 footer there; without it the whole file is unreadable; S3 multipart aborts)
@@ -205,7 +214,8 @@ skip — fails the page with `FaucetError::RowsUnaccounted` before the bookmark
 advances, so a resumed run reads the page again.
 
 **Where.** `crates/core/src/accounting.rs` (`WriteReport`, `RowAccounts`) and the
-write sites of `run_stream` / the columnar loop, which call
+write sites of `run_stream` / the Arrow loop (checkpointed through the
+checkpoint core), which call
 `Sink::write_batch_reported`. A sink that merges rows by key
 (`dedups_by_key()`) is credited with the merged rows by the trait default; one
 that declines rows by design reports them as `skipped`. Native loads are

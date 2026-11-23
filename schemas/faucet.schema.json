@@ -1700,7 +1700,7 @@
           ]
         },
         "value_detector": {
-          "description": "Value-based PII detector run over each *string* field value (and\ninteger values, for `credit_card`). Conservative (fully anchored) by\ndefault to avoid over-masking.",
+          "description": "Value-based PII detector run over each *string* field value (and\ninteger values, for `credit_card`, `credit_card_loose` and\n`phone_loose`). Every detector is fully anchored; numeric detectors can\nstill match ids that look like the class, so scope a rule to columns by\nname where ids are numeric.",
           "anyOf": [
             {
               "$ref": "#/$defs/Detector"
@@ -1721,7 +1721,7 @@
       "additionalProperties": false
     },
     "Detector": {
-      "description": "Built-in value detectors. All are conservative (anchored full-string\nmatches; the card detector additionally requires a valid Luhn checksum) so\nfalse positives stay rare — masking silently rewrites data, so a\nfalse positive is a data-quality bug, not just noise.",
+      "description": "Built-in value detectors. All are anchored full-string matches. Masking\nsilently rewrites data, so a false positive is a data-quality bug, not just\nnoise: the numeric detectors (`credit_card`, `credit_card_loose`,\n`phone_loose`) can still match ids that look like the class.",
       "oneOf": [
         {
           "description": "RFC-5322-ish email address.",
@@ -1729,7 +1729,7 @@
           "const": "email"
         },
         {
-          "description": "13–19 digit card number (spaces/dashes allowed, or a JSON integer)\npassing the Luhn check.",
+          "description": "13–19 digit card number (spaces/dashes allowed, or a JSON integer)\nwith a card network's prefix and length (Visa, Mastercard, Amex,\nDiscover, JCB, Diners, UnionPay, Maestro, Mir, RuPay, Troy, Verve,\nUATP), passing the Luhn check. Epoch-millisecond timestamps never\nmatch; ids that begin like a card number match about one time in ten.",
           "type": "string",
           "const": "credit_card"
         },
@@ -1752,6 +1752,11 @@
           "description": "Any 10–15 digit number, `+` and separators allowed, as a string or a\nJSON integer: the broad `phone` matcher of releases before faucet-core\n1.13. Catches bare and national formats `phone` skips, at the cost of\nmatching ids and epoch timestamps.",
           "type": "string",
           "const": "phone_loose"
+        },
+        {
+          "description": "Any 13–19 digit number passing the Luhn check, as a string or a JSON\ninteger: the `credit_card` matcher of releases before faucet-core 1.18.\nCatches cards outside the known networks, at the cost of matching about\none in ten long ids and epoch-millisecond timestamps.",
+          "type": "string",
+          "const": "credit_card_loose"
         }
       ]
     },
@@ -3443,6 +3448,15 @@
           "description": "Order in which ready sibling rows queue for a concurrency permit\n(#644). Defaults to `declared` — today's behaviour, byte for byte.",
           "$ref": "#/$defs/DispatchOrder",
           "default": "declared"
+        },
+        "max_fan_out_records": {
+          "description": "Most records one parent invocation may hand its child rows (`parent:`\nfan-out), default 1,000,000. Every captured record becomes one child\ninvocation, held in memory until its children run. A page that would\npass the cap is refused whole: the parent's own write of that page fails\nwith `budget exceeded: execution.max_fan_out_records` and its children\nare skipped. Must be between 1 and 10,000,000. A warning is logged when\na fan-out passes 100,000 records.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         }
       },
       "additionalProperties": false
@@ -3667,6 +3681,16 @@
             "type": "number",
             "format": "double"
           },
+          "default": null
+        },
+        "idle_timeout_secs": {
+          "description": "Drop counter and histogram series not updated for this many seconds\nfrom `/metrics` until they are emitted again; gauges never expire. `0`\nkeeps every series. Defaults to 86400 (24 h) for `faucet schedule` and\n`faucet mirror`, and to never for one-shot commands.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0,
           "default": null
         }
       },
@@ -4114,7 +4138,7 @@
           ]
         },
         "value_detector": {
-          "description": "A value detector (`email`, `credit_card`, `ssn`, `phone`, `ipv4`): a\ncolumn whose values look like the class carries the label. Reuses the\nmasking detectors, so a masked column no longer matches.",
+          "description": "A value detector (`email`, `credit_card`, `credit_card_loose`, `ssn`,\n`phone`, `phone_loose`, `ipv4`): a column whose values look like the\nclass carries the label. Reuses the masking detectors, so a masked\ncolumn no longer matches. A missed match lets a value through, so use\nthe `_loose` detectors when every candidate must be classified.",
           "anyOf": [
             {
               "$ref": "#/$defs/Detector"
@@ -4352,7 +4376,7 @@
       "type": "object",
       "properties": {
         "max_records": {
-          "description": "Most records the sink may accept. A page that would cross it is\nrefused whole and the run fails with `budget_exceeded`.",
+          "description": "Most records the run's destinations may accept, all rows together. A\npage that would cross it is refused whole and the run fails with\n`budget_exceeded`.",
           "type": [
             "integer",
             "null"
@@ -4370,7 +4394,7 @@
           "minimum": 0
         },
         "max_duration_secs": {
-          "description": "Longest an invocation may run. Past it the run is cancelled\ncooperatively (stops at the next page boundary, flushes) and fails\nwith `budget_exceeded`.",
+          "description": "Longest the run may take, measured from its start. Past it the run is cancelled\ncooperatively (stops at the next page boundary, flushes) and fails\nwith `budget_exceeded`.",
           "type": [
             "integer",
             "null"
@@ -12188,10 +12212,10 @@
       ]
     },
     "source_singer__MalformedPolicy": {
-      "description": "What to do when the tap emits a line that is not valid Singer JSON.",
+      "description": "What to do when the tap emits a line that is not a Singer message (plain\ntext, a JSON log line without a `type`). A `RECORD`, `STATE` or `SCHEMA`\nmessage that cannot be read always fails the run, whatever this says:\nskipping it would lose a row or checkpoint past it.",
       "oneOf": [
         {
-          "description": "Log the offending line at `warn` and continue (default).",
+          "description": "Log the line at `warn` and continue (default).",
           "type": "string",
           "const": "skip"
         },
@@ -17892,6 +17916,13 @@
               "description": "JSONPath to the topic name (first match wins). A record whose path\ndoes not resolve fails the batch. Must not be blank.",
               "type": "string"
             },
+            "allow_internal_topics": {
+              "description": "Let records name internal topics (names starting with `__`, such\nas `__consumer_offsets`). Off by default: such a record fails its\nrow. The configured exactly-once commit-token topic is refused\neither way, since a record written there would move another\npipeline's committed position.",
+              "type": [
+                "boolean",
+                "string"
+              ]
+            },
             "type": {
               "type": "string",
               "const": "from_path"
@@ -22174,7 +22205,7 @@
                       ]
                     },
                     "max_pages": {
-                      "description": "Optional cap on pages fetched per pass, across every pagination style.\nUnset by default: each pagination style already stops on its own end\nsignal and loop guards. When the cap cuts a pass short, only a persisted\ncursor bookmark (`persist_cursor`) is kept. An incremental or windowed\npass the cap cuts short fails the run instead — its record-derived or\nwindow bookmark would skip the unread pages, and keeping none would\nre-read the same pages forever — unless `assume_ordered` is set.",
+                      "description": "Optional cap on pages fetched per pass, across every pagination style.\nUnset by default: each pagination style already stops on its own end\nsignal and loop guards. When the cap cuts a pass short, a persisted\ncursor bookmark (`persist_cursor`) is kept, since it names the next\nunread page. An incremental or windowed\npass the cap cuts short fails the run instead — its record-derived or\nwindow bookmark would skip the unread pages, and keeping none would\nre-read the same pages forever — unless `assume_ordered` is set.",
                       "type": [
                         "integer",
                         "null",
@@ -22192,7 +22223,7 @@
                       ]
                     },
                     "assume_ordered": {
-                      "description": "The feed returns records in ascending `replication_key` order, so an\nincremental pass that `max_pages` cuts short may persist the largest key\nit read and resume from it next run. Without it such a pass fails the\nrun. Requires a `replication_bind` when `max_pages` is set: only a\nbookmark the server filters on moves the next run past the pages\nalready read. The bind must compare **inclusively** (`>=`, e.g. a\n`gte|${bookmark}` template): rows sharing the last key read may sit on\nthe first unread page, and an exclusive (`>`) server filter would skip\nthem; the client-side filter is inclusive, so the re-read rows at that\nkey arrive again (pair with an upsert sink). Ignored for windowed\npasses, with `persist_cursor`, and across `requests:` entries (a\ntruncated entry fails the run).",
+                      "description": "The feed returns records in ascending `replication_key` order, so an\nincremental pass that `max_pages` cuts short may persist the largest key\nit read and resume from it next run. Without it such a pass fails the\nrun. Requires a `replication_bind` when `max_pages` is set: only a\nbookmark the server filters on moves the next run past the pages\nalready read. The bind must compare **inclusively** (`>=`, e.g. a\n`gte|${bookmark}` template): rows sharing the last key read may sit on\nthe first unread page, and an exclusive (`>`) server filter would skip\nthem; the client-side filter is inclusive, so the re-read rows at that\nkey arrive again (pair with an upsert sink). Ignored for windowed\npasses; with several `requests:` entries it applies to each entry's\nown pass.",
                       "type": [
                         "boolean",
                         "string"
@@ -22325,7 +22356,7 @@
                       "default": 100
                     },
                     "requests": {
-                      "description": "`requests:` — one entry per request: a context map whose values are\nsubstituted into `path` placeholders. The stream is executed once per\nentry and results are concatenated. Empty means run once with no\nsubstitution. The pre-#670 spelling `partitions:` is still accepted.",
+                      "description": "`requests:` — one entry per request: a context map whose values are\nsubstituted into `path` placeholders. The stream is executed once per\nentry and results are concatenated. Empty means run once with no\nsubstitution. With incremental replication (or `window:`) and more\nthan one entry, each entry reads from and stores its own bookmark. The\npre-#670 spelling `partitions:` is still accepted.",
                       "type": "array",
                       "items": {
                         "type": "object",
@@ -22334,7 +22365,7 @@
                       "default": []
                     },
                     "request_concurrency": {
-                      "description": "`request_concurrency:` — maximum number of `requests` entries fetched\nconcurrently (`partition_concurrency:` is still accepted).\n`None` (and `0`/`1`) means sequential processing — the default.\n\nHonoured on **both** read paths since #624: the buffering `fetch_all`\nand the `stream_pages` path the pipeline actually drives, where it used\nto be silently ignored. Above 1, partition pages **interleave**: the\nstreams are polled together, so a page from partition 3 can arrive\nbefore partition 1 has finished. Partitions are disjoint and the\npersisted bookmark is a max across all of them, so this changes\nthroughput rather than the resume position — but a downstream that\nassumed partition-at-a-time page order no longer gets it.",
+                      "description": "`request_concurrency:` — maximum number of `requests` entries fetched\nconcurrently (`partition_concurrency:` is still accepted).\n`None` (and `0`/`1`) means sequential processing — the default.\n\nHonoured on **both** read paths since #624: the buffering `fetch_all`\nand the `stream_pages` path the pipeline actually drives, where it used\nto be silently ignored. Above 1, partition pages **interleave**: the\nstreams are polled together, so a page from partition 3 can arrive\nbefore partition 1 has finished. Each entry keeps its own bookmark,\nso this changes throughput rather than the resume position — but a downstream that\nassumed partition-at-a-time page order no longer gets it.",
                       "type": [
                         "integer",
                         "null",
@@ -22511,7 +22542,7 @@
                       ]
                     },
                     "persist_cursor": {
-                      "description": "Persist the terminal pagination cursor as this run's bookmark (riding the\nexisting `StreamPage.bookmark` / `StateStore` path — no core trait change)\nand, on resume, seed the stored bookmark back into the first request\n(query param for `cursor`, request body field for `cursor_in_body`) before\npaging. Only meaningful with `pagination: cursor` / `cursor_in_body`;\nmutually exclusive with `window` slicing. Default `false`.",
+                      "description": "Persist the terminal pagination cursor as this run's bookmark (riding the\nexisting `StreamPage.bookmark` / `StateStore` path — no core trait change)\nand, on resume, seed the stored bookmark back into the first request\n(query param for `cursor`, request body field for `cursor_in_body`) before\npaging. With a `state:` block this alone makes the source resume (no\nincremental settings needed). Only meaningful with `pagination: cursor`\n/ `cursor_in_body`; mutually exclusive with `window` slicing, several\n`requests:` entries and incremental replication (`replication_method:\nincremental`, `replication_key`, `replication_bind`), which would share\nits bookmark. Default `false`.",
                       "type": [
                         "boolean",
                         "string"
@@ -22891,6 +22922,20 @@
                       ],
                       "format": "uint",
                       "minimum": 0
+                    },
+                    "allow_repeated_pages": {
+                      "description": "Keep paging when a page holds the same records as an earlier,\nnon-adjacent page of the read, instead of failing the run — for feeds\nwhose pages can legitimately repeat. Requires `max_pages`, which then\nbounds a server that cycles pages. A page identical to the one just\nbefore it still ends paging, and a body cursor that repeats an earlier\none always fails.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
+                    },
+                    "allow_missing_records_path": {
+                      "description": "Accept a response with no element on the path to the records (the\nparent of the last `records_element_path` segment) as an empty page.\nBy default such a response fails the run: it is usually an error\ndocument served with HTTP 200, or a renamed element. Set it for an API\nthat omits the container on an empty result.",
+                      "type": [
+                        "boolean",
+                        "string"
+                      ]
                     },
                     "query_params": {
                       "description": "Query parameters to include in every request. Empty by default.\n\nThe `#[serde(default)]` is load-bearing: without it the field was\n**required**, so any config omitting it failed to deserialize — the same\noversight the REST source carried, and invisible until `faucet validate`\nstarted deserializing connector configs (#609).",
@@ -24449,7 +24494,7 @@
                       "type": "string"
                     },
                     "queue_group": {
-                      "description": "Optional queue group for core-NATS load-balanced subscriptions — all\nsubscribers sharing a group split the subject's messages. Ignored in\nJetStream mode.",
+                      "description": "Optional queue group for core-NATS load-balanced subscriptions — all\nsubscribers sharing a group split the subject's messages. Ignored in\nJetStream mode. A queue-group member takes messages from the group's\nother members, so preview, `--limit`, `plan --live`, fan-out rows,\noverwrite and output-replacing sinks refuse such a source.",
                       "type": [
                         "string",
                         "null"
@@ -28028,7 +28073,7 @@
                       "default": 67108864
                     },
                     "on_malformed": {
-                      "description": "How to handle a line that is not valid Singer JSON. Default\n[`MalformedPolicy::Skip`].",
+                      "description": "How to handle a line that is not a Singer message. Default\n[`MalformedPolicy::Skip`]. A broken `RECORD` / `STATE` / `SCHEMA`\nmessage always fails the run.",
                       "$ref": "#/$defs/source_singer__MalformedPolicy",
                       "default": "skip"
                     },
@@ -28256,7 +28301,7 @@
             "config": {
               "anyOf": [
                 {
-                  "additionalProperties": true,
+                  "x-faucet-follows-servers": true,
                   "title": "KafkaSourceConfig",
                   "type": "object",
                   "properties": {
@@ -28353,7 +28398,7 @@
                       "default": "fail"
                     },
                     "extra_client_config": {
-                      "description": "Raw librdkafka client properties to pass through. Use with care —\nthese can override anything set by `auth` or the typed fields above.\n\nKeys that name a broker (`bootstrap.servers`, `metadata.broker.list`),\na URL (`*.url`) or a local file (`*.location`, `*.file`,\n`sasl.kerberos.keytab`) are checked like the typed fields by a host\nthat confines configs (`faucet serve`); keys that load or run a\nprogram (`plugin.library.paths`, `ssl.engine.location`,\n`ssl.providers`, `*.cmd`) are refused for configs it does not trust.",
+                      "description": "Raw librdkafka client properties to pass through, applied after\n`auth` and the typed fields. Use with care.\n\nOptions faucet sets itself are refused when their value disagrees\nwith it: `bootstrap.servers` / `metadata.broker.list` (use `brokers`),\n`group.id` (use `group_id`), `auto.offset.reset` (use\n`auto_offset_reset`), `enable.auto.commit` (must stay `false`: offsets\nare committed only after a page is written) and `isolation.level`\n(must stay `read_committed`). Restating faucet's own value is allowed.\n\nKeys that name a broker (`bootstrap.servers`, `metadata.broker.list`),\na URL (`*.url`) or a local file (`*.location`, `*.file`,\n`sasl.kerberos.keytab`) are checked like the typed fields by a host\nthat confines configs (`faucet serve`); keys that load or run a\nprogram (`plugin.library.paths`, `ssl.engine.location`,\n`ssl.providers`, `*.cmd`) are refused for configs it does not trust.",
                       "type": "object",
                       "additionalProperties": {
                         "type": "string"
@@ -28402,7 +28447,7 @@
                       "default": 1000
                     }
                   },
-                  "x-faucet-follows-servers": true
+                  "additionalProperties": true
                 },
                 true
               ]
@@ -30513,7 +30558,7 @@
                       "default": 1000
                     },
                     "params": {
-                      "description": "Positional bind parameters for the query, sent as\n[`POSITIONAL`](https://cloud.google.com/bigquery/docs/parameterized-queries)\nquery parameters in declaration order before any context-derived\nvalues. Each value is typed from its JSON form: an integer as\n`INT64`, any other number as `FLOAT64`, a boolean as `BOOL`, and\neverything else (strings, arrays, objects, null) as `STRING`.",
+                      "description": "Positional bind parameters for the query, sent as\n[`POSITIONAL`](https://cloud.google.com/bigquery/docs/parameterized-queries)\nquery parameters, each bound to the next `?` the query holds; a\n`{token}` from a parent record binds at its own position in the\ntext. Each value is typed from its JSON form: an integer as\n`INT64`, any other number as `FLOAT64`, a boolean as `BOOL`, and\neverything else (strings, arrays, objects, null) as `STRING`.",
                       "type": "array",
                       "items": true,
                       "default": []
@@ -32435,6 +32480,13 @@
                         "null"
                       ]
                     },
+                    "allowed_subjects": {
+                      "description": "NATS subject patterns (`*` = one token, `>` = the remaining tokens)\nthat a subject taken from [`subject_field`](Self::subject_field) must\nmatch. Empty (the default) leaves ordinary subjects open. Subjects\nwhose first token starts with `$` (`$JS.API…`, `$KV…`, `$SYS…`) or that\nstart with `_INBOX.` belong to the server and are refused per row\nunless a pattern names that space literally (`$KV.cache.>`); `*` or\n`>` alone never opens it. A malformed record subject (whitespace, an\nempty token, a wildcard token) is always refused. The fixed\n[`subject`](Self::subject) is not checked.",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
                     "batch_size": {
                       "description": "Records per publish batch: the client is flushed (core NATS) or the\nacks awaited (JetStream) after every `batch_size` records. Defaults to\n[`DEFAULT_BATCH_SIZE`]. `0` publishes the whole page handed by the\npipeline before flushing / awaiting once.",
                       "type": [
@@ -33978,7 +34030,7 @@
             "config": {
               "anyOf": [
                 {
-                  "additionalProperties": true,
+                  "x-faucet-follows-servers": true,
                   "title": "KafkaSinkConfig",
                   "description": "Configuration for the Kafka sink connector.\n\nOnly [`brokers`](Self::brokers) and [`topic`](Self::topic) are required;\neverything else has a safe default (`acks: all` + `idempotent: true`).\nValidated at config load by [`validate`](Self::validate).",
                   "type": "object",
@@ -34178,7 +34230,7 @@
                       "default": -1
                     },
                     "extra_client_config": {
-                      "description": "Raw librdkafka producer properties, applied **last** so they override\neverything this config derives (`acks`, `enable.idempotence`,\n`compression.type`, `linger.ms`, `message.timeout.ms`,\n`queue.buffering.max.messages`). Empty by default.\n\nThe escape hatch for a knob faucet does not model — and the sharp edge\nthat goes with it: overriding a safety property here can weaken\ndelivery guarantees. The only exceptions are the exactly-once\ninvariants (`transactional.id`, `enable.idempotence`, `acks=all`),\nwhich the transactional producer force-sets on top so an override\ncannot break EOS.\n\nKeys that name a broker (`bootstrap.servers`, `metadata.broker.list`),\na URL (`*.url`) or a local file (`*.location`, `*.file`,\n`sasl.kerberos.keytab`) are checked like the typed fields by a host\nthat confines configs (`faucet serve`); keys that load or run a\nprogram (`plugin.library.paths`, `ssl.engine.location`,\n`ssl.providers`, `*.cmd`) are refused for configs it does not trust.",
+                      "description": "Raw librdkafka producer properties, applied after everything this\nconfig derives. Empty by default. The escape hatch for a knob faucet\ndoes not model (`compression.level`, `batch.size`, …).\n\nOptions faucet derives from a typed field are refused when their\nvalue disagrees with it: `bootstrap.servers` / `metadata.broker.list`\n(use `brokers`), `acks` / `request.required.acks` (use `acks`) and\n`enable.idempotence` (use `idempotent`). `transactional.id` is always\nrefused: faucet derives it per pipeline under `delivery:\nexactly_once`. Restating faucet's own value is allowed. Other\noverrides (`compression.type`, `linger.ms`, `message.timeout.ms`,\n`queue.buffering.max.messages`, …) win over the typed fields.\n\nKeys that name a broker (`bootstrap.servers`, `metadata.broker.list`),\na URL (`*.url`) or a local file (`*.location`, `*.file`,\n`sasl.kerberos.keytab`) are checked like the typed fields by a host\nthat confines configs (`faucet serve`); keys that load or run a\nprogram (`plugin.library.paths`, `ssl.engine.location`,\n`ssl.providers`, `*.cmd`) are refused for configs it does not trust.",
                       "type": "object",
                       "additionalProperties": {
                         "type": "string"
@@ -34217,7 +34269,7 @@
                       }
                     }
                   },
-                  "x-faucet-follows-servers": true
+                  "additionalProperties": true
                 },
                 true
               ]

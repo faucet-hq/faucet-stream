@@ -101,7 +101,12 @@ async fn dst_row_count(dst: &str) -> i64 {
 }
 
 fn config(src: &str, dst: &str, state_dir: &Path) -> PipelineConfig {
-    let yaml = format!(
+    faucet_cli::config::parse_with_extension(&config_yaml(src, dst, state_dir), "yaml")
+        .expect("config parses")
+}
+
+fn config_yaml(src: &str, dst: &str, state_dir: &Path) -> String {
+    format!(
         r#"
 version: 1
 name: bf
@@ -128,8 +133,7 @@ pipeline:
         src = src,
         dst = dst,
         state = state_dir.display(),
-    );
-    faucet_cli::config::parse_with_extension(&yaml, "yaml").expect("config parses")
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -533,4 +537,66 @@ pipeline:
         .expect("one window");
     assert_eq!(one.succeeded, 1);
     assert_eq!(dst_row_count(&dst).await, 6);
+}
+
+/// A backfill of a renamed row that follows another (`depends_on`) runs alone,
+/// leaves the row's pre-rename bookmark for the live row to adopt, and runs no
+/// per-unit SLA.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renamed_dependent_row_backfills_without_taking_its_old_bookmark() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (src, dst) = seed(dir.path()).await;
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{dst}"))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE events_first (id INTEGER PRIMARY KEY, day TEXT, amount INTEGER)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let state_dir = dir.path().join("state");
+    let mut yaml = config_yaml(&src, &dst, &state_dir);
+    yaml.push_str(
+        "matrix:\n  - id: first\n    sink: { config: { table_name: events_first } }\n  \
+         - id: live\n    depends_on: [first]\n    legacy_state_ids: [old]\n    \
+         sla: { min_rows_per_run: 1000 }\n",
+    );
+    let cfg = faucet_cli::config::parse_with_extension(&yaml, "yaml").expect("config parses");
+    let store = faucet_cli::state::build_state_store(cfg.pipeline.state.as_ref().unwrap())
+        .await
+        .unwrap();
+    store.put("bf::old", &json!("2026-07-04")).await.unwrap();
+
+    let mut o = opts(time_range("2026-06-01", "2026-06-03", 1));
+    o.row = Some("live".into());
+    let out = run_backfill(&cfg, o)
+        .await
+        .expect("backfill of a dependent row runs");
+    assert_eq!(
+        (out.succeeded, out.failed),
+        (2, 0),
+        "unit outcomes: {:?}",
+        out.units
+    );
+    assert_eq!(dst_row_count(&dst).await, 4);
+
+    assert_eq!(
+        store.get("bf::old").await.unwrap(),
+        Some(json!("2026-07-04")),
+        "the live row's pre-rename bookmark stays for the live row"
+    );
+    let hash = faucet_cli::backfill::plan::range_hash(&out.descriptor);
+    for unit in &out.units {
+        let key = unit_state_key("bf", &hash, &unit.unit);
+        let held = store.get(&key).await.unwrap();
+        assert_ne!(held, Some(json!("2026-07-04")), "{key}");
+        assert!(
+            store
+                .get(&format!("{key}::__sla__"))
+                .await
+                .unwrap()
+                .is_none(),
+            "no per-unit SLA history under {key}"
+        );
+    }
 }

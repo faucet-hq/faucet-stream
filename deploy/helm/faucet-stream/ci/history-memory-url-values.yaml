@@ -1,0 +1,7 @@
+# url: memory with backend unset is the in-memory history: a plain value, no Secret.
+# expect: value: "memory"
+# expect-not: name: t-faucet-stream-serve-history
+serve:
+  enabled: true
+  history:
+    url: memory

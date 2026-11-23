@@ -1,0 +1,4 @@
+# expect: - --metrics-idle-timeout-secs=3600
+serve:
+  metrics:
+    idleTimeoutSecs: 3600

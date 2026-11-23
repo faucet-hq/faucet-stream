@@ -241,11 +241,11 @@ fn policy() -> Arc<CompiledPolicy> {
 }
 
 fn facts(id: &str, residency: &str) -> SinkFacts {
-    SinkFacts {
-        id: id.into(),
-        kind: "test".into(),
-        attributes: [("residency".to_string(), residency.to_string())].into(),
-    }
+    SinkFacts::new(
+        id,
+        "test",
+        [("residency".to_string(), residency.to_string())].into(),
+    )
 }
 
 fn scope() -> PolicyScope {

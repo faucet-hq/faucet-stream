@@ -396,8 +396,8 @@ fn add_column_sql(table: &str, column: &faucet_core::PlannedColumn) -> String {
 
 /// An ISO 8601 timestamp carrying an offset as UTC wall time; `None` otherwise.
 fn utc_wall_time(s: &str) -> Option<String> {
-    let dt = chrono::DateTime::parse_from_rfc3339(s.trim()).ok()?;
-    Some(dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.f").to_string())
+    faucet_core::fidelity::offset_instant_utc(s)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.f").to_string())
 }
 
 /// Append `records` over the table's columns: the engine maps each record

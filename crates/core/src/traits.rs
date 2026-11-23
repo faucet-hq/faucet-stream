@@ -883,6 +883,18 @@ pub trait Sink: Send + Sync {
         Ok(None)
     }
 
+    /// How a record field addresses a column of
+    /// [`current_schema`](Self::current_schema): the rule every write path of
+    /// this configured sink uses to map a field onto a column. Schema-drift
+    /// handling resolves fields the same way, so a field that differs from a
+    /// column only by case (under a case-folding rule) is not reported as a new
+    /// column. When the sink's write paths disagree, fix the divergent path or
+    /// return [`ColumnMatching::Exact`](crate::ColumnMatching::Exact).
+    /// Default: `Exact`.
+    fn column_matching(&self) -> crate::ColumnMatching {
+        crate::ColumnMatching::Exact
+    }
+
     /// Whether this sink can apply additive/widening DDL via
     /// [`evolve_schema`](Self::evolve_schema). Default: `false`. The CLI rejects
     /// `on_drift: evolve` against a sink that returns `false` at config-load.

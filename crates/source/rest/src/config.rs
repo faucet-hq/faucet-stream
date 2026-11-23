@@ -187,8 +187,9 @@ pub struct RestStreamConfig {
     pub allow_missing_records_path: bool,
     /// Optional cap on pages fetched per pass, across every pagination style.
     /// Unset by default: each pagination style already stops on its own end
-    /// signal and loop guards. When the cap cuts a pass short, only a persisted
-    /// cursor bookmark (`persist_cursor`) is kept. An incremental or windowed
+    /// signal and loop guards. When the cap cuts a pass short, a persisted
+    /// cursor bookmark (`persist_cursor`) is kept, since it names the next
+    /// unread page. An incremental or windowed
     /// pass the cap cuts short fails the run instead — its record-derived or
     /// window bookmark would skip the unread pages, and keeping none would
     /// re-read the same pages forever — unless `assume_ordered` is set.
@@ -212,8 +213,8 @@ pub struct RestStreamConfig {
     /// the first unread page, and an exclusive (`>`) server filter would skip
     /// them; the client-side filter is inclusive, so the re-read rows at that
     /// key arrive again (pair with an upsert sink). Ignored for windowed
-    /// passes, with `persist_cursor`, and across `requests:` entries (a
-    /// truncated entry fails the run).
+    /// passes; with several `requests:` entries it applies to each entry's
+    /// own pass.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub assume_ordered: bool,
     /// Fixed delay between page requests, in seconds — a politeness knob for
@@ -321,7 +322,9 @@ pub struct RestStreamConfig {
     /// `requests:` — one entry per request: a context map whose values are
     /// substituted into `path` placeholders. The stream is executed once per
     /// entry and results are concatenated. Empty means run once with no
-    /// substitution. The pre-#670 spelling `partitions:` is still accepted.
+    /// substitution. With incremental replication (or `window:`) and more
+    /// than one entry, each entry reads from and stores its own bookmark. The
+    /// pre-#670 spelling `partitions:` is still accepted.
     #[serde(default, rename = "requests", alias = "partitions")]
     pub partitions: Vec<HashMap<String, Value>>,
     /// `request_concurrency:` — maximum number of `requests` entries fetched
@@ -332,9 +335,8 @@ pub struct RestStreamConfig {
     /// and the `stream_pages` path the pipeline actually drives, where it used
     /// to be silently ignored. Above 1, partition pages **interleave**: the
     /// streams are polled together, so a page from partition 3 can arrive
-    /// before partition 1 has finished. Partitions are disjoint and the
-    /// persisted bookmark is a max across all of them, so this changes
-    /// throughput rather than the resume position — but a downstream that
+    /// before partition 1 has finished. Each entry keeps its own bookmark,
+    /// so this changes throughput rather than the resume position — but a downstream that
     /// assumed partition-at-a-time page order no longer gets it.
     #[serde(
         default,
@@ -502,8 +504,12 @@ pub struct RestStreamConfig {
     /// existing `StreamPage.bookmark` / `StateStore` path — no core trait change)
     /// and, on resume, seed the stored bookmark back into the first request
     /// (query param for `cursor`, request body field for `cursor_in_body`) before
-    /// paging. Only meaningful with `pagination: cursor` / `cursor_in_body`;
-    /// mutually exclusive with `window` slicing. Default `false`.
+    /// paging. With a `state:` block this alone makes the source resume (no
+    /// incremental settings needed). Only meaningful with `pagination: cursor`
+    /// / `cursor_in_body`; mutually exclusive with `window` slicing, several
+    /// `requests:` entries and incremental replication (`replication_method:
+    /// incremental`, `replication_key`, `replication_bind`), which would share
+    /// its bookmark. Default `false`.
     #[serde(default)]
     pub persist_cursor: bool,
 
@@ -919,9 +925,20 @@ impl RestStreamConfig {
                     .into(),
             ));
         }
+        if self.persist_cursor
+            && (matches!(self.replication_method, ReplicationMethod::Incremental)
+                || self.replication_key.is_some()
+                || self.replication_bind.is_some())
+        {
+            return Err(faucet_core::FaucetError::Config(
+                "rest: persist_cursor resumes from the server's cursor; replication_method: \
+                 incremental (with replication_key / replication_bind) filters by a record \
+                 key. They share one bookmark, so they cannot be combined — pick one"
+                    .into(),
+            ));
+        }
         if self.assume_ordered
             && self.max_pages.is_some()
-            && !self.persist_cursor
             && matches!(self.replication_method, ReplicationMethod::Incremental)
             && self.replication_bind.is_none()
         {
@@ -1190,6 +1207,28 @@ impl RestStreamConfig {
                  several `requests:` entries — each would be seeded with another entry's cursor"
                     .into(),
             ));
+        }
+        if self
+            .odata
+            .as_ref()
+            .and_then(|o| o.partition.as_ref())
+            .is_some_and(|p| p.key.is_some())
+        {
+            if self.persist_cursor {
+                return Err(faucet_core::FaucetError::Config(
+                    "rest: `persist_cursor` resumes one cursor, so it cannot be combined with \
+                     OData key ranges (`odata.partition.key`), which page several ranges"
+                        .into(),
+                ));
+            }
+            if self.partitions.len() > 1 {
+                return Err(faucet_core::FaucetError::Config(
+                    "rest: OData key ranges (`odata.partition.key`) tile one entity, so they \
+                     cannot be combined with several `requests:` entries, which the key-range \
+                     read would ignore"
+                        .into(),
+                ));
+            }
         }
         if self.async_job.is_some() && !self.partitions.is_empty() {
             return Err(faucet_core::FaucetError::Config(
@@ -1803,6 +1842,37 @@ mod tests {
             body_cursor_field: "after".into(),
         };
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn persist_cursor_is_refused_with_incremental_replication() {
+        let cursor = RestStreamConfig::new("https://x", "/y")
+            .pagination(PaginationStyle::Cursor {
+                next_token_path: "$.next".into(),
+                param_name: "cursor".into(),
+            })
+            .persist_cursor(true);
+        assert!(cursor.validate().is_ok());
+        let refused = [
+            cursor
+                .clone()
+                .replication_method(ReplicationMethod::Incremental),
+            cursor.clone().replication_key("updated_at"),
+            cursor
+                .clone()
+                .replication_method(ReplicationMethod::Incremental)
+                .replication_key("updated_at")
+                .replication_bind(
+                    serde_json::from_value(serde_json::json!({"name": "since"})).unwrap(),
+                ),
+        ];
+        for c in refused {
+            let err = c.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("persist_cursor resumes from the server's cursor"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

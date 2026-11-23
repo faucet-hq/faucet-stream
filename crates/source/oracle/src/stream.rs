@@ -144,6 +144,8 @@ fn run_query_on(
         let raw = e.to_string();
         classify(query_error(&raw), &raw)
     })?;
+    faucet_core::util::check_unique_columns("Oracle", rows.column_info().iter().map(|c| c.name()))
+        .map_err(plain)?;
     let mut buf = Vec::with_capacity(job.chunk.min(job.array_size as usize));
     for row in rows {
         let row = row.map_err(|e| {

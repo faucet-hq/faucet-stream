@@ -1240,6 +1240,8 @@ pub fn source_state_schema(kind: &str) -> u32 {
     match kind {
         #[cfg(feature = "source-mongodb-cdc")]
         "mongodb-cdc" => faucet_source_mongodb_cdc::STATE_SCHEMA,
+        #[cfg(feature = "source-rest")]
+        "rest" => faucet_source_rest::STATE_SCHEMA,
         _ => 0,
     }
 }
@@ -1251,6 +1253,8 @@ pub fn migrate_source_state(kind: &str, from: u32, data: Value) -> Result<Value,
     match kind {
         #[cfg(feature = "source-mongodb-cdc")]
         "mongodb-cdc" => faucet_source_mongodb_cdc::migrate_state(from, data),
+        #[cfg(feature = "source-rest")]
+        "rest" => faucet_source_rest::migrate_state(from, data),
         _ if from == source_state_schema(kind) => Ok(data),
         _ => Err(FaucetError::State(format!(
             "{kind} has no migration from bookmark schema {from} to {}",
@@ -1455,6 +1459,7 @@ pub fn source_resumes_from_bookmark(kind: &str, config: &Value) -> bool {
         || (kind == "file" && config.get("incremental").is_some_and(|v| !v.is_null()))
         || (kind == "iceberg" && mode == Some("incremental"))
         || (kind == "dynamodb" && mode == Some("streams"))
+        || (kind == "rest" && config.get("persist_cursor") == Some(&Value::Bool(true)))
         || kind.ends_with("-cdc")
         || matches!(kind, "feed" | "kafka" | "kinesis" | "singer")
 }

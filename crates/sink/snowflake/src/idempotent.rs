@@ -41,6 +41,20 @@ pub const TRANSACTION_STATEMENT_COUNT: usize = 4;
 /// [`build_commit_only_statement`]'s output.
 pub const COMMIT_ONLY_STATEMENT_COUNT: usize = 3;
 
+/// Number of statements in the guarded page transaction for one INSERT:
+/// `BEGIN; lock; guard; INSERT; MERGE; COMMIT;` — see
+/// [`build_guarded_transaction_statement_inline_multi`].
+pub const GUARDED_TRANSACTION_STATEMENT_COUNT: usize = 6;
+
+/// Number of statements in the guarded empty-page transaction:
+/// `BEGIN; lock; guard; MERGE; COMMIT;` — see
+/// [`build_guarded_commit_only_statement_inline`].
+pub const GUARDED_COMMIT_ONLY_STATEMENT_COUNT: usize = 5;
+
+/// Text the watermark guard's error carries when the scope already holds a
+/// commit at or past the page's sequence.
+pub const WATERMARK_AHEAD_MARKER: &str = "faucet-eo-watermark-ahead";
+
 /// Fully-qualified, quoted reference to the shared commit-token watermark
 /// table in the target database/schema
 /// (`"db"."schema"."_faucet_commit_token"`).
@@ -102,6 +116,7 @@ fn build_merge_token(database: &str, schema: &str) -> String {
 /// `insert_sql` already carrying its payload inline and `scope` / `token`
 /// inlined as literals: `BEGIN; INSERT; MERGE; COMMIT;` —
 /// [`TRANSACTION_STATEMENT_COUNT`] statements and no bindings (SQL-44).
+#[deprecated(note = "unguarded against another writer's commit; use the build_guarded_* builders")]
 pub fn build_transaction_statement_inline(
     insert_sql: &str,
     database: &str,
@@ -109,6 +124,7 @@ pub fn build_transaction_statement_inline(
     scope: &str,
     token: &str,
 ) -> String {
+    #[allow(deprecated)] // the deprecated single-INSERT form of the deprecated multi form
     build_transaction_statement_inline_multi(
         &[insert_sql.to_owned()],
         database,
@@ -122,6 +138,7 @@ pub fn build_transaction_statement_inline(
 /// INSERTs (each payload within the per-value size limit), all in the one
 /// transaction: `BEGIN; INSERT…; MERGE; COMMIT;` —
 /// [`COMMIT_ONLY_STATEMENT_COUNT`] + `inserts.len()` statements.
+#[deprecated(note = "unguarded against another writer's commit; use the build_guarded_* builders")]
 pub fn build_transaction_statement_inline_multi(
     inserts: &[String],
     database: &str,
@@ -141,9 +158,83 @@ pub fn build_transaction_statement_inline_multi(
     )
 }
 
+/// The two statements that open a guarded exactly-once transaction:
+///
+/// 1. a no-op `UPDATE` of the scope's watermark row, which takes the commit
+///    table's lock and waits for any writer still holding it;
+/// 2. a `SELECT` that fails, with [`WATERMARK_AHEAD_MARKER`] in its error,
+///    when the stored token's 20-digit sequence is at or past `token`'s.
+///    Tokens start with a fixed-width sequence, so the prefixes compare as
+///    text in numeric order. The failing expression reads a column, so it is
+///    evaluated only for a matching row.
+///
+/// Both carry only `scope` and the token's sequence as literals.
+fn watermark_guard(database: &str, schema: &str, scope: &str, token: &str) -> [String; 2] {
+    let t = commit_table_ref(database, schema);
+    let scope_col = quote_ident(COMMIT_TOKEN_SCOPE_COL);
+    let token_col = quote_ident(COMMIT_TOKEN_TOKEN_COL);
+    let updated = quote_ident(UPDATED_AT_COL);
+    let scope = sql_string_literal(scope);
+    let seq: String = token.chars().take(20).collect();
+    let seq = sql_string_literal(&seq);
+    [
+        format!("UPDATE {t} SET {updated} = {updated} WHERE {scope_col} = {scope}"),
+        format!(
+            "SELECT TO_NUMBER('{WATERMARK_AHEAD_MARKER}:' || {token_col}) FROM {t} \
+WHERE {scope_col} = {scope} AND LEFT({token_col}, 20) >= {seq}"
+        ),
+    ]
+}
+
+/// The guarded page transaction (S8-03): `BEGIN; lock; guard; INSERT…; MERGE;
+/// COMMIT;` — [`GUARDED_COMMIT_ONLY_STATEMENT_COUNT`] + `inserts.len()`
+/// statements. A commit of this scope at or past the page that another
+/// writer finished first makes the guard fail, so the page is not written
+/// twice.
+pub fn build_guarded_transaction_statement_inline_multi(
+    inserts: &[String],
+    database: &str,
+    schema: &str,
+    scope: &str,
+    token: &str,
+) -> String {
+    let [lock, guard] = watermark_guard(database, schema, scope, token);
+    format!(
+        "BEGIN;\n{lock};\n{guard};\n{};\n{merge};\nCOMMIT;",
+        inserts.join(";\n"),
+        merge = merge_token_with(
+            database,
+            schema,
+            &sql_string_literal(scope),
+            &sql_string_literal(token)
+        ),
+    )
+}
+
+/// The guarded empty-page transaction: `BEGIN; lock; guard; MERGE; COMMIT;`
+/// — [`GUARDED_COMMIT_ONLY_STATEMENT_COUNT`] statements.
+pub fn build_guarded_commit_only_statement_inline(
+    database: &str,
+    schema: &str,
+    scope: &str,
+    token: &str,
+) -> String {
+    let [lock, guard] = watermark_guard(database, schema, scope, token);
+    format!(
+        "BEGIN;\n{lock};\n{guard};\n{merge};\nCOMMIT;",
+        merge = merge_token_with(
+            database,
+            schema,
+            &sql_string_literal(scope),
+            &sql_string_literal(token)
+        ),
+    )
+}
+
 /// The commit-only transaction for an empty page with `scope` / `token`
 /// inlined: `BEGIN; MERGE; COMMIT;` — [`COMMIT_ONLY_STATEMENT_COUNT`]
 /// statements and no bindings (SQL-44).
+#[deprecated(note = "unguarded against another writer's commit; use the build_guarded_* builders")]
 pub fn build_commit_only_statement_inline(
     database: &str,
     schema: &str,
@@ -221,6 +312,46 @@ mod tests {
             sql_string_literal(r#"{"k":"\u0000 it's \"q\""}"#),
             r#"'{"k":"\\u0000 it''s \\"q\\""}'"#
         );
+    }
+
+    #[test]
+    fn guarded_statements_lock_then_check_the_watermark_before_writing() {
+        let insert = "INSERT INTO \"db\".\"sch\".\"tbl\" (\"id\") SELECT 1";
+        let sql = build_guarded_transaction_statement_inline_multi(
+            &[insert.to_string()],
+            "db",
+            "sch",
+            "p::r'1",
+            "00000000000000000007#{\"a\":\"$$\"}",
+        );
+        assert!(!sql.contains('?'), "sql: {sql}");
+        assert_eq!(
+            sql.matches(";\n").count() + 1,
+            GUARDED_TRANSACTION_STATEMENT_COUNT
+        );
+        let stmts: Vec<&str> = sql.split(";\n").collect();
+        assert_eq!(stmts[0], "BEGIN");
+        assert_eq!(
+            stmts[1],
+            "UPDATE \"db\".\"sch\".\"_faucet_commit_token\" SET \"updated_at\" = \"updated_at\" \
+WHERE \"scope\" = 'p::r''1'"
+        );
+        assert_eq!(
+            stmts[2],
+            "SELECT TO_NUMBER('faucet-eo-watermark-ahead:' || \"token\") FROM \
+\"db\".\"sch\".\"_faucet_commit_token\" WHERE \"scope\" = 'p::r''1' AND \
+LEFT(\"token\", 20) >= '00000000000000000007'"
+        );
+        assert!(stmts[3].starts_with("INSERT INTO"));
+        assert!(stmts[4].starts_with("MERGE INTO"));
+        assert_eq!(stmts[5], "COMMIT;");
+
+        let only = build_guarded_commit_only_statement_inline("db", "sch", "s", "t");
+        assert_eq!(
+            only.matches(";\n").count() + 1,
+            GUARDED_COMMIT_ONLY_STATEMENT_COUNT
+        );
+        assert!(only.contains("LEFT(\"token\", 20) >= 't'"), "{only}");
     }
 
     #[test]

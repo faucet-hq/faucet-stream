@@ -112,6 +112,7 @@ fn opts(name: &str) -> ExecuteOptions {
         catalog: None,
         usage: Default::default(),
         budget: None,
+        budget_state: None,
         feed: Default::default(),
     }
 }
@@ -612,6 +613,38 @@ pipeline:
     );
     let cfg = PipelineConfig::from_text(&yaml(""), std::path::Path::new("p.yaml")).unwrap();
     assert!(expand(&cfg).is_ok());
+}
+
+#[test]
+fn a_persisted_rest_cursor_with_state_refuses_overwrite_and_cleanup() {
+    let yaml = |sink: &str| {
+        format!(
+            r#"
+version: 1
+pipeline:
+  source:
+    type: rest
+    config:
+      base_url: "http://localhost"
+      path: /items
+      persist_cursor: true
+      pagination: {{ type: Cursor, next_token_path: "$.next", param_name: cursor }}
+{sink}  state: {{ type: file, config: {{ path: ./st }} }}
+"#
+        )
+    };
+    let err = expand_err(&yaml(
+        "  sink:\n    type: sqlite\n    config:\n      database_url: \"sqlite://x.db\"\n      table_name: t\n      column_mapping: auto_map\n      write_mode: overwrite\n",
+    ));
+    assert!(
+        err.contains("only the rows changed since the last one"),
+        "{err}"
+    );
+    let cleanup = yaml(&format!(
+        "    complete_for:\n      scope: {{ group_id: 1 }}\n      on_missing: delete\n{SQLITE_UPSERT}"
+    ));
+    let err = expand_err(&cleanup);
+    assert!(err.contains("resumes from its stored bookmark"), "{err}");
 }
 
 // ── Complete reads (DynamoDB `on_gap: resnapshot`) ──────────────────────────

@@ -453,6 +453,9 @@ pub struct InstanceHeartbeat {
     /// What this instance enforces that older releases do not
     /// ([`INSTANCE_CAPABILITIES`]).
     pub capabilities: Vec<String>,
+    /// This instance's clock minus the history database's, in milliseconds
+    /// (`None`: not measured).
+    pub clock_offset_ms: Option<i64>,
 }
 
 /// A member enforces the policy versions a run was admitted under (#1051).
@@ -469,9 +472,17 @@ pub const CAP_REFERENCE_KINDS_V2: &str = "reference_kinds_v2";
 /// A member runs feeds (#1034): it knows the `feed` source and binds a
 /// delivery run to its claimed range.
 pub const CAP_FEEDS: &str = "feeds";
+/// A member counts a sharded run's budget against the run's ledger in the
+/// history (`faucet_serve_run_budgets`), not per shard.
+pub const CAP_RUN_BUDGET: &str = "run_budget";
+/// A member writes its run and shard leases on the history database's clock,
+/// so a reclaimer compares them without its own clock's skew.
+pub const CAP_DB_CLOCK: &str = "db_clock_leases";
 /// What this build advertises in its heartbeat.
 pub const INSTANCE_CAPABILITIES: &[&str] = &[
     CAP_POLICY_PIN,
+    CAP_RUN_BUDGET,
+    CAP_DB_CLOCK,
     CAP_CONNECTION_GENERATION,
     CAP_HOST_CREDENTIALS,
     CAP_REFERENCE_KINDS_V2,
@@ -498,6 +509,9 @@ pub struct InstanceRecord {
     /// capabilities, which counts as having none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Vec<String>>,
+    /// The member's clock minus the history database's, in milliseconds;
+    /// `None` for a member that does not report it.
+    pub clock_offset_ms: Option<i64>,
 }
 
 impl InstanceRecord {
@@ -693,6 +707,18 @@ pub enum HistoryError {
     /// (deleted or pruned meanwhile); nothing was written.
     #[error("template '{id}' has no version {version}")]
     VersionNotFound { id: String, version: u32 },
+    /// A conditional launch found another version live than the one it was
+    /// told to expect; nothing was written.
+    #[error(
+        "template '{id}''s live version changed (expected {}, found {})",
+        crate::error::live_label(*expected),
+        crate::error::live_label(*found)
+    )]
+    LaunchRaced {
+        id: String,
+        expected: Option<u32>,
+        found: Option<u32>,
+    },
 }
 
 impl HistoryError {
@@ -735,6 +761,18 @@ impl HistoryError {
     pub fn is_retriable(&self) -> bool {
         self.transience() != Transience::Permanent
     }
+}
+
+/// What [`RunHistory::coordinate_shards`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinateOutcome {
+    /// The run is split (by this call, or by an earlier one of this instance
+    /// whose answer was lost: `inserted` is then 0).
+    Sharded { inserted: usize },
+    /// Another instance holds the run now; nothing was written.
+    NotOwner,
+    /// A cancel was requested before the split; nothing was written.
+    CancelRequested,
 }
 
 /// One shard row to persist when a run is expanded into shards (Mode B, #230).
@@ -959,6 +997,13 @@ pub const RUN_LOG_TRUNCATED_SEQ: u64 = u64::MAX;
 pub trait RunHistory: Send + Sync {
     /// Atomically claim `key` for `run_id` (or report a replay/conflict). A prior
     /// claim older than `window` is treated as expired and re-claimable.
+    /// The history database's clock. Every lease write and expiry decision
+    /// reads it, so replicas compare one clock rather than each their own.
+    /// Default: this process's clock (a single-process backend).
+    async fn db_now(&self) -> Result<DateTime<Utc>, HistoryError> {
+        Ok(Utc::now())
+    }
+
     async fn claim_idempotency(
         &self,
         key: &str,
@@ -1172,6 +1217,35 @@ pub trait RunHistory: Send + Sync {
         self.upsert(rec).await.map(|_| true)
     }
 
+    /// Start a claimed run: write its record and renew its lease only while
+    /// this instance still owns it and it is `running`. `false`: a peer holds
+    /// it now (or it was requeued or finished), and nothing was written.
+    /// Default (one process, no peers): an upsert.
+    async fn start_owned(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
+        self.upsert(rec).await.map(|_| true)
+    }
+
+    /// Split a claimed run into shards in one transaction: flip it to
+    /// `sharded` (writing `sharded`, its record) only while this instance owns
+    /// it, it is `running`, no cancel is requested and it has no shard rows,
+    /// and insert every shard row with the flip. Default (one process): an
+    /// upsert and [`insert_shards`](Self::insert_shards).
+    async fn coordinate_shards(
+        &self,
+        sharded: &RunRecord,
+        shards: &[ShardInsert],
+    ) -> Result<CoordinateOutcome, HistoryError> {
+        self.upsert(sharded).await?;
+        let inserted = self.insert_shards(&sharded.run_id, shards).await?;
+        Ok(CoordinateOutcome::Sharded { inserted })
+    }
+
+    /// Cancel the pending shards of every `sharded` run whose cancel was
+    /// requested, returning how many. Default: none.
+    async fn cancel_flagged_shards(&self) -> Result<usize, HistoryError> {
+        Ok(0)
+    }
+
     /// Status-fenced finalize of a `Sharded` parent run: set the terminal
     /// `status` / `finished_at` / `error` only while the run is still `Sharded`,
     /// and — crucially — WITHOUT re-stamping `owner` / `lease_expires_at`. A
@@ -1241,10 +1315,10 @@ pub trait RunHistory: Send + Sync {
     // and any non-cluster deployment are unaffected. Implemented by the SQL
     // backends, which share one `faucet_serve_shards` table.
 
-    /// Idempotently insert the shard set for `run_id` (`INSERT … ON CONFLICT
-    /// (run_id, shard_id) DO NOTHING`), so concurrent coordinators converge on
-    /// the same set without a leader. Returns the number of rows newly inserted.
-    /// Default: no-op.
+    /// Insert shard rows for `run_id` (`INSERT … ON CONFLICT (run_id,
+    /// shard_id) DO NOTHING`), returning how many were new. Seeds shards for
+    /// tests and tooling only: a coordinator splits a run with
+    /// [`coordinate_shards`](Self::coordinate_shards). Default: no-op.
     async fn insert_shards(
         &self,
         run_id: &str,
@@ -1440,6 +1514,43 @@ pub trait RunHistory: Send + Sync {
     async fn policy_versions_delete(&self, scope: &str) -> Result<u64, HistoryError> {
         let _ = scope;
         Ok(0)
+    }
+
+    /// Grant up to `want` (records, bytes) of `run_id`'s run budget, capped
+    /// at `max` (`None` = no ceiling), atomically across every process that
+    /// shares this history: the ledger of a sharded run's budget. Returns
+    /// this grant and the run's granted totals. Default: unsupported, so a
+    /// sharded budgeted run refuses its pages rather than over-spend.
+    async fn budget_grant(
+        &self,
+        run_id: &str,
+        want: (u64, u64),
+        max: (Option<u64>, Option<u64>),
+    ) -> Result<faucet_core::BudgetGrant, HistoryError> {
+        let _ = (run_id, want, max);
+        Err(HistoryError::Backend(
+            "this run-history backend does not keep run budgets".into(),
+        ))
+    }
+
+    /// Return allowance `run_id`'s budget granted but nobody spent.
+    /// Default: inert.
+    async fn budget_give_back(
+        &self,
+        run_id: &str,
+        records: u64,
+        bytes: u64,
+    ) -> Result<(), HistoryError> {
+        let _ = (run_id, records, bytes);
+        Ok(())
+    }
+
+    /// The (records, bytes) granted against `run_id`'s budget, if it has a
+    /// ledger. Granted, not landed: a shard's unspent allowance counts until
+    /// it is given back. Default: none.
+    async fn budget_spent(&self, run_id: &str) -> Result<Option<(u64, u64)>, HistoryError> {
+        let _ = run_id;
+        Ok(None)
     }
 
     /// The sealed secret params of `run_id`, if still stored. Default: none.
@@ -2290,7 +2401,24 @@ pub trait RunHistory: Send + Sync {
         launched_by: Option<&str>,
         evidence: Option<&templates::EvidenceClaim>,
     ) -> Result<Option<u32>, HistoryError> {
-        let _ = (id, version, launched_by, evidence);
+        self.template_launch_expecting(id, version, launched_by, evidence, None)
+            .await
+    }
+
+    /// [`template_launch`](Self::template_launch), made only while the live
+    /// version is `expect_stable` (`Some(None)`: nothing launched yet), checked
+    /// in the same transaction as the append; a mismatch is
+    /// [`HistoryError::LaunchRaced`]. `None` checks nothing. A version that is
+    /// already stable is still a no-op. Default: unsupported.
+    async fn template_launch_expecting(
+        &self,
+        id: &str,
+        version: u32,
+        launched_by: Option<&str>,
+        evidence: Option<&templates::EvidenceClaim>,
+        expect_stable: Option<Option<u32>>,
+    ) -> Result<Option<u32>, HistoryError> {
+        let _ = (id, version, launched_by, evidence, expect_stable);
         Err(HistoryError::Backend(
             "this run-history backend does not support pipeline-template launches".into(),
         ))
@@ -2392,6 +2520,15 @@ pub trait RunHistory: Send + Sync {
         value: &str,
     ) -> Result<bool, HistoryError> {
         let _ = (key, expected, value);
+        Err(HistoryError::Backend(
+            "this run-history backend does not store server settings".into(),
+        ))
+    }
+
+    /// Remove a server-wide setting; a missing one is not an error.
+    /// Default: unsupported.
+    async fn meta_delete(&self, key: &str) -> Result<(), HistoryError> {
+        let _ = key;
         Err(HistoryError::Backend(
             "this run-history backend does not store server settings".into(),
         ))
@@ -2632,22 +2769,85 @@ pub trait RunHistory: Send + Sync {
                 protected.insert(v);
             }
         }
-        // A pending launch request names the version it will launch.
-        let pending = self
-            .change_list(&crate::serve::changes::ChangeListFilter {
-                status: Some(crate::serve::changes::ChangeStatus::Pending),
-                kind: Some(crate::serve::changes::ChangeKind::TemplateLaunch),
-                ..Default::default()
-            })
-            .await?;
-        protected.extend(templates::launch_request_pins(
-            pending.iter().map(|c| &c.payload),
-            id,
-        ));
-        for stale in templates::versions_to_prune(versions, &protected) {
+        protected.extend(self.template_pins(id).await?);
+        let stale = templates::versions_to_prune(versions, &protected);
+        if !stale.is_empty() {
+            tracing::debug!(
+                template = %id,
+                kept = ?protected,
+                "pruning old template versions; launched, labelled and pinned versions are kept"
+            );
+        }
+        for stale in stale {
             self.template_delete(id, Some(stale)).await?;
         }
         Ok(())
+    }
+
+    /// The versions of `id` something names by number, so pruning keeps them:
+    /// stored schedules and feed deliveries, pending and approved (incl.
+    /// deferred) launch, schedule and feed change requests, and the pins of
+    /// the server's own files ([`file_pins`](Self::file_pins)). Pins name
+    /// versions across ids: a schedule of template A pinning sink template B
+    /// at v7 keeps B v7. A run change carries a materialized config, not a
+    /// template reference, so it pins nothing.
+    async fn template_pins(
+        &self,
+        id: &str,
+    ) -> Result<std::collections::BTreeSet<u32>, HistoryError> {
+        use crate::serve::changes::{ChangeKind, ChangeListFilter, ChangeStatus};
+        let mut pins = self.file_pins();
+        for s in self.schedule_list().await? {
+            if let Ok(v) = serde_json::to_value(&s.spec.template) {
+                pins.extend(templates::reference_pins(&v));
+            }
+        }
+        for f in self.feed_list().await? {
+            for d in &f.spec.deliveries {
+                if let Some(t) = &d.template
+                    && let Ok(v) = serde_json::to_value(t)
+                {
+                    pins.extend(templates::reference_pins(&v));
+                }
+            }
+        }
+        let mut protected = templates::pinned_versions(&pins, id);
+        for status in [ChangeStatus::Pending, ChangeStatus::Approved] {
+            let changes = self
+                .change_list(&ChangeListFilter {
+                    status: Some(status),
+                    limit: u32::MAX as usize,
+                    ..Default::default()
+                })
+                .await?;
+            protected.extend(templates::launch_request_pins(
+                changes
+                    .iter()
+                    .filter(|c| c.kind == ChangeKind::TemplateLaunch)
+                    .map(|c| &c.payload),
+                id,
+            ));
+            let referenced: Vec<templates::Pin> = changes
+                .iter()
+                .filter(|c| matches!(c.kind, ChangeKind::Schedule | ChangeKind::Feed))
+                .flat_map(|c| templates::change_references(&c.payload))
+                .flat_map(templates::reference_pins)
+                .collect();
+            protected.extend(templates::pinned_versions(&referenced, id));
+        }
+        Ok(protected)
+    }
+
+    /// Record the template versions the server's own files pin
+    /// (`--schedules`, `--triggers`, `--feeds`), so pruning keeps them. They
+    /// live as long as this history handle; the default keeps none.
+    fn set_file_pins(&self, pins: Vec<templates::Pin>) {
+        let _ = pins;
+    }
+
+    /// The pins [`set_file_pins`](Self::set_file_pins) recorded.
+    fn file_pins(&self) -> Vec<templates::Pin> {
+        Vec::new()
     }
 
     /// The recovery probe: a write the backend must accept to count as

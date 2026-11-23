@@ -122,7 +122,7 @@ the secrets/redaction boundary like any other config string.
 | `drop_key_prefixes` | list | `[]` | Drop per-record keys starting with any of these prefixes — protocol control fields (OData's `@odata.etag`, JSON:API's `links`, HAL's `_links`) are metadata, not data, and are often invalid column names downstream. An `odata:` block implies `@odata.`, so existing OData configs need no change (#654). |
 | `max_pages` | int / null | unset | Optional cap on pages fetched per pass, across **all** pagination styles. Unset by default — every style stops on its own end signal and loop guards. A pass the cap cuts short keeps only a `persist_cursor` bookmark; an incremental or windowed pass it cuts short **fails the run** (a record-derived or window bookmark would skip the unread pages, and keeping none would re-read them every run), unless `assume_ordered` is set. |
 | `allow_repeated_pages` | bool | `false` | Keep paging when a `PageNumber` / `Offset` / `OffsetInBody` page holds the same records as an earlier, non-adjacent page of the pass, instead of failing the run — for feeds whose pages can legitimately repeat. Requires `max_pages` (refused at load time otherwise), which then bounds a server that cycles pages. A page identical to the page just before it still ends paging. |
-| `assume_ordered` | bool | `false` | The feed returns records in ascending `replication_key` order: an incremental pass `max_pages` cuts short persists the largest key it read and resumes from it next run. With `max_pages` it requires a `replication_bind` (refused at load time otherwise) — only a bookmark the server filters on moves the next run past the pages already read. The bind must compare **inclusively** (`>=`, e.g. `template: "gte|${bookmark}"`): rows sharing the last key read can sit on the first unread page, and a strict `>` filter would skip them for good. The rows re-read at that key arrive again, so pair it with an upsert sink. Ignored for windowed passes, with `persist_cursor`, and across `requests:` entries — a `requests:` run that `max_pages` cuts short fails its incremental pass, because the per-entry bookmarks cannot be consolidated. |
+| `assume_ordered` | bool | `false` | The feed returns records in ascending `replication_key` order: an incremental pass `max_pages` cuts short persists the largest key it read and resumes from it next run. With `max_pages` it requires a `replication_bind` (refused at load time otherwise) — only a bookmark the server filters on moves the next run past the pages already read. The bind must compare **inclusively** (`>=`, e.g. `template: "gte|${bookmark}"`): rows sharing the last key read can sit on the first unread page, and a strict `>` filter would skip them for good. The rows re-read at that key arrive again, so pair it with an upsert sink. Ignored for windowed passes. With several `requests:` entries it applies to each entry's own pass, since each entry keeps its own bookmark. |
 | `request_delay` | int (seconds) / null | `null` | Delay between consecutive page requests. |
 
 **Body & keyset pagination.** Two styles page without a query param or a response token:
@@ -148,7 +148,7 @@ the rows already emitted at the boundary value are dropped by whole-record
 fingerprint, so every row is read exactly once. A full page whose rows all share
 one value still fails the run, since the cursor cannot get past it.
 
-**Resumable cursor (`persist_cursor`).** With `persist_cursor: true`, a `Cursor` / `CursorInBody` stream emits its terminal cursor as the run's `StreamPage` bookmark (persisted via a `state:` store) and, on the next run, seeds that saved cursor into the first request — so an envelope-cursor feed (e.g. a `/transactions/sync` endpoint) resumes incrementally instead of re-pulling from the start. It resumes **one** cursor, so it is refused with more than one `requests:` entry.
+**Resumable cursor (`persist_cursor`).** With `persist_cursor: true`, a `Cursor` / `CursorInBody` stream emits its terminal cursor as the run's `StreamPage` bookmark (persisted via a `state:` store) and, on the next run, seeds that saved cursor into the first request — so an envelope-cursor feed (e.g. a `/transactions/sync` endpoint) resumes incrementally instead of re-pulling from the start. A `state:` block is all it needs: the source then reports a state key and `faucet run` / `schedule` / `serve` resume from the stored cursor. It resumes **one** cursor, so it is refused with more than one `requests:` entry, and with incremental replication (`replication_method: incremental`, `replication_key`, `replication_bind`), which would share its bookmark and filter records by the opaque cursor. Because each run reads only what the cursor names, a resuming `persist_cursor` source is refused with `write_mode: overwrite` (every run would replace the table with the delta) and with `complete_for: { on_missing: delete }` cleanup.
 
 ### Multi-array fan-out (`records_multi`) & envelope carry (`record_ancestors`)
 
@@ -402,7 +402,7 @@ a catalog endpoint, a REST admin API) is pure YAML, never a code path.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `list` | object / null | — | Step 1: listing request — `get` (path), `items` (JSONPath to the array), `name` (JSONPath per item), optional `keep_if` predicate and `exclude_name_suffixes`, and `next` (JSONPath to the next page's URL — absolute or relative to `base_url`; pages are followed until it is null/empty/repeats; without it only the first page is read). Omit when `objects` is supplied directly. |
+| `list` | object / null | — | Step 1: listing request — `get` (path), `items` (JSONPath to the array), `name` (JSONPath per item), optional `keep_if` predicate and `exclude_name_suffixes`, and `next` (JSONPath to the next page's URL — absolute or relative to `base_url`; pages are followed until it is null/empty or repeats the page just read; a link back to an earlier page fails discovery, since datasets behind the loop were never listed; without it only the first page is read). Omit when `objects` is supplied directly. |
 | `objects` | array<string> **or** string | `[]` | Datasets supplied directly — a list or a comma-separated string, so one run-param can drive it (`objects: "${param.objects}"`). |
 | `describe` | object / null | — | Step 2: per-dataset field discovery — `get` (templated path), `fields`/`field_name`/`field_type`/`field_nullable` JSONPaths, a `type_map`, and `skip_types`. Omit when the source returns every column by default. |
 | `emit.config` | object | — | Step 3: JSON deep-merged into the dataset's source config (e.g. a query built from `${field_names}`). Every string leaf is templated. |
@@ -473,8 +473,13 @@ source:
 Each `key_ranges.objects` entity whose `$metadata` declares a single **integer**
 key is tiled with `faucet_core::shard::plan_pk_shards` (the same primitive the
 SQL sources shard with) and fetched as concurrent `$filter` ranges; entities
-without such a key fall back to sequential paging. Ranges are planned per run —
-never bookmarked.
+without such a key fall back to sequential paging. Ranges are planned per run.
+With incremental replication the read persists one bookmark — the largest of
+the ranges' bookmarks — once every range finished (the ranges are disjoint
+slices of one entity with one replication clock); a range cut short by
+`max_pages` or a pagination loop fails an incremental read and persists
+nothing for a full refresh. Key ranges are refused together with
+`persist_cursor` and with more than one `requests:` entry.
 
 When `$metadata` is available, each emitted row's sink patch also carries the
 entity's column `schema` from its EDM types, so a typed sink declares real
@@ -775,8 +780,8 @@ the parsed document this path deliberately never materializes.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `requests` | array<map> | `[]` | Each entry is a context map substituted into `path` placeholders. The stream runs once per entry and concatenates results. Empty = run once with no substitution. Formerly `partitions` (still accepted, with a deprecation warning). |
-| `request_concurrency` | int / null | `null` | Max `requests` entries fetched concurrently. `null` / `0` / `1` = sequential. Honoured on both the buffering and the streaming read path since #624 (it was inert on the streaming one, which is the path `faucet run` drives). Above 1 the entries' pages **interleave** — entries are disjoint and the bookmark is a max across them, so only page order changes. Formerly `partition_concurrency` (still accepted). |
+| `requests` | array<map> | `[]` | Each entry is a context map substituted into `path` placeholders. The stream runs once per entry and concatenates results. Empty = run once with no substitution. With incremental replication (or `window:`) and more than one entry, each entry reads from and keeps **its own** bookmark, stored as `{"requests": {"<entry id>": <bookmark>, …}}` (the id is a hash of the entry's values, so no value lands in state; an entry rendered differently on every run, e.g. from `${now.*}`, gets a new id each run, starts from `start_replication_value` and logs a warning). A bookmark stored by an earlier release is every entry's start. Removing an entry drops its position; with one entry left it resumes from that entry's position and stores a plain bookmark again. Stored REST state is at schema 1 from this release, so an older release refuses it: rolling back needs a state reset. Formerly `partitions` (still accepted, with a deprecation warning). |
+| `request_concurrency` | int / null | `null` | Max `requests` entries fetched concurrently. `null` / `0` / `1` = sequential. Honoured on both the buffering and the streaming read path since #624 (it was inert on the streaming one, which is the path `faucet run` drives). Above 1 the entries' pages **interleave** — each entry keeps its own bookmark, so only page order changes. Formerly `partition_concurrency` (still accepted). |
 
 ## Authentication
 
@@ -970,17 +975,22 @@ The `pagination` field selects a `PaginationStyle` (tagged by `type`). `max_page
 | Style (`type`) | Fields | Stops when |
 |----------------|--------|------------|
 | `None` | — | After the first page. |
-| `Cursor` | `next_token_path`, `param_name` | Next-token JSONPath is null/absent, or the same cursor repeats (loop detection). |
-| `CursorInBody` | `next_token_path`, `body_cursor_field` | POST-search endpoints: the next-page cursor is read from the response body and written **into the request JSON body** at `body_cursor_field` (rather than a query param). Stops when the cursor is null/absent or repeats. E.g. a CRM `POST …/search` — `$.paging.next.after` → `after`. A JSON Pointer (`/variables/after`) targets a nested location (a new key of an existing object, or an existing value). |
-| `LinkHeader` | — | No `rel="next"` in the `Link` response header, or the same link repeats. |
-| `NextLinkInBody` | `next_link_path` | Next-page URL is absent, null, empty, or repeats. |
+| `Cursor` | `next_token_path`, `param_name` | Next-token JSONPath is null/absent, or the cursor just used comes back (an earlier one fails the run; see below). |
+| `CursorInBody` | `next_token_path`, `body_cursor_field` | POST-search endpoints: the next-page cursor is read from the response body and written **into the request JSON body** at `body_cursor_field` (rather than a query param). Stops when the cursor is null/absent or the one just used comes back. E.g. a CRM `POST …/search` — `$.paging.next.after` → `after`. A JSON Pointer (`/variables/after`) targets a nested location (a new key of an existing object, or an existing value). |
+| `LinkHeader` | — | No `rel="next"` in the `Link` response header, or the link just followed comes back. |
+| `NextLinkInBody` | `next_link_path` | Next-page URL is absent, null, empty, or the one just followed. |
 | `PageNumber` | `param_name`, `start_page`, `page_size`, `page_size_param` | A zero-record page, or the same records as the previous page (content-stagnation detection for APIs that clamp out-of-range pages); a repeat of an earlier, non-adjacent page fails the run. |
 | `Offset` | `offset_param`, `limit_param`, `limit`, `total_path`, `rows_path`, `stop_when_short` *(optional)* | A zero-record page, offset reaches `total` (via `total_path`), or an identical repeated page. Without `total_path` a short page does **not** stop paging — the server may cap `limit` — so the walk ends on the empty page after it; set `stop_when_short: true` for a server that never caps a page but rejects an offset past the end (`400`/`416`). The offset advances by the records received, or by the matches of `rows_path` (required when `records_path` fans out to nested children or `record_ancestors` is set). |
 
-"Repeats" means any cursor, link or page already seen in the same pass, not
-only the previous one, so a server alternating between two cursors (A→B→A)
-stops instead of looping; a next link pointing back at a URL already fetched
-counts as a repeat. A page (`PageNumber` / `Offset` / `OffsetInBody`)
+A cursor or link equal to the one just used (or a next link pointing back at
+the URL just fetched) is the server's end-of-feed echo and ends paging
+normally. One equal to an **earlier** cursor or link of the same pass (a
+server alternating A→B→A) means paging went round a loop and the pages behind
+it were never read, so the run **fails** — whether the pass is incremental or a
+full refresh. The one exception is an incremental pass declared
+`assume_ordered` with a `replication_bind`: it keeps the largest key read,
+since the unread rows sort after it and the next run starts there. Errors and
+logs show a repeated cursor or link by length and hash, never its text. A page (`PageNumber` / `Offset` / `OffsetInBody`)
 identical to the **previous** one is dropped and paging stops; one identical
 to an earlier, non-adjacent page fails the run, since the server is cycling or
 two pages hold identical records and rows may be unread. For a feed whose pages

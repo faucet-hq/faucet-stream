@@ -408,7 +408,7 @@ println!("transferred {} records", result.records_written);
 - A `sqlx::PgPool` is created once in `PostgresSink::new()` with the configured `max_connections` and reused for every batch.
 - `write_batch()` slices records into `batch_size` chunks (or forwards the whole slice when `batch_size = 0`) and inserts each chunk with a single multi-row `INSERT` in its own transaction.
 - **JSONB mode** inserts via `INSERT INTO table (col) SELECT * FROM unnest($1::jsonb[])` — one bound array, no per-row parameters.
-- **AutoMap mode** queries each column's name **and underlying type** (`udt_name`) from the catalog, scoped via `to_regclass` to exactly the relation the `INSERT` targets (the configured `schema`, else the `search_path`-resolved table). A multi-row `INSERT INTO ... VALUES ($1::int4, $2::timestamptz), ...` is built dynamically with a per-column cast; each value is bound as text so the destination column's input function parses it — numbers, booleans, timestamps, uuids, and `json`/`jsonb` columns all land in their native types. The column set is the **union** of record keys across the batch (in declared table order); on an append a row missing a column binds SQL `NULL`, while an upsert groups rows by the columns they carry and updates only those.
+- **AutoMap mode** queries each column's name **and underlying type** (`udt_name`) from the catalog, scoped via `to_regclass` to exactly the relation the `INSERT` targets (the configured `schema`, else the `search_path`-resolved table). A multi-row `INSERT INTO ... VALUES ($1::int4, $2::timestamptz), ...` is built dynamically with a per-column cast; each value is bound as text so the destination column's input function parses it — numbers, booleans, timestamps, uuids, and `json`/`jsonb` columns all land in their native types. An offset-bearing instant bound for a `timestamp` or `time` column (no zone) — on the INSERT and COPY paths alike — is written as its UTC wall time (`2026-09-18T12:00:00+02:00` → `2026-09-18 10:00:00`), since PostgreSQL ignores the offset there; `timestamptz` receives the instant unchanged. The column set is the **union** of record keys across the batch (in declared table order); on an append a row missing a column binds SQL `NULL`, while an upsert groups rows by the columns they carry and updates only those.
 - All identifiers (table + column names) are quoted with `quote_ident()` to prevent SQL injection.
 
 ## Lineage dataset URI
@@ -572,7 +572,8 @@ every key an upsert / delete touches is journaled into `_faucet_run_journal`
 table as `<table>__faucet_prev` (a `CREATE TABLE … AS SELECT` inside the swap transaction). `faucet rollback --run <id>` then
 deletes the run's appended rows, restores the journaled before-images, or
 swaps the previous table back — refusing (unless `--force`) when a later run
-changed the same keys — and rewinds the row's bookmark and exactly-once
+changed the same keys, or when another journaled run (of any pipeline or row) deleted a
+key it changed — and rewinds the row's bookmark and exactly-once
 watermark. For a scoped overwrite (`scope:`) only the window is checked and
 restored: rows outside it keep their earlier run ids without blocking the
 rollback, and stay as they are. Sink hooks: `supports_rollback`, `rollback_run`, `forget_run`,

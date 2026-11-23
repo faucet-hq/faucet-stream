@@ -15,12 +15,14 @@
 
 pub mod auth;
 pub mod format;
+mod owned;
 
 #[cfg(feature = "schema-registry")]
 pub mod schema_registry;
 
 pub use auth::{BasicAuth, KafkaAuth, ScramMechanism};
 pub use format::{CompressionType, KafkaValueFormat, OnDecodeError, OnKeyError};
+pub use owned::{OwnedKey, check_owned_keys};
 
 #[cfg(feature = "schema-registry")]
 pub use schema_registry::SchemaRegistryConfig;

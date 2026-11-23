@@ -444,8 +444,11 @@ async fn policy_gate(
         if report.violated() {
             let merged = serde_json::to_value(&loaded.cfg).unwrap_or(Value::Null);
             let fp = crate::serve::idempotency::fingerprint(&merged, loaded.cfg.name.as_deref());
-            let pipeline = loaded.cfg.name.as_deref().unwrap_or("serve");
-            crate::policy::record_metrics(pipeline, &report);
+            let pipeline = crate::exec_metrics::pipeline_label(
+                loaded.tenant.as_deref().map(|t| t.values.id.as_str()),
+                loaded.cfg.name.as_deref().unwrap_or("serve"),
+            );
+            crate::policy::record_metrics(&pipeline, &report);
             crate::serve::audit::record_detail(
                 state,
                 actor,
@@ -514,6 +517,10 @@ pub struct GovernedRun {
     pub concurrency: Option<usize>,
     /// One shard of a source-sharded run (#230).
     pub shard: Option<faucet_core::ShardSpec>,
+    /// When the run started, for a shard: its budget's records and bytes are
+    /// granted from the run's ledger in the history and its deadline is the
+    /// run's, so every shard on every replica shares one budget.
+    pub run_started: Option<chrono::DateTime<chrono::Utc>>,
     #[cfg(feature = "notify")]
     pub notifier: Option<std::sync::Arc<crate::notify::Notifier>>,
     /// Record the run in the Data Movement Catalog (whole runs only).
@@ -543,6 +550,18 @@ pub fn governed_options(
     let usage = runner::usage_options(cfg).map_err(|e| format!("usage: {e}"))?;
     #[cfg(not(feature = "catalog"))]
     let _ = run.catalog;
+    let budget = run_budget(cfg, tenant);
+    let budget_state = match (&budget, run.shard.is_some(), run.run_started) {
+        (Some(spec), true, Some(started)) if !spec.is_empty() => {
+            Some(crate::serve::budget_ledger::shard_budget_state(
+                state.history(),
+                &run.run_id,
+                spec,
+                started,
+            ))
+        }
+        _ => None,
+    };
     Ok(crate::executor::ExecuteOptions {
         legacy_state_writes: state.cluster().legacy_state_writes(),
         force_lease: false,
@@ -578,8 +597,9 @@ pub fn governed_options(
             annotations: Vec::new(),
             tenant: tenant.map(|t| t.values.id.clone()),
         }),
+        budget_state,
         usage,
-        budget: run_budget(cfg, tenant),
+        budget,
         feed: run.feed,
     })
 }
@@ -774,6 +794,19 @@ pub async fn submit(
         )
         .await?;
     }
+    // A budgeted sharded run waits until every member counts its shards
+    // against one run ledger: an older member would give each shard the
+    // whole budget.
+    if admitted.budget.as_ref().is_some_and(|b| !b.is_empty())
+        && admitted.loaded.cfg.shard.is_some()
+    {
+        require_member_capability(
+            state,
+            crate::serve::history::CAP_RUN_BUDGET,
+            RUN_BUDGET_REFUSAL,
+        )
+        .await?;
+    }
     req.pool = Some(pool);
     // The stored body (what a cluster peer re-runs) carries the ceilings too.
     req.budget = admitted.budget.clone();
@@ -793,6 +826,11 @@ pub const REFERENCE_KINDS_REFUSAL: &str = "listener unavailable: a cluster membe
 pub const PIN_SERVERS_REFUSAL: &str = "server pinning unavailable: a cluster member does not \
      keep a submitted config's clients on the servers it names; finish the rolling upgrade, \
      then retry";
+
+/// The refusal while a cluster member does not count a sharded run's budget
+/// against the run's ledger.
+pub const RUN_BUDGET_REFUSAL: &str = "run budget unavailable: a cluster member counts a \
+     sharded run's budget per shard; finish the rolling upgrade, then retry";
 
 /// The refusal while a cluster member does not enforce policy pins (#1051).
 pub const POLICY_PIN_REFUSAL: &str = "policy unavailable: a cluster member does not enforce the \
@@ -913,6 +951,9 @@ pub async fn cancel(
             "ok",
         )
         .await;
+        if state.cluster().enabled() {
+            persist_local_cancel(state, id).await;
+        }
         return Ok(CancelOutcome::Requested);
     }
     let rec = state
@@ -975,6 +1016,28 @@ pub async fn cancel(
     }
     // Single instance, no local token: the run is finishing or just finished.
     Ok(CancelOutcome::Finished)
+}
+
+/// How long a cancel answered from a local token waits to record the cancel
+/// in the history.
+const LOCAL_CANCEL_WRITE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Record a cancel this instance answered from its own token, so the run's
+/// shards on peers, and a split still in progress, stop too. Best effort: the
+/// local token already stops this instance's part.
+async fn persist_local_cancel(state: &ServerState, id: &str) {
+    match tokio::time::timeout(LOCAL_CANCEL_WRITE, state.history().request_cancel(id)).await {
+        Ok(Ok(())) => runner::maybe_finalize_parent(state, id).await,
+        Ok(Err(e)) => tracing::warn!(
+            run_id = %id,
+            error = %e,
+            "could not record the cancel in the run history; only this replica's part stops now"
+        ),
+        Err(_) => tracing::warn!(
+            run_id = %id,
+            "recording the cancel in the run history timed out; only this replica's part stops now"
+        ),
+    }
 }
 
 // ── Read operations ──────────────────────────────────────────────────────────
@@ -1145,11 +1208,10 @@ pub async fn verify(
     let loaded = &admitted.loaded;
     let permit = runner::inline_permit(state)?;
     let auth = loaded.auth_catalog().map_err(cli_to_serve)?;
-    let pipeline_name = loaded
-        .cfg
-        .name
-        .clone()
-        .unwrap_or_else(|| "verify".to_string());
+    let pipeline_name = crate::exec_metrics::pipeline_label(
+        loaded.tenant.as_deref().map(|t| t.values.id.as_str()),
+        loaded.cfg.name.as_deref().unwrap_or("verify"),
+    );
     let mut spec = loaded.cfg.verify.clone().unwrap_or_default();
     if let Some(n) = req.max_differences {
         spec.max_differences = n;
@@ -1922,6 +1984,65 @@ mod templates {
         )
     }
 
+    /// Refuse a run composed with a community template (a synced version of
+    /// an owner its origin does not trust, [`crate::templates::provenance`])
+    /// whose stored body names something of this machine: a local path, a
+    /// local or private network address, a `file:` URL, a program, a
+    /// listener, or this machine's own identity. Sync holds such a template
+    /// back; this also covers versions synced before the rule, and a `trust:`
+    /// edited since. The run itself stays the operator's (its sink template
+    /// and overlay keep their directives and paths).
+    async fn refuse_community_resources(
+        state: &ServerState,
+        m: &crate::templates::MaterializedConfig,
+    ) -> Result<(), ServeError> {
+        #[cfg(feature = "templates-sync")]
+        let origins = state
+            .templates_sync()
+            .map(|f| crate::templates::provenance::origin_trust(&f))
+            .unwrap_or_default();
+        #[cfg(not(feature = "templates-sync"))]
+        let origins: Vec<crate::templates::provenance::OriginTrust> = Vec::new();
+        let parts = [
+            Some((m.template_id.as_str(), m.version)),
+            m.sink_id.as_deref().zip(m.sink_version),
+            m.overlay_id.as_deref().zip(m.overlay_version),
+        ];
+        for (id, version) in parts.into_iter().flatten() {
+            let Some(rec) = state
+                .history()
+                .template_get(id, Some(version))
+                .await
+                .map_err(ServeError::from)?
+            else {
+                continue;
+            };
+            let Some(owner) = crate::templates::provenance::community_owner(
+                id,
+                rec.created_by.as_deref(),
+                &origins,
+            ) else {
+                continue;
+            };
+            let doc = crate::templates::parse_body(&rec.body, rec.format)
+                .map_err(|e| ServeError::Internal(format!("template '{id}' v{version}: {e}")))?;
+            if let Some(why) = crate::hub::community_use(&doc) {
+                tracing::warn!(
+                    template = %id,
+                    version,
+                    community_template = %owner,
+                    "refusing a run of a community template that reads this machine"
+                );
+                return Err(ServeError::Forbidden(format!(
+                    "template '{id}' v{version} is a community template (`{owner}`) and {why}; \
+                     a community template may not do that unless its origin lists `{owner}` \
+                     under `trust:`"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Run a registered template (#444): resolve the version, materialize it
     /// with the caller's params (composing a sink template, applying an
     /// overlay), label the run with its provenance and [`super::submit`] it.
@@ -2001,6 +2122,7 @@ mod templates {
         )
         .await
         .map_err(map_err)?;
+        refuse_community_resources(&state, &materialized).await?;
         if !body.pool_by_operator && body.pool.is_some() {
             let doc: serde_json::Value = serde_json::from_str(&materialized.body)
                 .map_err(|e| ServeError::Internal(format!("materialized config: {e}")))?;
@@ -2266,6 +2388,7 @@ mod tests {
             state_format: 0,
             pools: None,
             capabilities: caps,
+            clock_offset_ms: None,
         };
         state
             .cluster()
@@ -2304,6 +2427,7 @@ mod tests {
                 state_format: 0,
                 pools: Vec::new(),
                 capabilities: Vec::new(),
+                clock_offset_ms: None,
             })
             .await
             .unwrap();
@@ -2350,6 +2474,7 @@ mod tests {
                 state_format: 0,
                 pools: Vec::new(),
                 capabilities: Vec::new(),
+                clock_offset_ms: None,
             })
             .await
             .unwrap();
@@ -2377,6 +2502,7 @@ mod tests {
                 state_format: 0,
                 pools: None,
                 capabilities: None,
+                clock_offset_ms: None,
             }]);
         let actor = crate::serve::rbac::AuthContext {
             principal: "alice".into(),
@@ -2447,6 +2573,7 @@ mod tests {
                 state_format: 0,
                 pools: Vec::new(),
                 capabilities: Vec::new(),
+                clock_offset_ms: None,
             })
             .await
             .unwrap();
@@ -2474,6 +2601,7 @@ mod tests {
                 state_format: 0,
                 pools: None,
                 capabilities: None,
+                clock_offset_ms: None,
             }]);
         let actor = crate::serve::rbac::AuthContext {
             principal: "alice".into(),

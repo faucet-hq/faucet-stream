@@ -7,7 +7,9 @@
 //! but was read up to its tip has a `resume_at` time instead and restarts at
 //! `AT_TIMESTAMP(<persisted>)` — without it a quiet shard would restart at the
 //! configured start position, which under `latest` skips everything written
-//! between runs. Shards absent from both maps use the start position.
+//! between runs. Shards absent from both maps use the start position. A
+//! shard in either map counts as read when a reshard closes it, so it is
+//! drained before its children even when it delivered nothing yet.
 //! `resume_at` is omitted when empty, so a bookmark without it keeps the
 //! original shape (and an older release reading the new one ignores it).
 
@@ -62,6 +64,12 @@ impl ShardBookmarks {
     /// The persisted sequence for a shard, if any.
     pub fn get(&self, shard_id: &str) -> Option<&str> {
         self.shards.get(shard_id).map(String::as_str)
+    }
+
+    /// Whether an earlier run read the shard: it has a sequence or a
+    /// caught-up time.
+    pub fn has_position(&self, shard_id: &str) -> bool {
+        self.shards.contains_key(shard_id) || self.resume_at.contains_key(shard_id)
     }
 
     pub fn to_value(&self) -> Value {

@@ -72,7 +72,11 @@ transforms = [
     "transform-explode",
     "transform-cdc-unwrap",
 ]
-observability-install = ["dep:metrics-exporter-prometheus", "dep:tracing-subscriber"]
+observability-install = [
+    "dep:metrics-exporter-prometheus",
+    "dep:metrics-util",
+    "dep:tracing-subscriber",
+]
 # OTLP (OpenTelemetry) export of traces + metrics (#201). Opt-in; pulls the
 # 0.33-line OTel stack. The wiring inside `install_observability` is additionally
 # gated on `observability-install` (see otel.rs); enabling `otel` alone just makes

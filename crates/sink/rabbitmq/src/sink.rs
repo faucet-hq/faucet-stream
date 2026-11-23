@@ -14,7 +14,9 @@
 use crate::config::{RabbitMqSinkConfig, RoutingKey};
 use async_trait::async_trait;
 use faucet_common_rabbitmq::{amqp_error, check_exchange, declare_exchange, encode_payload};
-use faucet_core::driver::{DriverSink, MessageDriver, MessageSinkDriver, OutboundMessage};
+use faucet_core::driver::{
+    DriverSink, MessageDriver, MessageSinkDriver, OutboundMessage, RowOutcomes,
+};
 use faucet_core::{CallSlot, FaucetError, RowOutcome, Sink};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -124,9 +126,10 @@ impl RabbitMqDriver {
         calls: &CallSlot,
         messages: Vec<OutboundMessage>,
     ) -> Result<Vec<RowOutcome>, FaucetError> {
-        let mut outcomes: Vec<RowOutcome> = messages.iter().map(|_| Ok(())).collect();
+        let total = messages.len();
+        let mut outcomes = RowOutcomes::new();
         if messages.is_empty() {
-            return Ok(outcomes);
+            return Ok(Vec::new());
         }
         let prepared: Vec<(usize, (String, Vec<u8>))> = messages
             .into_iter()
@@ -161,28 +164,28 @@ impl RabbitMqDriver {
                 .await;
             match done {
                 Ok(Ok(Ok(()))) => {}
-                // A channel error: earlier groups keep their confirmed
-                // outcomes, the rest fail, and the next write reconnects.
+                // A channel error: confirmed rows keep their outcome, the
+                // rest fail, and the next write reconnects.
                 Ok(Ok(Err(e))) => {
                     *self.state.lock().await = None;
                     let undecided = prepared[n * chunk..].iter().map(|(i, _)| *i);
-                    fail_cut(&mut outcomes, undecided, &e);
-                    return Ok(outcomes);
+                    outcomes.fail_undecided(undecided, &e, "rabbitmq");
+                    return Ok(outcomes.into_rows(total, "rabbitmq"));
                 }
                 Ok(Err(_)) => {
                     let unconfirmed = prepared[n * chunk..].iter().map(|(i, _)| *i);
-                    fail_unconfirmed(&mut outcomes, unconfirmed, limit);
-                    return Ok(outcomes);
+                    outcomes.fail_undecided(unconfirmed, &publish_timeout(limit), "rabbitmq");
+                    return Ok(outcomes.into_rows(total, "rabbitmq"));
                 }
                 // The run's deadline cut the group (#880).
                 Err(cause) => {
                     let unconfirmed = prepared[n * chunk..].iter().map(|(i, _)| *i);
-                    fail_cut(&mut outcomes, unconfirmed, &cause);
-                    return Ok(outcomes);
+                    outcomes.fail_undecided(unconfirmed, &cause, "rabbitmq");
+                    return Ok(outcomes.into_rows(total, "rabbitmq"));
                 }
             }
         }
-        Ok(outcomes)
+        Ok(outcomes.into_rows(total, "rabbitmq"))
     }
 
     async fn publish_group(
@@ -191,7 +194,7 @@ impl RabbitMqDriver {
         group: &[(usize, (String, Vec<u8>))],
         props: &lapin::BasicProperties,
         options: BasicPublishOptions,
-        outcomes: &mut [RowOutcome],
+        outcomes: &mut RowOutcomes,
     ) -> Result<(), FaucetError> {
         {
             let mut confirms = FuturesUnordered::new();
@@ -211,7 +214,7 @@ impl RabbitMqDriver {
             }
             while let Some((i, result)) = confirms.next().await {
                 let confirmation = result.map_err(|e| sink_error("publisher confirm", e))?;
-                outcomes[i] = confirmation_outcome(confirmation, &self.config.exchange);
+                outcomes.decide(i, confirmation_outcome(confirmation, &self.config.exchange));
             }
         }
         Ok(())
@@ -411,46 +414,14 @@ impl MessageDriver for RabbitMqDriver {
     }
 }
 
-/// A publish group that timed out leaves its rows, and every row of the
-/// groups after it, failed with the timeout unless already decided (earlier
-/// groups' confirms, rows that failed on their own).
-/// The error is the typed, retriable [`FaucetError::Timeout`] (a broker
-/// resource alarm blocking publishers is the usual cause).
-fn fail_unconfirmed(
-    outcomes: &mut [faucet_core::RowOutcome],
-    rows: impl Iterator<Item = usize>,
-    after: std::time::Duration,
-) {
-    for i in rows {
-        if outcomes[i].is_ok() {
-            outcomes[i] = Err(FaucetError::Timeout {
-                operation: "rabbitmq publish (broker blocked by a resource alarm?)".into(),
-                after,
-            });
-        }
-    }
-}
-
-/// Like [`fail_unconfirmed`], for a group the run's call context cut short:
-/// every listed row not yet decided fails with that cause.
-fn fail_cut(
-    outcomes: &mut [faucet_core::RowOutcome],
-    rows: impl Iterator<Item = usize>,
-    cause: &FaucetError,
-) {
-    for i in rows {
-        if outcomes[i].is_ok() {
-            outcomes[i] = Err(match cause {
-                FaucetError::Cancelled { operation } => FaucetError::Cancelled {
-                    operation: operation.clone(),
-                },
-                FaucetError::Timeout { operation, after } => FaucetError::Timeout {
-                    operation: operation.clone(),
-                    after: *after,
-                },
-                other => FaucetError::Sink(format!("rabbitmq publish: {other}")),
-            });
-        }
+/// The error the rows of a publish group that timed out get, and those of
+/// every group after it, unless already decided. It is the typed, retriable
+/// [`FaucetError::Timeout`] (a broker resource alarm blocking publishers is
+/// the usual cause).
+fn publish_timeout(after: std::time::Duration) -> FaucetError {
+    FaucetError::Timeout {
+        operation: "rabbitmq publish (broker blocked by a resource alarm?)".into(),
+        after,
     }
 }
 
@@ -477,64 +448,55 @@ mod tests {
 
     #[test]
     fn a_cut_group_fails_only_rows_not_yet_decided() {
-        let mut outcomes: Vec<faucet_core::RowOutcome> =
-            vec![Err(FaucetError::Sink("own".into())), Ok(()), Ok(()), Ok(())];
-        fail_cut(
-            &mut outcomes,
-            [0, 1].into_iter(),
+        let mut outcomes = RowOutcomes::new();
+        outcomes.fail(0, FaucetError::Sink("own".into()));
+        outcomes.fail_undecided(
+            [0, 1],
             &FaucetError::Cancelled {
                 operation: "publish call".into(),
             },
+            "rabbitmq",
         );
-        assert!(matches!(&outcomes[0], Err(FaucetError::Sink(m)) if m == "own"));
-        assert!(matches!(&outcomes[1], Err(FaucetError::Cancelled { .. })));
-        fail_cut(
-            &mut outcomes,
-            [2].into_iter(),
+        outcomes.fail_undecided(
+            [2],
             &FaucetError::Timeout {
                 operation: "publish call (deadline)".into(),
                 after: std::time::Duration::ZERO,
             },
+            "rabbitmq",
         );
-        assert!(matches!(&outcomes[2], Err(FaucetError::Timeout { .. })));
-        fail_cut(
-            &mut outcomes,
-            [3].into_iter(),
-            &FaucetError::Source("x".into()),
-        );
-        assert!(matches!(&outcomes[3], Err(FaucetError::Sink(m)) if m.contains("x")));
+        outcomes.fail_undecided([3], &FaucetError::Source("x".into()), "rabbitmq");
+        let rows = outcomes.into_rows(4, "rabbitmq");
+        assert!(matches!(&rows[0], Err(FaucetError::Sink(m)) if m == "own"));
+        assert!(matches!(&rows[1], Err(FaucetError::Cancelled { .. })));
+        assert!(matches!(&rows[2], Err(FaucetError::Timeout { .. })));
+        assert!(matches!(&rows[3], Err(FaucetError::Sink(m)) if m.contains("x")));
     }
 
     #[test]
-    fn a_timeout_fails_only_rows_not_yet_decided() {
-        let mut outcomes: Vec<faucet_core::RowOutcome> = vec![
-            Ok(()),
-            Err(FaucetError::Sink("unroutable".into())),
-            Ok(()),
-            Ok(()),
-        ];
-        fail_unconfirmed(
-            &mut outcomes,
-            [1usize, 3].into_iter(),
-            std::time::Duration::from_secs(60),
+    fn a_timeout_keeps_the_confirms_that_already_arrived() {
+        let mut outcomes = RowOutcomes::new();
+        outcomes.decide(0, confirmation_outcome(Confirmation::Ack(None), "ex"));
+        outcomes.fail(1, FaucetError::Sink("unroutable".into()));
+        outcomes.decide(2, confirmation_outcome(Confirmation::NotRequested, "ex"));
+        outcomes.fail_undecided(
+            0..4,
+            &publish_timeout(std::time::Duration::from_secs(60)),
+            "rabbitmq",
         );
-        assert!(outcomes[0].is_ok() && outcomes[2].is_ok());
+        let rows = outcomes.into_rows(4, "rabbitmq");
+        assert!(rows[0].is_ok() && rows[2].is_ok());
         assert!(
-            outcomes[1]
+            rows[1]
                 .as_ref()
                 .unwrap_err()
                 .to_string()
                 .contains("unroutable")
         );
-        assert!(
-            outcomes[3]
-                .as_ref()
-                .unwrap_err()
-                .to_string()
-                .contains("timed out after 60s")
-        );
+        let err = rows[3].as_ref().unwrap_err();
+        assert!(err.to_string().contains("timed out after 60s"), "{err}");
         assert_eq!(
-            faucet_core::resilience::classify(outcomes[3].as_ref().unwrap_err()),
+            faucet_core::resilience::classify(err),
             Some(faucet_core::resilience::RetryClass::Timeout)
         );
     }

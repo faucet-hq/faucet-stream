@@ -690,6 +690,7 @@ mod tests {
             local_output_in_flight_grace: Duration::from_secs(60),
             preview: crate::serve::preview::PreviewConfig::default(),
             lease_ttl: Duration::from_secs(30),
+            metrics_idle_timeout: None,
             probe_timeout: Duration::from_secs(10),
             env_file: None,
             no_env_file: false,

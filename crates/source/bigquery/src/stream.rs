@@ -13,7 +13,9 @@ use crate::convert::row_to_json;
 use async_trait::async_trait;
 use faucet_common_bigquery::TokenProvider;
 use faucet_common_bigquery::raw::QueryResultsReader;
-use faucet_core::util::substitute_context_bind_params;
+use faucet_core::util::{
+    CONTEXT_MARK, SqlLexing, order_positional_bindings, substitute_context_bind_params,
+};
 use faucet_core::{DatasetDescriptor, FaucetError, Stream, StreamPage};
 use gcp_bigquery_client::Client;
 use gcp_bigquery_client::dataset::ListOptions as DatasetListOptions;
@@ -219,6 +221,7 @@ impl BigQuerySource {
     pub async fn new(config: BigQuerySourceConfig) -> Result<Self, FaucetError> {
         faucet_core::validate_batch_size(config.batch_size)?;
         Self::validate_read_api(&config)?;
+        faucet_core::util::check_no_context_mark("bigquery", &config.query)?;
         let (client, tokens) =
             faucet_common_bigquery::build_client_with_tokens(&config.auth).await?;
         Ok(Self {
@@ -420,16 +423,7 @@ impl BigQuerySource {
     /// Resolve the final SQL statement and ordered bind values for a given
     /// parent-record context.
     fn resolve_query(&self, context: &HashMap<String, Value>) -> (String, Vec<Value>) {
-        let mut bindings = self.config.params.clone();
-        let (rewritten, context_values) = if context.is_empty() {
-            (self.config.query.clone(), Vec::new())
-        } else {
-            substitute_context_bind_params(&self.config.query, context, bindings.len() + 1, |_| {
-                "?".to_string()
-            })
-        };
-        bindings.extend(context_values);
-        (rewritten, bindings)
+        resolve_query(&self.config, context)
     }
 
     fn build_query_request(&self, query: String, bindings: &[Value]) -> QueryRequest {
@@ -673,6 +667,28 @@ fn int64_timestamps() -> gcp_bigquery_client::model::data_format_options::DataFo
 /// Free-standing version of [`BigQuerySource::build_query_request`] — kept
 /// separate so unit tests can exercise it without spinning up a real
 /// `gcp_bigquery_client::Client`.
+/// The SQL and bind values for one parent-record context. POSITIONAL `?`
+/// markers bind in textual order, so each `params` value goes to the next
+/// `?` the query itself holds and each context value to the marker that
+/// replaced its `{token}`, wherever the two interleave.
+fn resolve_query(
+    config: &BigQuerySourceConfig,
+    context: &HashMap<String, Value>,
+) -> (String, Vec<Value>) {
+    if context.is_empty() {
+        return (config.query.clone(), config.params.clone());
+    }
+    let (marked, context_values) = substitute_context_bind_params(&config.query, context, 0, |i| {
+        format!("{CONTEXT_MARK}{i}{CONTEXT_MARK}")
+    });
+    order_positional_bindings(
+        &marked,
+        &config.params,
+        context_values,
+        SqlLexing::bigquery(),
+    )
+}
+
 fn build_query_request(
     cfg: &BigQuerySourceConfig,
     query: String,
@@ -754,11 +770,20 @@ fn clamp_timeout_ms(timeout: Duration) -> i32 {
     }
 }
 
-fn schema_fields(qr: &QueryResponse) -> Vec<TableFieldSchema> {
-    qr.schema
-        .as_ref()
-        .and_then(|s| s.fields.clone())
-        .unwrap_or_default()
+fn schema_fields(qr: &QueryResponse) -> Result<Vec<TableFieldSchema>, FaucetError> {
+    unique_fields(
+        qr.schema
+            .as_ref()
+            .and_then(|s| s.fields.clone())
+            .unwrap_or_default(),
+    )
+}
+
+/// A result's fields, refused when two share a name (a record keeps one
+/// value per name).
+fn unique_fields(fields: Vec<TableFieldSchema>) -> Result<Vec<TableFieldSchema>, FaucetError> {
+    faucet_core::util::check_unique_columns("BigQuery", fields.iter().map(|f| &f.name))?;
+    Ok(fields)
 }
 
 fn job_reference(qr: &QueryResponse) -> Result<(String, Option<String>), FaucetError> {
@@ -870,7 +895,7 @@ impl faucet_core::Source for BigQuerySource {
 
         self.signal_bytes_processed(&initial);
 
-        let fields = schema_fields(&initial);
+        let fields = schema_fields(&initial)?;
         let mut all_rows: Vec<Value> = rows_from_response(&initial, &fields);
         let mut page_token = initial.page_token.clone();
         let mut job_complete = initial.job_complete.unwrap_or(false);
@@ -914,7 +939,7 @@ impl faucet_core::Source for BigQuerySource {
                 && let Some(s) = resp.schema.as_ref()
                 && let Some(f) = s.fields.as_ref()
             {
-                fields = f.clone();
+                fields = unique_fields(f.clone())?;
             }
 
             for row in resp.rows.unwrap_or_default() {
@@ -988,7 +1013,7 @@ impl faucet_core::Source for BigQuerySource {
 
             self.signal_bytes_processed(&initial);
 
-            let mut fields = schema_fields(&initial);
+            let mut fields = schema_fields(&initial)?;
             let mut buffer: Vec<Value> = if batch_size == 0 {
                 Vec::with_capacity(1024)
             } else {
@@ -1043,7 +1068,7 @@ impl faucet_core::Source for BigQuerySource {
                     && let Some(s) = resp.schema.as_ref()
                     && let Some(f) = s.fields.as_ref()
                 {
-                    fields = f.clone();
+                    fields = unique_fields(f.clone())?;
                 }
 
                 for row in resp.rows.unwrap_or_default() {
@@ -1367,20 +1392,42 @@ mod tests {
 
     #[test]
     fn resolve_query_substitutes_context_with_positional_markers() {
-        // Test resolve_query without needing a Client by mimicking its core.
-        let c = cfg();
-        let mut bindings = c.params.clone();
+        let mut c = cfg();
+        c.query = "SELECT * FROM t WHERE id = {parent.id}".into();
         let mut ctx = HashMap::new();
         ctx.insert("parent.id".to_string(), json!(7));
-        let (rewritten, extra) = substitute_context_bind_params(
-            "SELECT * FROM t WHERE id = {parent.id}",
-            &ctx,
-            bindings.len() + 1,
-            |_| "?".to_string(),
-        );
-        bindings.extend(extra);
+        let (rewritten, bindings) = resolve_query(&c, &ctx);
         assert_eq!(rewritten, "SELECT * FROM t WHERE id = ?");
         assert_eq!(bindings, vec![json!(7)]);
+    }
+
+    #[test]
+    fn a_result_naming_one_field_twice_is_refused() {
+        let field = |n: &str| TableFieldSchema::new(n, FieldType::Int64);
+        assert!(unique_fields(vec![field("a"), field("b")]).is_ok());
+        let err = unique_fields(vec![field("a"), field("a")]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("BigQuery query returns two columns named \"a\"")
+        );
+    }
+
+    #[test]
+    fn resolve_query_binds_params_and_context_in_textual_order() {
+        let mut c = cfg();
+        c.query = "SELECT * FROM t WHERE a = {parent.id} AND b = ? AND note != '?'".into();
+        c.params = vec![json!("static")];
+        let mut ctx = HashMap::new();
+        ctx.insert("parent.id".to_string(), json!(7));
+        let (rewritten, bindings) = resolve_query(&c, &ctx);
+        assert_eq!(
+            rewritten,
+            "SELECT * FROM t WHERE a = ? AND b = ? AND note != '?'"
+        );
+        assert_eq!(bindings, vec![json!(7), json!("static")]);
+        let (q, b) = resolve_query(&c, &HashMap::new());
+        assert_eq!(q, c.query);
+        assert_eq!(b, vec![json!("static")]);
     }
 
     /// `read_api` over SQL polls the query job until it is DONE and reads its

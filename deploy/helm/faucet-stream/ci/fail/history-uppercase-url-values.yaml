@@ -1,0 +1,6 @@
+# The server's --history grammar is case-sensitive, so the chart's is too.
+# expect-error: cannot tell the history backend from serve.history.url
+serve:
+  enabled: true
+  history:
+    url: "POSTGRES://faucet:dummy-secret@db.example:5432/faucet"

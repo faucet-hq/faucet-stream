@@ -351,7 +351,11 @@ impl SyncLease {
                 Err(e) if !Self::unavailable(&e) => return Ok(None),
                 Err(e) => return Err(CliError::Internal(format!("reading the sync lease: {e}"))),
             };
-            let now = chrono::Utc::now();
+            let now = match store.db_now().await {
+                Ok(t) => t,
+                Err(e) if !Self::unavailable(&e) => return Ok(None),
+                Err(e) => return Err(CliError::Internal(format!("reading the sync lease: {e}"))),
+            };
             let held = current
                 .as_deref()
                 .and_then(|c| serde_json::from_str::<SyncLease>(c).ok())
@@ -389,7 +393,7 @@ impl SyncLease {
     async fn release_value(store: &TemplateStore, origin: &str, mine: &str) {
         let done = serde_json::json!(SyncLease {
             holder: Self::me().to_string(),
-            expires: chrono::Utc::now(),
+            expires: store.db_now().await.unwrap_or_else(|_| chrono::Utc::now()),
         })
         .to_string();
         if let Err(e) = store
@@ -458,15 +462,22 @@ pub async fn sync_origin(
 /// A template under an `<owner>/` directory is its owner's, not the
 /// operator's: unless the origin trusts the owner (or it is the `faucet-hq`
 /// namespace of the official catalog), it is registered only when it reads
-/// nothing of this server's and runs no program — the rule `faucet run`
-/// holds a community hub template to. Otherwise it is reported and skipped.
-fn hold_namespaced_templates(origin: &Origin, templates: &mut [fetch::RemoteTemplate]) {
-    let official_repo = match &origin.source {
+/// nothing of this server's or of the machine it runs on and runs no program
+/// — the rule `faucet run` holds a community template from a remote hub to
+/// ([`crate::hub::community_use`]). Otherwise it is reported and skipped.
+/// Whether an origin is the official catalog: `faucet-hq/template-hub` at
+/// `main`, where only the `faucet-hq` namespace is maintained by faucet-hq.
+pub fn is_official_origin(origin: &Origin) -> bool {
+    match &origin.source {
         OriginSource::Github(g) => {
             g.repo.eq_ignore_ascii_case("faucet-hq/template-hub") && g.r#ref == "main"
         }
         _ => false,
-    };
+    }
+}
+
+fn hold_namespaced_templates(origin: &Origin, templates: &mut [fetch::RemoteTemplate]) {
+    let official_repo = is_official_origin(origin);
     for r in templates
         .iter_mut()
         .filter(|r| r.unusable.is_none() && r.retired.is_none())
@@ -486,7 +497,7 @@ fn hold_namespaced_templates(origin: &Origin, templates: &mut [fetch::RemoteTemp
         let Ok(doc) = crate::templates::parse_body(&r.body, r.format) else {
             continue;
         };
-        if let Some(why) = crate::hub::untrusted_use(&doc) {
+        if let Some(why) = crate::hub::community_use(&doc) {
             r.unusable = Some(format!(
                 "template '{}' {why}; list `{owner}` under the origin's `trust:` after reviewing it",
                 r.stem

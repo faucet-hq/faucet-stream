@@ -16,7 +16,7 @@
 //! **Experimental** (PRINCIPLES.md §3): this block's shape may change in a
 //! minor release; any change is called out in the changelog.
 
-use super::backend::{Area, PartStream, StorageBackend};
+use super::backend::{Area, PartStream, SideCreate, StorageBackend};
 use super::layout::NameTemplate;
 use faucet_core::check::{CheckContext, CheckReport};
 use faucet_core::io::CallContext;
@@ -105,6 +105,23 @@ pub trait ObjectClient: Send + Sync {
         self.download(from, &tmp).await?;
         self.upload(&tmp, to).await?;
         self.delete(from).await
+    }
+    /// Whether [`create_new`](Self::create_new) is implemented. Default
+    /// `false`: the backend then cannot coordinate concurrent writers of one
+    /// output.
+    fn supports_create_new(&self) -> bool {
+        false
+    }
+    /// Publish `bytes` as `key` only when no object of that name exists:
+    /// `Ok(true)` created, `Ok(false)` it exists. Never retried blindly —
+    /// after an ambiguous failure the caller reads the key back. Default:
+    /// refused.
+    async fn create_new(&self, key: &str, bytes: &[u8]) -> Result<bool, FaucetError> {
+        let _ = bytes;
+        Err(FaucetError::Sink(format!(
+            "remote file sink: '{}' cannot be created only when absent by this store",
+            self.describe(key)
+        )))
     }
     /// Install the run's round-trip recorder the client's requests report
     /// to. Default: the client counts nothing.
@@ -216,87 +233,6 @@ pub struct RemoteBackend {
 }
 
 const SCRATCH_PREFIX: &str = "faucet-remote-";
-const OWNER_FILE: &str = ".owner";
-/// Age past which a scratch directory without an owner lock (left by a
-/// faucet that predates the lock) is treated as abandoned.
-const UNOWNED_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-
-/// Lock the owner file under a private name and only then rename it into
-/// place, so a concurrent sweep never sees an unlocked `.owner` in a live
-/// directory and removes it. On a file system without file locks the
-/// directory is left without an owner file (`None`): the lock only guards
-/// cleanup, and an unowned directory is swept by age instead.
-fn lock_owner(dir: &Path) -> std::io::Result<Option<std::fs::File>> {
-    let pending = dir.join(".owner.pending");
-    let file = std::fs::File::create(&pending)?;
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => {
-            return Err(std::io::Error::other(
-                "the new owner file is locked by another process",
-            ));
-        }
-        Err(std::fs::TryLockError::Error(e)) => {
-            tracing::warn!(
-                path = %dir.display(),
-                error = %e,
-                "remote file sink: the scratch file system does not support file locks; \
-                 an abandoned scratch directory is removed only once it is a day old"
-            );
-            drop(file);
-            std::fs::remove_file(&pending)?;
-            return Ok(None);
-        }
-    }
-    std::fs::rename(&pending, dir.join(OWNER_FILE))?;
-    Ok(Some(file))
-}
-
-/// Remove the scratch directories in `parent` whose run is gone: a crashed
-/// (SIGKILL, OOM) run of an encrypted sink leaves plaintext there. A live
-/// run holds its directory's owner lock; one whose lock can be taken is
-/// dead. Best effort — a directory that can not be inspected is left.
-fn sweep_orphaned_scratch(parent: &Path) {
-    let Ok(entries) = std::fs::read_dir(parent) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(SCRATCH_PREFIX)
-            || !entry.file_type().is_ok_and(|t| t.is_dir())
-        {
-            continue;
-        }
-        let dir = entry.path();
-        if scratch_is_orphaned(&dir) && std::fs::remove_dir_all(&dir).is_ok() {
-            tracing::info!(
-                path = %dir.display(),
-                "remote file sink: removed the scratch directory of a run that is gone"
-            );
-        }
-    }
-}
-
-fn scratch_is_orphaned(dir: &Path) -> bool {
-    let aged = || {
-        std::fs::metadata(dir)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age > UNOWNED_MAX_AGE)
-    };
-    match std::fs::File::open(dir.join(OWNER_FILE)) {
-        Ok(owner) => match owner.try_lock() {
-            Ok(()) => true,
-            Err(std::fs::TryLockError::WouldBlock) => false,
-            Err(std::fs::TryLockError::Error(_)) => aged(),
-        },
-        Err(_) => aged(),
-    }
-}
-
 /// A dropped backend (a cancelled or hard-dropped sink) stops its background
 /// uploads, so nothing is published for a sink that is gone.
 impl Drop for RemoteBackend {
@@ -329,7 +265,7 @@ impl RemoteBackend {
     ) -> Result<Self, FaucetError> {
         let base = base.into();
         let parent = scratch_dir.map_or_else(std::env::temp_dir, Path::to_path_buf);
-        sweep_orphaned_scratch(&parent);
+        super::scratch::sweep_orphaned(&parent, SCRATCH_PREFIX, None);
         let mut builder = tempfile::Builder::new();
         builder.prefix(SCRATCH_PREFIX);
         let scratch = match scratch_dir {
@@ -343,7 +279,7 @@ impl RemoteBackend {
                 |d| d.display().to_string()
             )
         )))?;
-        let owner = lock_owner(scratch.path()).map_err(sink_io(format!(
+        let owner = super::scratch::lock_owner(scratch.path()).map_err(sink_io(format!(
             "remote file sink: locking the scratch directory '{}'",
             scratch.path().display()
         )))?;
@@ -493,6 +429,47 @@ impl RemoteBackend {
             self.template.commit_ledger_dir_name(),
             super::layout::COMMIT_LEDGER_FILE
         )
+    }
+
+    /// The key prefix of this output's side files (lock, claims, ledger).
+    fn side_prefix(&self) -> String {
+        format!("{}{}/", self.base, self.template.commit_ledger_dir_name())
+    }
+
+    /// Download `key` into a private scratch file and read it as text.
+    async fn read_text(&self, key: &str, what: &str) -> Result<Option<String>, FaucetError> {
+        if !self.client.exists(key).await? {
+            return Ok(None);
+        }
+        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let to = self.scratch.path().join(format!("o-side-{n}"));
+        let downloaded = self.client.download(key, &to).await;
+        let text = downloaded.and_then(|()| {
+            std::fs::read_to_string(&to).map_err(|e| {
+                FaucetError::Sink(format!("remote file sink: reading the {what}: {e}"))
+            })
+        });
+        let _ = std::fs::remove_file(&to);
+        match text {
+            Ok(t) => Ok(Some(t)),
+            Err(_) if !self.client.exists(key).await? => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Upload `text` as `key` through a private scratch file.
+    async fn write_text(&self, key: &str, text: &str, what: &str) -> Result<(), FaucetError> {
+        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let to = self.scratch.path().join(format!("i-side-{n}"));
+        std::fs::write(&to, text.as_bytes()).map_err(|e| {
+            FaucetError::Sink(format!(
+                "remote file sink: writing the {what} '{}': {e}",
+                to.display()
+            ))
+        })?;
+        let result = self.client.upload(&to, key).await;
+        let _ = std::fs::remove_file(&to);
+        result
     }
 
     /// The full key of `name` in `area`.
@@ -666,32 +643,47 @@ impl StorageBackend for RemoteBackend {
     }
 
     async fn read_commit_record(&self) -> Result<Option<String>, FaucetError> {
-        let key = self.commit_ledger_key();
-        if !self.client.exists(&key).await? {
-            return Ok(None);
-        }
-        let to = self.scratch.path().join("o-commit-ledger");
-        self.client.download(&key, &to).await?;
-        let text = std::fs::read_to_string(&to);
-        let _ = std::fs::remove_file(&to);
-        text.map(Some).map_err(|e| {
-            FaucetError::Sink(format!(
-                "remote file sink: reading the overwrite commit ledger: {e}"
-            ))
-        })
+        self.read_text(&self.commit_ledger_key(), "overwrite commit ledger")
+            .await
     }
 
     async fn write_commit_record(&self, text: &str) -> Result<(), FaucetError> {
-        let to = self.scratch.path().join("i-commit-ledger");
-        std::fs::write(&to, text.as_bytes()).map_err(|e| {
-            FaucetError::Sink(format!(
-                "remote file sink: writing the overwrite commit ledger '{}': {e}",
-                to.display()
-            ))
-        })?;
-        let result = self.client.upload(&to, &self.commit_ledger_key()).await;
-        let _ = std::fs::remove_file(&to);
-        result
+        self.write_text(&self.commit_ledger_key(), text, "overwrite commit ledger")
+            .await
+    }
+
+    async fn create_side_file(&self, name: &str, text: &str) -> Result<SideCreate, FaucetError> {
+        if !self.client.supports_create_new() {
+            return Ok(SideCreate::Unsupported);
+        }
+        let key = format!("{}{name}", self.side_prefix());
+        Ok(if self.client.create_new(&key, text.as_bytes()).await? {
+            SideCreate::Created
+        } else {
+            SideCreate::Exists
+        })
+    }
+
+    async fn read_side_file(&self, name: &str) -> Result<Option<String>, FaucetError> {
+        self.read_text(&format!("{}{name}", self.side_prefix()), "side file")
+            .await
+    }
+
+    async fn write_side_file(&self, name: &str, text: &str) -> Result<(), FaucetError> {
+        self.write_text(&format!("{}{name}", self.side_prefix()), text, "side file")
+            .await
+    }
+
+    async fn delete_side_file(&self, name: &str) -> Result<(), FaucetError> {
+        self.client
+            .delete(&format!("{}{name}", self.side_prefix()))
+            .await
+    }
+
+    async fn list_side_files(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
+        let dir = self.side_prefix();
+        let keys = self.client.list(&format!("{dir}{prefix}")).await?;
+        Ok(direct_children(&dir, keys))
     }
 
     async fn promote(&self, name: &str) -> Result<(), FaucetError> {
@@ -932,6 +924,7 @@ pub fn object_layout(
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 pub(crate) mod tests {
+    use super::super::scratch::{OWNER_FILE, is_orphaned as scratch_is_orphaned};
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -957,6 +950,10 @@ pub(crate) mod tests {
         pub renames: AtomicUsize,
         pub lists: AtomicUsize,
         pub upload_scratch: AtomicBool,
+        pub no_create_new: AtomicBool,
+        pub ignores_precondition: AtomicBool,
+        pub fail_create: AtomicBool,
+        pub fail_side_writes: AtomicBool,
     }
 
     impl Mem {
@@ -995,6 +992,20 @@ pub(crate) mod tests {
         fn leaves_upload_scratch(&self) -> bool {
             self.upload_scratch.load(SeqCst)
         }
+        fn supports_create_new(&self) -> bool {
+            !self.no_create_new.load(SeqCst)
+        }
+        async fn create_new(&self, key: &str, bytes: &[u8]) -> Result<bool, FaucetError> {
+            if self.fail_create.load(SeqCst) {
+                return Err(FaucetError::Sink(format!("create of {key} timed out")));
+            }
+            let mut o = self.objects.lock().unwrap();
+            if o.contains_key(key) && !self.ignores_precondition.load(SeqCst) {
+                return Ok(false);
+            }
+            o.insert(key.to_string(), bytes.to_vec());
+            Ok(true)
+        }
         async fn list(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {
             self.lists.fetch_add(1, SeqCst);
             let o = self.objects.lock().unwrap();
@@ -1012,6 +1023,9 @@ pub(crate) mod tests {
             std::fs::write(to, body).map_err(io)
         }
         async fn upload(&self, from: &Path, key: &str) -> Result<(), FaucetError> {
+            if self.fail_side_writes.load(SeqCst) && key.contains(".commits/lock-") {
+                return Err(FaucetError::Sink(format!("write of {key} refused")));
+            }
             self.slow(key).await?;
             let body = std::fs::read(from).map_err(io)?;
             self.objects.lock().unwrap().insert(key.to_string(), body);

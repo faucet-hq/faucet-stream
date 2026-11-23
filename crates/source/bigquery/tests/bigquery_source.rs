@@ -335,6 +335,39 @@ async fn submits_positional_bindings_for_params_and_context() {
 }
 
 #[tokio::test]
+async fn a_context_token_before_a_static_marker_binds_in_textual_order() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    Mock::given(method("POST"))
+        .and(path(format!("/projects/{PROJECT_ID}/queries")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobComplete": true,
+            "schema": schema_two_cols(),
+            "jobReference": {"projectId": PROJECT_ID, "jobId": "job-order"},
+            "rows": rows(0, 1),
+        })))
+        .mount(&server)
+        .await;
+
+    let mut cfg = default_config().with_params(vec![json!("us-east")]);
+    cfg.query = "SELECT * FROM events WHERE id > {parent.min_id} AND region = ?".into();
+    let (src, _f) = build_source(&server, cfg).await;
+    let mut ctx = HashMap::new();
+    ctx.insert("parent.min_id".to_string(), json!(100));
+    src.fetch_with_context(&ctx).await.unwrap();
+
+    let reqs = server.received_requests().await.unwrap();
+    let query_req = reqs
+        .iter()
+        .find(|r| r.url.path().ends_with("/queries"))
+        .expect("captured jobs.query request");
+    let body: Value = serde_json::from_slice(&query_req.body).unwrap();
+    let params = body["queryParameters"].as_array().unwrap();
+    assert_eq!(params[0]["parameterValue"]["value"], "100");
+    assert_eq!(params[1]["parameterValue"]["value"], "us-east");
+}
+
+#[tokio::test]
 async fn fetch_all_decodes_all_bigquery_types_to_json() {
     // Type-aware decoding end-to-end through `jobs.query`: INTEGER, FLOAT,
     // BOOL, STRING, TIMESTAMP, a nested RECORD, and a REPEATED column all

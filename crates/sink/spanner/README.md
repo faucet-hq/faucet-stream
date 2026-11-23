@@ -79,7 +79,7 @@ Values are encoded against the destination column types read once from `INFORMAT
 | `JSON` | any | The value's JSON serialization. |
 | `ARRAY<T>` | array | Elements encoded as `T`. |
 
-Record fields with no matching column are dropped with a one-shot warning per field. A value the column type cannot take fails the **whole page** (the error names the row and column); with a DLQ and `on_batch_error: dlq_all` the page goes to the DLQ.
+Names match as GoogleSQL databases resolve them, ignoring ASCII case: a record field `userid` lands in a column declared `UserId` (an exactly spelled field wins), `key` and `table_name` match the table's PRIMARY KEY and name the same way, and mutations use the table's declared spelling. Schema-drift handling resolves fields the same way, so `on_drift: ignore` keeps such a field and `evolve` adds no column for it. A record carrying two fields that both fold onto one column (`email` and `EMAIL` for `Email`) with neither spelled exactly fails that row rather than writing one of them. (A PostgreSQL-dialect database has case-sensitive quoted identifiers; this sink targets GoogleSQL databases.) Record fields with no matching column are dropped with a one-shot warning per field. A value the column type cannot take fails the **whole page** (the error names the row and column); with a DLQ and `on_batch_error: dlq_all` the page goes to the DLQ.
 
 ## Write modes
 

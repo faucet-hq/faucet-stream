@@ -17,6 +17,14 @@ use std::time::Duration;
 /// the **store's** clock, never the caller's.
 #[async_trait]
 pub trait FeedStore: Send + Sync {
+    /// This store's identity: a random number written once, when its schema
+    /// is first created, and read back on every open. A restored backup
+    /// keeps it; a store recreated empty gets a new one. `None`: the backend
+    /// keeps none (the default), so a caller cannot tell two stores apart.
+    fn store_id(&self) -> Option<i64> {
+        None
+    }
+
     /// Create the feed if it is missing and store its limits. The tenant is
     /// fixed at creation: [`FeedError::TenantMismatch`](crate::FeedError::TenantMismatch)
     /// when it differs.
@@ -89,6 +97,14 @@ pub trait FeedStore: Send + Sync {
         from: Seq,
     ) -> Result<Option<u64>> {
         let _ = (calls, feed, from);
+        Ok(None)
+    }
+
+    /// Payload bytes every feed of `tenant` in this store holds together:
+    /// the figure the tenant's byte quota is checked against, delivered
+    /// events kept for replay included. `None`: the backend cannot say.
+    async fn tenant_bytes(&self, calls: &CallContext, tenant: &TenantId) -> Result<Option<u64>> {
+        let _ = (calls, tenant);
         Ok(None)
     }
 

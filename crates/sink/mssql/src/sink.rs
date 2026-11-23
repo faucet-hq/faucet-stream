@@ -2323,6 +2323,10 @@ impl SchemaDriver for MssqlDriver {
         self.current_schema_impl().await
     }
 
+    fn column_matching(&self) -> faucet_core::ColumnMatching {
+        faucet_core::ColumnMatching::FoldUnique
+    }
+
     fn evolvable(&self) -> bool {
         self.auto_columns()
     }

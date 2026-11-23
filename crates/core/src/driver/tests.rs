@@ -1200,6 +1200,7 @@ struct Queue {
     messages: Mutex<Vec<InboundMessage>>,
     acked: Mutex<Vec<AckToken>>,
     max: Option<usize>,
+    per_receive: usize,
 }
 
 impl Queue {
@@ -1218,7 +1219,22 @@ impl Queue {
             ),
             acked: Mutex::new(Vec::new()),
             max,
+            per_receive: usize::MAX,
         }
+    }
+
+    fn one_at_a_time(mut self) -> Self {
+        self.per_receive = 1;
+        self
+    }
+
+    fn acked(&self) -> Vec<String> {
+        self.acked
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|t| t.0.clone())
+            .collect()
     }
 }
 
@@ -1229,7 +1245,7 @@ impl MessageConsumer for Queue {
     }
     async fn receive(&self, _: &CallSlot, max: usize) -> Result<Vec<InboundMessage>, FaucetError> {
         let mut q = self.messages.lock().unwrap();
-        let n = max.min(q.len());
+        let n = max.min(self.per_receive).min(q.len());
         Ok(q.drain(..n).collect())
     }
     async fn ack(&self, _: &CallSlot, tokens: Vec<AckToken>) -> Result<(), FaucetError> {
@@ -1291,6 +1307,42 @@ async fn a_failed_write_leaves_its_messages_unacknowledged() {
     sink.1.store(true, Ordering::SeqCst);
     assert!(Pipeline::new(&source, &sink).run().await.is_err());
     assert!(source.driver().consumer().acked.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_second_run_after_a_failed_write_acknowledges_nothing_it_did_not_write() {
+    let source = DriverSource::new(MessageSourceDriver::new(Queue::of(3, None).one_at_a_time()));
+    let sink = Collect::default();
+    sink.1.store(true, Ordering::SeqCst);
+    assert!(Pipeline::new(&source, &sink).run().await.is_err());
+    assert!(source.driver().consumer().acked().is_empty());
+
+    sink.1.store(false, Ordering::SeqCst);
+    let r = Pipeline::new(&source, &sink).run().await.unwrap();
+    assert_eq!(r.records_written, 2);
+    assert_eq!(
+        *sink.0.lock().unwrap(),
+        vec![json!({"i": 1}), json!({"i": 2})]
+    );
+    assert_eq!(source.driver().consumer().acked(), vec!["1", "2"]);
+}
+
+#[tokio::test]
+async fn a_dropped_stream_acknowledges_nothing() {
+    use futures::StreamExt;
+    let source = DriverSource::new(MessageSourceDriver::new(Queue::of(3, None).one_at_a_time()));
+    let ctx = HashMap::new();
+    let mut first = source.stream_pages(&ctx, 1);
+    let page = first.next().await.unwrap().unwrap();
+    assert_eq!(page.records, vec![json!({"i": 0})]);
+    drop(first);
+
+    let mut second = source.stream_pages(&ctx, 1);
+    let page = second.next().await.unwrap().unwrap();
+    assert_eq!(page.records, vec![json!({"i": 1})]);
+    assert!(source.driver().consumer().acked().is_empty());
+    second.next().await.unwrap().unwrap();
+    assert_eq!(source.driver().consumer().acked(), vec!["1"]);
 }
 
 #[tokio::test]
@@ -1896,4 +1948,56 @@ async fn a_whole_page_write_that_loses_rows_fails() {
         })
     ));
     assert!(sink.write_batch_reported(&rows).await.is_err());
+}
+
+#[test]
+fn row_outcomes_fail_only_undecided_rows_and_keep_cut_types() {
+    let mut outcomes = RowOutcomes::new();
+    assert!(!outcomes.has_decisions());
+    outcomes.confirm(0);
+    outcomes.fail(1, FaucetError::Sink("own".into()));
+    outcomes.confirm(2);
+    outcomes.reopen(2);
+    assert!(outcomes.has_decisions());
+    assert!(outcomes.is_decided(0) && !outcomes.is_decided(2));
+    let timeout = FaucetError::Timeout {
+        operation: "broker publish".into(),
+        after: Duration::from_secs(3),
+    };
+    outcomes.fail_undecided([0, 1, 2], &timeout, "broker");
+    assert!(matches!(outcomes.get(0), Some(Ok(()))));
+    assert!(matches!(outcomes.get(1), Some(Err(FaucetError::Sink(m))) if m == "own"));
+    assert!(matches!(
+        outcomes.get(2),
+        Some(Err(FaucetError::Timeout { operation, after })) if operation == "broker publish" && *after == Duration::from_secs(3)
+    ));
+
+    let mut cancelled = RowOutcomes::new();
+    cancelled.fail_undecided(
+        [0],
+        &FaucetError::Cancelled {
+            operation: "publish call".into(),
+        },
+        "broker",
+    );
+    cancelled.fail_undecided([1], &FaucetError::Source("down".into()), "broker");
+    let map = cancelled.into_map();
+    assert!(
+        matches!(&map[&0], Err(FaucetError::Cancelled { operation }) if operation == "publish call")
+    );
+    assert!(matches!(&map[&1], Err(FaucetError::Sink(m)) if m.starts_with("broker publish: ")));
+}
+
+#[test]
+fn row_outcomes_never_report_an_undecided_row_as_delivered() {
+    let mut outcomes = RowOutcomes::new();
+    outcomes.confirm(0);
+    outcomes.confirm(2);
+    let rows = outcomes.into_rows(3, "broker");
+    assert_eq!(rows.len(), 3);
+    assert!(rows[0].is_ok() && rows[2].is_ok());
+    assert!(matches!(
+        &rows[1],
+        Err(FaucetError::Sink(m)) if m == "broker publish: no outcome was recorded for this message; treating it as not delivered"
+    ));
 }

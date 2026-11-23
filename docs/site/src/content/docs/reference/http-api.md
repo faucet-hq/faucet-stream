@@ -702,7 +702,7 @@ template) `POST /v1/templates/{id}/runs`, `run_template` and a template trigger.
 | `GET` | `/v1/runs` | `200` | List runs (filters below) |
 | `GET` | `/v1/runs/{id}` | `200` | Get one run record |
 | `DELETE` | `/v1/runs/{id}` | `204` | Remove a terminal run from history |
-| `POST` | `/v1/runs/{id}/cancel` | `202` / `200` | Request cancel (202) or no-op if terminal (200) |
+| `POST` | `/v1/runs/{id}/cancel` | `202` / `200` | Request cancel (202) or no-op if terminal (200); rows that had not started are reported skipped |
 | `GET` | `/v1/overview` | `200` | Fleet trends over the run history for the console's Overview page (`since`, `until`, `bucket`, `pipeline`, `pool`, `label`, `tenant`, `stale_after`, `top`) — viewer / `RunRead` |
 | `GET` | `/v1/runs/{id}/config` | `200` | The run's stored config (`{format, body, redacted}`); masked below an unscoped admin; `404` when none was stored (only clustered runs store one) — `RunRead`, audit `run.config` |
 | `GET` | `/v1/runs/{id}/logs` | `200` | Stream the run's logs (`text/event-stream`), or read persisted logs with `?format=jsonl\|text` |
@@ -1284,6 +1284,7 @@ table with permissions, the definition's fields and every ingest status code.
 | `POST /v1/feeds/{name}/deliveries`, `PUT`/`DELETE …/deliveries/{delivery}` | Add, replace and remove one delivery. |
 | `POST …/deliveries/{delivery}/pause`, `/resume`, `/deliver-now` | Stop, restart, or start a run now. |
 | `POST …/deliveries/{delivery}/replay`, `/skip`, `/recover` | Move a delivery's position (admin). |
+| `POST /v1/feeds/{name}/adopt-store` | Start a feed whose events are in another feed store empty in the store it names (admin). |
 | `GET`/`POST /v1/feeds/{name}/tokens`, `DELETE …/tokens/{id}` | Ingest tokens. |
 | `GET /v1/feeds/{name}/events`, `/events/{seq}`, `/refusals` | Browse retained events (a payload needs admin) and recently refused requests. |
 | `POST /v1/feeds/{name}/events`, `POST /v1/tenants/{tenant}/feeds/{name}/events` | **Ingest.** Outside the bearer authentication: a feed token or a signature. `202` once the events are stored. |

@@ -97,6 +97,9 @@ pub struct RowPolicyReport {
     pub sink: String,
     pub sink_kind: String,
     pub attributes: BTreeMap<String, String>,
+    /// Whether the policy owner trusts `attributes` (`false` for a config a
+    /// caller submitted to `faucet serve`).
+    pub attested: bool,
     pub column_source: ColumnSource,
     /// Columns known at the sink (after the transform chain).
     pub known_columns: usize,
@@ -166,13 +169,71 @@ pub fn evaluate_nodes(
     })
 }
 
-/// The DLQ as a policy destination: quarantined records reach it in full.
-pub fn dlq_facts(dlq: &crate::config::DlqSpec) -> SinkFacts {
-    SinkFacts {
-        id: "dlq".into(),
-        kind: dlq.sink.kind.clone(),
-        attributes: dlq.sink.attributes.clone(),
+/// Warnings for a template whose sinks declare `attributes` while a
+/// `${param.*}` value shapes the sink's config or attributes: a caller who
+/// supplies a free-text value for that param chooses the destination, so
+/// under `faucet serve` the sink's attributes are not trusted for policy. A
+/// param marked `trusted: true`, or with a closed `values:` set, keeps them
+/// trusted.
+pub fn caller_chosen_sink_warnings(doc: &Value) -> Vec<String> {
+    let mut blocks: Vec<(String, &Value)> = Vec::new();
+    let pipeline = doc.get("pipeline");
+    for (path, v) in [
+        ("sink", doc.get("sink")),
+        ("pipeline.sink", pipeline.and_then(|p| p.get("sink"))),
+        (
+            "pipeline.dlq.sink",
+            pipeline
+                .and_then(|p| p.get("dlq"))
+                .and_then(|d| d.get("sink")),
+        ),
+    ] {
+        if let Some(v) = v {
+            blocks.push((path.to_owned(), v));
+        }
     }
+    if let Some(sinks) = pipeline
+        .and_then(|p| p.get("sinks"))
+        .and_then(Value::as_object)
+    {
+        for (name, v) in sinks {
+            blocks.push((format!("pipeline.sinks.{name}"), v));
+        }
+    }
+    blocks
+        .into_iter()
+        .filter(|(_, v)| {
+            v.get("attributes")
+                .and_then(Value::as_object)
+                .is_some_and(|a| !a.is_empty())
+                && v.to_string().contains("${param.")
+        })
+        .map(|(path, _)| {
+            format!(
+                "policy: `{path}` declares `attributes` and takes a `${{param.*}}` value; when a \
+                 caller supplies free text for that param the sink's attributes are not trusted \
+                 for policy (mark the param `trusted: true` or give it closed `values:` to keep \
+                 them trusted)"
+            )
+        })
+        .collect()
+}
+
+/// The DLQ as a policy destination: quarantined records reach it in full.
+/// `attested`: whether the policy owner trusts its `attributes`.
+pub fn dlq_facts(dlq: &crate::config::DlqSpec, attested: bool) -> SinkFacts {
+    SinkFacts::new("dlq", dlq.sink.kind.clone(), dlq.sink.attributes.clone())
+        .with_attested(attested)
+}
+
+/// A row's sink as a policy destination, trusted as the row says.
+pub fn sink_facts(node: &ExpandedNode) -> SinkFacts {
+    SinkFacts::new(
+        node.sink_ref.clone(),
+        node.sink.kind.clone(),
+        node.sink.attributes.clone(),
+    )
+    .with_attested(node.sink_attested)
 }
 
 /// The columns as the DLQ receives them: masked by the main destination's
@@ -213,11 +274,7 @@ pub fn evaluate_node(
     } else {
         labelled_columns(policy, node, &inputs)
     };
-    let facts = SinkFacts {
-        id: node.sink_ref.clone(),
-        kind: node.sink.kind.clone(),
-        attributes: node.sink.attributes.clone(),
-    };
+    let facts = sink_facts(node);
     let mut violations = faucet_core::policy::evaluate(policy, &facts, &columns);
     // The DLQ is a destination of its own (#870): any configured DLQ can
     // receive a row (a quality / contract / drift / policy quarantine, or a
@@ -234,7 +291,7 @@ pub fn evaluate_node(
         };
         violations.extend(faucet_core::policy::evaluate(
             policy,
-            &dlq_facts(dlq),
+            &dlq_facts(dlq, node.dlq_attested),
             &at_dlq,
         ));
     }
@@ -243,6 +300,7 @@ pub fn evaluate_node(
         sink: node.sink_ref.clone(),
         sink_kind: node.sink.kind.clone(),
         attributes: node.sink.attributes.clone(),
+        attested: node.sink_attested,
         column_source,
         known_columns: known,
         columns,
@@ -684,11 +742,9 @@ pub fn evaluate_topology(spec: &PolicySpec, cfg: &PipelineConfig) -> CliResult<P
                 &masked,
             )
         };
-        let facts = SinkFacts {
-            id: id.clone(),
-            kind: sink_kind.clone(),
-            attributes: attributes.clone(),
-        };
+        let (attested, dlq_attested) = cfg.topology_destination_trust(id, template_name);
+        let facts = SinkFacts::new(id.clone(), sink_kind.clone(), attributes.clone())
+            .with_attested(attested);
         #[allow(unused_mut)]
         let mut violations = faucet_core::policy::evaluate(&compiled, &facts, &columns);
         // Each sink node's DLQ is a destination of its own (#870).
@@ -699,7 +755,7 @@ pub fn evaluate_topology(spec: &PolicySpec, cfg: &PipelineConfig) -> CliResult<P
             let at_dlq = columns.clone();
             violations.extend(faucet_core::policy::evaluate(
                 &compiled,
-                &dlq_facts(dlq),
+                &dlq_facts(dlq, dlq_attested),
                 &at_dlq,
             ));
         }
@@ -709,6 +765,7 @@ pub fn evaluate_topology(spec: &PolicySpec, cfg: &PipelineConfig) -> CliResult<P
             sink: template_name.to_string(),
             sink_kind,
             attributes,
+            attested,
             column_source,
             known_columns: known,
             columns,
@@ -796,6 +853,11 @@ pub fn render_human(report: &PolicyReport) -> String {
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect::<Vec<_>>()
                 .join(", ")
+        };
+        let attrs = if row.attested {
+            attrs
+        } else {
+            format!("{attrs}, not trusted: from the submitted config")
         };
         let knowledge = match row.column_source {
             ColumnSource::Schema => format!("{} column(s) from a schema", row.known_columns),

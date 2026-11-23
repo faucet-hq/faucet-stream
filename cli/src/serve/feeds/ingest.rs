@@ -204,13 +204,125 @@ fn depth(json: &[u8]) -> usize {
     deepest
 }
 
-fn parses(json: &[u8]) -> Result<(), String> {
+/// The key a delivery stores an event's metadata under; no event may carry it.
+const RESERVED_KEY: &str = faucet_source_feed::METADATA_KEY;
+
+/// Whether a JSON value is an object holding [`RESERVED_KEY`] at its top
+/// level, compared after unescaping and counting repeated keys.
+struct HoldsReserved;
+
+impl<'de> serde::de::DeserializeSeed<'de> for HoldsReserved {
+    type Value = bool;
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<bool, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for HoldsReserved {
+    type Value = bool;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<bool, A::Error> {
+        let mut found = false;
+        while let Some(key) = map.next_key::<String>()? {
+            found |= key == RESERVED_KEY;
+            map.next_value::<serde::de::IgnoredAny>()?;
+        }
+        Ok(found)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<bool, A::Error> {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(false)
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_unit<E>(self) -> Result<bool, E> {
+        Ok(false)
+    }
+}
+
+/// The events of a JSON body whose array elements are events: the place
+/// of the first event holding [`RESERVED_KEY`].
+struct FirstReserved;
+
+impl<'de> serde::de::Visitor<'de> for FirstReserved {
+    type Value = Option<usize>;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let (mut i, mut first) = (0, None);
+        while let Some(found) = seq.next_element_seed(HoldsReserved)? {
+            if found && first.is_none() {
+                first = Some(i);
+            }
+            i += 1;
+        }
+        Ok(first)
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+        Ok(HoldsReserved.visit_map(map)?.then_some(0))
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+}
+
+/// Parse `json` once: `Ok(Some(i))` names the first event (an array
+/// element when `elements_are_events`, else the value itself, `0`) holding
+/// the reserved metadata key.
+fn parses(json: &[u8], elements_are_events: bool) -> Result<Option<usize>, String> {
+    use serde::de::{DeserializeSeed, Deserializer};
     if depth(json) > MAX_JSON_DEPTH {
         return Err(format!("nested deeper than {MAX_JSON_DEPTH} levels"));
     }
-    serde_json::from_slice::<serde::de::IgnoredAny>(json)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    let mut de = serde_json::Deserializer::from_slice(json);
+    let found = if elements_are_events {
+        de.deserialize_any(FirstReserved)
+    } else {
+        HoldsReserved
+            .deserialize(&mut de)
+            .map(|found| found.then_some(0))
+    }
+    .and_then(|found| de.end().map(|()| found))
+    .map_err(|e| e.to_string())?;
+    Ok(found)
+}
+
+fn reserved(event: usize) -> Refusal {
+    Refusal::bad_request(format!(
+        "event {event}: the field \"{RESERVED_KEY}\" is reserved for the feed's metadata; \
+         rename it (a record taken from another feed must drop \"{RESERVED_KEY}\" first)"
+    ))
 }
 
 /// The elements of a JSON array, each as it was sent; `None` when `body`
@@ -278,15 +390,23 @@ pub fn split(content_type: &str, body: &[u8], max_event_bytes: u64) -> Result<Ve
             if line.is_empty() {
                 continue;
             }
-            parses(line)
-                .map_err(|e| Refusal::bad_request(format!("line {}: not JSON: {e}", n + 1)))?;
+            if parses(line, false)
+                .map_err(|e| Refusal::bad_request(format!("line {}: not JSON: {e}", n + 1)))?
+                .is_some()
+            {
+                return Err(reserved(pieces.len() + 1));
+            }
             pieces.push(Piece {
                 content_type: "application/json".into(),
                 payload: line.to_vec(),
             });
         }
     } else if is_json(&media) {
-        parses(body).map_err(|e| Refusal::bad_request(format!("the body is not JSON: {e}")))?;
+        if let Some(i) = parses(body, true)
+            .map_err(|e| Refusal::bad_request(format!("the body is not JSON: {e}")))?
+        {
+            return Err(reserved(i + 1));
+        }
         match array_elements(body) {
             Some(elements) => pieces.extend(elements.into_iter().map(|e| Piece {
                 content_type: media.clone(),
@@ -300,6 +420,11 @@ pub fn split(content_type: &str, body: &[u8], max_event_bytes: u64) -> Result<Ve
     } else {
         if media.starts_with("text/") && std::str::from_utf8(body).is_err() {
             return Err(Refusal::bad_request("the body is not UTF-8 text"));
+        }
+        if media == "application/x-www-form-urlencoded"
+            && url::form_urlencoded::parse(body).any(|(k, _)| k == RESERVED_KEY)
+        {
+            return Err(reserved(1));
         }
         pieces.push(Piece {
             content_type: content_type.trim().to_string(),
@@ -329,7 +454,7 @@ pub fn split(content_type: &str, body: &[u8], max_event_bytes: u64) -> Result<Ve
 }
 
 fn fit_key(key: String) -> String {
-    if key.len() <= MAX_DEDUPE_KEY {
+    if key.len() <= MAX_DEDUPE_KEY && !key.chars().any(char::is_control) {
         return key;
     }
     format!("sha256:{}", super::service::token_hash(&key))
@@ -496,10 +621,13 @@ fn ack_of(events: Vec<Appended>) -> AppendAck {
     }
 }
 
-/// Whether `e` proves the append stored nothing and may hold for one
-/// request of a group only.
-fn refused_whole(e: &FeedError) -> bool {
-    matches!(e, FeedError::Full { .. })
+/// Whether `e` proves the group's append stored nothing and may come from
+/// one request of it: a limit one request would cross, or a statement the
+/// store refused before its commit. A store that failed at or after its
+/// commit answers `Unavailable` (whether anything was stored is unknown),
+/// and a cancelled or timed-out call is unknown too; those fail the group.
+fn retry_alone(e: &FeedError) -> bool {
+    matches!(e, FeedError::Full { .. }) || !(e.is_transient() || matches!(e, FeedError::Call(_)))
 }
 
 fn group_failed(e: &FeedError) -> FeedError {
@@ -509,8 +637,11 @@ fn group_failed(e: &FeedError) -> FeedError {
 }
 
 /// Append the requests of `jobs` in one store transaction and answer each.
-/// Only a refusal that stored nothing (a limit one request would cross)
-/// is tried again request by request; any other failure fails the group.
+/// A failure that proves nothing was stored ([`retry_alone`]) is tried
+/// again request by request, so one request the store refuses fails alone;
+/// any other failure fails the group. Tried alone, a request whose outcome
+/// is unknown, or a second refusal in a row (the store refuses everything),
+/// fails the requests still waiting without trying them.
 async fn commit(store: &dyn FeedStore, uid: &FeedUid, label: &str, jobs: Vec<Job>) {
     let calls = store_calls();
     commit_with(label, jobs, |events| store.append(&calls, uid, events)).await;
@@ -535,7 +666,7 @@ where
                 }
                 return;
             }
-            Err(e) if refused_whole(&e) => {}
+            Err(e) if retry_alone(&e) => {}
             Err(e) => {
                 for job in jobs {
                     let _ = job.reply.send(Err(group_failed(&e)));
@@ -545,6 +676,7 @@ where
         }
     }
     let mut broken: Option<FeedError> = None;
+    let mut refused_before = false;
     for job in jobs {
         if let Some(e) = &broken {
             let _ = job.reply.send(Err(group_failed(e)));
@@ -553,10 +685,10 @@ where
         let started = Instant::now();
         let result = append(job.events).await;
         metrics::append_duration(label, started.elapsed());
-        if let Err(e) = &result
-            && !refused_whole(e)
-        {
-            broken = Some(group_failed(e));
+        match &result {
+            Ok(_) | Err(FeedError::Full { .. }) => refused_before = false,
+            Err(e) if retry_alone(e) && !refused_before => refused_before = true,
+            Err(e) => broken = Some(group_failed(e)),
         }
         let _ = job.reply.send(result.map(|a| ack_of(a.events)));
     }
@@ -822,6 +954,21 @@ fn admit(
 
 fn full_refusal(e: &FeedError) -> Option<Refusal> {
     match e {
+        FeedError::Full {
+            limit: faucet_common_feed::FullLimit::TenantBytes,
+            max,
+            actual,
+            ..
+        } => Some(Refusal::unavailable(
+            "full",
+            format!(
+                "the tenant's quota is reached (tenant_bytes): its feeds in this store would hold \
+                 {actual} of the {max} bytes allowed (max_feed_bytes), counting delivered events \
+                 kept for replay; room frees up as retention removes events older than \
+                 retention.max_age; retry later"
+            ),
+            RETRY_FULL_SECS,
+        )),
         FeedError::Full { limit, .. } => Some(Refusal::unavailable(
             "full",
             format!(
@@ -1068,6 +1215,21 @@ async fn handle(
         ));
     };
     let refuse = |r: Refusal| (Some(feed.clone()), r);
+    if rt.moved_of(feed.uid.as_str()).is_some() {
+        return Err(refuse(Refusal::unavailable(
+            "store_moved",
+            "the feed's events are in another feed store than the one it names; it accepts \
+             nothing until an operator fixes that; retry later",
+            RETRY_STORE_SECS,
+        )));
+    }
+    if feed.derived.signature_unreadable.is_some() {
+        return Err(refuse(Refusal::unavailable(
+            "seal",
+            "the feed's signature secret cannot be read on this server; retry later",
+            RETRY_STORE_SECS,
+        )));
+    }
     let spec = &feed.spec.ingest;
     let _reading = match (&token, &spec.auth.signature) {
         (None, Some(_)) => {
@@ -1139,7 +1301,7 @@ async fn handle(
     if let Some(sig) = &spec.auth.signature {
         let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
         let lookup = |h: &str| headers.get(h).and_then(|v| v.to_str().ok());
-        if !sig.check().verify(lookup, &body, now) {
+        if sig.secret.is_empty() || !sig.check().verify(lookup, &body, now) {
             return Err(refuse(Refusal::unauthorized()));
         }
         replay = replay_key(sig, &headers, now);
@@ -1439,6 +1601,24 @@ pub fn listener_router(state: ServerState, settings: &FeedSettings, listen: Sock
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_reserved_key_is_found_only_at_the_top_of_an_event() {
+        let key = RESERVED_KEY;
+        let body = format!(
+            r#"[1, -2, 1.5, true, null, "x", [{{"{key}": 1}}], {{"a": {{"{key}": 1}}}}, {{"{key}": 0}}]"#
+        );
+        assert_eq!(parses(body.as_bytes(), true), Ok(Some(8)));
+        for scalar in ["1", "-2", "1.5", "true", "null", "\"x\""] {
+            assert_eq!(parses(scalar.as_bytes(), true), Ok(None), "{scalar}");
+            assert_eq!(parses(scalar.as_bytes(), false), Ok(None), "{scalar}");
+        }
+        let one = format!(r#"{{"{key}": 1}}"#);
+        assert_eq!(parses(one.as_bytes(), true), Ok(Some(0)));
+        assert_eq!(parses(one.as_bytes(), false), Ok(Some(0)));
+        assert_eq!(parses(b"[1, 2]", false), Ok(None));
+        assert!(parses(b"[1,", true).is_err());
+    }
+
     fn gz(plain: &[u8]) -> Vec<u8> {
         use std::io::Write;
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -1631,6 +1811,54 @@ mod tests {
         assert_eq!(depth(br#"{"a": "[[[\"{", "b": [1, {"c": []}]}"#), 4);
         assert_eq!(array_elements(b"   "), None);
         assert_eq!(array_elements(b" {\"a\": []}"), None);
+    }
+
+    #[test]
+    fn an_event_holding_the_metadata_key_is_refused() {
+        for (content_type, body, event) in [
+            ("application/json", &br#"{"_feed": 1}"#[..], 1),
+            ("application/json", br#"{"\u005ffeed": 1}"#, 1),
+            (
+                "application/json",
+                br#"{"a": 1, "_feed": 2, "_feed": 3}"#,
+                1,
+            ),
+            (
+                "application/json",
+                br#"[{"a": 1}, 2, {"b": {"_feed": 1}, "_feed": 0}]"#,
+                3,
+            ),
+            ("application/json; charset=utf-8", br#"{"_feed": {}}"#, 1),
+            ("application/x-ndjson", b"{\"a\":1}\n\n{\"_feed\":1}\n", 2),
+            ("application/x-www-form-urlencoded", b"a=1&_feed=2", 1),
+            ("application/x-www-form-urlencoded", b"%5Ffeed=2", 1),
+            ("application/x-www-form-urlencoded", b"_fe%65d=2", 1),
+            (
+                "Application/X-WWW-Form-Urlencoded; charset=utf-8",
+                b"_feed=2",
+                1,
+            ),
+        ] {
+            let refusal = split(content_type, body, 1_000).unwrap_err();
+            assert_eq!(refusal.status, StatusCode::BAD_REQUEST, "{content_type}");
+            assert!(
+                refusal
+                    .message
+                    .starts_with(&format!("event {event}: the field \"_feed\"")),
+                "{content_type}: {}",
+                refusal.message
+            );
+        }
+        for (content_type, body) in [
+            ("application/json", &br#"{"a": {"_feed": 1}}"#[..]),
+            ("application/json", br#"["_feed", [{"_feed": 1}]]"#),
+            ("application/json", br#""_feed""#),
+            ("application/x-ndjson", b"[{\"_feed\": 1}]\n"),
+            ("application/x-www-form-urlencoded", b"a=_feed&x_feed=1"),
+            ("text/plain", b"_feed=1"),
+        ] {
+            assert!(split(content_type, body, 1_000).is_ok(), "{content_type}");
+        }
     }
 
     fn dedupe(header: Option<&str>, path: Option<&str>) -> DedupeSpec {
@@ -1885,7 +2113,7 @@ mod tests {
                             })
                             .collect(),
                     }),
-                    _ => Err(FeedError::Backend("timeout".into())),
+                    _ => Err(FeedError::Unavailable("timeout".into())),
                 }
             }
         })
@@ -1896,13 +2124,121 @@ mod tests {
         }
         assert!(got[0].as_ref().is_ok_and(|a| a.stored() == 1));
         assert!(matches!(got[1], Err(FeedError::Full { .. })));
-        assert!(matches!(got[2], Err(FeedError::Backend(_))));
-        assert!(matches!(got[3], Err(FeedError::Unavailable(_))));
+        assert!(matches!(&got[2], Err(FeedError::Unavailable(m)) if m == "timeout"));
+        assert!(matches!(&got[3], Err(FeedError::Unavailable(m)) if m.contains("unknown")));
         assert_eq!(
             calls.load(Ordering::SeqCst),
             4,
             "the last request is not tried"
         );
+    }
+
+    fn stored(events: &[NewEvent]) -> AppendAck {
+        AppendAck {
+            first_seq: None,
+            last_seq: None,
+            duplicates: 0,
+            events: events
+                .iter()
+                .map(|_| Appended {
+                    id: "a".into(),
+                    seq: faucet_common_feed::Seq(1),
+                    duplicate: false,
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_the_store_refuses_fails_alone_and_its_neighbours_are_stored_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let (group, answers) = jobs(3);
+        commit_with("f", group, |events| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let bad = events.iter().any(|e| e.payload == b"e1");
+            async move {
+                if bad {
+                    Err(FeedError::Backend("invalid byte sequence".into()))
+                } else {
+                    Ok(stored(&events))
+                }
+            }
+        })
+        .await;
+        let mut got = Vec::new();
+        for answer in answers {
+            got.push(answer.await.unwrap());
+        }
+        assert!(got[0].as_ref().is_ok_and(|a| a.stored() == 1));
+        assert!(matches!(got[1], Err(FeedError::Backend(_))));
+        assert!(got[2].as_ref().is_ok_and(|a| a.stored() == 1));
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "the group, then each once");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_or_ambiguous_group_is_never_tried_request_by_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for failure in [
+            || {
+                FeedError::Call(faucet_core::FaucetError::Cancelled {
+                    operation: "append".into(),
+                })
+            },
+            || FeedError::Unavailable("the append's outcome is unknown".into()),
+        ] {
+            let calls = AtomicUsize::new(0);
+            let (group, answers) = jobs(3);
+            commit_with("f", group, |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move { Err(failure()) }
+            })
+            .await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            for answer in answers {
+                assert!(matches!(
+                    answer.await.unwrap(),
+                    Err(FeedError::Unavailable(_))
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_that_refuses_everything_is_not_tried_for_every_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let (group, answers) = jobs(5);
+        commit_with("f", group, |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(FeedError::Backend("permission denied".into())) }
+        })
+        .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the group and two requests"
+        );
+        for answer in answers {
+            assert!(answer.await.unwrap().is_err());
+        }
+    }
+
+    #[test]
+    fn a_key_with_a_control_character_is_stored_hashed() {
+        for key in ["a\u{0}b", "tab\there", "\u{1f}", "line\n"] {
+            let fitted = fit_key(key.to_string());
+            assert!(
+                fitted.starts_with("sha256:") && fitted.len() == 71,
+                "{key:?}"
+            );
+            assert_eq!(
+                fitted,
+                fit_key(key.to_string()),
+                "the same key, the same hash"
+            );
+        }
+        assert_eq!(fit_key("plain-key é".into()), "plain-key é");
     }
 
     #[test]
@@ -1942,6 +2278,34 @@ mod tests {
         .unwrap();
         assert_eq!(full.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(full.retry_after, Some(RETRY_FULL_SECS));
+        assert!(full.message.contains("(undelivered_bytes)") && full.message.contains("catch up"));
+        let quota = full_refusal(&FeedError::Full {
+            feed: FeedUid::new("f").unwrap(),
+            limit: faucet_common_feed::FullLimit::TenantBytes,
+            max: 100,
+            actual: 120,
+        })
+        .unwrap();
+        assert_eq!(
+            (quota.status, quota.reason),
+            (StatusCode::SERVICE_UNAVAILABLE, "full")
+        );
+        assert!(
+            quota.message.contains("(tenant_bytes)"),
+            "{}",
+            quota.message
+        );
+        assert!(
+            quota.message.contains("120 of the 100 bytes"),
+            "{}",
+            quota.message
+        );
+        assert!(
+            quota.message.contains("retention.max_age"),
+            "{}",
+            quota.message
+        );
+        assert!(!quota.message.contains("catch up"), "{}", quota.message);
         assert!(full_refusal(&FeedError::Unavailable("x".into())).is_none());
     }
 }

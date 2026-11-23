@@ -158,9 +158,23 @@ incremental: { by: mtime }   # or: { by: name }
 
 - `by: mtime` reads files modified after the newest file the previous run read.
   Ties are broken by path, so a second file with the same timestamp is still
-  new. A rewritten file is read again.
+  new. A rewritten file is read again — including one rewritten within the
+  same timestamp tick as the previous read, detected by its size, inode or
+  change time (locally) or a strong `ETag` or `Content-Length` (over HTTP; a
+  weak `W/` ETag is ignored, since servers behind a load balancer can send a
+  different one per node). Changing a file's permissions moves its change time,
+  so such a file at the watermark tick is read once more. One case stays
+  unseen: a file rewritten within its own old tick after the watermark has
+  moved past that tick (only with coarse clocks and preserved timestamps).
 - `by: name` reads files whose path sorts after the last one read. Use it for
-  dated names that are never rewritten.
+  dated names that are never rewritten. The bookmark never moves past a file
+  that changed while it was read: the run stops at that file (later names
+  wait) and the next run reads it again from the start, so its rows may be
+  delivered twice but never lost. A file appended to on every run (a live
+  log) is therefore re-read in full each run and holds back every later name;
+  set `stable_for_secs` to the producer's write time for such producers.
+  Without `stable_for_secs`, `faucet validate` warns, because a producer that
+  pauses between writes is not seen.
 - **Producers that preserve timestamps.** `by: mtime` is a watermark: a file
   that lands *after* a newer file was read but keeps an older modification
   time — moved in with `mv`, copied with `cp -p` or `rsync -t`, extracted from

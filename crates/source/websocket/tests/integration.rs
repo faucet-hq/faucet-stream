@@ -512,11 +512,12 @@ async fn pages_flush_at_batch_size() {
     let mut total = 0usize;
     while let Some(page) = pages.next().await {
         let page = page.unwrap();
-        assert!(
-            page.bookmark.is_none(),
-            "websocket pages must carry no bookmark"
-        );
         total += page.records.len();
+        assert_eq!(
+            page.bookmark,
+            Some(serde_json::json!({"received": total})),
+            "every page carries the flush-only bookmark"
+        );
         page_sizes.push(page.records.len());
     }
     assert_eq!(total, 5, "all 5 records must arrive");
@@ -808,4 +809,105 @@ async fn buffered_messages_are_emitted_before_a_closing_error() {
     assert_eq!(first.records.len(), 3);
     let err = pages.next().await.expect("then the error").unwrap_err();
     assert!(err.to_string().contains("reconnect=false"), "{err}");
+}
+
+/// A sink counting rows and `flush` calls.
+#[derive(Default)]
+struct FlushCounter {
+    rows: AtomicUsize,
+    flushes: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl faucet_core::Sink for FlushCounter {
+    async fn write_batch(&self, records: &[serde_json::Value]) -> Result<usize, FaucetError> {
+        self.rows.fetch_add(records.len(), Ordering::SeqCst);
+        Ok(records.len())
+    }
+
+    async fn flush(&self) -> Result<(), FaucetError> {
+        self.flushes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// The source under a fixed state key, as the CLI runs it.
+struct Keyed(WebsocketSource);
+
+#[async_trait::async_trait]
+impl Source for Keyed {
+    async fn fetch_with_context(
+        &self,
+        context: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<Vec<serde_json::Value>, FaucetError> {
+        Source::fetch_with_context(&self.0, context).await
+    }
+
+    fn stream_pages<'a>(
+        &'a self,
+        context: &'a std::collections::HashMap<String, serde_json::Value>,
+        batch_size: usize,
+    ) -> std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<faucet_core::StreamPage, FaucetError>> + Send + 'a>,
+    > {
+        self.0.stream_pages(context, batch_size)
+    }
+
+    async fn apply_start_bookmark(&self, bookmark: serde_json::Value) -> Result<(), FaucetError> {
+        self.0.apply_start_bookmark(bookmark).await
+    }
+
+    fn connector_name(&self) -> &'static str {
+        self.0.connector_name()
+    }
+
+    fn state_key(&self) -> Option<String> {
+        Some("ws-feed".into())
+    }
+}
+
+/// Each page makes the pipeline flush the sink and store the flush bookmark;
+/// a later run ignores it and takes the feed from where it now is.
+#[tokio::test]
+async fn every_page_flushes_the_sink_and_a_stored_bookmark_is_not_resumed() {
+    let store: Arc<dyn faucet_core::StateStore> = Arc::new(faucet_core::MemoryStateStore::new());
+    for _ in 0..2 {
+        let messages = (1..=5).map(|i| format!(r#"{{"id":{i}}}"#)).collect();
+        let url = spawn_pushing_server(messages).await;
+        let mut cfg = base_config(&url);
+        cfg.batch_size = 2;
+        cfg.max_messages = Some(5);
+        cfg.idle_timeout = Some(Duration::from_secs(5));
+        let source = Keyed(WebsocketSource::new(cfg).unwrap());
+        let sink = FlushCounter::default();
+        faucet_core::Pipeline::new(&source, &sink)
+            .with_state_store(store.clone())
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(sink.rows.load(Ordering::SeqCst), 5);
+        assert!(sink.flushes.load(Ordering::SeqCst) >= 3);
+        let stored = store.get("ws-feed").await.unwrap().expect("stored");
+        assert!(stored.to_string().contains("received"), "{stored}");
+    }
+}
+
+/// A slow feed yields a partial page after a few seconds instead of holding
+/// it until a full page arrives.
+#[tokio::test]
+async fn a_partial_page_is_yielded_while_the_feed_is_quiet() {
+    let url = spawn_pushing_server(vec![r#"{"id":1}"#.into()]).await;
+    let mut cfg = base_config(&url);
+    cfg.batch_size = 1000;
+    cfg.idle_timeout = Some(Duration::from_secs(60));
+    let src = WebsocketSource::new(cfg).unwrap();
+    let ctx = std::collections::HashMap::new();
+    let mut pages = src.stream_pages(&ctx, 1000);
+    let page = tokio::time::timeout(Duration::from_secs(15), pages.next())
+        .await
+        .expect("a partial page before the idle timeout")
+        .expect("a page")
+        .unwrap();
+    assert_eq!(page.records.len(), 1);
+    assert_eq!(page.bookmark, Some(serde_json::json!({"received": 1})));
 }

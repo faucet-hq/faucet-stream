@@ -349,9 +349,77 @@ async fn a_key_a_later_run_deleted_is_a_conflict_not_a_resurrection() {
         .await
         .unwrap();
     assert_eq!(
+        (out.conflicts, out.applied),
+        (1, false),
+        "the delete is found from the journal even when this row has no later runs: {out:?}"
+    );
+    assert!(rows(&url).await.is_empty());
+
+    let mut forced = opts(RollbackMode::Upsert);
+    forced.force = true;
+    let out = sink.rollback_run("r1", &forced).await.unwrap();
+    assert_eq!(
+        (out.restored, out.conflicts, out.applied),
+        (1, 1, true),
+        "{out:?}"
+    );
+    assert_eq!(
+        rows(&url).await,
+        vec![(1, "old-1".into(), Some("r0".into()))]
+    );
+}
+
+#[tokio::test]
+async fn another_rows_journaled_delete_blocks_a_rollback_without_later_runs() {
+    let (_dir, url) = fresh_db(CREATE_USERS).await;
+    exec(&url, "INSERT INTO users VALUES (1, 'old-1', 'r0')").await;
+    exec(&url, "INSERT INTO users VALUES (2, 'old-2', 'r0')").await;
+    let sink = SqliteSink::new(upsert_config(&url, "r1")).await.unwrap();
+    sink.write_batch(&[user(1, "new-1", "r1"), user(2, "new-2", "r1")])
+        .await
+        .unwrap();
+    let other = SqliteSink::new(upsert_config(&url, "other-row-run"))
+        .await
+        .unwrap();
+    other
+        .write_batch(&[json!({"id": 1, "__op": "d"})])
+        .await
+        .unwrap();
+
+    let out = sink
+        .rollback_run("r1", &opts(RollbackMode::Upsert))
+        .await
+        .unwrap();
+    assert_eq!((out.conflicts, out.applied), (1, false), "{out:?}");
+    assert_eq!(
+        rows(&url).await,
+        vec![(2, "new-2".into(), Some("r1".into()))],
+        "blocked: nothing changed"
+    );
+}
+
+#[tokio::test]
+async fn a_journaled_delete_on_another_table_is_no_conflict() {
+    let (_dir, url) = fresh_db(CREATE_USERS).await;
+    exec(&url, "INSERT INTO users VALUES (1, 'old-1', 'r0')").await;
+    let sink = SqliteSink::new(upsert_config(&url, "r1")).await.unwrap();
+    sink.write_batch(&[json!({"id": 1, "__op": "d"})])
+        .await
+        .unwrap();
+    exec(
+        &url,
+        r#"INSERT INTO _faucet_run_journal (run_id, table_name, key_json, before_json) VALUES ('r2', 'accounts', '{"id":"1"}', NULL)"#,
+    )
+    .await;
+
+    let out = sink
+        .rollback_run("r1", &opts(RollbackMode::Upsert))
+        .await
+        .unwrap();
+    assert_eq!(
         (out.restored, out.conflicts, out.applied),
         (1, 0, true),
-        "without later runs a vanished key is the run's own delete and is restored"
+        "{out:?}"
     );
     assert_eq!(
         rows(&url).await,

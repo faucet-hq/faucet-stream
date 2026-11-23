@@ -36,12 +36,13 @@ pub use faucet_core::{FaucetError, Source};
 pub const DESCRIPTOR: faucet_core::ConnectorDescriptor =
     faucet_core::ConnectorDescriptor::new("nats", capabilities);
 
-/// A JetStream consumer acknowledges what it read (the kind-level view, a
-/// `Null` config, reports what some config enables).
+/// A JetStream consumer acknowledges what it read, and a core queue-group
+/// member takes messages away from the group's other members (the
+/// kind-level view, a `Null` config, reports what some config enables).
 fn capabilities(config: &faucet_core::Value) -> faucet_core::Capabilities {
-    let jetstream =
-        config.is_null() || config.get("jetstream_stream").is_some_and(|v| !v.is_null());
+    let set = |key: &str| config.get(key).is_some_and(|v| !v.is_null());
+    let consumes = config.is_null() || set("jetstream_stream") || set("queue_group");
     faucet_core::Capabilities::builder()
-        .consumes_destructively(jetstream)
+        .consumes_destructively(consumes)
         .build()
 }

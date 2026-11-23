@@ -157,6 +157,15 @@ Kerberos (`sasl.mechanism: GSSAPI` through the connectors' `extra_client_config`
 works there; Cyrus SASL does not build on Windows, so GSSAPI is unavailable in
 Windows builds.
 
+### Options faucet owns
+
+`check_owned_keys(connector, &extra_client_config, &[OwnedKey { keys, accepts,
+owner }])` refuses an `extra_client_config` entry that sets one of the listed
+options (any alias, key names compared trimmed and ignoring ASCII case) to a
+value `accepts` rejects. The Kafka source and sink use it so the raw map cannot
+silently disagree with the options faucet derives from typed fields; the error
+names the key and the field to use, never the value.
+
 ### Kerberos and the host's identity
 
 `check_client_config(&ClientConfig)` checks a client's final options (after

@@ -125,6 +125,67 @@ pub struct Feed {
     pub revision: u64,
     /// The feed and its deliveries exist in the store.
     pub ensured: bool,
+    /// What this server learned about the feed when it loaded it.
+    pub derived: Derived,
+}
+
+/// What a server learned about a feed when it loaded its definition, beside
+/// the definition itself.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Derived {
+    /// The sealed signature secret does not open with this server's vault
+    /// key; the spec's secret is then empty and ingest refuses every request.
+    pub signature_unreadable: Option<String>,
+    /// A `--feeds` file feed's strings that held a `${…}` reference: the
+    /// resolved value, and the text views show in its place.
+    pub references: BTreeMap<String, String>,
+    /// A `--feeds` file feed's template params each delivery's template
+    /// declares secret (shown as the keep marker); `None` when the template
+    /// could not be read, so every param is shown as the marker.
+    pub secret_params: BTreeMap<String, Option<Vec<String>>>,
+    /// The feed's events are in another physical store than the one its
+    /// definition now names: nothing is received, delivered or created
+    /// for it until an operator adopts the new store.
+    pub store_moved: Option<StoreMoved>,
+}
+
+/// How long a reload waits for a feed store to open before checking its
+/// feeds on a later pass instead.
+const STORE_OPEN_WAIT: Duration = Duration::from_secs(2);
+
+/// The settings key recording which physical store holds a feed's rows.
+pub fn store_binding_key(feed_uid: &str) -> String {
+    format!("feed_store:{feed_uid}")
+}
+
+/// Which physical store holds a feed's rows: the store's name when the
+/// binding was written, and its identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreBinding {
+    pub store: String,
+    pub id: i64,
+}
+
+/// A feed whose events are in another store than the one it now names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreMoved {
+    /// The store holding its events, by the name it had then, and its identity.
+    pub recorded_store: String,
+    pub recorded_id: i64,
+    /// The store its definition names now, and that store's identity.
+    pub now_store: String,
+    pub now_id: i64,
+}
+
+impl std::fmt::Display for StoreMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "its events are in feed store '{}' (id {}) but its definition now names store '{}', \
+             which is a different store (id {})",
+            self.recorded_store, self.recorded_id, self.now_store, self.now_id
+        )
+    }
 }
 
 impl Feed {
@@ -258,6 +319,14 @@ pub struct Readiness {
     pub feeds: usize,
     pub stalled: Vec<String>,
     pub held: Vec<String>,
+    /// Feeds whose signature secret this server cannot open: they refuse
+    /// every ingest request with `503`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub secret_unreadable: Vec<String>,
+    /// Feeds whose events are in another feed store than the one they name:
+    /// they receive and deliver nothing.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub store_moved: Vec<String>,
 }
 
 /// The ids of a `--feeds` file feed, kept in the run history's settings so
@@ -351,6 +420,12 @@ pub struct FeedsRuntime {
     readiness: Mutex<Readiness>,
     bytes: Mutex<HashMap<String, (FeedBytes, Instant)>>,
     guarantees: Mutex<HashMap<String, (String, Instant)>>,
+    /// Feeds whose store binding matched, by uid: the store identity seen.
+    bound: Mutex<HashMap<String, i64>>,
+    /// Feeds whose events are in another store, by uid.
+    moved: Mutex<HashMap<String, StoreMoved>>,
+    /// Stores already reported as keeping no identity.
+    unidentified: Mutex<HashSet<String>>,
 }
 
 impl std::fmt::Debug for FeedsRuntime {
@@ -385,6 +460,9 @@ impl FeedsRuntime {
             readiness: Mutex::new(Readiness::default()),
             bytes: Mutex::new(HashMap::new()),
             guarantees: Mutex::new(HashMap::new()),
+            bound: Mutex::new(HashMap::new()),
+            moved: Mutex::new(HashMap::new()),
+            unidentified: Mutex::new(HashSet::new()),
         }
     }
 
@@ -520,6 +598,22 @@ impl FeedsRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         r.started = self.started();
+        r.secret_unreadable = self
+            .snapshot()
+            .feeds
+            .iter()
+            .filter(|f| f.derived.signature_unreadable.is_some())
+            .map(|f| f.label())
+            .collect();
+        r.secret_unreadable.sort();
+        r.store_moved = self
+            .snapshot()
+            .feeds
+            .iter()
+            .filter(|f| self.moved_of(f.uid.as_str()).is_some())
+            .map(|f| f.label())
+            .collect();
+        r.store_moved.sort();
         r
     }
 
@@ -567,9 +661,208 @@ impl FeedsRuntime {
             .map(|(w, _)| w.clone())
     }
 
-    /// The store that holds `feed`, opened on first use.
+    /// The store that holds `feed`, opened on first use. Handed out only
+    /// once this server has checked that the store is the one holding the
+    /// feed's rows ([`check_store`](Self::check_store), done by every reload
+    /// and scheduler pass): nothing is read from or written to another
+    /// store for it.
     pub async fn store_for(&self, feed: &Feed) -> Result<Arc<dyn FeedStore>, String> {
-        self.stores.get(&feed.spec.store).await
+        if let Some(moved) = self.moved_of(feed.uid.as_str()) {
+            return Err(format!("feed '{}': {moved}", feed.label()));
+        }
+        let store = self.stores.get(&feed.spec.store).await?;
+        if let Some(id) = store.store_id()
+            && self
+                .bound
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(feed.uid.as_str())
+                != Some(&id)
+        {
+            return Err(format!(
+                "feed '{}': its store has not been checked yet; retry shortly",
+                feed.label()
+            ));
+        }
+        Ok(store)
+    }
+
+    /// Why `feed_uid`'s events are not in the store it names, when they are not.
+    pub fn moved_of(&self, feed_uid: &str) -> Option<StoreMoved> {
+        self.moved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(feed_uid)
+            .cloned()
+    }
+
+    fn set_moved(&self, feed: &Feed, moved: Option<StoreMoved>) {
+        let mut held = self
+            .moved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match moved {
+            Some(m) => {
+                if held
+                    .insert(feed.uid.as_str().to_string(), m.clone())
+                    .is_none()
+                {
+                    tracing::error!(feed = %feed.label(), "{m}; nothing is received or delivered for it until the store is pointed back or adopted (faucet feed adopt-store)");
+                }
+                metrics::store_moved(&feed.label(), true);
+            }
+            None => {
+                if held.remove(feed.uid.as_str()).is_some() {
+                    metrics::store_moved(&feed.label(), false);
+                }
+            }
+        }
+    }
+
+    /// Check that `store` is the physical store holding `feed`'s rows,
+    /// recording it the first time. A store without an identity is not
+    /// checked (reported once). Nothing creates rows for a feed before this
+    /// passes.
+    pub async fn check_store(
+        &self,
+        state: &ServerState,
+        feed: &Feed,
+        store: &dyn FeedStore,
+    ) -> Result<(), EnsureError> {
+        let Some(id) = store.store_id() else {
+            if self
+                .unidentified
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(feed.spec.store.clone())
+            {
+                tracing::info!(store = %feed.spec.store, "this feed store keeps no identity: a change of the store a feed names cannot be detected");
+            }
+            return Ok(());
+        };
+        let uid = feed.uid.as_str();
+        if self
+            .bound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(uid)
+            == Some(&id)
+        {
+            self.set_moved(feed, None);
+            return Ok(());
+        }
+        let history = state.history();
+        let key = store_binding_key(uid);
+        let unavailable = |e: crate::serve::history::HistoryError| EnsureError::Store {
+            transient: true,
+            message: format!("reading which store holds the feed: {e}"),
+        };
+        for _ in 0..3 {
+            let found = history.meta_get(&key).await.map_err(unavailable)?;
+            let recorded = match found.as_deref().filter(|s| !s.is_empty()) {
+                None => {
+                    let binding = StoreBinding {
+                        store: feed.spec.store.clone(),
+                        id,
+                    };
+                    let text = serde_json::to_string(&binding).unwrap_or_default();
+                    if !history
+                        .meta_compare_and_set(&key, found.as_deref(), &text)
+                        .await
+                        .map_err(unavailable)?
+                    {
+                        continue;
+                    }
+                    binding
+                }
+                Some(text) => {
+                    serde_json::from_str::<StoreBinding>(text).map_err(|e| EnsureError::Store {
+                        transient: false,
+                        message: format!("the record of the feed's store cannot be read: {e}"),
+                    })?
+                }
+            };
+            if recorded.id == id {
+                self.bound
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(uid.to_string(), id);
+                self.set_moved(feed, None);
+                return Ok(());
+            }
+            let moved = StoreMoved {
+                recorded_store: recorded.store,
+                recorded_id: recorded.id,
+                now_store: feed.spec.store.clone(),
+                now_id: id,
+            };
+            self.set_moved(feed, Some(moved.clone()));
+            return Err(EnsureError::Moved(moved));
+        }
+        Err(EnsureError::Store {
+            transient: true,
+            message: "the record of the feed's store kept changing".into(),
+        })
+    }
+
+    /// Record `store` as the one holding `feed`'s rows from now on, whatever
+    /// held them before.
+    pub(crate) async fn rebind(
+        &self,
+        state: &ServerState,
+        feed: &Feed,
+        store: &dyn FeedStore,
+    ) -> Result<(), String> {
+        let Some(id) = store.store_id() else {
+            self.set_moved(feed, None);
+            return Ok(());
+        };
+        let binding = StoreBinding {
+            store: feed.spec.store.clone(),
+            id,
+        };
+        let text = serde_json::to_string(&binding).map_err(|e| e.to_string())?;
+        state
+            .history()
+            .meta_put(&store_binding_key(feed.uid.as_str()), &text)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.bound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(feed.uid.as_str().to_string(), id);
+        self.set_moved(feed, None);
+        Ok(())
+    }
+
+    /// Forget a deleted feed's store record.
+    pub(crate) async fn unbind(&self, state: &ServerState, feed_uid: &str) -> Result<(), String> {
+        state
+            .history()
+            .meta_delete(&store_binding_key(feed_uid))
+            .await
+            .map_err(|e| e.to_string())?;
+        self.bound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(feed_uid);
+        self.moved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(feed_uid);
+        Ok(())
+    }
+
+    /// [`check_store`](Self::check_store), then create the feed's rows.
+    pub async fn ensure(
+        &self,
+        state: &ServerState,
+        feed: &Feed,
+        store: &dyn FeedStore,
+        tenant_limits: Option<&TenantLimits>,
+    ) -> Result<(), EnsureError> {
+        self.check_store(state, feed, store).await?;
+        ensure_in_store(store, feed, tenant_limits).await
     }
 
     /// Start the scheduler on this server if it is not running: called when
@@ -676,6 +969,29 @@ impl FeedsRuntime {
             .into_iter()
             .filter(|t| t.usable(now) && !deleted.contains(&t.feed))
             .collect();
+        // Check that each feed's store holds its rows (a store that cannot
+        // be opened now is checked on a later pass; until then nothing hands
+        // it out for the feed).
+        let mut opened: HashMap<String, Option<Arc<dyn FeedStore>>> = HashMap::new();
+        for feed in &mut feeds {
+            if feed.derived.store_moved.is_some() {
+                continue;
+            }
+            let name = feed.spec.store.clone();
+            if !opened.contains_key(&name) {
+                let store = tokio::time::timeout(STORE_OPEN_WAIT, self.stores.get(&name))
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                opened.insert(name.clone(), store);
+            }
+            let Some(Some(store)) = opened.get(&name) else {
+                continue;
+            };
+            if let Err(EnsureError::Moved(moved)) = self.check_store(state, feed, &**store).await {
+                Arc::make_mut(feed).derived.store_moved = Some(moved);
+            }
+        }
         let mut snapshot = Snapshot::new(feeds, tokens, tenant_limits);
         snapshot.unfinished = unfinished;
         let snapshot = Arc::new(snapshot);
@@ -721,6 +1037,27 @@ impl FeedsRuntime {
                 },
             );
         }
+        let mut derived = Derived {
+            references: self.file.references.get(key).cloned().unwrap_or_default(),
+            ..Derived::default()
+        };
+        for d in &spec.deliveries {
+            let Some(t) = &d.template else {
+                continue;
+            };
+            let secret = crate::serve::schedules::secrets::declared_secret_params(
+                state,
+                &t.id,
+                t.version.as_deref(),
+            )
+            .await
+            .ok();
+            crate::serve::schedules::secrets::mask_declared(
+                &mut t.params.clone(),
+                secret.as_deref(),
+            );
+            derived.secret_params.insert(d.name.clone(), secret);
+        }
         let mut feed = Feed {
             uid,
             spec: spec.clone(),
@@ -729,6 +1066,7 @@ impl FeedsRuntime {
             approved: true,
             revision: 0,
             ensured: false,
+            derived,
         };
         let already = self
             .ensured
@@ -736,8 +1074,15 @@ impl FeedsRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(key);
         if !already {
-            let store = self.store_for(&feed).await?;
-            ensure_in_store(&*store, &feed, limits).await?;
+            let store = self.stores.get(&feed.spec.store).await?;
+            match self.ensure(state, &feed, &*store, limits).await {
+                Ok(()) => {}
+                Err(EnsureError::Moved(moved)) => {
+                    feed.derived.store_moved = Some(moved);
+                    return Ok(feed);
+                }
+                Err(e) => return Err(e.into()),
+            }
             let calls = store_calls();
             for id in &gone {
                 let dropped =
@@ -780,19 +1125,67 @@ impl FeedsRuntime {
     }
 }
 
+/// Why a feed's rows could not be created in its store.
+#[derive(Debug)]
+pub enum EnsureError {
+    /// The store failed or refused.
+    Store {
+        /// Waiting may fix it (the store is down, busy or timed out).
+        transient: bool,
+        message: String,
+    },
+    /// The feed's events are in another store than the one it names.
+    Moved(StoreMoved),
+}
+
+impl EnsureError {
+    fn store(e: &faucet_common_feed::FeedError, context: Option<&str>) -> Self {
+        EnsureError::Store {
+            transient: e.is_transient() || matches!(e, faucet_common_feed::FeedError::Call(_)),
+            message: match context {
+                Some(c) => format!("{c}: {e}"),
+                None => e.to_string(),
+            },
+        }
+    }
+
+    /// Whether waiting may fix it.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            EnsureError::Store { transient, .. } => *transient,
+            EnsureError::Moved(_) => false,
+        }
+    }
+}
+
+impl std::fmt::Display for EnsureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EnsureError::Store { message, .. } => f.write_str(message),
+            EnsureError::Moved(m) => m.fmt(f),
+        }
+    }
+}
+
+impl From<EnsureError> for String {
+    fn from(e: EnsureError) -> Self {
+        e.to_string()
+    }
+}
+
 /// Create `feed` and its deliveries in `store` when missing, and store its
 /// limits.
 pub async fn ensure_in_store(
     store: &dyn FeedStore,
     feed: &Feed,
     tenant_limits: Option<&TenantLimits>,
-) -> Result<(), String> {
+) -> Result<(), EnsureError> {
     let calls = store_calls();
     let tenant = feed
         .tenant()
         .map(TenantId::new)
         .transpose()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| EnsureError::store(&e, None))?;
     store
         .ensure_feed(
             &calls,
@@ -801,23 +1194,32 @@ pub async fn ensure_in_store(
             &store_limits(&feed.spec, tenant_limits),
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| EnsureError::store(&e, None))?;
     for d in &feed.spec.deliveries {
         if let Some(r) = feed.delivery(&d.name) {
             store
                 .ensure_delivery(&calls, &r.uid, start_of(d.start))
                 .await
-                .map_err(|e| format!("delivery '{}': {e}", d.name))?;
+                .map_err(|e| EnsureError::store(&e, Some(&format!("delivery '{}'", d.name))))?;
         }
     }
     Ok(())
 }
 
-/// The runnable form of a stored feed: its signature secret opened.
+/// The runnable form of a stored feed: its signature secret opened. A secret
+/// that does not open leaves the feed usable for everything but ingest: its
+/// secret is emptied (never the sealed text, which is no secret) and
+/// [`Derived::signature_unreadable`] says why.
 pub fn feed_of_record(state: &ServerState, record: &FeedRecord) -> Result<Feed, String> {
     let uid = FeedUid::new(record.uid.clone()).map_err(|e| e.to_string())?;
     let mut spec = record.spec.clone();
-    secrets::open_signature(state, &mut spec, &record.uid)?;
+    let mut derived = Derived::default();
+    if let Err(e) = secrets::open_signature(state, &mut spec, &record.uid) {
+        if let Some(sig) = spec.ingest.auth.signature.as_mut() {
+            sig.secret.clear();
+        }
+        derived.signature_unreadable = Some(e);
+    }
     let mut deliveries = BTreeMap::new();
     for (name, meta) in &record.deliveries {
         deliveries.insert(
@@ -836,6 +1238,7 @@ pub fn feed_of_record(state: &ServerState, record: &FeedRecord) -> Result<Feed, 
         approved: record.approved,
         revision: record.revision,
         ensured: true,
+        derived,
     })
 }
 

@@ -107,6 +107,20 @@
       "summary": "a cancelled run flushes, so buffered output is not lost"
     },
     {
+      "id": "drift_resolution",
+      "role": "sink",
+      "triggers": [
+        {
+          "kind": "overrides",
+          "arg": "column_matching"
+        }
+      ],
+      "assertions": [
+        "assert_drift_resolves_like_writes"
+      ],
+      "summary": "a field the sink's column-matching rule folds onto a column lands there, and schema drift resolves it the same way"
+    },
+    {
       "id": "partial_outcomes",
       "role": "sink",
       "triggers": [

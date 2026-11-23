@@ -165,6 +165,13 @@ and the [stream-pages architecture note](https://github.com/faucet-hq/faucet-str
 flow while the receive window is open, and each sender is answered once its page is
 written).
 
+`grpc` (server-streaming), `websocket` and `webhook` have no position to resume from,
+so each page carries a flush-only bookmark (`{"received": n}`): the pipeline flushes
+the sink after every page, and with a `state:` block stores the value, which the
+source ignores on the next run. A quiet `grpc` or `websocket` feed cuts a partial page
+after 5 s, so a sink that commits per flush (Iceberg, Delta, the file family) commits
+at most that often; raise `batch_size` for those.
+
 **Sources that intentionally keep the buffered default:** `grpc` unary mode (a single
 response — no paging primitive) and `webhook` with `ack: on_receive` (it collects
 POSTs over a window and emits them when it closes). S3/GCS/Azure fall back to buffered for the JSON-array format only
@@ -256,7 +263,7 @@ config this project treats as a defect.
 | Local files | T1 ✅ | `sink-file` | no-op | ✓ | ✗ | ✗ | atomic (no rollover) | [file sink](/faucet-stream/cookbook/file-formats/#the-local-file-sink): JSONL / JSON / CSV / XML / Excel / Avro / Parquet by extension; temp-then-rename finalisation, record/byte rollover with a `{part}` template, `write_mode: overwrite` swaps the whole output set; Parquet (and Avro) take the columnar path |
 | Snowflake | T2 | `sink-snowflake` | ✓ | ✗ | ✗ | **✓** | atomic (`batch_size: 0`) | SQL REST API; multi-statement `BEGIN;INSERT;MERGE;COMMIT` transaction for effectively-once |
 | Amazon Redshift | T1 ✅ | `sink-redshift` | ✓ | ✗ | ✗ | ✗ | atomic (COPY + `batch_size: 0`) | COPY-from-S3 (staged) or multi-row `INSERT`, over the PostgreSQL wire (password or refreshed IAM credentials) or the Redshift Data API; append-only; auto-creates the table (`create_table`) |
-| ClickHouse | T1 ✅ | `sink-clickhouse` | ✓ | ✗ | ✗ | ✗ | atomic (`batch_size: 0` or staged) | `INSERT … FORMAT JSONEachRow`; optional `async_insert`; append-only; auto-creates the table (`create_table`) |
+| ClickHouse | T1 ✅ | `sink-clickhouse` | ✓ | ✗ | ✗ | ✗ | best effort | `INSERT … FORMAT JSONEachRow`; optional `async_insert`; append-only; auto-creates the table (`create_table`) |
 | MySQL | T1 ✅ | `sink-mysql` | ✓ | ✗ | **✓** | **✓** | atomic keyed | multi-row `INSERT` |
 | Microsoft SQL Server | T1 ✅ | `sink-mssql` | ✓ | ✗ | **✓** | **✓** | atomic keyed | multi-row `INSERT` (2100-param auto-split, per-row DLQ) |
 | Oracle Database | T1 ✅ | `sink-oracle` | ✓ | ✗ | **✓** | **✓** | atomic | array DML per page (per-row DLQ), keyed `MERGE` upsert / `DELETE`, `_faucet_commit_token` in the same transaction; needs Oracle Instant Client at runtime ([installation](/faucet-stream/getting-started/installation/#oracle-instant-client)) |
@@ -385,6 +392,13 @@ Inspect the exact fields with `faucet schema source <name>` / `faucet schema sin
   so a file written after the source widens picks up the new schema. A Parquet
   file's schema is immutable once opened, so a field appearing only later *within
   a single file* is dropped with a per-file one-shot warning.
+- **Kafka source and sink — `extra_client_config`** — a raw option faucet sets
+  itself is refused when its value disagrees: on the source `bootstrap.servers`,
+  `group.id`, `auto.offset.reset`, `enable.auto.commit` (must stay `false`) and
+  `isolation.level` (must stay `read_committed`); on the sink `bootstrap.servers`,
+  `acks` and `enable.idempotence` (set the typed fields), and `transactional.id`
+  always. A `from_path` topic may not name the commit-token topic, nor an internal
+  `__…` topic unless `allow_internal_topics: true`.
 - **MongoDB CDC source** — `max_staged_records` (default 1,000,000) caps the
   in-memory change-event buffer (including under `batch_size: 0`) and aborts with
   a typed error rather than risking OOM, mirroring `postgres-cdc` / `mysql-cdc`.

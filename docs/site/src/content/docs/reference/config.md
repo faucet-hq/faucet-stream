@@ -910,7 +910,7 @@ pipeline:
     rules:                                # required, non-empty; first match per field wins
       - name: emails                      # optional label (logs + metric); default rule_<n>
         match:                            # at least one of the three must be set
-          value_detector: email          # email | credit_card | ssn | phone | phone_loose | ipv4
+          value_detector: email          # email | credit_card | credit_card_loose | ssn | phone | phone_loose | ipv4
         action: { type: redact }          # replace with `mask` (default "***")
       - match: { field_pattern: '(?i)^ssn$' }   # regex over the field dot-path
         action: { type: hash }            # HMAC-SHA256 (keyed) / SHA-256 (unkeyed) hex
@@ -924,13 +924,14 @@ pipeline:
 | `description` | — | Documentation metadata. |
 | `key` | — | Secret for keyed HMAC-SHA256 `hash`/`tokenize` (deterministic + irreversible). Absent → unkeyed SHA-256 (deterministic but recomputable). Resolved after secrets, so `${vault:...}` etc. work. |
 | `rules[]` | — | Required, non-empty. Each rule = `name` (optional label) + `match` + `action` + optional `applies_to`. Evaluated in order; the first rule that matches a field wins. |
-| `rules[].match` | — | At least one of `field_pattern` (regex over the dot-path), `value_detector` (`email`/`credit_card`/`ssn`/`phone`/`phone_loose`/`ipv4`, run over string values), `fields` (explicit dot-paths). A match on a container masks the whole subtree (`redact` replaces it; `hash`/`tokenize`/`partial` rewrite every non-null scalar inside it). |
+| `rules[].match` | — | At least one of `field_pattern` (regex over the dot-path), `value_detector` (`email`/`credit_card`/`credit_card_loose`/`ssn`/`phone`/`phone_loose`/`ipv4`, run over string values), `fields` (explicit dot-paths). A match on a container masks the whole subtree (`redact` replaces it; `hash`/`tokenize`/`partial` rewrite every non-null scalar inside it). |
 | `rules[].action` | — | Tagged by `type`: `redact` (`mask`, default `"***"`; `mask: null` nulls the field), `hash`, `tokenize` (`prefix`), `partial` (`keep_last` default `4`, `mask_char` default `*`; `keep_last >= len` masks everything). |
 | `rules[].applies_to` | `[]` (all sinks) | Scope the rule to specific sinks by template name (under `pipeline.sinks:`) or connector kind (e.g. `bigquery`). |
 
-Detectors are conservative (fully anchored; `credit_card` requires a valid
-Luhn checksum; `ssn` excludes never-issued ranges) so false positives stay
-rare. A `credit_card` or `phone_loose` rule can match a JSON number, so with one
+Detectors are fully anchored; `credit_card` requires a card network's prefix
+and length and a valid Luhn checksum (`credit_card_loose` only the checksum);
+`ssn` excludes never-issued ranges. A `credit_card`, `credit_card_loose` or
+`phone_loose` rule can match a JSON number, so with one
 in the policy every number is written as a string, keeping each column one type
 across pages (see the [masking cookbook](/faucet-stream/cookbook/masking/#detectors)). `hash`/`tokenize` are deterministic → masked values stay joinable across
 pipelines that share a `key`. A malformed policy (empty rules, an empty
@@ -959,7 +960,7 @@ policy:
     - label: pii
       fields: [email, phone]              # full dot-path or leaf key
       field_pattern: "(?i)_?name$"        # regex over the dot-path
-      value_detector: email               # email | credit_card | ssn | phone | phone_loose | ipv4
+      value_detector: email               # email | credit_card | credit_card_loose | ssn | phone | phone_loose | ipv4
   rules:
     - name: pii-eu
       when: { label: pii }                # + optional sink_kind: [..], sink: { attr: [..] }
@@ -999,6 +1000,19 @@ Every classification needs at least one of `fields` / `field_pattern` /
   (abort pending and in-flight work on first failure).
 - `schedule` — the order ready sibling rows queue for a permit: `declared`
   (default, matrix order) or `lpt`.
+- `max_fan_out_records` — the most records one parent invocation may hand its
+  child rows (default `1000000`, between `1` and `10000000`). Each captured
+  record becomes a child invocation held in memory until it runs. A page that
+  would pass the cap is refused whole: the parent's own write of that page fails
+  with `budget exceeded: execution.max_fan_out_records` (error kind
+  `budget_exceeded`) and its children are skipped. A warning is logged once a
+  fan-out passes 100,000 records.
+
+Invocations start as concurrency permits free up, in `schedule` order, so at
+most `max_concurrent` exist at a time however wide a fan-out is. Each level of
+the matrix (roots, then their children and dependents) finishes before the next
+starts. After an external cancel (serve cancel / timeout / shutdown, a schedule
+run timeout, Ctrl-C), rows that had not started are reported skipped.
 
 ### Dispatch order (`schedule: lpt`)
 
@@ -1830,6 +1844,23 @@ observability:
 | `service_name` | string | `faucet` | Value of the OpenTelemetry resource attribute `service.name` attached to every span and metric point. |
 | `timeout_secs` | integer | `10` | Per-export timeout in seconds. Timed-out exports are counted in `faucet_otel_export_failures_total` but do not fail the run. |
 | `metric_interval_secs` | integer | `60` | How often (in seconds) accumulated metric points are pushed to the collector. |
+
+### `prometheus:`
+
+Serves a Prometheus `/metrics` endpoint.
+
+```yaml
+observability:
+  prometheus:
+    listen: "127.0.0.1:9464"
+    idle_timeout_secs: 86400
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `listen` | string | required | Socket address the scrape endpoint binds. |
+| `buckets` | list of numbers | faucet's defaults | Histogram bucket boundaries (seconds) applied to every histogram. |
+| `idle_timeout_secs` | integer | `86400` for `faucet schedule` and `faucet mirror`, none for one-shot commands | Counter and histogram series not updated for this many seconds leave `/metrics` until they are emitted again; gauges never expire. `0` keeps every series. A counter that comes back restarts at zero, which `rate()` / `increase()` read as a reset. |
 
 **Coexistence:** `observability.otel:` and `observability.prometheus:` are
 fully independent; both can be active at the same time and metrics fan out to

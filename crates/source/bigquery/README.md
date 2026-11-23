@@ -69,7 +69,7 @@ faucet run pipeline.yaml
 | `use_legacy_sql` | bool | `false` | Use BigQuery's legacy SQL dialect. Leave `false` (Standard SQL) unless the query uses legacy `[project:dataset.table]` references. |
 | `location` | string | *(unset)* | Location override for non-`US` jobs (`"EU"`, `"asia-east1"`, …). When unset, BigQuery uses the queried tables' default location. |
 | `max_results_per_page` | int | `1000` | Rows per `jobs.getQueryResults` page. Smaller = more HTTP round-trips, less memory; larger = fewer requests, more memory. |
-| `params` | array | `[]` | Positional bind parameters, sent in declaration order **before** any context-derived values. Typed from each JSON value. |
+| `params` | array | `[]` | Positional bind parameters, each bound to the next `?` the query holds; a `{token}` from a parent record binds at its own position in the text. Typed from each JSON value. |
 | `statement_timeout` | int (seconds) | `60` | Per-statement server-side timeout (`timeoutMs` on `jobs.query`). If the query isn't done within this window, BigQuery returns `jobComplete=false` and the source begins polling. |
 | `poll_timeout` | int (seconds) | `300` | Max wall-clock time spent polling `jobs.getQueryResults` for a job still reporting `jobComplete=false`, before failing with `FaucetError::Source`. **`0` disables the cap** (poll forever). Only the completion wait is bounded; `pageToken` paging afterward is unaffected. |
 | `batch_size` | int | `1000` | Records per emitted `StreamPage`. **`0` = no batching**: the entire result set is emitted in a single page (good for small lookup tables or sinks that prefer one large request). |

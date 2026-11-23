@@ -305,6 +305,7 @@ pub async fn replay(
             catalog: None,
             usage: Default::default(),
             budget,
+            budget_state: None,
             feed: Default::default(),
         },
     ))

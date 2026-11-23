@@ -12,6 +12,7 @@ use crate::error::{CliError, CliResult};
 use crate::serve::history::tenants::validate_slug;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 /// The `--feeds` file.
@@ -245,6 +246,10 @@ pub fn check_file(file: &FeedsFile) -> Result<(), String> {
 pub struct LoadedFile {
     pub feeds: Vec<FeedSpec>,
     pub dir: PathBuf,
+    /// Per feed key, every string of its definition that held a `${…}`
+    /// reference: its resolved value and the text the file holds. Views show
+    /// the text, never the value.
+    pub references: HashMap<String, BTreeMap<String, String>>,
 }
 
 impl LoadedFile {
@@ -278,11 +283,27 @@ pub async fn load_file(path: &Path) -> CliResult<LoadedFile> {
             .map_err(|e| CliError::Serve(format!("parsing feeds YAML: {e}")))?
     };
     crate::serve::load::protect_references(&doc);
+    let raw_feeds: Vec<serde_json::Value> = doc
+        .get("feeds")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     crate::interpolate::interpolate_value(&mut doc)
         .map_err(|e| CliError::Serve(format!("feeds file {}: {e}", path.display())))?;
     let file: FeedsFile = serde_json::from_value(doc)
         .map_err(|e| CliError::Serve(format!("parsing feeds file {}: {e}", path.display())))?;
     check_file(&file).map_err(CliError::Serve)?;
+    let mut references = HashMap::new();
+    for (f, raw) in file.feeds.iter().zip(&raw_feeds) {
+        let found = referenced_strings(raw)
+            .map_err(|e| CliError::Serve(format!("feeds file {}: {e}", path.display())))?;
+        if !found.is_empty() {
+            references.insert(
+                crate::serve::history::feeds::feed_key(f.tenant.as_deref(), &f.name),
+                found,
+            );
+        }
+    }
     let loaded = LoadedFile {
         feeds: file.feeds,
         dir: path
@@ -290,6 +311,7 @@ pub async fn load_file(path: &Path) -> CliResult<LoadedFile> {
             .filter(|p| !p.as_os_str().is_empty())
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from(".")),
+        references,
     };
     for f in &loaded.feeds {
         if let Some(sig) = &f.ingest.auth.signature {
@@ -313,10 +335,69 @@ pub async fn load_file(path: &Path) -> CliResult<LoadedFile> {
     Ok(loaded)
 }
 
+/// Every string of `raw` (an uninterpolated document) that holds a `${…}`
+/// reference, keyed by what it resolves to, with its text. (Resolving a
+/// reference registers its value for log redaction.)
+pub fn referenced_strings(raw: &serde_json::Value) -> Result<BTreeMap<String, String>, String> {
+    fn walk(v: &serde_json::Value, out: &mut BTreeMap<String, String>) -> Result<(), String> {
+        match v {
+            serde_json::Value::String(text) if text.contains("${") => {
+                let resolved = crate::interpolate::interpolate(text).map_err(|e| e.to_string())?;
+                if resolved != *text {
+                    out.insert(resolved, text.clone());
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, out)?;
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for item in map.values() {
+                    walk(item, out)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut out = BTreeMap::new();
+    walk(raw, &mut out)?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn referenced_strings_map_each_resolved_value_to_its_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("key");
+        std::fs::write(&key_file, "file-held-api-key-value").unwrap();
+        let reference = format!("${{file:{}}}", key_file.display());
+        let raw = json!({
+            "name": "orders",
+            "description": "plain",
+            "deliveries": [{"template": {"params": {
+                "token": reference,
+                "header": format!("Bearer {reference}"),
+                "region": "eu"
+            }}}]
+        });
+        let found = referenced_strings(&raw).unwrap();
+        assert_eq!(
+            found.get("file-held-api-key-value").map(String::as_str),
+            Some(reference.as_str())
+        );
+        assert!(found.contains_key("Bearer file-held-api-key-value"));
+        assert_eq!(found.len(), 2);
+        assert!(
+            !crate::secrets::registry::redact("x file-held-api-key-value y")
+                .contains("file-held-api-key-value")
+        );
+    }
 
     fn feed(v: serde_json::Value) -> FeedSpec {
         serde_json::from_value(v).unwrap()

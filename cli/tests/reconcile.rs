@@ -57,6 +57,7 @@ fn opts_with_reconcile(reconcile: Option<ReconcileSpec>) -> ExecuteOptions {
         catalog: None,
         usage: Default::default(),
         budget: None,
+        budget_state: None,
         feed: Default::default(),
     }
 }

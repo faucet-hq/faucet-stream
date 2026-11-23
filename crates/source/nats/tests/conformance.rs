@@ -424,6 +424,7 @@ async fn conformance_descriptor_matches_built_source() {
     #[allow(unused_mut)]
     let configs = vec![
         r#"{"subject": "events.>", "servers": ["nats://127.0.0.1:1"], "idle_timeout_secs": 1}"#,
+        r#"{"subject": "events.>", "servers": ["nats://127.0.0.1:1"], "idle_timeout_secs": 1, "queue_group": "workers"}"#,
     ];
     for raw in configs {
         let v: faucet_core::Value = faucet_core::serde_json::from_str(raw).expect("json");

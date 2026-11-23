@@ -1033,7 +1033,18 @@ paths:
         (kept in the run history) and those of the `--feeds` file (read-only),
         each with its store position, its deliveries and their status, and what
         the last 24 hours brought (`events_24h`, `bytes_24h`, `last_event_at`).
-        With a tenant, the tenant's quotas too. `ingest_on_api` is `false` when
+        With a tenant, the tenant's quotas too, counted over all of its feeds
+        whatever the page: `feeds`, and `stored_bytes` (the bytes its feeds
+        hold in the store where they hold the most, delivered events kept for
+        replay included: what `max_feed_bytes` is checked against in each
+        store), with `stored_bytes_by_store` when its feeds are in more than
+        one store. A feed's `status` is, worst first, `held`, `store_moved`
+        (its events are in another feed store than the one it names: nothing
+        is received or delivered until it is adopted), `secret_unreadable` (this server cannot open its signature secret and
+        answers its senders 503), `stalled`,
+        `full` (an undelivered limit is reached), `over_quota` (the tenant's
+        feeds in this store hold its whole byte quota), `paused` or
+        `receiving`. `ingest_on_api` is `false` when
         `--feeds-listen` serves the ingest routes on another listener.
         Each feed carries `retained_bytes` (every retained event, the
         delivered ones kept for replay included) and `undelivered_bytes`
@@ -1430,6 +1441,33 @@ paths:
         "404": { $ref: "#/components/responses/Error" }
         "409": { $ref: "#/components/responses/Error" }
         "422": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+  /v1/feeds/{name}/adopt-store:
+    post:
+      summary: Start a feed empty in the store it now names
+      description: >
+        For a feed whose events are in another physical feed store than the one
+        its definition names (status `store_moved`, for example after a store
+        name was pointed at another database): removes its deliveries' run
+        state, records the named store as the feed's and creates the feed and
+        its deliveries there at each delivery's `start`. Its events in the old
+        store are not delivered. 409 when the feed is in the store it names.
+        `faucet feed adopt-store --all` adopts every such feed at once.
+        Requires `FeedAdmin` (admin); audited as `feed.adopt_store`.
+      operationId: adoptFeedStore
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, required: false, schema: { type: string }, description: "The tenant whose feed is meant (operators; a tenant principal's own is implied)." }
+      responses:
+        "200":
+          description: "`{feed, tenant?, store, store_id, abandoned_store, abandoned_store_id}`."
+          content:
+            application/json:
+              schema: { type: object }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
         "503": { $ref: "#/components/responses/Error" }
   /v1/feeds/{name}/tokens:
     get:
@@ -1978,7 +2016,7 @@ paths:
         "401": { description: Missing or invalid bearer token }
         "403": { description: Principal's role lacks the required permission }
         "409": { description: A stateful config's range was submitted before and neither `resume` nor `restart` is set }
-        "422": { description: "`resume` and `restart` both set, or a `callback` was supplied" }
+        "422": { description: "`resume` and `restart` both set, a `callback` was supplied, or a root row declares `complete_for` cleanup (a unit reads one window)" }
   /v1/dlq/inspect:
     post:
       summary: Inspect a dead-letter-queue location (read-only)
@@ -4010,6 +4048,7 @@ paths:
                             listen: { type: string, nullable: true }
                             pools: { type: array, nullable: true, items: { type: string }, description: "null for a member that predates execution pools: it claims any pending run, so a non-default pool is refused while it is live." }
                             capabilities: { type: array, nullable: true, items: { type: string }, description: "What the member enforces that older releases do not (`policy_pin`, #1051; `connection_generation`; `host_credentials`); null for a member that predates them. Runs under a policy, and policy changes, wait while any live member lacks `policy_pin`. A hosted OAuth flow moves a connection's `updated_at` when it assigns a generation only while every live member has `connection_generation`. A caller's run whose connectors check the server's own identity when they are built is refused (503) while any live member lacks `host_credentials`." }
+                            clock_offset_ms: { type: integer, nullable: true, description: "The member's clock minus the history database's, in milliseconds, at its last heartbeat; null for a member that does not report it. Leases use the database's clock." }
                             in_flight: { type: integer }
                             max_concurrent: { type: integer }
                   triggers:

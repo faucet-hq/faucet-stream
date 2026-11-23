@@ -1,7 +1,9 @@
-//! Value-based PII detectors (issue #206). Conservative by design: every
-//! detector fully anchors its match and the card detector additionally
-//! verifies the Luhn checksum, so false positives — which would silently
-//! rewrite non-PII data — stay rare.
+//! Value-based PII detectors (issue #206). Every detector fully anchors its
+//! match. The card detector additionally requires a card-network prefix and
+//! length and a valid Luhn checksum; Luhn alone passes one number in ten, so
+//! without the network table epoch-millisecond timestamps and long ids would be
+//! rewritten. Numbers that begin like a card (ids starting 3, 4, 5, 6 or 8 at
+//! card lengths) still match about one time in ten.
 
 use super::config::Detector;
 use regex::Regex;
@@ -16,11 +18,12 @@ pub fn detects(detector: Detector, value: &str) -> bool {
         Detector::Ipv4 => is_ipv4(value),
         Detector::CreditCard => is_credit_card(value),
         Detector::PhoneLoose => is_phone_loose(value),
+        Detector::CreditCardLoose => card_digits(value).is_some_and(|d| luhn_valid(&d)),
     }
 }
 
 /// [`detects`] over a JSON scalar. Strings go through every detector; a JSON
-/// number only through the card detector (an integer can hold a card number,
+/// number only through the card detectors (an integer can hold a card number)
 /// and through `phone_loose`, which opts into matching one,
 /// while ids, epoch timestamps and amounts are numbers that look like phone
 /// numbers); booleans and containers never match.
@@ -37,7 +40,10 @@ pub fn detects_value(detector: Detector, value: &serde_json::Value) -> bool {
 /// Whether `detector` can match a JSON number, so a rule using it may turn a
 /// numeric value into a string.
 pub(crate) fn matches_numbers(detector: Detector) -> bool {
-    matches!(detector, Detector::CreditCard | Detector::PhoneLoose)
+    matches!(
+        detector,
+        Detector::CreditCard | Detector::CreditCardLoose | Detector::PhoneLoose
+    )
 }
 
 fn email_re() -> &'static Regex {
@@ -121,9 +127,80 @@ fn is_ipv4(value: &str) -> bool {
     octets == 4
 }
 
-/// A credit-card candidate: 13–19 digits (after stripping single space/dash
-/// separators) that passes the Luhn checksum.
+/// A card network's issuer range: the first `prefix_len` digits fall in
+/// `lo..=hi` and the number has one of `lengths` digits.
+struct CardRange {
+    lo: u32,
+    hi: u32,
+    prefix_len: usize,
+    lengths: &'static [usize],
+}
+
+const fn range(lo: u32, hi: u32, prefix_len: usize, lengths: &'static [usize]) -> CardRange {
+    CardRange {
+        lo,
+        hi,
+        prefix_len,
+        lengths,
+    }
+}
+
+const L16_19: &[usize] = &[16, 17, 18, 19];
+const L14_19: &[usize] = &[14, 15, 16, 17, 18, 19];
+const L13_19: &[usize] = &[13, 14, 15, 16, 17, 18, 19];
+
+/// Issuer ranges of the card networks: Visa, Mastercard, Amex, Discover, JCB,
+/// Diners, UnionPay, Maestro, Mir, RuPay, Troy, Verve and UATP. Deliberately
+/// broad, so a real card is not missed.
+const CARD_NETWORKS: &[CardRange] = &[
+    range(4, 4, 1, &[13, 16, 19]),
+    range(51, 55, 2, &[16]),
+    range(2221, 2720, 4, &[16]),
+    range(34, 34, 2, &[15]),
+    range(37, 37, 2, &[15]),
+    range(6011, 6011, 4, L16_19),
+    range(644, 649, 3, L16_19),
+    range(65, 65, 2, L16_19),
+    range(622_126, 622_925, 6, L16_19),
+    range(3528, 3589, 4, L16_19),
+    range(300, 305, 3, L14_19),
+    range(3095, 3095, 4, L14_19),
+    range(36, 36, 2, L14_19),
+    range(38, 39, 2, L14_19),
+    range(62, 62, 2, L16_19),
+    range(81, 81, 2, L16_19),
+    range(50, 50, 2, L13_19),
+    range(56, 69, 2, L13_19),
+    range(2200, 2204, 4, L16_19),
+    range(60, 60, 2, &[16]),
+    range(82, 82, 2, &[16]),
+    range(508, 508, 3, &[16]),
+    range(9792, 9792, 4, &[16]),
+    range(506, 507, 3, L16_19),
+    range(650, 650, 3, L16_19),
+    range(1, 1, 1, &[15]),
+];
+
+fn issued_by_a_network(digits: &[u8]) -> bool {
+    CARD_NETWORKS.iter().any(|n| {
+        n.lengths.contains(&digits.len())
+            && (n.lo..=n.hi).contains(
+                &digits[..n.prefix_len]
+                    .iter()
+                    .fold(0u32, |acc, d| acc * 10 + u32::from(*d)),
+            )
+    })
+}
+
+/// A card number: 13–19 digits (single space/dash separators allowed) with a
+/// card network's prefix and length, passing the Luhn checksum.
 fn is_credit_card(value: &str) -> bool {
+    card_digits(value).is_some_and(|d| issued_by_a_network(&d) && luhn_valid(&d))
+}
+
+/// The digits of a 13–19 digit candidate written with single space/dash
+/// separators, or `None` when `value` is not shaped like one.
+fn card_digits(value: &str) -> Option<Vec<u8>> {
     // Reject anything that isn't digits + single space/dash separators.
     let mut digits: Vec<u8> = Vec::with_capacity(19);
     let mut prev_sep = true; // disallow leading separator
@@ -135,20 +212,17 @@ fn is_credit_card(value: &str) -> bool {
             }
             ' ' | '-' => {
                 if prev_sep {
-                    return false; // no leading / doubled separators
+                    return None; // no leading / doubled separators
                 }
                 prev_sep = true;
             }
-            _ => return false,
+            _ => return None,
         }
     }
     if prev_sep && !digits.is_empty() && (value.ends_with(' ') || value.ends_with('-')) {
-        return false; // trailing separator
+        return None; // trailing separator
     }
-    if digits.len() < 13 || digits.len() > 19 {
-        return false;
-    }
-    luhn_valid(&digits)
+    (13..=19).contains(&digits.len()).then_some(digits)
 }
 
 /// Luhn (mod-10) checksum over already-parsed digits.
@@ -186,6 +260,7 @@ mod tests {
             Detector::Phone,
             Detector::Ipv4,
             Detector::PhoneLoose,
+            Detector::CreditCardLoose,
         ] {
             let hit = numbers.iter().any(|n| detects_value(det, n));
             assert_eq!(hit, matches_numbers(det), "{det}");
@@ -253,6 +328,135 @@ mod tests {
         assert!(!detects(Detector::CreditCard, "1234567890")); // too short
         assert!(!detects(Detector::CreditCard, "4111 1111 1111 111a")); // non-digit
         assert!(!detects(Detector::CreditCard, "-4111111111111111")); // leading sep
+    }
+
+    /// A Luhn-valid number of `len` digits starting with `prefix`.
+    fn luhn_number(prefix: &str, len: usize) -> String {
+        let mut body: Vec<u8> = prefix.bytes().map(|b| b - b'0').collect();
+        while body.len() < len - 1 {
+            body.push(((body.len() * 7) % 10) as u8);
+        }
+        let check = (0..10u8)
+            .find(|c| {
+                let mut all = body.clone();
+                all.push(*c);
+                luhn_valid(&all)
+            })
+            .unwrap();
+        body.push(check);
+        body.iter().map(|d| char::from(b'0' + d)).collect()
+    }
+
+    #[test]
+    fn credit_card_matches_one_number_per_network() {
+        let published = [
+            "4111111111111111", // Visa
+            "4222222222222",    // Visa 13
+            "5555555555554444", // Mastercard
+            "2223003122003222", // Mastercard 2-series
+            "378282246310005",  // Amex
+            "371449635398431",  // Amex
+            "6011111111111117", // Discover
+            "3530111333300000", // JCB
+            "30569309025904",   // Diners
+            "6200000000000005", // UnionPay
+            "6759649826438453", // Maestro
+            "135410014004955",  // UATP
+        ];
+        let generated = [
+            ("4", 19),
+            ("2200", 16),
+            ("2204", 19),
+            ("644", 16),
+            ("65", 19),
+            ("622126", 16),
+            ("3589", 19),
+            ("3095", 14),
+            ("36", 14),
+            ("38", 16),
+            ("81", 16),
+            ("50", 13),
+            ("60", 16),
+            ("82", 16),
+            ("508", 16),
+            ("9792", 16),
+            ("506", 16),
+            ("650", 19),
+            ("1", 15),
+        ];
+        let numbers = published
+            .iter()
+            .map(|s| (*s).to_owned())
+            .chain(generated.iter().map(|(p, l)| luhn_number(p, *l)));
+        for n in numbers {
+            assert!(detects(Detector::CreditCard, &n), "{n}");
+            let spaced: String = n
+                .chars()
+                .enumerate()
+                .flat_map(|(i, c)| (i > 0 && i % 4 == 0).then_some(' ').into_iter().chain([c]))
+                .collect();
+            assert!(detects(Detector::CreditCard, &spaced), "{spaced}");
+            let int: u64 = n.parse().unwrap();
+            assert!(
+                detects_value(Detector::CreditCard, &serde_json::json!(int)),
+                "{n}"
+            );
+        }
+    }
+
+    #[test]
+    fn credit_card_skips_epoch_millis_and_ids_outside_card_ranges() {
+        let epoch_hits = (0..10_000u64)
+            .map(|i| 1_731_974_400_000 + i)
+            .filter(|ms| {
+                detects(Detector::CreditCard, &ms.to_string())
+                    || detects_value(Detector::CreditCard, &serde_json::json!(ms))
+            })
+            .count();
+        assert_eq!(epoch_hits, 0);
+        let loose_hits = (0..10_000u64)
+            .map(|i| 1_731_974_400_000 + i)
+            .filter(|ms| detects(Detector::CreditCardLoose, &ms.to_string()))
+            .count();
+        assert!(loose_hits > 500, "{loose_hits}");
+        for (prefix, len) in [
+            ("1", 19),
+            ("1", 16),
+            ("7", 16),
+            ("9", 16),
+            ("2999", 16),
+            ("1", 13),
+        ] {
+            let id = luhn_number(prefix, len);
+            assert!(!detects(Detector::CreditCard, &id), "{id}");
+            assert!(detects(Detector::CreditCardLoose, &id), "{id}");
+        }
+        // A Luhn-valid 19-digit id starting with 4 begins like a Visa card and
+        // still matches: the documented residual.
+        assert!(detects(Detector::CreditCard, &luhn_number("4", 19)));
+        // Wrong length for the network.
+        assert!(!detects(Detector::CreditCard, &luhn_number("34", 16)));
+        assert!(!detects(Detector::CreditCard, &luhn_number("4", 14)));
+    }
+
+    #[test]
+    fn credit_card_loose_keeps_the_luhn_only_matcher() {
+        assert!(detects(Detector::CreditCardLoose, "4111111111111111"));
+        assert!(detects(Detector::CreditCardLoose, "4111 1111 1111 1111"));
+        assert!(!detects(Detector::CreditCardLoose, "4111111111111112"));
+        assert!(!detects(Detector::CreditCardLoose, "1234567890"));
+        assert!(!detects(Detector::CreditCardLoose, "-4111111111111111"));
+        assert!(detects_value(
+            Detector::CreditCardLoose,
+            &serde_json::json!(luhn_number("1", 19).parse::<u64>().unwrap())
+        ));
+        assert_eq!(Detector::CreditCardLoose.to_string(), "credit_card_loose");
+        let d: Detector = serde_json::from_value(serde_json::json!("credit_card_loose")).unwrap();
+        assert_eq!(d, Detector::CreditCardLoose);
+        assert_eq!(
+            serde_json::to_value(Detector::CreditCardLoose).unwrap(),
+            serde_json::json!("credit_card_loose")
+        );
     }
 
     #[test]

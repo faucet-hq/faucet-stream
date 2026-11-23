@@ -246,7 +246,7 @@ async fn an_oversized_exactly_once_page_stays_one_transaction() {
     assert!(inserts >= 2);
     assert_eq!(
         tx["parameters"]["MULTI_STATEMENT_COUNT"],
-        (inserts + 3).to_string()
+        (inserts + 5).to_string()
     );
 }
 

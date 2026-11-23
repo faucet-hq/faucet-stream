@@ -167,7 +167,8 @@ SQLite has dynamic typing — values are stored as INTEGER, REAL, TEXT, BLOB, or
 | REAL (`f64`) | `number` |
 | INTEGER 0 / 1 in a column declared `BOOLEAN` / `BOOL` | `boolean` (other values stay numbers) |
 | BLOB | `string` (base64) |
-| NULL / unsupported | `null` |
+| NULL | `null` |
+| TEXT that is not valid UTF-8 | fails the read naming the column — select it as `CAST(c AS BLOB)` to read the bytes |
 
 SQLite has no native datetime / UUID / decimal types — those are stored as TEXT/INTEGER/REAL and surface accordingly. A non-finite `f64` (NaN / infinity) cannot be represented in JSON and decodes to `null`.
 
@@ -325,6 +326,14 @@ range during the run are still read, and exactly one shard additionally
 matches `key IS NULL` so nullable keys are never silently dropped. Each shard
 keeps its own state key (`{run}::{shard}`), so a reassigned shard resumes
 where its previous owner left off.
+
+The key must hold only numbers. SQLite compares a text value in a `TEXT`
+column (or a text value stored in any column) with the integer range bounds as
+text, so the ranges would overlap and read rows twice; when the key's largest
+value is text or a blob, planning fails with *shard key "k" holds non-integer
+values*. Shard on an integer column, or select the key as
+`CAST(k AS INTEGER) AS k` in the query. The same check applies to
+`faucet verify` range mode.
 
 Outside the cluster coordinator the `shard` config has **no effect** — a plain
 `faucet run` streams the whole query.

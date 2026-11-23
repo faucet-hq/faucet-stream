@@ -173,7 +173,10 @@ impl FallbackHistory {
         let p = match (self.primary.get(), &self.connector) {
             (Some(p), _) => p,
             (None, Some(connect)) => match connect().await {
-                Ok(p) => self.primary.get_or_init(|| p),
+                Ok(p) => {
+                    p.set_file_pins(self.fallback.file_pins());
+                    self.primary.get_or_init(|| p)
+                }
                 Err(e) => {
                     tracing::debug!(backend = self.label, error = %e, "run-history backend still unreachable");
                     return false;
@@ -316,6 +319,18 @@ macro_rules! strict {
 
 #[async_trait]
 impl RunHistory for FallbackHistory {
+    async fn db_now(&self) -> Result<chrono::DateTime<chrono::Utc>, HistoryError> {
+        via!(self, p => p.db_now(), f => f.db_now())
+    }
+    fn set_file_pins(&self, pins: Vec<super::templates::Pin>) {
+        if let Some(p) = self.primary.get() {
+            p.set_file_pins(pins.clone());
+        }
+        self.fallback.set_file_pins(pins);
+    }
+    fn file_pins(&self) -> Vec<super::templates::Pin> {
+        self.fallback.file_pins()
+    }
     async fn claim_idempotency(
         &self,
         key: &str,
@@ -491,6 +506,23 @@ impl RunHistory for FallbackHistory {
 
     // ── Source shards (Mode B, #230) ─────────────────────────────────────────
 
+    async fn start_owned(&self, rec: &RunRecord) -> Result<bool, HistoryError> {
+        strict!(self, p => p.start_owned(rec), f => f.start_owned(rec))
+    }
+    async fn coordinate_shards(
+        &self,
+        sharded: &RunRecord,
+        shards: &[super::ShardInsert],
+    ) -> Result<super::CoordinateOutcome, HistoryError> {
+        strict!(
+            self,
+            p => p.coordinate_shards(sharded, shards),
+            f => f.coordinate_shards(sharded, shards)
+        )
+    }
+    async fn cancel_flagged_shards(&self) -> Result<usize, HistoryError> {
+        strict!(self, p => p.cancel_flagged_shards(), f => f.cancel_flagged_shards())
+    }
     async fn insert_shards(
         &self,
         run_id: &str,
@@ -771,6 +803,27 @@ impl RunHistory for FallbackHistory {
     async fn run_secrets_delete(&self, run_id: &str) -> Result<(), HistoryError> {
         strict!(self, p => p.run_secrets_delete(run_id), f => f.run_secrets_delete(run_id))
     }
+    // A sharded run's budget is shared across replicas: never grant it from
+    // the empty in-memory fallback.
+    async fn budget_grant(
+        &self,
+        run_id: &str,
+        want: (u64, u64),
+        max: (Option<u64>, Option<u64>),
+    ) -> Result<faucet_core::BudgetGrant, HistoryError> {
+        strict!(self, p => p.budget_grant(run_id, want, max), f => f.budget_grant(run_id, want, max))
+    }
+    async fn budget_give_back(
+        &self,
+        run_id: &str,
+        records: u64,
+        bytes: u64,
+    ) -> Result<(), HistoryError> {
+        strict!(self, p => p.budget_give_back(run_id, records, bytes), f => f.budget_give_back(run_id, records, bytes))
+    }
+    async fn budget_spent(&self, run_id: &str) -> Result<Option<(u64, u64)>, HistoryError> {
+        strict!(self, p => p.budget_spent(run_id), f => f.budget_spent(run_id))
+    }
     // The policy in force is shared state: never read it from, or write it
     // to, the empty in-memory fallback.
     async fn policy_version_insert(
@@ -1024,6 +1077,9 @@ impl RunHistory for FallbackHistory {
     async fn meta_put(&self, key: &str, value: &str) -> Result<(), HistoryError> {
         strict!(self, p => p.meta_put(key, value), f => f.meta_put(key, value))
     }
+    async fn meta_delete(&self, key: &str) -> Result<(), HistoryError> {
+        strict!(self, p => p.meta_delete(key), f => f.meta_delete(key))
+    }
     async fn schedule_insert(
         &self,
         schedule: &super::schedules::ScheduleRecord,
@@ -1102,17 +1158,18 @@ impl RunHistory for FallbackHistory {
     async fn template_delete_tag(&self, id: &str, tag: &str) -> Result<bool, HistoryError> {
         strict!(self, p => p.template_delete_tag(id, tag), f => f.template_delete_tag(id, tag))
     }
-    async fn template_launch(
+    async fn template_launch_expecting(
         &self,
         id: &str,
         version: u32,
         launched_by: Option<&str>,
         evidence: Option<&super::templates::EvidenceClaim>,
+        expect_stable: Option<Option<u32>>,
     ) -> Result<Option<u32>, HistoryError> {
         strict!(
             self,
-            p => p.template_launch(id, version, launched_by, evidence),
-            f => f.template_launch(id, version, launched_by, evidence)
+            p => p.template_launch_expecting(id, version, launched_by, evidence, expect_stable),
+            f => f.template_launch_expecting(id, version, launched_by, evidence, expect_stable)
         )
     }
     async fn template_record_test(

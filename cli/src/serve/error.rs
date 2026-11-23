@@ -178,9 +178,9 @@ impl From<crate::serve::history::HistoryError> for ServeError {
                 ..
             } => ServeError::Unavailable(format!("history unavailable: {e}; retry shortly")),
             HistoryError::VersionNotFound { .. } => ServeError::NotFound,
-            HistoryError::TemplateKindConflict { .. } | HistoryError::StaleEvidence(_) => {
-                ServeError::Conflict(e.to_string())
-            }
+            HistoryError::TemplateKindConflict { .. }
+            | HistoryError::StaleEvidence(_)
+            | HistoryError::LaunchRaced { .. } => ServeError::Conflict(e.to_string()),
             HistoryError::Backend(_) | HistoryError::BackendClassified { .. } => {
                 ServeError::Internal(e.to_string())
             }
@@ -260,6 +260,12 @@ mod tests {
         };
         assert_eq!(ServeError::from(e).status(), StatusCode::NOT_FOUND);
         let e = HistoryError::StaleEvidence("moved".into());
+        assert_eq!(ServeError::from(e).status(), StatusCode::CONFLICT);
+        let e = HistoryError::LaunchRaced {
+            id: "t".into(),
+            expected: Some(1),
+            found: Some(2),
+        };
         assert_eq!(ServeError::from(e).status(), StatusCode::CONFLICT);
     }
 

@@ -24,6 +24,33 @@ tests:
       records:
         - { contact: "***", card: "***************1111", city: "NYC" }
 
+  # `credit_card` needs a card-network prefix and length, so a Luhn-valid
+  # epoch-millisecond timestamp is not a card; `credit_card_loose` (the
+  # pre-1.18 matcher) still masks it.
+  - name: card detector leaves epoch timestamps alone
+    pipeline:
+      masking:
+        rules:
+          - match: { value_detector: credit_card }
+            action: { type: redact }
+    input:
+      - { card: "5555555555554444", created_ms: "1731974400003" }
+    expect:
+      records:
+        - { card: "***", created_ms: "1731974400003" }
+
+  - name: loose card detector masks every Luhn-valid number
+    pipeline:
+      masking:
+        rules:
+          - match: { value_detector: credit_card_loose }
+            action: { type: redact }
+    input:
+      - { created_ms: "1731974400003" }
+    expect:
+      records:
+        - { created_ms: "***" }
+
   # Keyed hashing is deterministic → equal inputs produce equal hashes, so
   # masked values stay joinable. (We assert the two ids collapse to one via a
   # subset match on the second field.)

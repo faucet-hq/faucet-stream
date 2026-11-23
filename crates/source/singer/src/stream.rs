@@ -147,6 +147,16 @@ impl Source for SingerSource {
                             )))?;
                         }
                     },
+                    Recv::Line(Line::Broken { message_type, reason }) => {
+                        let tail = process.stderr_tail();
+                        process.shutdown().await;
+                        let what = message_type.as_deref().unwrap_or("Singer");
+                        Err(FaucetError::Source(format!(
+                            "tap wrote a {what} message faucet could not read ({reason}); \
+                             stopping so the row is not lost behind the next STATE; last \
+                             stderr:\n{tail}"
+                        )))?;
+                    }
                     Recv::Line(Line::Overlong(max)) => {
                         let tail = process.stderr_tail();
                         process.shutdown().await;

@@ -1746,8 +1746,9 @@ impl BigQueryDriver {
             return Ok(records.len());
         }
         let columns = self.target_schema(calls).await?;
-        self.reject_unknown_fields(&columns, records)?;
-        let payload = serde_json::to_string(records).map_err(|e| {
+        let records = idempotent::canonical_records(&columns, records);
+        self.reject_unknown_fields(&columns, &records)?;
+        let payload = serde_json::to_string(&*records).map_err(|e| {
             FaucetError::Sink(format!("BigQuery overwrite: serialize page payload: {e}"))
         })?;
         let sql = idempotent::build_insert_select(
@@ -2751,7 +2752,8 @@ impl BigQueryDriver {
     ) -> Result<usize, FaucetError> {
         let columns = self.target_schema(calls).await?;
         merge::validate_keys_present(&columns, &self.config.write.key)?;
-        self.reject_unknown_fields(&columns, &plan.upserts)?;
+        let upserts = idempotent::canonical_records(&columns, &plan.upserts);
+        self.reject_unknown_fields(&columns, &upserts)?;
 
         let has_upserts = !plan.upserts.is_empty();
         let has_deletes = !plan.deletes.is_empty();
@@ -2792,7 +2794,7 @@ impl BigQueryDriver {
 
         let mut params = Vec::new();
         if has_upserts {
-            let payload = serde_json::to_string(&plan.upserts).map_err(|e| {
+            let payload = serde_json::to_string(&*upserts).map_err(|e| {
                 FaucetError::Sink(format!("bigquery upsert: serialize payload: {e}"))
             })?;
             params.push(Self::string_param("payload", &payload));
@@ -3114,9 +3116,10 @@ impl BigQueryDriver {
         }
 
         let columns = self.target_schema(calls).await?;
-        self.reject_unknown_fields(&columns, records)?;
+        let records = idempotent::canonical_records(&columns, records);
+        self.reject_unknown_fields(&columns, &records)?;
 
-        let payload = serde_json::to_string(records).map_err(|e| {
+        let payload = serde_json::to_string(&*records).map_err(|e| {
             FaucetError::Sink(format!(
                 "BigQuery exactly-once: serialize page payload: {e}"
             ))
@@ -3788,8 +3791,25 @@ impl CommitTokenDriver for BigQueryDriver {
         scope: &str,
         token: &str,
     ) -> Result<WriteReport, FaucetError> {
-        let n = self.write_idempotent(calls, records, scope, token).await?;
-        Ok(self.report(records.len(), n))
+        match self.write_idempotent(calls, records, scope, token).await {
+            Ok(n) => Ok(self.report(records.len(), n)),
+            Err(e) if e.to_string().contains(idempotent::WATERMARK_AHEAD_MARKER) => {
+                let stored = self.last_token(calls, scope).await?;
+                match faucet_core::check_watermark(stored.as_deref(), token) {
+                    faucet_core::WatermarkCheck::Committed => {
+                        tracing::warn!(
+                            scope,
+                            token,
+                            "BigQuery exactly-once: an earlier attempt of this page committed; \
+                             counting it written"
+                        );
+                        Ok(self.report(records.len(), records.len()))
+                    }
+                    _ => Err(faucet_core::watermark_ahead_error(scope, token)),
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -3797,6 +3817,10 @@ impl CommitTokenDriver for BigQueryDriver {
 impl SchemaDriver for BigQueryDriver {
     fn evolvable(&self) -> bool {
         true
+    }
+
+    fn column_matching(&self) -> faucet_core::ColumnMatching {
+        faucet_core::ColumnMatching::CaseInsensitive
     }
 
     /// Read the live destination schema via a schema-only `tables.get`, mapped

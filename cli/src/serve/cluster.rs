@@ -415,6 +415,7 @@ mod tests {
             local_output_in_flight_grace: Duration::from_secs(60),
             preview: crate::serve::preview::PreviewConfig::default(),
             lease_ttl: std::time::Duration::from_secs(30),
+            metrics_idle_timeout: None,
             probe_timeout: std::time::Duration::from_secs(10),
             env_file: None,
             no_env_file: false,
@@ -462,6 +463,7 @@ mod tests {
             state_format: 0,
             pools: Some(vec!["a".into()]),
             capabilities: None,
+            clock_offset_ms: None,
         };
         h.set_live_members(vec![m]);
         assert_eq!(

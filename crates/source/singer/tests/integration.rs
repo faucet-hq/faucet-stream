@@ -291,3 +291,58 @@ async fn discovery_times_out_and_redacts_stderr() {
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }
+
+/// A Python tap's bare `NaN` arrives as a counted `null` instead of the whole
+/// record being skipped as malformed.
+#[tokio::test]
+async fn a_nan_from_the_tap_is_a_counted_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let tap = script(
+        &dir,
+        r#"echo '{"type":"RECORD","stream":"s","record":{"id":1,"v":NaN}}'
+echo '{"type":"STATE","value":{"last_id":1}}'"#,
+    );
+    let source = SingerSource::new(SingerSourceConfig::new(tap, "s"));
+    let sink = UpsertSink::default();
+    let accounts = Arc::new(faucet_core::accounting::RowAccounts::new());
+    let result = Pipeline::new(&source, &sink)
+        .with_row_accounts(accounts.clone())
+        .run()
+        .await
+        .expect("the run succeeds");
+    assert_eq!(result.records_written, 1);
+    assert_eq!(
+        sink.rows.lock().unwrap().get(&1),
+        Some(&json!({"id": 1, "v": null}))
+    );
+    assert_eq!(accounts.snapshot().non_finite, 1);
+}
+
+/// A RECORD that cannot be read fails the run before the next STATE is
+/// checkpointed, even under the default `on_malformed: skip`; a plain log
+/// line is still skipped.
+#[tokio::test]
+async fn a_broken_record_fails_before_its_state_is_checkpointed() {
+    let dir = tempfile::tempdir().unwrap();
+    let tap = script(
+        &dir,
+        r#"echo 'INFO starting'
+echo '{"level":"info","msg":"structured log"}'
+echo '{"type":"RECORD","stream":"s","record":{"id":1}}'
+echo '{"type":"RECORD","stream":"s","record":{"id":2'
+echo '{"type":"STATE","value":{"last_id":2}}'"#,
+    );
+    let mut cfg = SingerSourceConfig::new(tap, "s");
+    cfg.state_key = Some("singer_broken".into());
+    let source = SingerSource::new(cfg);
+    let sink = UpsertSink::default();
+    let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+    let err = Pipeline::new(&source, &sink)
+        .with_state_store(store.clone())
+        .run()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("could not read"), "{err}");
+    assert_eq!(store.get("singer_broken").await.unwrap(), None);
+}

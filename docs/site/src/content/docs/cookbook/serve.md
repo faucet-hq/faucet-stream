@@ -227,6 +227,11 @@ cross-process resume, so re-submit to continue. A run still stuck *mid-write*
 after a bounded flush grace is hard-dropped (its buffered output may be lost),
 so a hung run can't wedge shutdown.
 
+Once a run is cancelled it starts nothing more: matrix rows that had not started
+(waiting for a concurrency slot, a `depends_on` row or their parent) are
+reported `skipped: the run was cancelled before this row started`, and the
+children and `depends_on` rows of a row that was cut short are skipped too.
+
 ## `--default-config` (workspace defaults)
 
 Pass `--default-config <file>` to merge shared settings **under** every submitted

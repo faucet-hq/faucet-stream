@@ -790,3 +790,42 @@ fn set_test_env() {
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
     });
 }
+
+/// An offset-bearing instant bound for a `timestamp` / `time` column (no
+/// zone) is written as its UTC wall time; `timestamptz` is left to the server.
+#[tokio::test(flavor = "multi_thread")]
+async fn offset_instants_land_as_utc_wall_time_in_zone_less_columns() {
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let pool = seed_pool(port).await;
+    sqlx::query("CREATE TABLE walls (id BIGINT, at TIMESTAMP, t TIME, tz TIMESTAMPTZ)")
+        .execute(&pool)
+        .await
+        .expect("create table");
+    let sink = RedshiftSink::new(insert_config(port, "walls", 1000))
+        .await
+        .expect("sink builds");
+    sink.write_batch(&[json!({
+        "id": 1,
+        "AT": "2026-09-18T12:00:00+02:00",
+        "t": "01:00:00+02:00",
+        "tz": "2026-09-18T12:00:00+02:00",
+    })])
+    .await
+    .expect("insert runs");
+    sink.flush().await.expect("flush");
+    let row: (String, String, String) =
+        sqlx::query_as("SELECT at::text, t::text, (tz AT TIME ZONE 'UTC')::text FROM walls")
+            .fetch_one(&pool)
+            .await
+            .expect("read");
+    assert_eq!(
+        row,
+        (
+            "2026-09-18 10:00:00".to_string(),
+            "23:00:00".to_string(),
+            "2026-09-18 10:00:00".to_string()
+        )
+    );
+    pool.close().await;
+}

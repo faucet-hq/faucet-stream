@@ -57,12 +57,14 @@ pub fn install_metrics_recorder(
     }
     let handle = match (prom, listen) {
         (Some(p), Some(listen)) => {
-            let (recorder, exporter) = PrometheusBuilder::new()
+            let builder = PrometheusBuilder::new()
                 .with_http_listener(listen)
                 .set_buckets(p.buckets.as_deref().unwrap_or(DEFAULT_BUCKETS))
-                .map_err(|e| CliError::Observability(e.to_string()))?
-                .build()
                 .map_err(|e| CliError::Observability(e.to_string()))?;
+            let (recorder, exporter) =
+                faucet_core::observability::with_idle_timeout(builder, p.idle_timeout)
+                    .build()
+                    .map_err(|e| CliError::Observability(e.to_string()))?;
             let handle = recorder.handle();
             if ::metrics::set_global_recorder(recorder).is_ok() {
                 tokio::spawn(exporter);
@@ -457,6 +459,7 @@ faucet_pipeline_in_flight{pipeline=\"p\",row=\"r\"} 1
         let prom = faucet_core::PrometheusConfig {
             listen: "not-an-address".into(),
             buckets: None,
+            idle_timeout: None,
         };
         let err = install_metrics_recorder(Some(&prom)).expect_err("bad listen");
         assert!(matches!(err, CliError::Observability(_)), "{err:?}");
@@ -483,6 +486,7 @@ faucet_pipeline_in_flight{pipeline=\"p\",row=\"r\"} 1
         let prom = faucet_core::PrometheusConfig {
             listen: "127.0.0.1:0".into(),
             buckets: None,
+            idle_timeout: None,
         };
         let handle = install_metrics_recorder(Some(&prom)).expect("listener install");
         let _ = handle.render();

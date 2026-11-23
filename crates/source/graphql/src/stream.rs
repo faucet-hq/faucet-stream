@@ -10,7 +10,8 @@ use faucet_core::driver::{DriverSource, PageStream, SourceDriver};
 use faucet_core::http::Client;
 use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::replication::{
-    filter_incremental_path_inclusive, max_replication_value_path, max_value,
+    PassEnd, ResumeRules, Truncation, bookmark_after_pass, filter_incremental_path_inclusive,
+    max_replication_value_path, max_value,
 };
 use faucet_core::util::{self, DEFAULT_ERROR_BODY_MAX_LEN};
 use faucet_core::{
@@ -453,7 +454,7 @@ impl GraphqlDriver {
                                     DEFAULT_ERROR_BODY_MAX_LEN,
                                 )
                                 .await?;
-                                return self.client.json(resp).await;
+                                return self.client.json_value(resp).await;
                             }
                             self.read_with_matchers(resp, matches).await
                         }
@@ -575,6 +576,8 @@ impl GraphqlDriver {
             let mut offset = 0usize;
             let mut cursor_guard = CursorGuard::new();
             let mut prev_fingerprint: Option<u64> = None;
+            let mut seen_fingerprints: std::collections::HashSet<u64> =
+                std::collections::HashSet::new();
             let mut pages_fetched = 0usize;
             let mut warned_unresolved_has_next = false;
             // Incremental replication (#751): filter each page against the
@@ -589,17 +592,16 @@ impl GraphqlDriver {
             let mut running_max: Option<Value> = start.clone();
             let mut missing_keys = 0usize;
             let mut bookmark_emitted = false;
-            // The run stopped with pages possibly unread (`max_pages`, a
-            // tolerated cursor loop): the max over the pages read is a safe
-            // bookmark only for results ordered by the key.
-            let mut truncated = false;
+            // How the page loop ended; a pass that stopped with pages possibly
+            // unread keeps its bookmark only under `bookmark_after_pass`.
+            let mut end = PassEnd::Complete;
 
             loop {
                 if let Some(max) = self.config.max_pages
                     && pages_fetched >= max
                 {
                     tracing::warn!("max pages ({max}) reached");
-                    truncated = true;
+                    end = PassEnd::Truncated(Truncation::MaxPages { max });
                     break;
                 }
 
@@ -646,8 +648,8 @@ impl GraphqlDriver {
                         match step {
                             PageStep::Stop => false,
                             PageStep::StopLoop => {
-                                tracing::warn!("cursor loop detected, stopping pagination");
-                                truncated = true;
+                                tracing::warn!("the server repeated the cursor just used, stopping pagination");
+                                end = PassEnd::Truncated(Truncation::RepeatedCursor);
                                 false
                             }
                             PageStep::Inconsistent(why) => {
@@ -668,9 +670,9 @@ impl GraphqlDriver {
                                         )))?;
                                     }
                                     tracing::warn!(
-                                        "cursor cycle detected (cursor already seen), stopping pagination"
+                                        "cursor cycle detected (an earlier cursor repeated), stopping pagination"
                                     );
-                                    truncated = true;
+                                    end = PassEnd::Truncated(Truncation::Cycle);
                                     false
                                 } else {
                                     cursor = Some(next);
@@ -685,11 +687,22 @@ impl GraphqlDriver {
                         // otherwise have rows skipped on every page (API-15).
                         let repeated = prev_fingerprint == Some(fingerprint);
                         prev_fingerprint = Some(fingerprint);
+                        let earlier = records_in_page > 0
+                            && !repeated
+                            && !seen_fingerprints.insert(fingerprint);
                         if repeated && records_in_page > 0 {
                             tracing::warn!(
                                 "GraphQL offset pagination returned an identical page; stopping"
                             );
                             records.clear();
+                            false
+                        } else if earlier {
+                            tracing::warn!(
+                                "GraphQL offset pagination returned a page identical to an \
+                                 earlier one; stopping"
+                            );
+                            records.clear();
+                            end = PassEnd::Truncated(Truncation::Cycle);
                             false
                         } else {
                             let advance = offset_should_continue(records_in_page, off);
@@ -702,16 +715,13 @@ impl GraphqlDriver {
                     None => false,
                 };
 
-                if !has_next && truncated && key.is_some() {
-                    running_max = truncated_bookmark(
-                        running_max,
-                        self.config.replication_key_ordered,
-                        self.config.replication_bind.is_some(),
-                    )?;
-                }
                 if has_next {
                     // Intermediate page — bookmark stays `None`.
                     yield StreamPage { records, bookmark: None };
+                } else if end != PassEnd::Complete {
+                    // The trailing checkpoint decides what this pass may keep.
+                    yield StreamPage { records, bookmark: None };
+                    break;
                 } else {
                     // Final page — attach the consolidated bookmark.
                     bookmark_emitted = running_max.is_some();
@@ -726,13 +736,11 @@ impl GraphqlDriver {
             // Trailing checkpoint: if the loop exited (e.g. via `max_pages`
             // truncation) without carrying the bookmark on a real page, emit
             // one empty page carrying it so the pipeline persists progress.
-            if truncated && !bookmark_emitted && key.is_some() {
-                running_max = truncated_bookmark(
-                    running_max,
-                    self.config.replication_key_ordered,
-                    self.config.replication_bind.is_some(),
-                )?;
-            }
+            let rules = ResumeRules::new()
+                .incremental(key.is_some())
+                .ordered(self.config.replication_key_ordered)
+                .pushes_bookmark(self.config.replication_bind.is_some());
+            running_max = bookmark_after_pass(end, rules, running_max).map_err(pass_refusal)?;
             if !bookmark_emitted && running_max.is_some() {
                 yield StreamPage {
                     records: Vec::new(),
@@ -755,28 +763,29 @@ impl GraphqlDriver {
     }
 }
 
-/// The bookmark a run that stopped with pages unread (`max_pages`, a cursor
-/// loop) may persist. Only results ordered by the key whose bookmark the next
-/// request pushes to the server (`replication_bind`) can resume past the pages
-/// read: every unread row sorts at or after the max, and the server starts
-/// there. Otherwise the bookmark could not advance and every run would re-read
-/// the same pages with a green result, so the pass fails instead.
-fn truncated_bookmark(
-    running_max: Option<Value>,
-    ordered: bool,
-    bound: bool,
-) -> Result<Option<Value>, FaucetError> {
-    if ordered && bound {
-        return Ok(running_max);
+/// The error for a pass that stopped with pages unread and cannot keep its
+/// bookmark (see [`bookmark_after_pass`]). Only results ordered by the key
+/// whose bookmark the next request pushes to the server (`replication_bind`)
+/// can resume past the pages read.
+fn pass_refusal(truncation: Truncation) -> FaucetError {
+    match truncation {
+        Truncation::Cycle => FaucetError::Source(
+            "graphql: the server repeated an earlier cursor or page (not the one just used), \
+             so pagination went round a loop and the pages behind it were never read; \
+             stopping rather than ending the run with rows missing. When the query sorts \
+             ascending by the replication key, `replication_key_ordered: true` together with \
+             a `replication_bind` keeps the bookmark of the pages read"
+                .into(),
+        ),
+        _ => FaucetError::Source(
+            "graphql: the incremental pass stopped before the last page (`max_pages` or a \
+             repeated cursor), so its bookmark cannot advance and every run would re-read the \
+             same pages. Raise or remove `max_pages`, or set `replication_key_ordered: true` \
+             together with a `replication_bind` when the query sorts ascending by the \
+             replication key"
+                .into(),
+        ),
     }
-    Err(FaucetError::Source(
-        "graphql: the incremental pass stopped before the last page (`max_pages` or a \
-         repeated cursor), so its bookmark cannot advance and every run would re-read the \
-         same pages. Raise or remove `max_pages`, or set `replication_key_ordered: true` \
-         together with a `replication_bind` when the query sorts ascending by the \
-         replication key"
-            .into(),
-    ))
 }
 
 #[async_trait]

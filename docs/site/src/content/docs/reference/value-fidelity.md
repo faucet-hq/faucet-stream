@@ -28,6 +28,15 @@ produced it, and every sink reads the same rendering back.
 | Date, time of day | `YYYY-MM-DD`, `HH:MM:SS[.fff…]` | `"2026-02-28"`, `"12:30:00.5"` |
 | Binary — `BYTEA`, `BLOB`, `VARBINARY`, Arrow `Binary`, Avro `bytes` | standard **base64** with padding | `"AAEC/f7/"` |
 
+**Instants written into a column without a zone.** A `TIMESTAMP` / `TIME`
+column that has no zone would drop the offset of a value like
+`2026-09-18T12:00:00+02:00` and store `12:00:00`. The `postgres`, `redshift`,
+`oracle`, `duckdb` and `snowflake` sinks convert such a value to its UTC wall
+time (`2026-09-18 10:00:00`) before writing it; a zoned column
+(`TIMESTAMPTZ`) receives the instant unchanged. A `TIME` value with an offset
+is shifted to UTC and the day it crosses into is dropped (`01:00:00+02:00` →
+`23:00:00`).
+
 **Exception — MySQL `DATETIME`.** The `mysql` query source and the
 `mysql-cdc` source render a zone-less `DATETIME` as RFC 3339 at `+00:00`
 (`"2024-01-03T04:05:06.123456+00:00"`), not as a local date-time. The query
@@ -37,7 +46,9 @@ rendering from `"2024-01-03 04:05:06.123456"`). The `+00:00` is a
 convention, not an offset MySQL stored: a column holding wall-clock local
 times keeps those wall-clock values, so treat the offset as "as stored" rather
 than converting them as UTC instants. `TIMESTAMP` is a real instant and is
-rendered in UTC as usual.
+rendered in UTC as usual. A zero or invalid date (`0000-00-00`, which MySQL
+accepts without `NO_ZERO_DATE`) has no instant at all and is kept as MySQL's
+own text (`"0000-00-00"`, `"0000-00-00 00:00:00"`) rather than becoming `null`.
 
 Temporal values are never truncated. A converter that knows the column's unit
 (Arrow `Timestamp(µs)`, Avro `timestamp-micros`) renders that unit's fixed
@@ -64,6 +75,10 @@ and counts it:
 On the columnar (Arrow) path a non-finite float is still a float; it becomes a
 counted `null` only where a batch is turned into JSON rows.
 
+A Singer tap written in Python spells these as bare `NaN`, `Infinity` and
+`-Infinity`, which is not JSON. The Singer source reads them as counted `null`s
+rather than skipping the record.
+
 ## How sinks read the renderings
 
 - A string bound into an exact-decimal column is parsed by the server, never
@@ -72,6 +87,10 @@ counted `null` only where a batch is turned into JSON rows.
   binary double `0.1000000000000000055511151231257827`.
 - A binary column reads base64. The Kafka sink's Avro `bytes_encoding` defaults
   to `base64`; `hex` reads the lowercase hex sources wrote before this model.
+- An existing Iceberg or Delta table's binary columns (`binary`, `fixed(n)`,
+  `uuid`) read base64 too. A 16-byte fixed column (an Iceberg `uuid`) also
+  reads UUID text (`8-4-4-4-12`) or 32 hex digits; neither can be the base64
+  of 16 bytes.
 - A JSON payload is parsed with every number exact: a literal the parsed value
   would not spell again — an integer past `u64`, a decimal longer than a double
   carries — is kept as a string of its digits. A 17-digit rendering of a double

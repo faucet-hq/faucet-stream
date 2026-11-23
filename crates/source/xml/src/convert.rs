@@ -110,8 +110,30 @@ fn append_child(parent: &mut Map<String, Value>, name: String, value: Value) {
 pub fn stream_extract<F: FnMut(Value)>(
     xml: &str,
     records_element_path: Option<&str>,
-    mut on_record: F,
+    on_record: F,
 ) -> Result<(), FaucetError> {
+    stream_extract_checked(xml, records_element_path, on_record).map(|_| ())
+}
+
+/// What [`stream_extract_checked`] saw of the records' path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct PathSeen {
+    /// The records' container was in the document: the element named by
+    /// every segment of `records_element_path` but the last (for a
+    /// one-segment path, the document's root element carrying that name).
+    /// Always `true` without a path.
+    pub container: bool,
+}
+
+/// [`stream_extract`], also reporting whether the records' container was in
+/// the document — so a response that lacks it (an error document served with
+/// HTTP 200) can be told apart from an empty result.
+pub fn stream_extract_checked<F: FnMut(Value)>(
+    xml: &str,
+    records_element_path: Option<&str>,
+    mut on_record: F,
+) -> Result<PathSeen, FaucetError> {
     let target: Option<Vec<&str>> = records_element_path.map(|p| p.split('.').collect());
     let full_doc = target.is_none();
     let mut reader = Reader::from_str(xml);
@@ -137,6 +159,19 @@ pub fn stream_extract<F: FnMut(Value)>(
             path.len() == t.len() && path.iter().zip(t).all(|(a, b)| a.as_str() == *b)
         })
     };
+    let opens_container = |path: &[String]| -> bool {
+        target.as_deref().is_some_and(|t| {
+            let parent = &t[..t.len().saturating_sub(1)];
+            if parent.is_empty() {
+                path.len() == 1 && path[0] == t[0]
+            } else {
+                path.len() == parent.len() && path.iter().zip(parent).all(|(a, b)| a.as_str() == *b)
+            }
+        })
+    };
+    let mut seen = PathSeen {
+        container: full_doc,
+    };
 
     loop {
         let event = reader
@@ -149,6 +184,7 @@ pub fn stream_extract<F: FnMut(Value)>(
                 }
                 let frame = Frame::open(e)?;
                 path.push(frame.name.clone());
+                seen.container |= opens_container(&path);
                 if full_doc || start_depth.is_some() {
                     frames.push(frame);
                 } else if matches(&path) {
@@ -159,6 +195,7 @@ pub fn stream_extract<F: FnMut(Value)>(
             Event::Empty(e) => {
                 let (name, value) = Frame::empty(e)?;
                 path.push(name);
+                seen.container |= opens_container(&path);
                 let is_match = matches(&path);
                 let name = path.pop().unwrap_or_default();
                 if full_doc || start_depth.is_some() {
@@ -216,7 +253,7 @@ pub fn stream_extract<F: FnMut(Value)>(
             .ok_or_else(|| FaucetError::Transform("empty XML document".into()))?;
         on_record(Value::Object(root.obj));
     }
-    Ok(())
+    Ok(seen)
 }
 
 /// Navigate into a JSON value using a dot-separated path and extract
@@ -480,6 +517,33 @@ mod tests {
         let json = xml_to_json(xml).unwrap();
         let users = extract_at_path(&json, "soap:Envelope.soap:Body.GetUsersResponse.User");
         assert_eq!(users.len(), 2);
+    }
+
+    #[test]
+    fn the_records_container_is_reported() {
+        let seen = |xml: &str, path: &str| {
+            stream_extract_checked(xml, Some(path), |_| {})
+                .unwrap()
+                .container
+        };
+        assert!(seen(
+            "<Root><Items><Item>1</Item></Items></Root>",
+            "Root.Items.Item"
+        ));
+        assert!(seen("<Root><Items/></Root>", "Root.Items.Item"));
+        assert!(!seen("<Error><Code>1</Code></Error>", "Root.Items.Item"));
+        assert!(!seen("<Root><Other/></Root>", "Root.Items.Item"));
+        assert!(seen("<Item>1</Item>", "Item"));
+        assert!(!seen("<Error/>", "Item"));
+        assert!(seen(
+            "<ns:Root><ns:Items/></ns:Root>",
+            "ns:Root.ns:Items.ns:Item"
+        ));
+        assert!(
+            stream_extract_checked("<a/>", None, |_| {})
+                .unwrap()
+                .container
+        );
     }
 
     fn collect_stream_extract(xml: &str, path: Option<&str>) -> Vec<Value> {

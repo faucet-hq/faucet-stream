@@ -341,6 +341,19 @@ pub enum CliError {
     )]
     UnknownPipelineTemplate { id: String, version: Option<u32> },
 
+    /// A launch made on condition of the live version found another one live;
+    /// nothing was launched.
+    #[error(
+        "template '{id}''s live version changed ({} → {}); nothing was launched",
+        crate::error::live_label(*expected),
+        crate::error::live_label(*found)
+    )]
+    TemplateLaunchRaced {
+        id: String,
+        expected: Option<u32>,
+        found: Option<u32>,
+    },
+
     /// A `tests.requires_suites` range matched no registered release of the
     /// shared suite (#856).
     #[error(
@@ -1026,4 +1039,9 @@ mod tests {
         };
         assert!(e.to_string().contains("f.yaml") && e.to_string().contains("string path"));
     }
+}
+
+/// A template's live version as text: `vN`, or `none` before a first launch.
+pub(crate) fn live_label(v: Option<u32>) -> String {
+    v.map_or_else(|| "none".to_string(), |v| format!("v{v}"))
 }

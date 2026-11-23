@@ -357,7 +357,10 @@ async fn pushed_events_are_stored_then_delivered_by_a_run() {
     // Text and a form are one event each.
     for (content_type, body) in [
         ("text/plain; charset=utf-8", "plain words"),
-        ("application/x-www-form-urlencoded", "id=8&name=a+b"),
+        (
+            "application/x-www-form-urlencoded",
+            "id=8&name=a+b&tag=x&tag=y&tag=&empty=",
+        ),
     ] {
         let a = srv
             .send(
@@ -369,6 +372,29 @@ async fn pushed_events_are_stored_then_delivered_by_a_run() {
             )
             .await;
         assert_eq!(a.status, 202, "{content_type}: {}", a.body);
+    }
+    assert_eq!(srv.watermark("orders", &uid).await, 8);
+
+    // An event may not carry the metadata key, however it is spelled.
+    for (content_type, body) in [
+        ("application/json", r#"[{"id": 9}, {"\u005ffeed": 1}]"#),
+        ("application/x-www-form-urlencoded", "id=9&%5Ffeed=x"),
+    ] {
+        let refused = srv
+            .send(
+                srv.client
+                    .post(srv.url("/v1/feeds/orders/events"))
+                    .bearer_auth(&token)
+                    .header("content-type", content_type)
+                    .body(body),
+            )
+            .await;
+        assert_eq!(refused.status, 400, "{content_type}: {}", refused.body);
+        assert!(
+            refused.body.to_string().contains("reserved"),
+            "{}",
+            refused.body
+        );
     }
     assert_eq!(srv.watermark("orders", &uid).await, 8);
 
@@ -396,6 +422,8 @@ async fn pushed_events_are_stored_then_delivered_by_a_run() {
     assert_eq!(got[4]["_feed"]["headers"]["x-request-id"], "req-7");
     assert_eq!(got[6]["value"], "plain words");
     assert_eq!(got[7]["name"], "a b");
+    assert_eq!(got[7]["tag"], json!(["x", "y", ""]));
+    assert_eq!(got[7]["empty"], "");
 
     // The token's use is recorded, off the request's path.
     let mut used = None;
@@ -955,6 +983,127 @@ async fn a_signed_feed_checks_the_signature_and_its_timestamp() {
     assert_eq!(srv.watermark("hooks", &uid).await, 2);
 }
 
+/// A stored feed whose signature secret this server cannot open stays
+/// listed, refuses senders with 503 (never checking a signature against the
+/// stored ciphertext), and can be repaired or deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feed_whose_secret_will_not_open_refuses_senders_and_can_be_repaired() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &[]).await;
+    for name in ["hooks", "gone"] {
+        srv.feed(json!({
+            "name": name,
+            "ingest": {"auth": {"signature": {"header": "X-Signature", "secret": "hmac-secret-1"}}}
+        }))
+        .await;
+    }
+    let post = |secret: String| {
+        let body = r#"{"id": 1}"#;
+        srv.send(
+            srv.client
+                .post(srv.url("/v1/feeds/hooks/events"))
+                .header("content-type", "application/json")
+                .header("x-signature", sign(&secret, body.as_bytes()))
+                .body(body),
+        )
+    };
+    assert_eq!(post("hmac-secret-1".into()).await.status, 202);
+
+    // This server's vault key changes: the stored secret no longer opens.
+    srv.state.set_vault(Some(Arc::new(
+        faucet_cli::serve::vault::Vault::new("another-vault-key-0123456789abcdef", &[]).unwrap(),
+    )));
+    srv.state.feeds().refresh_now(&srv.state).await.unwrap();
+    let view = service::get(&srv.state, &admin(), None, "hooks")
+        .await
+        .unwrap();
+    assert_eq!(view.feed.status, "secret_unreadable");
+    assert!(
+        view.feed
+            .warnings
+            .iter()
+            .any(|w| w.contains("refuses every request")),
+        "{:?}",
+        view.feed.warnings
+    );
+    assert_eq!(
+        view.feed
+            .spec
+            .ingest
+            .auth
+            .signature
+            .as_ref()
+            .unwrap()
+            .secret,
+        "$sealed"
+    );
+    let ready = srv.state.feeds().readiness();
+    assert_eq!(
+        ready.secret_unreadable,
+        vec!["gone".to_string(), "hooks".to_string()]
+    );
+
+    let sealed = srv
+        .state
+        .history()
+        .feed_get("-/hooks")
+        .await
+        .unwrap()
+        .unwrap()
+        .spec
+        .ingest
+        .auth
+        .signature
+        .unwrap()
+        .secret;
+    let ciphertext = sealed.trim_start_matches("$sealed:").to_string();
+    for secret in [
+        "hmac-secret-1".to_string(),
+        sealed,
+        ciphertext,
+        String::new(),
+    ] {
+        let refused = post(secret).await;
+        assert_eq!(refused.status, 503, "{}", refused.body);
+        assert!(refused.retry_after.is_some());
+        assert!(
+            refused.body.to_string().contains("cannot be read"),
+            "{}",
+            refused.body
+        );
+    }
+
+    // Keeping the unreadable secret is refused; sending a new one repairs it.
+    let mut spec = service::get(&srv.state, &admin(), None, "hooks")
+        .await
+        .unwrap()
+        .feed
+        .spec;
+    let kept = service::update(&srv.state, &admin(), None, "hooks", spec.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(kept.api_error().error.code, "unprocessable", "{kept:?}");
+    assert!(
+        kept.api_error()
+            .error
+            .message
+            .contains("can no longer be opened"),
+        "{kept:?}"
+    );
+    spec.ingest.auth.signature.as_mut().unwrap().secret = "hmac-secret-2".into();
+    service::update(&srv.state, &admin(), None, "hooks", spec)
+        .await
+        .unwrap();
+    srv.state.feeds().refresh_now(&srv.state).await.unwrap();
+    assert_eq!(post("hmac-secret-2".into()).await.status, 202);
+
+    // The other one can still be deleted.
+    service::delete(&srv.state, &admin(), None, "gone")
+        .await
+        .unwrap();
+    assert!(service::find(&srv.state, None, "gone").await.is_err());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn duplicates_rate_limits_and_a_full_feed_are_answered_as_the_feed_says() {
     let dir = tempfile::tempdir().unwrap();
@@ -1039,6 +1188,25 @@ async fn duplicates_rate_limits_and_a_full_feed_are_answered_as_the_feed_says() 
         (&json!(false), &json!(1))
     );
     assert_eq!(srv.watermark("strict", &strict_uid).await, 2);
+    // A key holding a control character is stored (hashed) and still dedupes.
+    let control = r#"{"event": {"id": "a\u0000b"}}"#;
+    let stored = srv.push("strict", &strict, control).await;
+    assert_eq!(stored.status, 202, "{}", stored.body);
+    assert_eq!(srv.push("strict", &strict, control).await.status, 409);
+    let keyed = srv
+        .store("strict")
+        .await
+        .read(&store_calls(), &strict_uid, Seq(3), Seq(4))
+        .await
+        .unwrap();
+    assert!(
+        keyed.events[0]
+            .dedupe_key
+            .as_deref()
+            .is_some_and(|k| k.starts_with("sha256:")),
+        "{:?}",
+        keyed.events[0].dedupe_key
+    );
 
     // A rate limit: the burst passes, the next request waits.
     let (limited_uid, limited) = srv
@@ -2396,6 +2564,55 @@ async fn the_management_api_serves_feeds_to_each_role_and_audits_every_change() 
             "max_feed_bytes": 1_000_000, "max_feed_events_per_sec": 50
         })
     );
+    // The list pages; the tenant's quotas cover every feed on every page.
+    for name in ["app2", "app3"] {
+        let mut more = tenant_feed.clone();
+        more["name"] = json!(name);
+        let made = call(M::POST, "/v1/feeds", "acme-tok", Some(more)).await;
+        assert_eq!(made.status, 201, "{}", made.body);
+    }
+    let first = call(M::GET, "/v1/feeds?limit=2", "acme-tok", None).await;
+    assert_eq!(first.status, 200, "{}", first.body);
+    let names = |page: &Answer| -> Vec<String> {
+        page.body["feeds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(names(&first), vec!["app", "app2"]);
+    let next = first.body["next"].as_str().unwrap().to_string();
+    let second = call(
+        M::GET,
+        &format!("/v1/feeds?tenant=acme&after={next}&limit=2"),
+        "acme-tok",
+        None,
+    )
+    .await;
+    assert_eq!(second.status, 200, "{}", second.body);
+    assert_eq!(names(&second), vec!["app3"]);
+    assert!(second.body.get("next").is_none_or(Value::is_null));
+    for page in [&first, &second] {
+        assert_eq!(page.body["quotas"]["feeds"], 3);
+        assert_eq!(page.body["quotas"], first.body["quotas"]);
+    }
+    assert_eq!(
+        call(M::GET, "/v1/feeds?page=2", "acme-tok", None)
+            .await
+            .status,
+        400
+    );
+    for name in ["app2", "app3"] {
+        let gone = call(
+            M::DELETE,
+            &format!("/v1/feeds/{name}?tenant=acme"),
+            "admin-tok",
+            None,
+        )
+        .await;
+        assert_eq!(gone.status, 204, "{}", gone.body);
+    }
     assert_eq!(
         call(M::GET, "/v1/feeds/app", "acme-tok", None).await.status,
         200

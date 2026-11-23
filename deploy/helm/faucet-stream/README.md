@@ -564,6 +564,8 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `serve.enabled` | `true` | deploy the control plane |
 | `serve.auth.mode` | `token` | `token` \| `none` \| `rbac` |
 | `serve.history.backend` | `""` | unset: the server default, `$FAUCET_DATA_DIR/history.db` on the data volume; `sqlite` \| `postgres` \| `memory` (any other value fails rendering) |
+| `serve.history.url` | `""` | the `--history` URL. Any url but `memory` reaches the pod from a chart-managed Secret, never as a plain env value. With `backend` unset, the backend is read from it (`postgres://`, `postgresql://`, `sqlite:`, `memory`, case-sensitive like the server); any other url fails rendering |
+| `serve.history.existingSecret` | `""` | read the URL from your own Secret (key `existingSecretKey`); needs `backend` set, since the chart cannot read the Secret |
 | `serve.localOutputs.retentionDays` | `7` | days before local sink output files (jsonl/csv/parquet) are reclaimed; `0` disables the sweep |
 | `serve.localOutputs.inFlightGraceSeconds` | `60` | never delete an output touched within this window (guards against unlinking a file a run is writing); `0` disables |
 | `serve.allowListen` | `[]` | where a config submitted over HTTP or MCP may open a listener (a `webhook` source's `listen_addr`): `ADDR:PORT` / `ADDR:FIRST-LAST` entries; `FAUCET_SERVE_ALLOW_LISTEN`. Empty: `127.0.0.1:29100-29199` and `[::1]:29100-29199`; `[none]`: no listener. A non-loopback listener also needs `auth_token` or `signature`. Never for a tenant |
@@ -581,6 +583,7 @@ See [`values.yaml`](./values.yaml) — every key is commented. Common ones:
 | `serve.feeds.listen.allowedHosts` | `[]` | `--feeds-allowed-host`; empty = any host |
 | `serve.feeds.listen.ingress` | disabled | an Ingress for the ingest Service only: `enabled`, `className`, `annotations`, `hosts`, `tls` |
 | `serve.tenantDeliveryMinIntervalSecs` | `10` | `--tenant-delivery-min-interval-secs` |
+| `serve.metrics.idleTimeoutSecs` | `86400` | `--metrics-idle-timeout-secs`: counter and histogram series idle this long leave `/metrics` until emitted again; gauges never expire; `0` keeps every series |
 | `serve.policy.store` | `server` | `--policy-store`: `server` keeps approved versions in the history store (the file only seeds an empty store); `file` makes the file the policy, read-only in the console (needs `serve.policy.enabled`) |
 | `serve.cluster.vaultKey.existingSecret` | `""` | vault key (`FAUCET_VAULT_KEY`) that seals clustered template runs' `secret: true` params; `cluster.previousKeys` open values sealed under an earlier key |
 | `serve.tenants.enabled` | `false` | tenants; needs `vaultKey.existingSecret` (+ `existingSecretKey`, default `FAUCET_VAULT_KEY`) and persistent history |

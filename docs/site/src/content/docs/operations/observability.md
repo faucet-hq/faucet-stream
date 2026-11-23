@@ -190,6 +190,24 @@ Never use high-cardinality values (record ids, URLs, query strings) as metric
 labels. `parent_record_key` in a DAG is a span attribute only. Connector authors
 must return a non-empty `&'static str` from `connector_name()`.
 
+The config `name`, matrix row ids and profiled column names do become label
+values, so a long-running process that runs many different pipelines keeps
+adding series. `faucet serve`, `faucet schedule` and `faucet mirror` therefore
+drop counter and histogram series that saw no update for 24 hours (serve:
+`--metrics-idle-timeout-secs`; schedule and mirror:
+`observability.prometheus.idle_timeout_secs`; `0` keeps every series). A series
+comes back when it is emitted again and restarts at zero, which `rate()` and
+`increase()` read as a counter reset. A pipeline that runs less often than the
+timeout loses its counters between runs: raise the timeout for it. Gauges never
+expire, because staleness alerts read them while a pipeline is idle
+(`faucet_pipeline_last_bookmark_unix_seconds`, heartbeats); so gauges such as
+`faucet_pipeline_in_flight`, `faucet_pipeline_start_time_unix_seconds`,
+`faucet_pipeline_sla_baseline_runs` and `faucet_profile_columns` still keep one
+series per pipeline and row for the life of the process.
+
+A tenant's run on `faucet serve` labels every metric `pipeline="<tenant>::<name>"`,
+so two tenants whose configs share a name stay apart.
+
 ## Structured (JSON) logs
 
 `--log-format json` (or `FAUCET_LOG_FORMAT=json`) renders every log record as

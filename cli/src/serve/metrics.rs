@@ -128,9 +128,26 @@ pub fn set_cluster_instances(n: usize) {
     metrics::gauge!("faucet_serve_cluster_instances").set(n as f64);
 }
 
+/// This instance's clock minus the history database's (seconds), measured at
+/// each membership heartbeat. Leases use the database's clock; timestamps and
+/// timeouts still use this one.
+pub fn set_clock_offset(offset_ms: i64) {
+    metrics::gauge!("faucet_serve_clock_offset_seconds").set(offset_ms as f64 / 1000.0);
+}
+
 /// Pending (unclaimed) cluster runs in one execution pool (#957).
 pub fn set_runs_pending(pool: &str, n: usize) {
     metrics::gauge!("faucet_serve_runs_pending", "pool" => pool.to_string()).set(n as f64);
+}
+
+/// A claimed run this instance found held by a peer when it went to start it.
+pub fn record_run_lost_ownership() {
+    metrics::counter!("faucet_serve_runs_lost_ownership_total").increment(1);
+}
+
+/// One split of a sharded run, by outcome (`sharded`, `not_owner`, `cancelled`).
+pub fn record_shard_coordination(outcome: &'static str) {
+    metrics::counter!("faucet_serve_shard_coordinations_total", "outcome" => outcome).increment(1);
 }
 
 /// Count failover reclaims, split by outcome.

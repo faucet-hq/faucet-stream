@@ -788,3 +788,55 @@ async fn the_per_row_write_is_a_metered_cancellable_call() {
         "{err:?}"
     );
 }
+
+/// Base64 binary values (and UUID text for a `uuid` column) land as their
+/// bytes in a table created outside the sink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn base64_binary_lands_in_a_pre_created_table() {
+    use iceberg::TableCreation;
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    let dir = TempDir::new().expect("tempdir");
+    let cfg = sink_config(&dir, "bins");
+    let reader = open_reader_catalog(&dir).await;
+    let ns = NamespaceIdent::from_strs(["db"]).unwrap();
+    reader
+        .create_namespace(&ns, Default::default())
+        .await
+        .expect("create namespace");
+    let schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(2, "b", Type::Primitive(PrimitiveType::Binary)).into(),
+            NestedField::optional(3, "f", Type::Primitive(PrimitiveType::Fixed(4))).into(),
+            NestedField::optional(4, "u", Type::Primitive(PrimitiveType::Uuid)).into(),
+        ])
+        .build()
+        .expect("schema");
+    reader
+        .create_table(
+            &ns,
+            TableCreation::builder()
+                .name("bins".to_string())
+                .schema(schema)
+                .build(),
+        )
+        .await
+        .expect("create table");
+
+    let sink = IcebergSink::new(cfg).await.expect("IcebergSink::new");
+    sink.write_batch(&[
+        json!({"id": 1, "b": "ABEi", "f": "3q2+7w==", "u": "00010203-0405-0607-0809-0a0b0c0d0e0f"}),
+        json!({"id": 2, "b": "AAAA", "f": null, "u": "AAECAwQFBgcICQoLDA0ODw=="}),
+    ])
+    .await
+    .expect("write binary values");
+    sink.flush().await.expect("flush");
+
+    let rows = read_rows(&dir, "bins").await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0]["b"], "ABEi");
+    assert_eq!(rows[0]["f"], "3q2+7w==");
+    assert_eq!(rows[0]["u"], "AAECAwQFBgcICQoLDA0ODw==");
+    assert_eq!(rows[1]["b"], "AAAA", "all-hex base64 is not read as hex");
+    assert_eq!(rows[1]["u"], "AAECAwQFBgcICQoLDA0ODw==");
+}

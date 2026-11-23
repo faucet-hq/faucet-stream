@@ -422,11 +422,17 @@ fn resume_claimed(
                 return;
             }
         };
+        // A reload does not watch the token: a cancel, or the lease fence,
+        // that fired while it ran stops the run before anything else.
+        if run_token.is_cancelled() {
+            stop_claimed(&state, &rec, Terminal::cancelled()).await;
+            return;
+        }
 
-        // Mode B (#230): a sharded run is expanded into shard rows here — the
+        // Mode B (#230): a sharded run is split into shard rows here — the
         // claiming instance acts as the (ephemeral) coordinator — and is NOT
-        // executed as a whole. Enumeration + insert is idempotent, so two
-        // instances both claiming + coordinating converge on the same shard set.
+        // executed as a whole. The split is one owner-fenced transaction, so
+        // only the instance that holds the run writes a shard set.
         let principal = crate::runtime::Principal::stored(&state, AuthContext::runtime(), &rec);
         if let Some(sh) = loaded.cfg.shard.clone()
             && sh.count >= 2
@@ -585,8 +591,13 @@ async fn shard_with_retry(
 ) -> Result<bool, Terminal> {
     let mut wait = RELOAD_RETRY_BASE;
     loop {
-        match coordinate_sharded_run(state, &rec.run_id, loaded, count).await {
-            Ok(sharded) => return Ok(sharded),
+        if cancel.is_cancelled() {
+            return Err(Terminal::cancelled());
+        }
+        match coordinate_sharded_run(state, &rec.run_id, loaded, count, cancel).await {
+            Ok(Coordinated::Whole) => return Ok(false),
+            Ok(Coordinated::Sharded | Coordinated::Lost) => return Ok(true),
+            Ok(Coordinated::Cancelled) => return Err(Terminal::cancelled()),
             Err(crate::error::CliError::HistoryUnavailable(m)) => {
                 metrics::record_run_reload_retry();
                 tracing::warn!(run_id = %rec.run_id, error = %m, "sharding a claimed run waits for the run history");
@@ -604,20 +615,44 @@ async fn shard_with_retry(
     }
 }
 
-/// Coordinator step (Mode B): expand a sharded run into `faucet_serve_shards`
-/// rows. Returns `Ok(true)` when the run was sharded (caller must not execute it
-/// as a whole), `Ok(false)` when it isn't shardable (caller runs it whole).
+/// What [`coordinate_sharded_run`] did with a claimed run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Coordinated {
+    /// Not shardable: the caller runs it whole.
+    Whole,
+    /// Split into shards; the shard loop runs them.
+    Sharded,
+    /// Another instance holds the run now: nothing to do here.
+    Lost,
+    /// A cancel was requested before the split.
+    Cancelled,
+}
+
+/// Coordinator step (Mode B): split a sharded run into `faucet_serve_shards`
+/// rows.
 ///
-/// Idempotent: enumeration is deterministic and the insert is
-/// `ON CONFLICT DO NOTHING`, so a re-coordinated run (e.g. after the coordinator
-/// crashed and the Pending run was requeued) converges on the same shard set.
+/// The shard plan is computed first (a bounds query may scan), with no
+/// history write; then [`RunHistory::coordinate_shards`] flips the run to
+/// `sharded` and inserts every shard row in one transaction, only while this
+/// instance owns the run, it is `running`, no cancel is requested and it has
+/// no shard rows. So two coordinators (a stalled first claimer and the peer
+/// that reclaimed the run) never mix two plans, a cancel requested before the
+/// split stops it, and a crash before the commit leaves a `running` run that
+/// reclaim hands to another instance rather than a `sharded` run with no
+/// shards. (A release before this one still splits without the fence; a run
+/// whose second coordinator is such a release can still mix plans during a
+/// rolling upgrade.)
+///
+/// [`RunHistory::coordinate_shards`]: crate::serve::history::RunHistory::coordinate_shards
 async fn coordinate_sharded_run(
     state: &ServerState,
     run_id: &str,
     loaded: &LoadedSubmission,
     count: usize,
-) -> crate::error::CliResult<bool> {
+    cancel: &CancellationToken,
+) -> crate::error::CliResult<Coordinated> {
     use crate::error::CliError;
+    use crate::serve::history::CoordinateOutcome;
 
     // Sharding applies to a single-source pipeline; a matrix fan-out is not
     // shardable (each row is already an independent unit — use Mode A).
@@ -627,7 +662,7 @@ async fn coordinate_sharded_run(
             nodes = loaded.nodes.len(),
             "shard requested but the run is not a single-node pipeline; running it whole"
         );
-        return Ok(false);
+        return Ok(Coordinated::Whole);
     }
     let node = &loaded.nodes[0];
     let auth = loaded
@@ -640,42 +675,16 @@ async fn coordinate_sharded_run(
             kind = %node.source.kind,
             "source is not shardable; running the run whole"
         );
-        return Ok(false);
-    }
-
-    // Mark the parent run Sharded BEFORE inserting any shard rows (F27).
-    // Orphan recovery (`recover_orphans` / `reclaim_orphans`) only reclaims
-    // `running` runs; once the parent is `Sharded` it is immune to a false
-    // fail. Doing this first guarantees the invariant that **no shard row ever
-    // exists while the parent is still `running`** — otherwise a coordinator
-    // crash between `insert_shards` and the status flip would let orphan
-    // recovery mark the run Failed while its already-inserted shards are
-    // claimed, execute, and write data (a run the user believes failed and may
-    // resubmit → duplicate writes). If the flip itself fails, the run stays
-    // `running` + owned by us with no shards inserted, so a crash here is
-    // safely *requeued* by reclaim, not falsely failed. (A crash after the flip
-    // but before `insert_shards` leaves a 0-shard `Sharded` run, which
-    // `all_terminal()` never finalizes — an availability leak, not a
-    // correctness/duplication bug; the desired trade.)
-    {
-        let mut r = state
-            .history()
-            .get(run_id)
-            .await
-            .map_err(history_cli_error)?
-            .ok_or_else(|| CliError::Internal(format!("run {run_id} vanished before sharding")))?;
-        r.status = RunStatus::Sharded;
-        state
-            .history()
-            .upsert(&r)
-            .await
-            .map_err(history_cli_error)?;
+        return Ok(Coordinated::Whole);
     }
 
     let shards = source
         .enumerate_shards(count.min(faucet_core::shard::MAX_SHARDS))
         .await
         .map_err(|e| CliError::Internal(format!("enumerate_shards: {e}")))?;
+    if cancel.is_cancelled() {
+        return Ok(Coordinated::Cancelled);
+    }
     let inserts: Vec<ShardInsert> = shards
         .iter()
         .map(|s| ShardInsert {
@@ -684,21 +693,47 @@ async fn coordinate_sharded_run(
             size_estimate: s.size_estimate,
         })
         .collect();
-    let inserted = state
+    let mut sharded = state
         .history()
-        .insert_shards(run_id, &inserts)
+        .get(run_id)
+        .await
+        .map_err(history_cli_error)?
+        .ok_or_else(|| CliError::Internal(format!("run {run_id} vanished before sharding")))?;
+    sharded.status = RunStatus::Sharded;
+    let outcome = state
+        .history()
+        .coordinate_shards(&sharded, &inserts)
         .await
         .map_err(history_cli_error)?;
-    tracing::info!(
-        run_id,
-        shards = inserts.len(),
-        inserted,
-        "expanded run into shards (Mode B)"
-    );
-
-    // Wake the local claim loop so it picks up the freshly-inserted shards.
-    state.cluster().kick();
-    Ok(true)
+    metrics::record_shard_coordination(match outcome {
+        CoordinateOutcome::Sharded { .. } => "sharded",
+        CoordinateOutcome::NotOwner => "not_owner",
+        CoordinateOutcome::CancelRequested => "cancelled",
+    });
+    match outcome {
+        CoordinateOutcome::Sharded { inserted } => {
+            tracing::info!(
+                run_id,
+                shards = inserts.len(),
+                inserted,
+                "split the run into shards (Mode B)"
+            );
+            // Wake the local claim loop so it picks up the new shards.
+            state.cluster().kick();
+            Ok(Coordinated::Sharded)
+        }
+        CoordinateOutcome::NotOwner => {
+            tracing::warn!(
+                run_id,
+                "another replica holds this run now; not splitting it here"
+            );
+            Ok(Coordinated::Lost)
+        }
+        CoordinateOutcome::CancelRequested => {
+            tracing::info!(run_id, "cancelled while it was being split into shards");
+            Ok(Coordinated::Cancelled)
+        }
+    }
 }
 
 /// A history failure while coordinating: one that may pass is
@@ -914,6 +949,15 @@ async fn execute_shard(
             return (ShardOutcome::Failed, ShardExit::Finished);
         }
     };
+    // A shard's budget is the run's: granted from the run's ledger, measured
+    // from when the run started.
+    let run_started = match state.history().get(run_id).await {
+        Ok(rec) => rec.and_then(|r| r.started_at).unwrap_or(submitted_at),
+        Err(e) => {
+            tracing::warn!(run_id, shard_id, error = %e, "shard: could not read the run's start");
+            submitted_at
+        }
+    };
     // `coop` is the per-shard cancel token registered by `resume_claimed_shard`;
     // a cross-instance cancel (F10), a server shutdown, or a timeout all fire it
     // so the shard's pipeline flushes at its next page boundary. A shard is not
@@ -929,6 +973,7 @@ async fn execute_shard(
             cancel: coop.clone(),
             concurrency,
             shard: Some(shard),
+            run_started: Some(run_started),
             #[cfg(feature = "notify")]
             notifier: None,
             catalog: false,
@@ -942,6 +987,7 @@ async fn execute_shard(
         }
     };
 
+    let budget_state = opts.budget_state.clone();
     let server_shutdown = state.shutdown_token();
     let span = tracing::info_span!(parent: None, "faucet.serve.shard", serve_run_id = %run_id, shard = %shard_id);
     let audit_state = state.clone();
@@ -995,6 +1041,11 @@ async fn execute_shard(
                 .after_interrupt(tokio::time::timeout(RUN_FLUSH_GRACE, &mut work).await.ok())
         }
     };
+    // Return the allowance this shard was granted but did not spend, on every
+    // exit; a missed return only stops the run early.
+    if let Some(budget) = &budget_state {
+        budget.close().await;
+    }
     let exit = match terminal {
         Terminal::ShutdownFailed { .. } => ShardExit::Shutdown,
         Terminal::Cancelled { .. } if fenced => ShardExit::Fenced,
@@ -2111,6 +2162,7 @@ async fn execute_run(
     mut own: RunRecord,
 ) {
     let server_shutdown = state.shutdown_token();
+    let claim_path = claimed.is_some();
     let untrusted_targets = own.caller_config || !own.caller_params.is_empty();
     let auth_result = loaded.auth_catalog();
     let LoadedSubmission {
@@ -2136,7 +2188,30 @@ async fn execute_run(
     let started = Utc::now();
     own.status = RunStatus::Running;
     own.started_at = Some(started);
-    if let Err(e) = state.history().upsert(&own).await {
+    if claim_path {
+        // A claimed run starts only while this instance still owns it: a peer
+        // that reclaimed it (this instance's lease lapsed while it loaded)
+        // runs it instead.
+        if run_token.is_cancelled() {
+            stop_claimed(&state, &own, Terminal::cancelled()).await;
+            return;
+        }
+        match state.history().start_owned(&own).await {
+            Ok(true) => {}
+            Ok(false) => {
+                metrics::record_run_lost_ownership();
+                tracing::warn!(%run_id, "run is owned by another replica now; not executing it here");
+                return;
+            }
+            Err(e) => tracing::warn!(
+                %run_id,
+                error = %e,
+                fenced = state.cluster().is_fenced(),
+                history_reachable = state.cluster().history_reachable(),
+                "could not record the run as running; the lease fence still guards it"
+            ),
+        }
+    } else if let Err(e) = state.history().upsert(&own).await {
         tracing::warn!(%run_id, error = %e, "could not record the run as running");
     }
     metrics::set_run_gauges(&state);
@@ -2230,6 +2305,7 @@ async fn execute_run(
             cancel: coop.clone(),
             concurrency,
             shard: None,
+            run_started: None,
             #[cfg(feature = "notify")]
             notifier,
             catalog: true,
@@ -3793,6 +3869,7 @@ mod tests {
             local_output_in_flight_grace: Duration::from_secs(60),
             preview: crate::serve::preview::PreviewConfig::default(),
             lease_ttl: Duration::from_secs(30),
+            metrics_idle_timeout: None,
             probe_timeout: Duration::from_secs(10),
             env_file: None,
             no_env_file: false,
@@ -3921,6 +3998,7 @@ mod tests {
             local_output_in_flight_grace: Duration::from_secs(60),
             preview: crate::serve::preview::PreviewConfig::default(),
             lease_ttl: Duration::from_secs(30),
+            metrics_idle_timeout: None,
             probe_timeout: Duration::from_secs(10),
             env_file: None,
             no_env_file: false,
@@ -4021,6 +4099,7 @@ mod tests {
             local_output_in_flight_grace: Duration::from_secs(60),
             preview: crate::serve::preview::PreviewConfig::default(),
             lease_ttl: Duration::from_secs(30),
+            metrics_idle_timeout: None,
             probe_timeout: Duration::from_secs(10),
             env_file: None,
             no_env_file: false,
@@ -4175,6 +4254,7 @@ mod tests {
             local_output_in_flight_grace: Duration::from_secs(60),
             preview: crate::serve::preview::PreviewConfig::default(),
             lease_ttl: Duration::from_secs(30),
+            metrics_idle_timeout: None,
             probe_timeout: Duration::from_secs(10),
             env_file: None,
             no_env_file: false,
@@ -4306,6 +4386,7 @@ mod tests {
                 local_output_in_flight_grace: Duration::from_secs(60),
                 preview: crate::serve::preview::PreviewConfig::default(),
                 lease_ttl: Duration::from_secs(30),
+                metrics_idle_timeout: None,
                 probe_timeout: Duration::from_secs(10),
                 env_file: None,
                 no_env_file: false,
@@ -4427,7 +4508,12 @@ mod tests {
                  sink: { type: stdout, config: {} }\n",
             )
             .await;
-            assert!(!coordinate_sharded_run(&state, "r", &l, 4).await.unwrap());
+            assert_eq!(
+                coordinate_sharded_run(&state, "r", &l, 4, &CancellationToken::new())
+                    .await
+                    .unwrap(),
+                Coordinated::Whole
+            );
         }
 
         #[tokio::test]
@@ -4444,7 +4530,12 @@ mod tests {
                 input.display()
             ))
             .await;
-            assert!(!coordinate_sharded_run(&state, "r", &l, 4).await.unwrap());
+            assert_eq!(
+                coordinate_sharded_run(&state, "r", &l, 4, &CancellationToken::new())
+                    .await
+                    .unwrap(),
+                Coordinated::Whole
+            );
         }
 
         #[tokio::test]
@@ -4460,7 +4551,12 @@ mod tests {
                  sink: { type: stdout, config: {} }\n",
             )
             .await;
-            assert!(coordinate_sharded_run(&state, "r", &l, 4).await.unwrap());
+            assert_eq!(
+                coordinate_sharded_run(&state, "r", &l, 4, &CancellationToken::new())
+                    .await
+                    .unwrap(),
+                Coordinated::Sharded
+            );
             // 4 shards inserted; parent flipped to Sharded.
             let prog = state.history().shard_progress("r").await.unwrap();
             assert_eq!(prog.total, 4);
@@ -4468,6 +4564,137 @@ mod tests {
             assert_eq!(
                 state.history().get("r").await.unwrap().unwrap().status,
                 RunStatus::Sharded
+            );
+        }
+
+        /// A sqlite source split on its key, over a table of ten rows.
+        #[cfg(feature = "source-sqlite")]
+        async fn sharded_sqlite(dir: &std::path::Path) -> LoadedSubmission {
+            use sqlx::Connection as _;
+            let db = dir.join("src.db");
+            let mut conn =
+                sqlx::SqliteConnection::connect(&format!("sqlite:{}?mode=rwc", db.display()))
+                    .await
+                    .unwrap();
+            sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            for i in 1..=10 {
+                sqlx::query("INSERT INTO t VALUES (?)")
+                    .bind(i)
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+            }
+            loaded(&format!(
+                "version: 1\npipeline:\n  \
+                 source: {{ type: sqlite, config: {{ database_url: \"sqlite:{}\", \
+                 query: \"SELECT id FROM t\", shard: {{ key: id }} }} }}\n  \
+                 sink: {{ type: stdout, config: {{}} }}\n",
+                db.display()
+            ))
+            .await
+        }
+
+        /// The split is fenced: a run whose cancel was requested, or that
+        /// another replica holds, gets no shard rows, and a cancel seen before
+        /// the split stops it without a write.
+        #[cfg(feature = "source-sqlite")]
+        #[tokio::test]
+        async fn a_split_writes_nothing_for_a_cancelled_or_lost_run() {
+            let dir = tempfile::tempdir().unwrap();
+            let state = sqlite_state(dir.path()).await;
+            let l = sharded_sqlite(dir.path()).await;
+
+            seed_run(&state, "flagged", RunStatus::Running).await;
+            state.history().request_cancel("flagged").await.unwrap();
+            assert_eq!(
+                coordinate_sharded_run(&state, "flagged", &l, 2, &CancellationToken::new())
+                    .await
+                    .unwrap(),
+                Coordinated::Cancelled
+            );
+            assert_eq!(
+                state
+                    .history()
+                    .shard_progress("flagged")
+                    .await
+                    .unwrap()
+                    .total,
+                0
+            );
+            assert_eq!(
+                state
+                    .history()
+                    .get("flagged")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                RunStatus::Running
+            );
+
+            let peer = SqliteHistory::connect(
+                &format!("sqlite://{}/h.db", dir.path().display()),
+                Duration::from_secs(300),
+                Duration::from_secs(300),
+                "inst-peer".into(),
+            )
+            .await
+            .unwrap();
+            let mut held =
+                RunRecord::queued("held".into(), None, BTreeMap::new(), None, Utc::now());
+            held.status = RunStatus::Running;
+            peer.upsert(&held).await.unwrap();
+            assert_eq!(
+                coordinate_sharded_run(&state, "held", &l, 2, &CancellationToken::new())
+                    .await
+                    .unwrap(),
+                Coordinated::Lost
+            );
+            assert_eq!(
+                state.history().shard_progress("held").await.unwrap().total,
+                0
+            );
+
+            seed_run(&state, "mine", RunStatus::Running).await;
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            assert_eq!(
+                coordinate_sharded_run(&state, "mine", &l, 2, &cancel)
+                    .await
+                    .unwrap(),
+                Coordinated::Cancelled
+            );
+            let rec = state.history().get("mine").await.unwrap().unwrap();
+            let r = shard_with_retry(&state, &rec, &l, 2, &cancel, None).await;
+            assert!(matches!(r, Err(Terminal::Cancelled { .. })));
+            assert_eq!(
+                state.history().shard_progress("mine").await.unwrap().total,
+                0
+            );
+
+            let r = shard_with_retry(&state, &rec, &l, 2, &CancellationToken::new(), None).await;
+            assert!(matches!(r, Ok(true)));
+            assert_eq!(
+                state.history().shard_progress("mine").await.unwrap().total,
+                2
+            );
+            assert_eq!(
+                state.history().get("mine").await.unwrap().unwrap().status,
+                RunStatus::Sharded
+            );
+            assert_eq!(
+                coordinate_sharded_run(&state, "mine", &l, 2, &CancellationToken::new())
+                    .await
+                    .unwrap(),
+                Coordinated::Sharded,
+                "a split this instance already made is not split again"
+            );
+            assert_eq!(
+                state.history().shard_progress("mine").await.unwrap().total,
+                2
             );
         }
 
@@ -4860,6 +5087,103 @@ mod tests {
             assert!(!state.history().release_shard("r", "nope").await.unwrap());
         }
 
+        /// A cancel answered from a local token is recorded in the history
+        /// in a cluster, so the run's shards that run on peers stop too.
+        #[tokio::test]
+        async fn a_local_cancel_reaches_the_shards_on_peers() {
+            use crate::serve::history::ShardInsert;
+            let dir = tempfile::tempdir().unwrap();
+            let mut cluster = crate::serve::cluster::ClusterConfig::disabled();
+            cluster.enabled = true;
+            let state = sqlite_state_with(dir.path(), cluster).await;
+            seed_run(&state, "r", RunStatus::Running).await;
+            let mut sharded = state.history().get("r").await.unwrap().unwrap();
+            sharded.status = RunStatus::Sharded;
+            let shards: Vec<ShardInsert> = (0..2)
+                .map(|i| ShardInsert {
+                    shard_id: i.to_string(),
+                    descriptor: serde_json::json!({ "i": i }),
+                    size_estimate: None,
+                })
+                .collect();
+            state
+                .history()
+                .coordinate_shards(&sharded, &shards)
+                .await
+                .unwrap();
+            let token = CancellationToken::new();
+            state
+                .registry()
+                .register_run("r".into(), token.clone(), None);
+            let out =
+                crate::runtime::server::cancel(&state, &crate::runtime::Principal::local(), "r")
+                    .await
+                    .unwrap();
+            assert!(matches!(
+                out,
+                crate::runtime::server::CancelOutcome::Requested
+            ));
+            assert!(token.is_cancelled());
+            let p = state.history().shard_progress("r").await.unwrap();
+            assert_eq!(
+                p.cancelled, 2,
+                "the pending shards stop wherever they would run"
+            );
+            assert_eq!(
+                state.history().get("r").await.unwrap().unwrap().status,
+                RunStatus::Cancelled
+            );
+        }
+
+        /// A claimed run a peer took over while this instance loaded it is
+        /// not started or finished here: the peer runs it.
+        #[cfg(all(feature = "source-csv", feature = "sink-stdout"))]
+        #[tokio::test]
+        async fn a_claimed_run_a_peer_took_over_is_not_started_here() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cluster = crate::serve::cluster::ClusterConfig::disabled();
+            cluster.enabled = true;
+            let state = sqlite_state_with(dir.path(), cluster).await;
+            let input = dir.path().join("in.csv");
+            std::fs::write(&input, "id\n1\n").unwrap();
+            let mut rec = RunRecord::queued("r".into(), None, BTreeMap::new(), None, Utc::now());
+            rec.status = RunStatus::Pending;
+            rec.config_body = Some(format!(
+                "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: \"{}\" }} }}\n  \
+                 sink: {{ type: stdout, config: {{}} }}\n",
+                input.display()
+            ));
+            state.history().upsert(&rec).await.unwrap();
+            let claimed = state
+                .history()
+                .claim_pending(1, &crate::serve::pools::default_only())
+                .await
+                .unwrap();
+            assert_eq!(claimed.len(), 1);
+            let peer = SqliteHistory::connect(
+                &format!("sqlite://{}/h.db", dir.path().display()),
+                Duration::from_secs(300),
+                Duration::from_secs(300),
+                "inst-peer".into(),
+            )
+            .await
+            .unwrap();
+            peer.upsert(&claimed[0]).await.unwrap();
+            resume_claimed_run(state.clone(), claimed.into_iter().next().unwrap());
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if state.registry().in_flight() == 0 {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(state.registry().in_flight(), 0);
+            let after = state.history().get("r").await.unwrap().unwrap();
+            assert_eq!(after.status, RunStatus::Running, "left to the peer");
+            assert!(after.started_at.is_none(), "never started here");
+            assert!(peer.lease_lost("r").await.is_ok_and(|lost| !lost));
+        }
+
         #[cfg(feature = "source-webhook")]
         #[tokio::test]
         async fn a_clustered_shutdown_hands_a_claimed_run_back_as_pending() {
@@ -5038,7 +5362,11 @@ mod tests {
                  sink: { type: stdout, config: {} }\n",
             )
             .await;
-            assert!(coordinate_sharded_run(&state, "r", &l, 4).await.is_err());
+            assert!(
+                coordinate_sharded_run(&state, "r", &l, 4, &CancellationToken::new())
+                    .await
+                    .is_err()
+            );
         }
 
         #[tokio::test]

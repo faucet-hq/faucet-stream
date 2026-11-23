@@ -141,14 +141,7 @@ async fn decodes_typed_rows_to_json() {
     );
     assert_eq!(r0["flag"], json!(true));
     assert_eq!(r0["note"], Value::Null, "SQL NULL decodes to JSON null");
-    assert!(
-        r0["ts"]
-            .as_str()
-            .unwrap()
-            .starts_with("2024-01-02T03:04:05"),
-        "timestamptz should render as RFC3339, got {:?}",
-        r0["ts"]
-    );
+    assert_eq!(r0["ts"], json!("2024-01-02T03:04:05.000000Z"));
 
     assert_eq!(rows[1]["id"], json!(2));
     assert_eq!(rows[1]["flag"], json!(false));
@@ -374,9 +367,9 @@ async fn decodes_all_pg_type_arms() {
     assert_eq!(r["i4"], json!(70000)); // i32 arm
     assert_eq!(r["r4"].as_f64().unwrap(), 1.5); // f32 arm
     assert_eq!(r["f8"].as_f64().unwrap(), 2.5); // f64 arm
-    assert_eq!(r["t"], json!("13:14:15")); // NaiveTime arm
+    assert_eq!(r["t"], json!("13:14:15.000000")); // NaiveTime arm
     assert_eq!(r["d"], json!("2024-05-06")); // NaiveDate arm
-    assert!(r["ts"].as_str().unwrap().starts_with("2024-05-06")); // NaiveDateTime arm
+    assert_eq!(r["ts"], json!("2024-05-06T07:08:09.000000")); // NaiveDateTime arm
     assert_eq!(r["u"], json!("11111111-2222-3333-4444-555555555555")); // Uuid arm
     // bytea → base64 of 0xDEADBEEF
     assert_eq!(r["b"], json!("3q2+7w=="));
@@ -594,5 +587,19 @@ async fn a_fractional_numeric_cursor_keeps_tied_rows() {
     assert!(
         sent.contains(&"CAST($1 AS NUMERIC(38,3)"),
         "the resumed run binds the bookmark at its scale: {sent:#?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_result_with_two_columns_of_one_name_is_refused() {
+    let _guard = serial().lock().await;
+    let (_container, port) = start_postgres().await;
+    let source = RedshiftSource::new(full_config(port, "SELECT 1 AS id, 2 AS id", 1000))
+        .expect("source builds");
+    let err = source.fetch_all().await.expect_err("a column would vanish");
+    assert!(
+        err.to_string()
+            .contains("Redshift query returns two columns named \"id\""),
+        "{err}"
     );
 }

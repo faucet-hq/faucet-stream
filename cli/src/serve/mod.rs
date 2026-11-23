@@ -5,6 +5,7 @@
 
 pub mod audit;
 pub mod auth;
+pub mod budget_ledger;
 pub mod callback;
 pub mod caller_limits;
 pub mod changes;

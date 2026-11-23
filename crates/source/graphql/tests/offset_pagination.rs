@@ -340,3 +340,26 @@ async fn a_repeated_page_with_changing_extensions_still_stops() {
     assert_eq!(records.len(), 2);
     assert_eq!(hits.load(Ordering::SeqCst), 2);
 }
+
+/// A server alternating between two pages (page 1, page 2, page 1, …) went
+/// round a loop: the rows behind it were never read, so the run fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offset_server_alternating_pages_fails() {
+    let server = MockServer::start().await;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = hits.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |_req: &Request| {
+            let n = h.fetch_add(1, Ordering::SeqCst) as u64;
+            ResponseTemplate::new(200).set_body_json(make_page((n % 2) * 2, 2))
+        })
+        .mount(&server)
+        .await;
+    let err = GraphqlStream::new(offset_config(&server, 2, false))
+        .fetch_all()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("went round a loop"), "{err}");
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+}

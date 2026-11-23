@@ -15,6 +15,27 @@ pub const FAILING_AFTER: u32 = 3;
 pub const FIRST_BACKOFF_SECS: u64 = 5;
 pub const MAX_BACKOFF_SECS: u64 = 60;
 const ATTEMPTS: usize = 5;
+/// How long one event must keep failing, with events waiting behind it,
+/// before its delivery stalls: an outage shorter than this never stalls a
+/// delivery, a poison event still does within minutes.
+pub const MIN_STALL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The floor in force: [`MIN_STALL`]. Debug builds (the test suite) may
+/// lower it with `FAUCET_FEED_TEST_MIN_STALL_SECS`; release binaries never
+/// read it.
+pub fn min_stall() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Some(secs) = std::env::var(TEST_MIN_STALL_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return std::time::Duration::from_secs(secs);
+    }
+    MIN_STALL
+}
+
+/// The debug-build override of [`min_stall`] (tests only).
+pub const TEST_MIN_STALL_ENV: &str = "FAUCET_FEED_TEST_MIN_STALL_SECS";
 
 /// The settings key of a delivery's status.
 pub fn status_key(feed_uid: &str, delivery_uid: &str) -> String {
@@ -63,6 +84,10 @@ pub struct LiveClaim {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     pub claimed_at: DateTime<Utc>,
+    /// Events were waiting past the claimed range when it was claimed: a
+    /// failure of a one-event claim then holds them back.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blocking: bool,
 }
 
 /// How a delivery run ended.
@@ -103,9 +128,12 @@ pub struct DeliveryStatus {
     /// Failed runs in a row.
     #[serde(default)]
     pub consecutive_failures: u32,
-    /// Failed runs in a row of a single event.
+    /// Failed runs in a row of a single event that held others back.
     #[serde(default)]
     pub failures_at_one: u32,
+    /// When the first of those failures happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_failure_at_one: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -250,6 +278,7 @@ impl DeliveryStatus {
                 }
                 self.consecutive_failures = 0;
                 self.failures_at_one = 0;
+                self.first_failure_at_one = None;
                 self.health = Health::Ok;
                 self.last_error = None;
                 self.backoff_secs = 0;
@@ -258,14 +287,19 @@ impl DeliveryStatus {
             }
             Outcome::Failed(e) => {
                 self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-                if size == 1 {
+                if size == 1 && claim.blocking {
                     self.failures_at_one = self.failures_at_one.saturating_add(1);
-                } else {
+                    self.first_failure_at_one.get_or_insert(now);
+                } else if size > 1 {
                     self.failures_at_one = 0;
+                    self.first_failure_at_one = None;
                 }
                 self.batch_events = Some(halved(size));
                 self.last_error = Some(e.clone());
-                self.health = if self.failures_at_one >= retries.max(1) {
+                let long_enough = self
+                    .first_failure_at_one
+                    .is_some_and(|first| (now - first).to_std().unwrap_or_default() >= min_stall());
+                self.health = if self.failures_at_one >= retries.max(1) && long_enough {
                     Health::Stalled
                 } else if self.consecutive_failures >= FAILING_AFTER {
                     Health::Failing
@@ -293,6 +327,7 @@ impl DeliveryStatus {
         self.health = Health::Ok;
         self.consecutive_failures = 0;
         self.failures_at_one = 0;
+        self.first_failure_at_one = None;
         self.last_error = None;
         self.backoff_secs = 0;
         self.backoff_until = None;
@@ -380,7 +415,70 @@ mod tests {
             to,
             run_id: Some(format!("run-{id}")),
             claimed_at: Utc::now(),
+            blocking: true,
         }
+    }
+
+    fn lone(id: &str) -> LiveClaim {
+        LiveClaim {
+            blocking: false,
+            ..claim(id, 1, 2)
+        }
+    }
+
+    #[test]
+    fn a_lone_failing_event_retries_and_never_stalls() {
+        let start = Utc::now();
+        let mut s = DeliveryStatus::default();
+        for i in 0..20 {
+            s.finish(
+                &lone(&format!("l{i}")),
+                &Outcome::Failed("destination down".into()),
+                8,
+                3,
+                start + chrono::Duration::minutes(i),
+            );
+            assert_ne!(s.health, Health::Stalled, "attempt {i}");
+        }
+        assert_eq!(s.health, Health::Failing);
+        assert_eq!((s.failures_at_one, s.first_failure_at_one), (0, None));
+        assert!(s.health.runs());
+    }
+
+    #[test]
+    fn a_blocking_event_stalls_only_after_failing_for_the_minimum_time() {
+        let start = Utc::now();
+        let mut s = DeliveryStatus::default();
+        let fail = |s: &mut DeliveryStatus, id: &str, at: DateTime<Utc>| {
+            s.finish(&claim(id, 1, 2), &Outcome::Failed("x".into()), 8, 3, at);
+        };
+        for (i, minutes) in [0, 1, 2, 5, 9].into_iter().enumerate() {
+            fail(
+                &mut s,
+                &format!("b{i}"),
+                start + chrono::Duration::minutes(minutes),
+            );
+            assert_ne!(s.health, Health::Stalled, "{minutes} min: a short outage");
+        }
+        assert_eq!(s.failures_at_one, 5);
+        assert_eq!(s.first_failure_at_one, Some(start));
+        // A lone failure in between neither counts nor restarts the clock.
+        s.finish(&lone("gap"), &Outcome::Failed("x".into()), 8, 3, start);
+        assert_eq!(s.failures_at_one, 5);
+        fail(&mut s, "late", start + chrono::Duration::minutes(10));
+        assert_eq!(s.health, Health::Stalled);
+        // Delivering, or a larger batch failing, starts the count again.
+        s.reset();
+        assert_eq!((s.failures_at_one, s.first_failure_at_one), (0, None));
+        fail(&mut s, "again", start + chrono::Duration::minutes(30));
+        s.finish(
+            &claim("big", 1, 5),
+            &Outcome::Failed("x".into()),
+            8,
+            3,
+            start,
+        );
+        assert_eq!((s.failures_at_one, s.first_failure_at_one), (0, None));
     }
 
     #[test]
@@ -481,9 +579,17 @@ mod tests {
             3,
             now,
         );
+        assert_eq!(s.health, Health::Failing, "not failing long enough yet");
+        s.finish(
+            &claim("one3", 1, 2),
+            &Outcome::Failed("poison".into()),
+            8,
+            3,
+            now + chrono::Duration::from_std(MIN_STALL).unwrap(),
+        );
         assert_eq!(s.health, Health::Stalled);
         assert!(!s.health.runs());
-        assert_eq!(s.failures_at_one, 3);
+        assert_eq!(s.failures_at_one, 4);
         assert_eq!(s.last_error.as_deref(), Some("poison"));
         assert_eq!(s.backoff_secs, MAX_BACKOFF_SECS);
         s.reset();

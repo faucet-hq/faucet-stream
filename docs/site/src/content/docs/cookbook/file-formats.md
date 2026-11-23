@@ -376,7 +376,11 @@ after the last one read. The bookmark advances after each file. `by: mtime` is a
 watermark: a file that arrives later but keeps an older modification time
 (`mv`, `cp -p`, `rsync -t`, archive extraction) is skipped — the run warns and
 names it — so have producers touch files as they publish them, or use
-`by: name`. Over HTTP, the
+`by: name`. A file rewritten within the same timestamp tick as the previous
+read is still read again (its size, inode or change time, or a strong `ETag`,
+changed). Under `by: name` the bookmark never passes a file that changed while
+it was read: the run stops there and the next run reads it again; set
+`stable_for_secs` for producers that write slowly. Over HTTP, the
 `Last-Modified` header is the modification time. JSON Lines, Avro, ORC and
 Parquet stream, and so does CSV (with the `csv:` dialect above); the other
 formats are read whole per file. `parquet: { columns: [...] }` projects a

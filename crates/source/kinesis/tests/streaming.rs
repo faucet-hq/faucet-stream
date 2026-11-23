@@ -506,3 +506,68 @@ async fn a_quiet_shard_under_latest_does_not_skip_records_written_between_runs()
     is.sort_unstable();
     assert_eq!(is, (0..10).collect::<Vec<i64>>());
 }
+
+/// A shard read to its tip without records in one run, then closed by a split
+/// before the next, is still drained: the records written to it in between
+/// are read, before its children's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quiet_shard_closed_by_a_split_is_still_drained() {
+    let (_container, endpoint) = start_localstack().await;
+    let client = raw_client(&endpoint).await;
+    create_stream(&client, "quiet-split", 1).await;
+
+    let mut cfg = source_config(&endpoint, "quiet-split");
+    cfg.start_position = faucet_source_kinesis::StartPosition::Latest;
+    let first = KinesisSource::new(cfg.clone()).await.expect("source");
+    let ctx: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut pages = first.stream_pages(&ctx, 25);
+    let mut bookmark = None;
+    while let Some(page) = support::phase("next page", pages.next()).await {
+        let page = page.expect("page");
+        assert!(page.records.is_empty());
+        bookmark = page.bookmark.or(bookmark);
+    }
+    drop(pages);
+    let bookmark = bookmark.expect("the quiet shard is bookmarked");
+
+    put_records(&client, "quiet-split", 0, 10).await;
+    let parent = client
+        .list_shards()
+        .stream_name("quiet-split")
+        .send()
+        .await
+        .expect("list")
+        .shards()[0]
+        .clone();
+    let range = parent.hash_key_range().expect("hash range");
+    let start: u128 = range.starting_hash_key().parse().unwrap();
+    let end: u128 = range.ending_hash_key().parse().unwrap();
+    client
+        .split_shard()
+        .stream_name("quiet-split")
+        .shard_to_split(parent.shard_id())
+        .new_starting_hash_key((start + (end - start) / 2).to_string())
+        .send()
+        .await
+        .expect("split shard");
+    for _ in 0..60 {
+        let shards = client
+            .list_shards()
+            .stream_name("quiet-split")
+            .send()
+            .await
+            .expect("list");
+        if shards.shards().len() == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    create_stream_ready(&client, "quiet-split").await;
+
+    let second = KinesisSource::new(cfg).await.expect("source");
+    second.apply_start_bookmark(bookmark).await.expect("apply");
+    let records = support::phase("fetch_all", second.fetch_all())
+        .await
+        .expect("resume fetch");
+    assert_eq!(seen_is(&records), (0..10).collect::<Vec<i64>>());
+}

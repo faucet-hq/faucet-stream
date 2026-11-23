@@ -206,6 +206,56 @@ pub fn parse_token_parts(s: &str) -> Option<(u64, Option<Value>)> {
     }
 }
 
+/// What a destination's stored watermark says about a page about to be
+/// written with an exactly-once token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WatermarkCheck {
+    /// Nothing at or past this page is stored: write it.
+    Behind,
+    /// This exact page (same sequence and bookmark) is already committed, by
+    /// an earlier attempt of the same write.
+    Committed,
+    /// Another writer committed this sequence or a later one, with a
+    /// different token: the page must not be reported as written.
+    Ahead,
+}
+
+/// Compare the `stored` watermark of a scope with the `token` of the page
+/// about to be written. Only an exact match counts as this page's commit; a
+/// stored token without a bookmark (written by a release before bookmarks
+/// were embedded) matches on its sequence alone.
+pub fn check_watermark(stored: Option<&str>, token: &str) -> WatermarkCheck {
+    let Some((stored_seq, stored_bookmark)) = stored.and_then(parse_token_parts) else {
+        return WatermarkCheck::Behind;
+    };
+    let Some(seq) = parse_token(token) else {
+        return WatermarkCheck::Behind;
+    };
+    if stored_seq < seq {
+        return WatermarkCheck::Behind;
+    }
+    let stored = stored.unwrap_or_default().trim();
+    let legacy = stored_bookmark.is_none() && !stored.contains(TOKEN_BOOKMARK_SEP);
+    if stored == token.trim() || (legacy && stored_seq == seq) {
+        WatermarkCheck::Committed
+    } else {
+        WatermarkCheck::Ahead
+    }
+}
+
+/// The error for a page whose scope already holds another writer's commit at
+/// or past its sequence ([`WatermarkCheck::Ahead`]). Not retriable: the next
+/// run resumes from the destination's watermark.
+pub fn watermark_ahead_error(scope: &str, token: &str) -> crate::FaucetError {
+    let page = parse_token(token).map_or_else(|| token.to_string(), |s| s.to_string());
+    crate::FaucetError::Sink(format!(
+        "exactly-once: the destination already holds a commit at or past page {page} \
+         for scope {scope:?} (another writer finished it); the next run resumes from \
+         the destination's watermark"
+    ))
+}
+
 /// Wrap a bookmark + sequence into the exactly-once state value.
 pub fn wrap_state(bookmark: Option<&Value>, seq: u64) -> Value {
     serde_json::json!({
@@ -247,6 +297,17 @@ pub fn unwrap_state(value: &Value) -> (Option<Value>, u64) {
         Some(value.clone())
     };
     (bookmark, 0)
+}
+
+/// The bookmark an at-least-once run resumes from, given a stored state value
+/// whose versioned envelope is already peeled. An exactly-once wrapper yields
+/// its inner bookmark (`None` when it has none); any other value, including a
+/// bare `null`, is returned unchanged.
+pub(crate) fn resume_bookmark(stored: Value) -> Option<Value> {
+    if !is_eo_envelope(&stored) {
+        return Some(stored);
+    }
+    unwrap_state(&stored).0
 }
 
 /// Canonical watermark table the SQL sinks UPSERT the commit token into.
@@ -496,6 +557,54 @@ pub fn legacy_scope_key(scope: &str, max: usize) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resume_bookmark_peels_only_the_exactly_once_wrapper() {
+        use super::resume_bookmark;
+        use serde_json::json;
+        assert_eq!(
+            resume_bookmark(wrap_state(Some(&json!({"lsn": 9})), 4)),
+            Some(json!({"lsn": 9}))
+        );
+        assert_eq!(resume_bookmark(wrap_state(None, 4)), None);
+        assert_eq!(resume_bookmark(json!("2026")), Some(json!("2026")));
+        assert_eq!(resume_bookmark(Value::Null), Some(Value::Null));
+        let not_eo = json!({"__faucet_eo": 2, "bookmark": 1});
+        assert_eq!(resume_bookmark(not_eo.clone()), Some(not_eo));
+    }
+
+    #[test]
+    fn only_an_exact_token_counts_as_this_pages_commit() {
+        let bm = serde_json::json!({"o": 5});
+        let ours = format_token_with_bookmark(7, Some(&bm));
+        let theirs = format_token_with_bookmark(7, Some(&serde_json::json!({"o": 9})));
+        assert_eq!(check_watermark(None, &ours), WatermarkCheck::Behind);
+        assert_eq!(check_watermark(Some(""), &ours), WatermarkCheck::Behind);
+        assert_eq!(
+            check_watermark(Some(&format_token(6)), &ours),
+            WatermarkCheck::Behind
+        );
+        assert_eq!(
+            check_watermark(Some(&ours), &ours),
+            WatermarkCheck::Committed
+        );
+        assert_eq!(check_watermark(Some(&theirs), &ours), WatermarkCheck::Ahead);
+        assert_eq!(
+            check_watermark(Some(&format_token_with_bookmark(8, Some(&bm))), &ours),
+            WatermarkCheck::Ahead
+        );
+        assert_eq!(
+            check_watermark(Some(&format_token(7)), &ours),
+            WatermarkCheck::Committed
+        );
+        assert_eq!(
+            check_watermark(Some(&format_token(8)), &ours),
+            WatermarkCheck::Ahead
+        );
+        let err = watermark_ahead_error("p::r", &ours);
+        assert!(!err.is_retriable());
+        assert!(err.to_string().contains("at or past page 7"), "{err}");
+    }
+
     use super::*;
     use serde_json::json;
 

@@ -105,6 +105,13 @@ Deletes carry the removed row in `before`; inserts and updates carry the current
 image in `after` (the source queries in `N'all'` mode, so an update's pre-image
 is not emitted).
 
+Column values are decoded exactly as the `mssql` query source decodes them
+(one shared decoder in `faucet-common-mssql`), so a snapshot and its change
+stream spell a value alike: `DATETIME` / `SMALLDATETIME` with whole
+milliseconds (`2026-03-04T10:00:00.003`, as SQL Server displays it),
+`DATETIME2` with its fraction, `DATETIMEOFFSET` as RFC 3339, `DATE` as
+`YYYY-MM-DD`.
+
 ## Mirroring to an upsert sink
 
 Pair the envelope with the `cdc_unwrap` transform stage (which normalizes `op`

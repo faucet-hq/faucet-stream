@@ -419,7 +419,7 @@ fn check_budget_sinks(
 /// that node's failure. The timers stop when this is dropped.
 #[derive(Default)]
 pub struct TopologyBudgets {
-    states: HashMap<String, std::sync::Arc<faucet_core::BudgetState>>,
+    states: HashMap<String, faucet_core::BudgetHandle>,
     /// Each sink node's governance and the ids its masking rules are scoped
     /// by, so the run can attach that node's governed DLQ (#870).
     governance: HashMap<String, (faucet_core::Governance, Vec<String>)>,
@@ -450,7 +450,7 @@ impl TopologyBudgets {
         let mut out: Vec<(String, String)> = self
             .states
             .iter()
-            .filter_map(|(id, s)| s.verdict().map(|v| (id.clone(), v.error().to_string())))
+            .filter_map(|(id, h)| h.stopped().map(|v| (id.clone(), v.error().to_string())))
             .collect();
         out.sort();
         out
@@ -1035,6 +1035,14 @@ async fn build_topology_inner(
     validate_topology_spec(cfg)?;
     let budget = opts.budget.as_ref().filter(|b| !b.is_empty());
     check_budget_sinks(cfg, budget)?;
+    // One budget for the graph: every sink node (both sides of a tee, the DLQ)
+    // counts against the same ceilings and the run's clock.
+    let run_budget = budget.map(|b| {
+        std::sync::Arc::new(faucet_core::BudgetState::for_run(
+            b,
+            std::time::SystemTime::now(),
+        ))
+    });
     if let Some(spec) = &cfg.metadata_columns {
         faucet_core::CompiledMetadata::compile(spec)
             .map_err(|e| CliError::Config(format!("metadata_columns: {e}")))?;
@@ -1161,6 +1169,7 @@ async fn build_topology_inner(
                         run_id: &run_id,
                         source_label: source_label(cfg, reaching.get(*id)),
                         budget,
+                        budget_state: run_budget.clone(),
                         cancel: opts.cancel.clone().unwrap_or_default(),
                         dry_run: opts.dry_run,
                         preview: opts.is_preview(),
@@ -1186,10 +1195,8 @@ async fn build_topology_inner(
                     if limit.is_some() {
                         states.limit_padded.insert((*id).clone(), padded);
                     }
-                    if let Some(state) = governed.budget_state() {
-                        states
-                            .states
-                            .insert((*id).clone(), std::sync::Arc::clone(state));
+                    if let Some(handle) = governed.budget_handle() {
+                        states.states.insert((*id).clone(), handle);
                     }
                     states.governance.insert(
                         (*id).clone(),
@@ -2085,17 +2092,17 @@ async fn post_run_observability(cfg: &PipelineConfig, ctx: PostRun<'_>) -> Vec<(
         let node_failed_by_profile = profile_failures.iter().any(|(id, _)| id == row);
 
         // ── Notifications (#280) ─────────────────────────────────────────────
+        // Delivered in the background, in order per sink node.
         #[cfg(feature = "notify")]
         if let Some(notifier) = &notifier {
             use crate::notify::NotifyEvent;
+            let mut events = Vec::new();
             match (&node.error, node_failed_by_profile) {
                 (None, false) => {
-                    notifier
-                        .emit(crate::executor::keep_sla_open(
-                            NotifyEvent::run_success(pipeline_name, row, node.records as u64),
-                            !violations.is_empty(),
-                        ))
-                        .await;
+                    events.push(crate::executor::keep_sla_open(
+                        NotifyEvent::run_success(pipeline_name, row, node.records as u64),
+                        !violations.is_empty(),
+                    ));
                 }
                 (None, true) => {
                     let msg = profile_failures
@@ -2103,46 +2110,43 @@ async fn post_run_observability(cfg: &PipelineConfig, ctx: PostRun<'_>) -> Vec<(
                         .find(|(id, _)| id == row)
                         .map(|(_, m)| m.clone())
                         .unwrap_or_default();
-                    notifier
-                        .emit(NotifyEvent::run_failure(
-                            pipeline_name,
-                            row,
-                            "profile_drift",
-                            msg,
-                        ))
-                        .await;
+                    events.push(NotifyEvent::run_failure(
+                        pipeline_name,
+                        row,
+                        "profile_drift",
+                        msg,
+                    ));
                 }
                 (Some(msg), _) => {
-                    notifier
-                        .emit(NotifyEvent::run_failure(pipeline_name, row, "sink", msg))
-                        .await;
+                    events.push(NotifyEvent::run_failure(pipeline_name, row, "sink", msg));
                 }
             }
             for v in &violations {
-                notifier
-                    .emit(NotifyEvent::sla_breach(
-                        pipeline_name,
-                        row,
-                        v.kind(),
-                        v.to_string(),
-                    ))
-                    .await;
+                events.push(NotifyEvent::sla_breach(
+                    pipeline_name,
+                    row,
+                    v.kind(),
+                    v.to_string(),
+                ));
             }
             if let (Some(o), Some(spec)) = (&profile_outcome, cfg.profiling.as_ref())
                 && spec.on_drift != faucet_core::OnProfileDrift::Warn
             {
                 for d in &o.drift {
-                    notifier
-                        .emit(NotifyEvent::profile_drift(
-                            pipeline_name,
-                            row,
-                            &d.column,
-                            d.metric.as_str(),
-                            d.to_string(),
-                        ))
-                        .await;
+                    events.push(NotifyEvent::profile_drift(
+                        pipeline_name,
+                        row,
+                        &d.column,
+                        d.metric.as_str(),
+                        d.to_string(),
+                    ));
                 }
             }
+            crate::notify::dispatch(
+                notifier,
+                (None, pipeline_name.to_string(), row.to_string()),
+                events,
+            );
         }
         #[cfg(not(feature = "notify"))]
         let _ = (&violations, node_failed_by_profile);
@@ -3087,10 +3091,9 @@ pipeline:
             .sink_builder()
             .build(Box::new(NullSink));
         let mut budgets = TopologyBudgets::default();
-        budgets.states.insert(
-            "w".into(),
-            std::sync::Arc::clone(governed.budget_state().unwrap()),
-        );
+        budgets
+            .states
+            .insert("w".into(), governed.budget_handle().unwrap());
         assert!(budgets.verdicts().is_empty());
         tokio::time::timeout(std::time::Duration::from_secs(5), cancel.cancelled())
             .await

@@ -83,6 +83,7 @@ fn serve_args(
         preview_default_rows: default_rows,
         preview_max_rows: max_rows,
         lease_ttl_secs: 30,
+        metrics_idle_timeout_secs: 86_400,
         probe_timeout_secs: 5,
         env_file: None,
         no_env_file: true,

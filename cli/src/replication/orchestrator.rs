@@ -60,21 +60,12 @@ pub(crate) fn build_snapshot_node(
     cdc_node: &ExpandedNode,
     snapshot_source: crate::config::ConnectorSpec,
 ) -> ExpandedNode {
-    let mut n = cdc_node.clone();
-    n.id = "snapshot".to_string();
+    let mut n = crate::sub_run::derive(
+        cdc_node,
+        crate::sub_run::SubRun::MirrorSnapshot,
+        "snapshot".to_string(),
+    );
     n.source = snapshot_source;
-    n.delivery = faucet_core::DeliveryMode::AtLeastOnce;
-    // Keep the derived-guarantee report truthful for the forced-at-least-once
-    // snapshot phase — unless the sink dedups by key, in which case the
-    // snapshot inherits keyed-upsert effectively-once (the recommended
-    // `write_mode: upsert` mirror setup).
-    if n.delivery_guarantee
-        != faucet_core::DeliveryGuarantee::EffectivelyOnce(
-            faucet_core::EffectivelyOnceMechanism::KeyedUpsert,
-        )
-    {
-        n.delivery_guarantee = faucet_core::DeliveryGuarantee::AtLeastOnce;
-    }
     n.transforms.retain(|t| t.kind != "cdc_unwrap");
     n
 }
@@ -129,6 +120,7 @@ pub(crate) fn make_opts(
         catalog: opts.catalog.clone(),
         usage: opts.usage.clone(),
         budget: opts.budget.clone(),
+        budget_state: None,
         feed: Default::default(),
     }
 }

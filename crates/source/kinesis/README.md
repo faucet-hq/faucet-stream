@@ -28,7 +28,7 @@ source:
 | `credentials` | `{ type: default }` | `default` \| `profile` \| `access_key` \| `assume_role` \| `web_identity` — see `faucet-common-kinesis`. |
 | `start_position` | `{ type: trim_horizon }` | `trim_horizon` \| `latest` \| `at_timestamp { timestamp_secs }` \| `at_sequence_number { sequence }` \| `after_sequence_number { sequence }`. `at_timestamp` matches at **second** granularity. A sequence number belongs to one shard, so the sequence positions require `shard_ids` to list exactly that shard. |
 | `shard_ids` | `[]` (all) | Explicit shard allowlist. |
-| `include_closed` | `false` | Also drain closed (post-resharding) shards inside the retention window that have no bookmark. A closed shard **with** a bookmark is always drained. A fully-drained closed shard counts as *done*, not idle. |
+| `include_closed` | `false` | Also drain closed (post-resharding) shards inside the retention window that have no bookmark. A closed shard read in an earlier run (a bookmark or a caught-up time) is always drained. A fully-drained closed shard counts as *done*, not idle. |
 | `poll_interval_ms` | `1000` | Base wait between `GetRecords` per shard; floored at 200 ms (the 5 reads/sec/shard API budget). |
 | `records_per_request` | `500` | `GetRecords` limit (1–10000). |
 | `shard_concurrency` | `4` | Maximum concurrent `GetRecords` calls. Every eligible shard is read, in turn, even when there are more shards than this. |
@@ -67,8 +67,9 @@ reshard) are dropped from the map. A shard's first `GetShardIterator` is
 retried with backoff, and consecutive throughput throttles back off further
 each time.
 
-**Resharding:** after a split or merge, a closed parent shard that has a
-bookmark is drained before its children start, so its unread tail is never
+**Resharding:** after a split or merge, a closed parent shard that was read in
+an earlier run (with or without records: a shard read to its tip carries a
+caught-up time) is drained before its children start, so its unread tail is never
 dropped and a key's older records (in the parent) are written before its newer
 ones (in the children). A child of a parent that was read starts at
 `TRIM_HORIZON` rather than `start_position`, so nothing written to it after the

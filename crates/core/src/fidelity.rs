@@ -455,6 +455,54 @@ pub fn timestamp_naive(dt: &NaiveDateTime, precision: TimePrecision) -> Value {
     ))
 }
 
+/// The UTC wall time of an offset-bearing date-time string (RFC 3339, or
+/// ISO 8601 with a space separator, a space before the offset, or no
+/// seconds), for storing an instant in a column without a zone. `None` when
+/// the string carries no offset or is not a date-time.
+pub fn offset_instant_utc(s: &str) -> Option<NaiveDateTime> {
+    const OFFSET_FORMATS: [&str; 4] = [
+        "%Y-%m-%dT%H:%M:%S%.f%#z",
+        "%Y-%m-%d %H:%M:%S%.f%#z",
+        "%Y-%m-%d %H:%M:%S%.f %#z",
+        "%Y-%m-%dT%H:%M%#z",
+    ];
+    let s = s.trim();
+    let dt = DateTime::parse_from_rfc3339(s).ok().or_else(|| {
+        OFFSET_FORMATS
+            .iter()
+            .find_map(|f| DateTime::parse_from_str(s, f).ok())
+    })?;
+    Some(dt.naive_utc())
+}
+
+/// The UTC time of day of an offset-bearing time string (`10:00:00+02:00`),
+/// for a column without a zone. The day the shift crosses into is dropped
+/// (`01:00:00+02:00` → `23:00:00`). `None` when there is no offset.
+pub fn offset_time_utc(s: &str) -> Option<NaiveTime> {
+    let s = s.trim();
+    let split = s
+        .char_indices()
+        .skip(1)
+        .find(|&(_, c)| c == '+' || c == '-' || c == 'Z' || c == 'z')
+        .map(|(i, _)| i)?;
+    let (time, offset) = s.split_at(split);
+    let time = NaiveTime::parse_from_str(time.trim(), "%H:%M:%S%.f")
+        .or_else(|_| NaiveTime::parse_from_str(time.trim(), "%H:%M"))
+        .ok()?;
+    let seconds = if offset.eq_ignore_ascii_case("z") {
+        0
+    } else {
+        DateTime::parse_from_str(
+            &format!("2000-01-01T00:00:00{offset}"),
+            "%Y-%m-%dT%H:%M:%S%#z",
+        )
+        .ok()?
+        .offset()
+        .local_minus_utc()
+    };
+    Some(time - chrono::Duration::seconds(i64::from(seconds)))
+}
+
 /// A date as `YYYY-MM-DD`.
 pub fn date(d: &NaiveDate) -> Value {
     Value::String(d.format("%Y-%m-%d").to_string())
@@ -512,11 +560,92 @@ pub fn from_str(text: &str) -> Result<Value, serde_json::Error> {
     serde_json::from_str(&rewritten)
 }
 
+/// [`from_str`] for JSON text from a writer that spells non-finite floats as
+/// bare `NaN`, `Infinity` or `-Infinity` (Python's `json` module does). Valid
+/// JSON parses as [`from_str`] does; otherwise each such token in a value
+/// position, outside a string, becomes `null` and is counted with
+/// [`record_non_finite`]. When nothing is rewritten, or the rewritten text
+/// still does not parse, the original error is returned.
+pub fn from_str_allow_non_finite(text: &str) -> Result<Value, serde_json::Error> {
+    let first = match from_str(text) {
+        Ok(v) => return Ok(v),
+        Err(e) => e,
+    };
+    let (rewritten, count) = rewrite_non_finite(text);
+    if count == 0 {
+        return Err(first);
+    }
+    match from_str(&rewritten) {
+        Ok(v) => {
+            for _ in 0..count {
+                record_non_finite();
+            }
+            Ok(v)
+        }
+        Err(_) => Err(first),
+    }
+}
+
+fn rewrite_non_finite(text: &str) -> (String, usize) {
+    const TOKENS: [&str; 3] = ["-Infinity", "Infinity", "NaN"];
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let (mut i, mut last, mut count) = (0, 0, 0);
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            match b {
+                b'\\' => i += 1,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        let before_ok = i == 0
+            || matches!(
+                bytes[i - 1],
+                b':' | b',' | b'[' | b' ' | b'\t' | b'\n' | b'\r'
+            );
+        let token = TOKENS.iter().find(|t| {
+            let end = i + t.len();
+            before_ok
+                && bytes[i..].starts_with(t.as_bytes())
+                && (end == bytes.len()
+                    || matches!(
+                        bytes[end],
+                        b',' | b']' | b'}' | b' ' | b'\t' | b'\n' | b'\r'
+                    ))
+        });
+        match token {
+            Some(t) => {
+                out.push_str(&text[last..i]);
+                out.push_str("null");
+                i += t.len();
+                last = i;
+                count += 1;
+            }
+            None => i += 1,
+        }
+    }
+    out.push_str(&text[last..]);
+    (out, count)
+}
+
 /// [`from_str`] over bytes, for a body that should be UTF-8.
 pub fn from_slice(bytes: &[u8]) -> Result<Value, serde_json::Error> {
     match std::str::from_utf8(bytes) {
         Ok(text) => from_str(text),
-        Err(_) => serde_json::from_slice(bytes),
+        Err(e) => Err(serde::de::Error::custom(format!(
+            "invalid UTF-8 in JSON at byte {}",
+            e.valid_up_to()
+        ))),
     }
 }
 
@@ -613,6 +742,78 @@ pub fn unscoped_non_finite() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_slice_refuses_a_body_that_is_not_utf8() {
+        let e = from_slice(b"{\"a\": \"\xff\"}").unwrap_err().to_string();
+        assert!(e.contains("invalid UTF-8 in JSON at byte 7"), "{e}");
+        assert_eq!(from_slice(b"[1]").unwrap(), serde_json::json!([1]));
+    }
+
+    #[tokio::test]
+    async fn bare_non_finite_tokens_become_counted_nulls() {
+        let counter = NonFiniteCounter::new();
+        let v = counter
+            .scope(async {
+                from_str_allow_non_finite(
+                    r#"{"a":NaN,"b":[Infinity,-Infinity,[NaN,1]],"s":"NaN \" Infinity","n":-1}"#,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"a": null, "b": [null, null, [null, 1]], "s": "NaN \" Infinity", "n": -1})
+        );
+        assert_eq!(counter.count(), 4);
+        let valid = counter
+            .scope(async { from_str_allow_non_finite("[1,2]") })
+            .await;
+        assert_eq!(valid.unwrap(), serde_json::json!([1, 2]));
+        assert_eq!(counter.count(), 4);
+        assert!(from_str_allow_non_finite("[NaNx]").is_err());
+        assert!(from_str_allow_non_finite(r#"{"a":NaN"#).is_err());
+        assert!(from_str_allow_non_finite("[x1]").is_err());
+        assert_eq!(counter.count(), 4);
+    }
+
+    #[test]
+    fn offset_instants_become_utc_wall_time() {
+        let at = |s| offset_instant_utc(s).map(|d| d.format("%Y-%m-%dT%H:%M:%S%.f").to_string());
+        assert_eq!(
+            at("2026-09-18T12:00:00+02:00").as_deref(),
+            Some("2026-09-18T10:00:00")
+        );
+        assert_eq!(
+            at("2026-09-18T12:00:00.5Z").as_deref(),
+            Some("2026-09-18T12:00:00.500")
+        );
+        assert_eq!(
+            at("2026-09-18 01:00:00-03:30").as_deref(),
+            Some("2026-09-18T04:30:00")
+        );
+        assert_eq!(
+            at("2026-09-18 23:30:00 -0100").as_deref(),
+            Some("2026-09-19T00:30:00")
+        );
+        assert_eq!(
+            at("2026-09-18T12:00+01:00").as_deref(),
+            Some("2026-09-18T11:00:00")
+        );
+        assert_eq!(at("2026-09-18T12:00:00"), None);
+        assert_eq!(at("not a date"), None);
+    }
+
+    #[test]
+    fn offset_times_become_utc_time_of_day() {
+        let at = |s| offset_time_utc(s).map(|t| t.format("%H:%M:%S%.f").to_string());
+        assert_eq!(at("10:00:00+02:00").as_deref(), Some("08:00:00"));
+        assert_eq!(at("01:00:00.25+02:00").as_deref(), Some("23:00:00.250"));
+        assert_eq!(at("23:00:00-02:00").as_deref(), Some("01:00:00"));
+        assert_eq!(at("12:00:00Z").as_deref(), Some("12:00:00"));
+        assert_eq!(at("12:00:00"), None);
+        assert_eq!(at("x+02:00"), None);
+    }
 
     #[test]
     fn exponents_are_written_out_only_up_to_the_digit_bound() {

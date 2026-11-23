@@ -12,6 +12,7 @@
     feature = "serve-history-postgres"
 ))]
 #![allow(clippy::disallowed_methods)] // tests pace their own polling
+#![allow(unsafe_code)] // two tests lower the stall floor through the environment
 
 use clap::Parser;
 use faucet_cli::serve::config::ServeConfig;
@@ -626,8 +627,47 @@ async fn deliveries_run_move_their_cursors_and_never_share_state() {
     assert_eq!(srv.tick().await.feeds, 0);
 }
 
+/// One pending event whose run keeps failing holds nothing back: the
+/// delivery keeps retrying (`failing`) and never stalls, even with no
+/// minimum stall time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lone_failing_event_keeps_retrying_and_never_stalls() {
+    unsafe { std::env::set_var(faucet_cli::serve::feeds::status::TEST_MIN_STALL_ENV, "0") };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut srv = Srv::start(root, &[]).await;
+    register(&srv.state, "orders_lake", &root.join("state")).await;
+    let blocker = root.join("blocked");
+    std::fs::write(&blocker, "not a directory").unwrap();
+    let mut d = delivery("lake", "orders_lake", &blocker.join("lake.jsonl"));
+    d["retries"] = json!(2);
+    service::create(&srv.state, &admin(), None, feed_spec("orders", json!([d])))
+        .await
+        .unwrap();
+    srv.append("orders", 1..=1).await;
+    let retried = srv
+        .until("orders", "lake", true, "six failed runs", |p| {
+            p.status.consecutive_failures >= 6
+        })
+        .await;
+    assert_eq!(retried.status.health, Health::Failing);
+    assert_eq!(retried.status.failures_at_one, 0);
+    assert_eq!(retried.cursor, 1);
+
+    // Another event arrives behind it: now the failing event holds it back.
+    srv.append("orders", 2..=2).await;
+    let stalled = srv
+        .until("orders", "lake", true, "stalled", |p| {
+            p.status.health == Health::Stalled
+        })
+        .await;
+    assert_eq!((stalled.cursor, stalled.status.failures_at_one), (1, 2));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failing_sink_halves_the_batch_until_one_event_stalls_and_a_skip_moves_on() {
+    // A stall needs only `retries` failures here, not minutes of them.
+    unsafe { std::env::set_var(faucet_cli::serve::feeds::status::TEST_MIN_STALL_ENV, "0") };
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let mut srv = Srv::start(root, &[]).await;
@@ -1210,6 +1250,257 @@ async fn a_crash_between_submit_and_the_status_write_is_recovered_by_the_claim_l
     }
     let still = srv.pos("orders", "lake").await;
     assert!(still.cursor == 4 && !still.claimed, "{still:?}");
+}
+
+/// A `--feeds` file holds its delivery params as written: views show a
+/// param its template declares secret as the keep marker and a string that
+/// held a `${…}` reference as the reference, and a file-read value is
+/// scrubbed from the logs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feeds_file_shows_its_secret_and_referenced_params_masked() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    unsafe { std::env::set_var("FEED_TEST_REGION", "region-from-env") };
+    let token_file = root.join("token");
+    std::fs::write(&token_file, "file-held-bearer-value").unwrap();
+    let feeds = root.join("feeds.yaml");
+    std::fs::write(
+        &feeds,
+        format!(
+            "version: 1\nfeeds:\n  - name: orders\n    ingest: {{ auth: {{ tokens: managed }} }}\n    deliveries:\n      - name: lake\n        template:\n          id: secret_lake\n          params:\n            out: \"{}\"\n            api_key: literal-api-key-value\n            region: \"${{env:FEED_TEST_REGION}}\"\n            header: \"Bearer ${{file:{}}}\"\n",
+            root.join("lake.jsonl").display(),
+            token_file.display()
+        ),
+    )
+    .unwrap();
+    let feeds_arg = feeds.display().to_string();
+    let history = format!("sqlite:{}", root.join("history.db").display());
+    let cfg = config(root, &history, &["--feeds", &feeds_arg]);
+    let srv = Srv::over(&cfg).await;
+    srv.state.feeds().stop_scheduling();
+    register_with_secret(&srv.state, "secret_lake", &root.join("state")).await;
+    srv.state.feeds().refresh(&srv.state).await.unwrap();
+
+    let view = service::get(&srv.state, &admin(), None, "orders")
+        .await
+        .unwrap();
+    let params = &view.feed.spec.deliveries[0]
+        .template
+        .as_ref()
+        .unwrap()
+        .params;
+    assert_eq!(params["api_key"], json!({"$sealed": true}));
+    assert_eq!(params["region"], json!("${env:FEED_TEST_REGION}"));
+    assert_eq!(
+        params["header"],
+        json!(format!("Bearer ${{file:{}}}", token_file.display()))
+    );
+    assert_eq!(
+        params["out"],
+        json!(root.join("lake.jsonl").display().to_string())
+    );
+    let shown = serde_json::to_string(&view).unwrap();
+    for value in [
+        "literal-api-key-value",
+        "region-from-env",
+        "file-held-bearer-value",
+    ] {
+        assert!(!shown.contains(value), "{value} in {shown}");
+    }
+    // What the delivery runs with is the resolved value.
+    let snapshot = srv.state.feeds().snapshot();
+    let feed = snapshot.feed(None, "orders").unwrap();
+    let runs_with = &feed.spec.deliveries[0].template.as_ref().unwrap().params;
+    assert_eq!(runs_with["region"], json!("region-from-env"));
+    for value in ["literal-api-key-value", "file-held-bearer-value"] {
+        assert!(
+            !faucet_cli::secrets::registry::redact(&format!("log {value}")).contains(value),
+            "{value} is scrubbed from logs"
+        );
+    }
+}
+
+/// A feed store name redefined to another database leaves the feed's
+/// events behind: the feed is blocked (no rows are created in the new
+/// store, senders get 503) until an admin adopts the new store, which starts
+/// it empty there, its old positions forgotten even after a replay bumped
+/// their epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feed_whose_store_changed_is_blocked_until_its_new_store_is_adopted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let history = format!("sqlite:{}", root.join("history.db").display());
+    let first = format!("x=sqlite:{}", root.join("x1.db").display());
+    let mut srv = Srv::over(&config(root, &history, &["--feed-store", &first])).await;
+    srv.state.feeds().stop_scheduling();
+    register(&srv.state, "orders_lake", &root.join("state")).await;
+    let out = root.join("lake.jsonl");
+    let mut spec = feed_spec("orders", json!([delivery("lake", "orders_lake", &out)]));
+    spec.store = "x".into();
+    service::create(&srv.state, &admin(), None, spec)
+        .await
+        .unwrap();
+    srv.append("orders", 1..=2).await;
+    srv.delivered("orders", "lake", 3).await;
+    service::replay(
+        &srv.state,
+        &admin(),
+        None,
+        "orders",
+        "lake",
+        service::Position::Seq(1),
+    )
+    .await
+    .unwrap();
+    srv.delivered("orders", "lake", 3).await;
+    assert_eq!(ids(&out), vec![1, 2, 1, 2]);
+    let uid = service::find(&srv.state, None, "orders")
+        .await
+        .unwrap()
+        .feed
+        .uid
+        .clone();
+    drop(srv);
+
+    // The name `x` now points to another, empty database.
+    let second_db = root.join("x2.db");
+    let second = format!("x=sqlite:{}", second_db.display());
+    let cfg = config(root, &history, &["--feed-store", &second]);
+    let mut srv = Srv::over(&cfg).await;
+    srv.state.feeds().stop_scheduling();
+    srv.state.feeds().refresh(&srv.state).await.unwrap();
+    let view = service::get(&srv.state, &admin(), None, "orders")
+        .await
+        .unwrap();
+    assert_eq!(view.feed.status, "store_moved");
+    assert!(
+        view.feed.warnings.iter().any(|w| w.contains("adopt")),
+        "{:?}",
+        view.feed.warnings
+    );
+    assert_eq!(
+        srv.state.feeds().readiness().store_moved,
+        vec!["orders".to_string()]
+    );
+    for _ in 0..3 {
+        srv.tick().await;
+    }
+    let raw = srv.state.feeds().stores().get("x").await.unwrap();
+    assert!(
+        raw.heads(&store_calls(), std::slice::from_ref(&uid))
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing is created in the new store"
+    );
+    let (_, token) = service::token_create(&srv.state, &admin(), None, "orders", "s", None)
+        .await
+        .unwrap();
+    let base = srv.http().await;
+    let refused = reqwest::Client::new()
+        .post(format!("{base}/v1/feeds/orders/events"))
+        .bearer_auth(&token)
+        .header("content-type", "application/json")
+        .body("{\"id\": 9}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status().as_u16(), 503);
+    assert!(refused.headers().get("retry-after").is_some());
+    assert!(
+        service::adopt_store(&srv.state, &admin(), None, "nope")
+            .await
+            .is_err()
+    );
+
+    // Adopted: empty in the new store, delivering from its start.
+    let adopted = service::adopt_store(&srv.state, &admin(), None, "orders")
+        .await
+        .unwrap();
+    assert_eq!(
+        (adopted.store.as_str(), adopted.abandoned_store.as_str()),
+        ("x", "x")
+    );
+    assert_ne!(adopted.store_id, adopted.abandoned_store_id);
+    assert!(matches!(
+        service::adopt_store(&srv.state, &admin(), None, "orders").await,
+        Err(ServeError::Conflict(_))
+    ));
+    let view = service::get(&srv.state, &admin(), None, "orders")
+        .await
+        .unwrap();
+    assert_ne!(view.feed.status, "store_moved");
+    srv.append("orders", 3..=3).await;
+    let pos = srv.delivered("orders", "lake", 2).await;
+    assert_ne!(pos.status.health, Health::Held, "the old bookmark is gone");
+    assert_eq!(ids(&out), vec![1, 2, 1, 2, 3]);
+
+    // Deleting the feed forgets which store held it.
+    let binding = format!("feed_store:{uid}");
+    assert!(
+        srv.state
+            .history()
+            .meta_get(&binding)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    service::delete(&srv.state, &admin(), None, "orders")
+        .await
+        .unwrap();
+    assert_eq!(srv.state.history().meta_get(&binding).await.unwrap(), None);
+}
+
+/// A `--feeds` file feed whose store changed fails the server's start,
+/// naming the feed and the remedy; adopting every moved feed of the store at
+/// once lets it start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feeds_file_feed_moved_to_another_store_fails_the_start_until_adopted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let feeds = root.join("feeds.yaml");
+    std::fs::write(
+        &feeds,
+        "version: 1\nfeeds:\n  - name: orders\n    store: x\n    ingest: { auth: { tokens: managed } }\n  - name: refunds\n    store: x\n    ingest: { auth: { tokens: managed } }\n",
+    )
+    .unwrap();
+    let feeds_arg = feeds.display().to_string();
+    let history = format!("sqlite:{}", root.join("history.db").display());
+    let start = |db: &str| {
+        let store = format!("x=sqlite:{}", root.join(db).display());
+        config(
+            root,
+            &history,
+            &["--feeds", &feeds_arg, "--feed-store", &store],
+        )
+    };
+    let srv = Srv::over(&start("x1.db")).await;
+    srv.state.feeds().stop_scheduling();
+    service::refuse_moved_file_feeds(&srv.state).await.unwrap();
+    srv.append("orders", 1..=2).await;
+    drop(srv);
+
+    let srv = Srv::over(&start("x2.db")).await;
+    srv.state.feeds().stop_scheduling();
+    let refused = service::refuse_moved_file_feeds(&srv.state)
+        .await
+        .unwrap_err();
+    for want in ["'orders'", "'refunds'", "adopt-store", "different store"] {
+        assert!(refused.contains(want), "{want}: {refused}");
+    }
+    let (done, failed) = service::adopt_store_all(&srv.state, &admin(), Some("x"))
+        .await
+        .unwrap();
+    assert!(failed.is_empty(), "{failed:?}");
+    assert_eq!(done.len(), 2);
+    service::refuse_moved_file_feeds(&srv.state).await.unwrap();
+    let (store, uid) = srv.store("orders").await;
+    let head = store
+        .heads(&store_calls(), std::slice::from_ref(&uid))
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(head.watermark.get(), 0, "it starts empty");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2304,12 +2595,77 @@ async fn under_feed_approval_every_change_waits_and_names_its_feed() {
     assert!(matches!(unknown, Err(ServeError::NotFound)));
 }
 
+/// An approved feed change whose write landed before its execution was
+/// interrupted (the change was never saved as executed) ends executed, with
+/// its audit entry, when it runs again, instead of invalidated by its own
+/// write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_approved_feed_change_interrupted_after_its_write_is_executed() {
+    use faucet_cli::serve::changes::{self, ChangeStatus};
+    use service::{ChangeAction, ChangePayload};
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &["--require-approval", "feed"]).await;
+    service::create(&srv.state, &admin(), None, feed_spec("orders", json!([])))
+        .await
+        .unwrap();
+    let mut edited = feed_spec("orders", json!([]));
+    edited.description = Some("edited".into());
+    for (action, spec) in [
+        (ChangeAction::Update, Some(edited)),
+        (ChangeAction::Delete, None),
+    ] {
+        let proposed = pending(
+            service::change(
+                &srv.state,
+                &admin(),
+                ChangePayload::new(action, None, "orders", spec),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        // The execution's write lands; the server stops before saving the
+        // change (a delete stops once the feed is marked deleted).
+        let p: ChangePayload = serde_json::from_value(proposed.payload.clone()).unwrap();
+        let deleting = matches!(p.action, ChangeAction::Delete);
+        if deleting {
+            srv.state
+                .feeds()
+                .stop_removals_after(Some(faucet_cli::serve::feeds::StopAfter::Marked));
+        }
+        let _ = service::apply(&srv.state, &admin(), p, true, Some(&proposed.id)).await;
+        srv.state.feeds().stop_removals_after(None);
+        let done = changes::approve(&srv.state, &bob(), &proposed.id, None)
+            .await
+            .unwrap();
+        assert_eq!(done.status, ChangeStatus::Executed, "{:?}", done.error);
+    }
+    assert!(service::find(&srv.state, None, "orders").await.is_err());
+    let audit = srv
+        .state
+        .history()
+        .list_audit(&faucet_cli::serve::history::AuditFilter {
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    for action in ["feed.update", "feed.delete"] {
+        assert!(
+            audit.iter().any(|e| e.action == action
+                && e.detail.as_deref().is_some_and(|d| d.contains("recovered"))),
+            "{action}: {audit:?}"
+        );
+    }
+}
+
 /// A stall and a crossing of a `warn_at` threshold each send one
 /// notification through the delivery template's `notifications:`, however
 /// often the scheduler looks again.
 #[cfg(feature = "notify")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stall_and_a_nearly_full_feed_each_notify_once() {
+    unsafe { std::env::set_var(faucet_cli::serve::feeds::status::TEST_MIN_STALL_ENV, "0") };
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     let hook = MockServer::start().await;
@@ -3146,10 +3502,24 @@ async fn a_changed_tenant_byte_quota_reaches_its_existing_feeds() {
     srv.tick().await;
     store.append(&calls, &feed.uid, big()).await.unwrap();
 
-    history.tenant_upsert(&tenant(7000)).await.unwrap();
+    history.tenant_upsert(&tenant(6000)).await.unwrap();
     srv.tick().await;
     let full = store.append(&calls, &feed.uid, big()).await.unwrap_err();
     assert!(full.to_string().contains("is full"), "{full}");
+
+    // Nothing waits to be delivered, yet the feed is over the tenant's
+    // quota: the quota counts what the store keeps, and the view says so.
+    let listed = service::overview(&srv.state, &admin(), Some("acme"), Default::default())
+        .await
+        .unwrap();
+    let quotas = listed.quotas.unwrap();
+    let view = service::get(&srv.state, &admin(), Some("acme"), "orders")
+        .await
+        .unwrap();
+    assert_eq!(view.feed.status, "over_quota", "{quotas:?}");
+    assert_eq!((quotas.feeds, quotas.stored_bytes), (1, 6000));
+    assert_eq!(quotas.max_feed_bytes, Some(6000));
+    assert!(quotas.stored_bytes_by_store.is_empty());
 }
 
 /// A delivery whose definition was stored but whose store position was
@@ -4022,4 +4392,66 @@ async fn a_feed_definition_and_its_tokens_round_trip_through_memory() {
         faucet_cli::serve::history::memory::MemoryHistory::new(Duration::from_secs(60)),
     ))
     .await;
+}
+
+/// Retention keeps up with a busy feed: one maintenance pass removes every
+/// expired event and dedupe key, in short calls, however many there are,
+/// and a pass that runs out of time leaves the feed due again soon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retention_removes_everything_due_in_one_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &[]).await;
+    srv.state.feeds().stop_scheduling();
+    let spec: FeedSpec = serde_json::from_value(json!({
+        "name": "busy",
+        "ingest": {"auth": {"tokens": "managed"}, "dedupe": {"header": "X-Event-Id", "window": "1s"}},
+        "retention": {"max_age": "0s"}
+    }))
+    .unwrap();
+    service::create(&srv.state, &admin(), None, spec)
+        .await
+        .unwrap();
+    let (store, uid) = srv.store("busy").await;
+    let calls = store_calls();
+    for chunk in 0..6u64 {
+        let events = (0..2_000u64)
+            .map(|i| {
+                NewEvent::new("application/json", b"{}".to_vec())
+                    .dedupe_key(format!("k{}", chunk * 2_000 + i))
+            })
+            .collect();
+        store.append(&calls, &uid, events).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    // Out of time: nothing is lost, the feed is behind and due again soon.
+    let feed = srv.state.feeds().snapshot().feed(None, "busy").unwrap();
+    let rt = srv.state.feeds();
+    assert_eq!(
+        runner::maintain_feed(&rt, &*store, &feed, std::time::Instant::now()).await,
+        runner::Maintained::Behind
+    );
+
+    let mut maintenance = runner::Maintenance::default();
+    let pass = maintenance
+        .pass(&srv.state, runner::MAINTENANCE_BUDGET)
+        .await;
+    assert_eq!((pass.maintained, pass.behind.len()), (1, 0), "{pass:?}");
+    let head = store
+        .heads(&calls, std::slice::from_ref(&uid))
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!((head.watermark.get(), head.oldest.get()), (12_000, 12_001));
+    assert_eq!(head.bytes, 0);
+    assert_eq!(
+        store.purge_dedupe(&calls, &uid, 100_000).await.unwrap(),
+        0,
+        "every expired dedupe key is gone"
+    );
+    // Kept up: not due again for a while.
+    let again = maintenance
+        .pass(&srv.state, runner::MAINTENANCE_BUDGET)
+        .await;
+    assert_eq!(again.maintained, 0);
 }

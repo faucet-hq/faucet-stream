@@ -259,3 +259,35 @@ fn bind_json_covers_all_scalar_kinds() {
     assert!(err.contains("big_id"), "{err}");
     assert!(err.contains(&u64::MAX.to_string()), "{err}");
 }
+
+#[test]
+fn offset_values_for_zone_less_columns_become_utc_wall_time() {
+    use serde_json::json;
+    let typed = vec![
+        ("at".to_string(), "timestamp without time zone".to_string()),
+        ("tz".to_string(), "timestamp with time zone".to_string()),
+        ("t".to_string(), "time without time zone".to_string()),
+        ("name".to_string(), "character varying(256)".to_string()),
+    ];
+    let records = vec![json!({
+        "AT": "2026-09-18T12:00:00+02:00",
+        "tz": "2026-09-18T12:00:00+02:00",
+        "t": "01:00:00+02:00",
+        "name": "2026-09-18T12:00:00+02:00",
+    })];
+    let out = super::utc_wall_times(&records, &typed);
+    assert_eq!(
+        out[0],
+        json!({
+            "AT": "2026-09-18 10:00:00",
+            "tz": "2026-09-18T12:00:00+02:00",
+            "t": "23:00:00",
+            "name": "2026-09-18T12:00:00+02:00",
+        })
+    );
+    let plain = vec![json!({"at": "2026-09-18 12:00:00"})];
+    assert!(matches!(
+        super::utc_wall_times(&plain, &typed),
+        std::borrow::Cow::Borrowed(_)
+    ));
+}

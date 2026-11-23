@@ -685,3 +685,71 @@ async fn cleanup_matches_written_keys_in_any_text_form() {
     assert_eq!(deleted, 1, "only the row this run did not write");
     assert_eq!(support::count_rows(&conn, "k").await, 2);
 }
+
+/// GoogleSQL identifiers are case-insensitive: lower-case fields and key land
+/// in mixed-case columns of a mixed-case table, two fields folding onto one
+/// column fail that row, and an addition that already names a column adds
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn names_match_ignoring_case() {
+    let conn = support::create_database(
+        "em-case",
+        vec![
+            "CREATE TABLE Users (UserId INT64 NOT NULL, Email STRING(MAX)) PRIMARY KEY (UserId)"
+                .to_string(),
+        ],
+    )
+    .await;
+    let mut cfg = SpannerSinkConfig::new(
+        conn.project_id.clone(),
+        conn.instance.clone(),
+        conn.database.clone(),
+        "users",
+    );
+    cfg.connection.emulator_host = conn.emulator_host.clone();
+    cfg.write = WriteSpec {
+        write_mode: WriteMode::Upsert,
+        key: vec!["userid".to_string()],
+        delete_marker: None,
+        rollback: None,
+    };
+    let sink = SpannerSink::new(cfg).await.expect("sink");
+    sink.write_batch(&[json!({"userid": 1, "email": "a@x"})])
+        .await
+        .expect("lower-case fields land");
+    sink.write_batch(&[json!({"userid": 1, "email": "b@x"})])
+        .await
+        .expect("the upsert keys on the same row");
+    assert_eq!(
+        support::first_string(&conn, "SELECT Email FROM Users WHERE UserId = 1").await,
+        Some("b@x".to_string())
+    );
+    assert_eq!(support::count_rows(&conn, "Users").await, 1);
+
+    let outcomes = sink
+        .write_batch_partial(&[
+            json!({"userid": 2, "email": "a", "EMAIL": "b"}),
+            json!({"userid": 3, "email": "c"}),
+        ])
+        .await
+        .expect("page");
+    let err = outcomes[0].as_ref().unwrap_err().to_string();
+    assert!(err.contains("both name column `Email`"), "{err}");
+    assert!(outcomes[1].is_ok());
+
+    sink.evolve_schema(&faucet_core::SchemaEvolution {
+        additions: vec![faucet_core::ColumnChange {
+            name: "email".into(),
+            from: None,
+            to: json!({"type": "string"}),
+        }],
+        widenings: vec![],
+        relax_nullability: vec![],
+    })
+    .await
+    .expect("no ADD COLUMN for an existing column");
+    assert_eq!(
+        sink.column_matching(),
+        faucet_core::ColumnMatching::CaseInsensitive
+    );
+}

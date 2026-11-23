@@ -404,7 +404,7 @@ impl Source for NatsSource {
     }
 
     fn consumes_destructively(&self) -> bool {
-        self.config.is_jetstream()
+        self.config.consumes_destructively()
     }
 
     fn connector_name(&self) -> &'static str {

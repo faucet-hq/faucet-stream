@@ -99,10 +99,11 @@ pub struct RollbackOptions {
     pub force: bool,
     /// Count what would change without changing anything.
     pub dry_run: bool,
-    /// A later run wrote this dataset after the one being undone. A journaled
-    /// key with a before-image whose row is now gone, and which a later run's
-    /// journal also holds, was deleted by that later run, so restoring it
-    /// would resurrect it: it counts as a conflict.
+    /// Informational: this row has later runs. The vanished-key check (a
+    /// journaled key with a before-image whose row is now gone and which
+    /// another run journaled later, so restoring it would resurrect a row
+    /// that run deleted) runs regardless of this flag, because another
+    /// pipeline or row writing the same table is a later run too.
     #[serde(default)]
     pub later_runs: bool,
 }
@@ -304,6 +305,30 @@ impl JournalSql {
         )
     }
 
+    /// The keys of one run's journal rows against one table that another run
+    /// also journaled at or after that run's first journal row. The
+    /// intersection runs in the database, so only this run's own keys come
+    /// back. Binds: `p1` table, `p2` run, `p3` run, `p4` table, `p5` run.
+    pub fn later_matching_keys(&self) -> String {
+        let m = if self.key_column.contains("key_hash") {
+            "key_hash"
+        } else {
+            "key_json"
+        };
+        format!(
+            "SELECT DISTINCT r.key_json FROM {t} r JOIN {t} l ON l.table_name = r.table_name \
+             AND l.{m} = r.{m} WHERE r.table_name = {p1} AND r.run_id = {p2} AND l.run_id <> {p3} \
+             AND l.recorded_at >= (SELECT MIN(recorded_at) FROM {t} WHERE table_name = {p4} \
+             AND run_id = {p5})",
+            t = self.t(),
+            p1 = (self.placeholder)(1),
+            p2 = (self.placeholder)(2),
+            p3 = (self.placeholder)(3),
+            p4 = (self.placeholder)(4),
+            p5 = (self.placeholder)(5),
+        )
+    }
+
     /// Drop one run's journal rows for one table (after a restore).
     pub fn delete_table(&self) -> String {
         format!(
@@ -406,16 +431,16 @@ impl JournalEntry {
 /// Split journal entries into what a restore does: keys to **delete** (the
 /// run created them) and before-images to **write back** (the run changed or
 /// deleted them). Pure.
-/// Journaled keys whose undo would re-insert a before-image. When a later run
-/// wrote the dataset, each of these that no longer has a row is a conflict
-/// (see [`RollbackOptions::later_runs`]).
+/// Journaled keys whose undo would re-insert a before-image. Each of these
+/// that no longer has a row, and that another run journaled later, is a
+/// conflict.
 pub fn restorable(entries: &[JournalEntry]) -> Vec<&JournalEntry> {
     entries.iter().filter(|e| e.before.is_some()).collect()
 }
 
 /// The restorable entries whose key a later run also journaled
-/// (`later_keys` holds that run's `key_json` texts, from
-/// [`JournalSql::later_keys`]). Only such a key's missing row was deleted by a
+/// (`later_keys` holds `key_json` texts, from
+/// [`JournalSql::later_matching_keys`] or [`JournalSql::later_keys`]). Only such a key's missing row was deleted by a
 /// later run; a key the undone run deleted itself is not among them, so
 /// restoring it is the undo, not a conflict.
 pub fn touched_later<'a>(
@@ -481,6 +506,23 @@ mod tests {
         assert!(
             sql.contains("run_id <> $2") && sql.contains("run_id = $4"),
             "{sql}"
+        );
+        let sql = j.later_matching_keys();
+        assert!(
+            sql.contains("l.key_json = r.key_json")
+                && sql.contains("r.run_id = $2")
+                && sql.contains("l.run_id <> $3")
+                && sql.contains("run_id = $5"),
+            "{sql}"
+        );
+        let hashed = JournalSql {
+            key_column: "key_json TEXT NOT NULL, key_hash CHAR(64)",
+            ..j
+        };
+        assert!(
+            hashed
+                .later_matching_keys()
+                .contains("l.key_hash = r.key_hash")
         );
     }
 

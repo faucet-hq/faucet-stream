@@ -2,9 +2,7 @@
 
 use crate::config::SqliteSourceConfig;
 use async_trait::async_trait;
-use faucet_core::shard::{
-    PkShardBounds, ShardSpec, parse_pk_shard, pk_bounds_query, pk_shards_from_bounds,
-};
+use faucet_core::shard::{PkShardBounds, ShardSpec, parse_pk_shard, pk_shards_from_bounds};
 use faucet_core::{FaucetError, Stream, StreamPage};
 use futures::TryStreamExt;
 use serde_json::Value;
@@ -105,36 +103,54 @@ impl SqliteSource {
 /// decodes NULL as `""` when asked for a `String`. TEXT is parsed as JSON only
 /// when it holds an object or array, so `'19.90'`, `'00501'` and `'null'` stay
 /// the strings they are.
-fn sqlite_value_to_json(row: &sqlx::sqlite::SqliteRow, idx: usize) -> Value {
-    let Ok(raw) = row.try_get_raw(idx) else {
-        return Value::Null;
-    };
+fn sqlite_value_to_json(row: &sqlx::sqlite::SqliteRow, idx: usize) -> Result<Value, FaucetError> {
+    let raw = row
+        .try_get_raw(idx)
+        .map_err(|e| undecodable(row, idx, &e))?;
     if raw.is_null() {
-        return Value::Null;
+        return Ok(Value::Null);
     }
-    match raw.type_info().name() {
-        "INTEGER" => match row.try_get::<i64, _>(idx) {
-            Ok(v @ (0 | 1)) if declared_boolean(row, idx) => Value::Bool(v == 1),
-            Ok(v) => Value::Number(v.into()),
-            Err(_) => Value::Null,
+    Ok(match raw.type_info().name() {
+        "INTEGER" => match row
+            .try_get::<i64, _>(idx)
+            .map_err(|e| undecodable(row, idx, &e))?
+        {
+            v @ (0 | 1) if declared_boolean(row, idx) => Value::Bool(v == 1),
+            v => Value::Number(v.into()),
         },
-        "REAL" => row
-            .try_get::<f64, _>(idx)
-            .ok()
-            .map(faucet_core::fidelity::float64)
-            .unwrap_or(Value::Null),
-        "BLOB" => row
-            .try_get::<Vec<u8>, _>(idx)
-            .map(|v| {
-                use base64::Engine as _;
-                Value::String(base64::engine::general_purpose::STANDARD.encode(v))
-            })
-            .unwrap_or(Value::Null),
-        _ => row
-            .try_get::<String, _>(idx)
-            .map(text_to_json)
-            .unwrap_or(Value::Null),
-    }
+        "REAL" => faucet_core::fidelity::float64(
+            row.try_get::<f64, _>(idx)
+                .map_err(|e| undecodable(row, idx, &e))?,
+        ),
+        "BLOB" => {
+            use base64::Engine as _;
+            let v = row
+                .try_get::<Vec<u8>, _>(idx)
+                .map_err(|e| undecodable(row, idx, &e))?;
+            Value::String(base64::engine::general_purpose::STANDARD.encode(v))
+        }
+        _ => text_to_json(row.try_get::<String, _>(idx).map_err(|_| {
+            let c = column_name(row, idx);
+            FaucetError::Source(format!(
+                "SQLite column {c} holds text that is not valid UTF-8; select it as \
+                 CAST({c} AS BLOB) to read the bytes"
+            ))
+        })?),
+    })
+}
+
+fn column_name(row: &sqlx::sqlite::SqliteRow, idx: usize) -> String {
+    row.columns()
+        .get(idx)
+        .map_or_else(|| idx.to_string(), |c| c.name().to_string())
+}
+
+/// A non-NULL cell no decoder accepts fails the read; `null` is only SQL NULL.
+fn undecodable(row: &sqlx::sqlite::SqliteRow, idx: usize, e: &sqlx::Error) -> FaucetError {
+    FaucetError::Source(format!(
+        "SQLite column {} could not be decoded: {e}",
+        column_name(row, idx)
+    ))
 }
 
 /// Whether the result column is declared `BOOLEAN` / `BOOL`.
@@ -293,6 +309,34 @@ fn descriptors_from_catalog(rows: Vec<CatalogRow>) -> Vec<faucet_core::DatasetDe
     out
 }
 
+/// The PK-range bounds of `query`'s `quoted_key`, plus the storage class of
+/// its largest value. SQLite orders integer/real < text < blob, so that class
+/// is `text` or `blob` exactly when the key holds a value that is not a
+/// number.
+fn shard_bounds_query(query: &str, quoted_key: &str) -> String {
+    format!(
+        "SELECT CAST(MIN({quoted_key}) AS INTEGER) AS lo, \
+         CAST(MAX({quoted_key}) AS INTEGER) AS hi, \
+         typeof(MAX({quoted_key})) AS hi_type \
+         FROM ({query}) AS _faucet_bounds"
+    )
+}
+
+/// Refuse a shard key holding text or blob values: SQLite compares them with
+/// the integer range literals as text (or above every number), so the ranges
+/// would overlap or miss rows.
+fn check_shard_key_values(key: &str, hi_type: Option<&str>) -> Result<(), FaucetError> {
+    match hi_type {
+        Some("text" | "blob") => Err(FaucetError::Source(format!(
+            "sqlite: shard key {key:?} holds non-integer values (text or blob), which \
+             SQLite does not compare as integers, so integer ranges would overlap; shard \
+             on an integer column, or select it as CAST({key} AS INTEGER) AS {key} in the \
+             query"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Convert a single `SqliteRow` into a JSON object whose keys are the row's
 /// column names. A result with two columns of the same name is refused: a map
 /// keeps only one of them, so the other column's values would vanish.
@@ -307,7 +351,7 @@ fn row_to_json(row: &sqlx::sqlite::SqliteRow) -> Result<Value, FaucetError> {
                  is lost"
             )));
         }
-        map.insert(name.to_string(), sqlite_value_to_json(row, idx));
+        map.insert(name.to_string(), sqlite_value_to_json(row, idx)?);
     }
     Ok(Value::Object(map))
 }
@@ -531,11 +575,8 @@ impl faucet_core::Source for SqliteSource {
             return Ok(vec![ShardSpec::whole()]);
         };
 
-        let bounds_sql = pk_bounds_query(
-            &self.config.query,
-            &quote_ident_sqlite(&shard_cfg.key),
-            "INTEGER",
-        );
+        let bounds_sql =
+            shard_bounds_query(&self.config.query, &quote_ident_sqlite(&shard_cfg.key));
         let row = self
             .calls
             .call_once("query", async {
@@ -558,6 +599,10 @@ impl faucet_core::Source for SqliteSource {
         let hi: Option<i64> = row
             .try_get("hi")
             .map_err(|e| FaucetError::Source(format!("sqlite: shard bounds decode failed: {e}")))?;
+        let hi_type: Option<String> = row
+            .try_get("hi_type")
+            .map_err(|e| FaucetError::Source(format!("sqlite: shard bounds decode failed: {e}")))?;
+        check_shard_key_values(&shard_cfg.key, hi_type.as_deref())?;
         Ok(pk_shards_from_bounds(&shard_cfg.key, lo, hi, target))
     }
 
@@ -687,7 +732,7 @@ mod tests {
             .fetch_all(&source.pool)
             .await
             .unwrap();
-        let v = sqlite_value_to_json(&rows[0], 0);
+        let v = sqlite_value_to_json(&rows[0], 0).unwrap();
         assert_eq!(v, Value::String("AP8=".to_string()), "BLOB must be base64");
     }
 
@@ -750,6 +795,22 @@ mod tests {
             }
             _ => panic!("expected a batch_size Config error"),
         }
+    }
+
+    #[test]
+    fn a_shard_key_holding_text_or_blob_is_refused() {
+        assert!(check_shard_key_values("id", Some("integer")).is_ok());
+        assert!(check_shard_key_values("id", Some("real")).is_ok());
+        assert!(check_shard_key_values("id", Some("null")).is_ok());
+        assert!(check_shard_key_values("id", None).is_ok());
+        for t in ["text", "blob"] {
+            let err = check_shard_key_values("id", Some(t))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("non-integer values"), "{err}");
+            assert!(err.contains("CAST(id AS INTEGER) AS id"), "{err}");
+        }
+        assert!(shard_bounds_query("SELECT 1", "\"k\"").contains("typeof(MAX(\"k\")) AS hi_type"));
     }
 
     // dataset_uri is a pure-config method — test the logic without needing a

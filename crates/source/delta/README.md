@@ -32,6 +32,8 @@ Fabric) write.
 
 Every column is present in every row (a null is `null`); a decimal keeps every digit as a string.
 
+Rows carry the table's schema, not each file's: a column added to the table after a file was written (`ALTER TABLE … ADD COLUMNS`) is `null` in that file's rows, a column a file stores at a narrower or zone-less physical type reads as the table's type (a timestamp as UTC, `…Z`), and partition values are decoded to their column's type. A file column that cannot be cast to the table's type, or a partition value its column cannot hold, fails the read naming the column and the file. The row and columnar paths give the same rows.
+
 ## Configuration
 
 | Field | Type | Default | Notes |
@@ -63,7 +65,7 @@ materialization. Every batch carries the table's schema — its columns in table
 order (only the `columns` requested, when set), a column a file predates
 (`ALTER TABLE … ADD COLUMNS`) as nulls, and a column a file stores at a
 narrower physical type cast to the table's type — so a sink sees one schema for
-the whole run, as on the row path.
+the whole run, exactly as on the row path.
 
 ```yaml
 pipeline:

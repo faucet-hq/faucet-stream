@@ -153,6 +153,7 @@ pub fn build_router(
                 "/v1/feeds/{name}/deliveries/{delivery}/recover",
                 post(f::recover),
             )
+            .route("/v1/feeds/{name}/adopt-store", post(f::adopt_store))
             .route(
                 "/v1/feeds/{name}/tokens",
                 get(f::tokens).post(f::token_create),
@@ -635,10 +636,32 @@ pub(crate) fn lease_interval(lease_ttl: Duration) -> Duration {
 /// heartbeat, a live-member refresh (`member_ttl = period * 3`), and a
 /// failover `reclaim_orphans` that re-queues an expired-lease peer's runs
 /// (capped at `max_attempts`) rather than failing them outright.
+/// This process's clock minus the history database's, in milliseconds,
+/// measured against the midpoint of the round trip; `None` when the read fails.
+pub(crate) async fn measure_clock_offset(state: &ServerState) -> Option<i64> {
+    let before = chrono::Utc::now();
+    let db = state.history().db_now().await.ok()?;
+    let after = chrono::Utc::now();
+    let offset = clock_offset_ms(before, after, db);
+    crate::serve::metrics::set_clock_offset(offset);
+    Some(offset)
+}
+
+/// `(before + after) / 2 - db` in milliseconds.
+pub(crate) fn clock_offset_ms(
+    before: chrono::DateTime<chrono::Utc>,
+    after: chrono::DateTime<chrono::Utc>,
+    db: chrono::DateTime<chrono::Utc>,
+) -> i64 {
+    let mid = before + (after - before) / 2;
+    (mid - db).num_milliseconds()
+}
+
 /// Heartbeat this member and refresh the live-member view: the member count
 /// and the state format every member reads (#736).
 pub(crate) async fn refresh_membership(state: &ServerState, member_ttl: Duration) {
     let cluster = state.cluster();
+    let clock_offset_ms = measure_clock_offset(state).await;
     let beat = crate::serve::history::InstanceHeartbeat {
         started_at: cluster.started_at(),
         listen: Some(cluster.listen().to_string()),
@@ -650,6 +673,7 @@ pub(crate) async fn refresh_membership(state: &ServerState, member_ttl: Duration
             .iter()
             .map(|c| (*c).to_string())
             .collect(),
+        clock_offset_ms,
     };
     if let Err(e) = state.history().heartbeat_instance(&beat).await {
         tracing::warn!(error = %e, "cluster: heartbeat_instance failed");
@@ -729,6 +753,10 @@ pub async fn maintain_leases(
     crate::serve::runner::retry_pending_finalize(state).await;
     let mut renewed = true;
     let forgotten = state.forgotten_runs();
+    // The fence counts from before the renewal: the lease a renewal writes
+    // runs from the database's clock read at its start, not from when the
+    // whole tick ends.
+    let attempted = std::time::Instant::now();
     if let Err(e) = state.history().renew_leases_except(&forgotten).await {
         tracing::warn!(error = %e, "lease heartbeat (renew_leases) failed");
         renewed = false;
@@ -751,9 +779,7 @@ pub async fn maintain_leases(
             return lost;
         }
     }
-    if !health.observe(renewed, std::time::Instant::now(), fence_after)
-        || !state.cluster().enabled()
-    {
+    if !health.observe(renewed, attempted, fence_after) || !state.cluster().enabled() {
         return 0;
     }
     // The fence fires `fence_after` into the outage, short of the lease TTL;
@@ -852,6 +878,16 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
                         ),
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "cluster: purging sealed secret params failed"),
+                    }
+                    // A cancel recorded for a sharded run stops its pending
+                    // shards wherever it was requested.
+                    match state.history().cancel_flagged_shards().await {
+                        Ok(n) if n > 0 => tracing::info!(
+                            cancelled = n,
+                            "cluster: cancelled the pending shards of cancelled runs"
+                        ),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "cluster: cancelling flagged shards failed"),
                     }
                     match crate::serve::runner::sweep_sharded_parents(&state).await {
                         Ok(n) if n > 0 => tracing::info!(
@@ -993,11 +1029,18 @@ pub async fn retry_policy_seed(state: &ServerState) -> Result<(), crate::serve::
 /// Boot the server: install observability, build state + router, bind, serve
 /// until SIGTERM/SIGINT, then drain in-flight runs up to the grace window.
 pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> CliResult<()> {
-    let (prom, log_hub) = crate::serve::observability::install(
+    let (prom, log_hub) = crate::serve::observability::install_with(
         &config.log_level,
         config.log_format,
         config.otel.as_ref(),
+        config.metrics_idle_timeout,
     );
+    if let (Some(handle), Some(idle)) = (&prom, config.metrics_idle_timeout) {
+        tokio::spawn(faucet_core::observability::prune_idle_series(
+            handle.clone(),
+            idle,
+        ));
+    }
     crate::serve::callback::set_allow_hosts(config.callback_allow_hosts.clone());
     let short = crate::serve::auth::short_tokens(&config.auth);
     if short > 0 {
@@ -1285,6 +1328,41 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         #[cfg(feature = "triggers")]
         triggers_handle,
     );
+    // Template versions this server's own files pin are never pruned.
+    {
+        #[allow(unused_mut)]
+        let mut references: Vec<serde_json::Value> = Vec::new();
+        #[cfg(all(feature = "schedule", feature = "templates"))]
+        references.extend(
+            schedules_file
+                .iter()
+                .filter_map(|s| serde_json::to_value(&s.template).ok()),
+        );
+        #[cfg(feature = "triggers")]
+        if let Some(t) = &triggers {
+            references.extend(
+                t.triggers
+                    .iter()
+                    .filter_map(|c| c.spec.template.as_ref())
+                    .filter_map(|t| serde_json::to_value(t).ok()),
+            );
+        }
+        #[cfg(feature = "feeds")]
+        references.extend(
+            feeds_file
+                .feeds
+                .iter()
+                .flat_map(|f| f.deliveries.iter())
+                .filter_map(|d| d.template.as_ref())
+                .filter_map(|t| serde_json::to_value(t).ok()),
+        );
+        state.history().set_file_pins(
+            references
+                .iter()
+                .flat_map(crate::serve::history::templates::reference_pins)
+                .collect(),
+        );
+    }
     // Template tests this server runs screen for its credentials and record
     // this instance on their results (#856).
     #[cfg(feature = "templates")]
@@ -1538,6 +1616,9 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         crate::serve::feeds::service::check_file_deliveries(&state)
             .await
             .map_err(CliError::Serve)?;
+        crate::serve::feeds::service::refuse_moved_file_feeds(&state)
+            .await
+            .map_err(CliError::Serve)?;
         state.feeds().lease_tick(&state).await;
     }
 
@@ -1664,6 +1745,24 @@ async fn wait_for_signal() {
 mod tests {
     use super::*;
     use crate::serve::history::memory::MemoryHistory;
+
+    #[test]
+    fn the_clock_offset_is_measured_at_the_round_trip_midpoint() {
+        let before = chrono::Utc::now();
+        let after = before + chrono::Duration::milliseconds(100);
+        assert_eq!(clock_offset_ms(before, after, before), 50);
+        assert_eq!(
+            clock_offset_ms(before, after, before + chrono::Duration::seconds(2)),
+            -1950
+        );
+    }
+
+    #[tokio::test]
+    async fn the_heartbeat_reports_a_measured_offset() {
+        let state = crate::serve::test_support::test_state();
+        let offset = measure_clock_offset(&state).await.unwrap();
+        assert!(offset.abs() < 1000, "{offset}");
+    }
     use crate::serve::history::{RunRecord, RunStatus};
     use chrono::Utc;
     use std::collections::BTreeMap;

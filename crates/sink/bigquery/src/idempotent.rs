@@ -323,6 +323,30 @@ WHEN NOT MATCHED THEN INSERT ({scope}, {token}, updated_at) VALUES (S.{scope}, S
     )
 }
 
+/// The message the watermark guard raises when the scope already holds a
+/// commit at or past the page's sequence. Recognised only on the
+/// exactly-once path.
+pub const WATERMARK_AHEAD_MARKER: &str = "faucet-eo-watermark-ahead";
+
+/// The first statement of an exactly-once transaction: roll back and raise
+/// [`WATERMARK_AHEAD_MARKER`] when the scope's stored token is at or past
+/// `@token`'s sequence. Tokens start with a fixed-width 20-digit sequence, so
+/// comparing that prefix as text orders them numerically. If another writer
+/// commits after the check, BigQuery aborts this transaction for the
+/// concurrent update on the token table and the retry sees the commit.
+pub fn build_watermark_guard(project: &str, dataset: &str) -> String {
+    format!(
+        "IF EXISTS (SELECT 1 FROM {t} WHERE {scope} = @scope \
+AND SUBSTR({token}, 1, 20) >= SUBSTR(@token, 1, 20)) THEN\n\
+  ROLLBACK TRANSACTION;\n\
+  RAISE USING MESSAGE = '{WATERMARK_AHEAD_MARKER}';\n\
+END IF",
+        t = commit_table_ref(project, dataset),
+        scope = COMMIT_TOKEN_SCOPE_COL,
+        token = COMMIT_TOKEN_TOKEN_COL,
+    )
+}
+
 /// The atomic overwrite swap (#492): replace `target_ref`'s contents with
 /// `temp_ref`'s in one multi-statement transaction. `TRUNCATE`+`INSERT … SELECT`
 /// (rather than `CREATE OR REPLACE … AS SELECT`) preserves the target table's
@@ -379,7 +403,8 @@ pub(crate) fn build_insert_select(
     )
 }
 
-/// The full atomic transaction: typed INSERT of the page + watermark MERGE.
+/// The full atomic transaction: the watermark guard, the typed INSERT of the
+/// page and the watermark MERGE.
 pub fn build_transaction_sql(
     columns: &[FieldSpec],
     project: &str,
@@ -387,7 +412,8 @@ pub fn build_transaction_sql(
     table: &str,
 ) -> String {
     format!(
-        "BEGIN TRANSACTION;\n{insert};\n{merge};\nCOMMIT TRANSACTION;",
+        "BEGIN TRANSACTION;\n{guard};\n{insert};\n{merge};\nCOMMIT TRANSACTION;",
+        guard = build_watermark_guard(project, dataset),
         insert = build_insert_select(columns, project, dataset, table),
         merge = build_merge_token(project, dataset),
     )
@@ -395,6 +421,39 @@ pub fn build_transaction_sql(
 
 /// Top-level record fields with no matching column in `columns`, sorted and
 /// deduplicated (SQL-94). Non-object records contribute nothing.
+/// `records` with each top-level field renamed to the spelling of the column
+/// it addresses (the exactly-named field first, else one equal ignoring case,
+/// as BigQuery resolves column names). The typed `JSON_VALUE` / `JSON_QUERY`
+/// extraction reads `$.<column>` case-sensitively, so a field spelled
+/// differently from its column would otherwise be read as `NULL`.
+pub(crate) fn canonical_records<'a>(
+    columns: &[FieldSpec],
+    records: &'a [Value],
+) -> std::borrow::Cow<'a, [Value]> {
+    let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+    let exact: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+    let needs = records.iter().any(|r| {
+        r.as_object()
+            .is_some_and(|o| o.keys().any(|k| !exact.contains(k.as_str())))
+    });
+    if !needs {
+        return std::borrow::Cow::Borrowed(records);
+    }
+    std::borrow::Cow::Owned(
+        records
+            .iter()
+            .map(|r| match r.as_object() {
+                Some(obj) => Value::Object(faucet_core::canonical_record(
+                    obj,
+                    &names,
+                    faucet_core::ColumnMatching::CaseInsensitive,
+                )),
+                None => r.clone(),
+            })
+            .collect(),
+    )
+}
+
 pub(crate) fn unknown_fields(columns: &[FieldSpec], records: &[Value]) -> Vec<String> {
     let known: std::collections::HashSet<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -1053,6 +1112,22 @@ mod tests {
     }
 
     #[test]
+    fn the_watermark_guard_rolls_back_and_raises_the_marker() {
+        assert_eq!(
+            build_watermark_guard("p", "d"),
+            "IF EXISTS (SELECT 1 FROM `p.d._faucet_commit_token` WHERE scope = @scope \
+AND SUBSTR(token, 1, 20) >= SUBSTR(@token, 1, 20)) THEN\nROLLBACK TRANSACTION;\n\
+RAISE USING MESSAGE = 'faucet-eo-watermark-ahead';\nEND IF"
+        );
+        let cols = vec![scalar("id", BqType::Int64)];
+        let sql = build_transaction_sql(&cols, "p", "d", "t");
+        let g = sql.find("IF EXISTS").unwrap();
+        let i = sql.find("INSERT INTO").unwrap();
+        assert!(sql.starts_with("BEGIN TRANSACTION;\nIF EXISTS"), "{sql}");
+        assert!(g < i, "the guard runs before the page is written: {sql}");
+    }
+
+    #[test]
     fn transaction_sql_wraps_insert_and_merge() {
         let cols = vec![scalar("id", BqType::Int64), scalar("name", BqType::String)];
         let sql = build_transaction_sql(&cols, "p", "d", "t");
@@ -1113,6 +1188,40 @@ mod tests {
             ]
         );
         assert_eq!(shape_mismatches(&columns, &bad, 2).len(), 2);
+    }
+
+    #[test]
+    fn canonical_records_use_the_column_spelling_the_extraction_reads() {
+        let col = |n: &str| FieldSpec {
+            name: n.into(),
+            ty: BqType::String,
+            repeated: false,
+            fields: vec![],
+        };
+        let columns = vec![col("Id"), col("Email")];
+        let exact = vec![json!({"Id": 1, "Email": "a"})];
+        assert!(matches!(
+            canonical_records(&columns, &exact),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let records = vec![
+            json!({"id": 1, "EMAIL": "a"}),
+            json!({"Id": 2, "email": "shadowed", "Email": "b", "extra": 1}),
+            json!(5),
+        ];
+        let out = canonical_records(&columns, &records);
+        assert_eq!(
+            out.as_ref(),
+            &[
+                json!({"Id": 1, "Email": "a"}),
+                json!({"Id": 2, "Email": "b", "extra": 1}),
+                json!(5),
+            ]
+        );
+        // Every key the typed insert reads (`$.Id`, `$.Email`) is now present.
+        let sql = build_insert_select(&columns, "p", "d", "t");
+        assert!(sql.contains("'$.Id'") && sql.contains("'$.Email'"), "{sql}");
+        assert_eq!(unknown_fields(&columns, &out), vec!["extra"]);
     }
 
     #[test]

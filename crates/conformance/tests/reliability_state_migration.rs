@@ -302,3 +302,78 @@ async fn legacy_writes_for_a_mixed_version_cluster_store_the_bare_bookmark() {
         "{err:?}"
     );
 }
+
+/// `Keyed`, refusing any bookmark still wrapped in the exactly-once envelope —
+/// a real source reads only its own bookmark shape.
+struct BareOnly<'a>(&'a PagedSource);
+
+#[async_trait]
+impl Source for BareOnly<'_> {
+    async fn fetch_with_context(
+        &self,
+        ctx: &HashMap<String, Value>,
+    ) -> Result<Vec<Value>, FaucetError> {
+        self.0.fetch_with_context(ctx).await
+    }
+    fn stream_pages<'a>(
+        &'a self,
+        ctx: &'a HashMap<String, Value>,
+        batch_size: usize,
+    ) -> Pin<Box<dyn futures_core::Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>>
+    {
+        self.0.stream_pages(ctx, batch_size)
+    }
+    fn state_key(&self) -> Option<String> {
+        Some("orders::row".into())
+    }
+    async fn apply_start_bookmark(&self, bookmark: Value) -> Result<(), FaucetError> {
+        if faucet_core::idempotency::is_eo_envelope(&bookmark) {
+            return Err(FaucetError::State(format!(
+                "the source was handed the exactly-once envelope: {bookmark}"
+            )));
+        }
+        self.0.apply_start_bookmark(bookmark).await
+    }
+    fn supports_exactly_once(&self) -> bool {
+        true
+    }
+    fn config_schema(&self) -> Value {
+        self.0.config_schema()
+    }
+    fn connector_name(&self) -> &'static str {
+        "paged"
+    }
+}
+
+#[tokio::test]
+async fn switching_from_exactly_once_to_at_least_once_keeps_the_position() {
+    let log = EventLog::new();
+    let sink = ScriptedSink::new(log.clone()).idempotent();
+    let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+
+    let first = PagedSource::new(5, 4).failing_after(3);
+    let _ = Pipeline::new(&BareOnly(&first), &sink)
+        .with_state_store(store.clone())
+        .with_delivery(DeliveryMode::ExactlyOnce)
+        .run()
+        .await;
+    let stored = store.get("orders::row").await.unwrap().expect("state");
+    assert!(faucet_core::state_version::is_versioned(&stored));
+    assert!(faucet_core::idempotency::is_eo_envelope(
+        &faucet_core::state_version::peel_versioned(&stored)
+    ));
+
+    sink.rearm(Boundary::Never);
+    let second = PagedSource::new(5, 4);
+    Pipeline::new(&BareOnly(&second), &sink)
+        .with_state_store(store)
+        .run()
+        .await
+        .expect("at-least-once run");
+    assert_eq!(
+        second.emitted_pages(),
+        vec![3, 4],
+        "the at-least-once run resumes after the last exactly-once page"
+    );
+    assert_eq!(log.records_written(), 20, "no page lost or written twice");
+}

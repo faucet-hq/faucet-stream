@@ -246,6 +246,7 @@ async fn an_overwrite_commit_replaces_the_previous_objects() {
         .contents()
         .iter()
         .filter_map(|o| o.key().map(str::to_string))
+        .filter(|k| !k.contains(".commits/"))
         .collect();
     assert_eq!(keys.len(), 3, "three new parts and nothing else: {keys:?}");
     let mut ids = Vec::new();

@@ -281,3 +281,36 @@ async fn conformance_declared_types_create() {
     )
     .await;
 }
+
+/// Check 28: Spanner identifiers are case-insensitive — a lower-case field
+/// lands in a mixed-case column, a mixed-case `table_name` finds the table,
+/// and `on_drift: ignore` keeps the field.
+#[tokio::test(flavor = "multi_thread")]
+async fn conformance_drift_resolves_like_writes() {
+    let conn = support::create_database(
+        "conf-case",
+        vec![
+            "CREATE TABLE Users (id INT64 NOT NULL, Email STRING(MAX)) PRIMARY KEY (id)"
+                .to_string(),
+        ],
+    )
+    .await;
+    let mut cfg = SpannerSinkConfig::new(
+        conn.project_id.clone(),
+        conn.instance.clone(),
+        conn.database.clone(),
+        "users",
+    )
+    .with_batch_size(0);
+    cfg.connection.emulator_host = conn.emulator_host.clone();
+    let sink = SpannerSink::new(cfg).await.expect("sink");
+    faucet_conformance::assert_drift_resolves_like_writes(&sink, "Email", "email", |id| {
+        let conn = conn.clone();
+        async move {
+            support::first_string(&conn, &format!("SELECT Email FROM Users WHERE id = {id}"))
+                .await
+                .map(serde_json::Value::from)
+        }
+    })
+    .await;
+}

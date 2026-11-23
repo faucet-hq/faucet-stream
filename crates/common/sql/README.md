@@ -20,6 +20,12 @@ used to carry its own copy of.
   unless the record already carries that column or several match) or
   `UpperFold` (a field reaches an all-upper-case column through its
   upper-case form). Union column sets and present-column groups.
+  `mapping::column_for_field` delegates to `faucet_core::column_for_field`
+  (`From<ColumnMatching> for faucet_core::ColumnMatching`), and
+  `SqlSinkDriver` reports the dialect's rule as the sink's
+  `column_matching()`, so schema drift resolves fields the way the engine
+  writes them. `evolution_steps` skips an addition that already resolves to an
+  existing column under that rule.
 - **`SqlSinkEngine<D>`** — the planning, run over a backend's `SqlExecutor`:
   mapping (a record matching no column is an error), union-column appends
   (a missing column binds NULL), one upsert per set of carried columns (an
@@ -112,6 +118,14 @@ engine.apply_plans(&mut Exec { conn: &mut tx }, &target, &plans).await?;
 
 The backend keeps transactions, bulk-load paths (`COPY`), overwrite swaps and
 catalog queries, and words its own errors per `StatementKind`.
+
+## Instants into columns without a zone
+
+`temporal::naive_temporal(sql_type)` recognises a zone-less `timestamp` /
+`time` type, and `naive_temporal_text(sql_type, text)` turns an offset-bearing
+value bound for one into its UTC wall time (`None` = bind it unchanged). The
+`postgres` and `redshift` sinks bind through it, so an instant from a zoned
+source is not stored with its offset dropped.
 
 ## Who uses what
 

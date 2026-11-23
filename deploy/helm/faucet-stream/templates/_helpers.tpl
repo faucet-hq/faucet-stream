@@ -348,10 +348,38 @@ true
 
 {{/*
 serve.history.backend, lower-cased (validation.yaml refuses any other value).
-Unset is the server's own default (#1049): a SQLite file in the data dir.
+Unset: read from serve.history.url with the server's own --history grammar
+(case-sensitive postgres:// | postgresql:// | sqlite: | memory); with no url,
+the server's default (#1049), a SQLite file in the data dir.
 */}}
 {{- define "faucet-stream.historyBackend" -}}
-{{- .Values.serve.history.backend | default "sqlite" | toString | lower | trim -}}
+{{- $h := .Values.serve.history -}}
+{{- if $h.backend -}}
+{{- $h.backend | toString | lower | trim -}}
+{{- else if $h.url -}}
+{{- $u := toString $h.url -}}
+{{- if or (hasPrefix "postgres://" $u) (hasPrefix "postgresql://" $u) -}}
+postgres
+{{- else if hasPrefix "sqlite:" $u -}}
+sqlite
+{{- else if eq $u "memory" -}}
+memory
+{{- else -}}
+{{- fail "cannot tell the history backend from serve.history.url (the server accepts postgres://, postgresql://, sqlite:<path> or memory); set serve.history.backend." -}}
+{{- end -}}
+{{- else if $h.existingSecret -}}
+{{- fail "serve.history.existingSecret needs serve.history.backend (postgres or sqlite): the chart cannot read the secret to tell which history it names." -}}
+{{- else -}}
+sqlite
+{{- end -}}
+{{- end -}}
+
+{{/* "true" when serve.history.url reaches the pod through the chart's Secret:
+     any url but memory, unless an existingSecret is given. */}}
+{{- define "faucet-stream.historyUrlSecret" -}}
+{{- if and .Values.serve.history.url (not .Values.serve.history.existingSecret) (ne (include "faucet-stream.historyBackend" .) "memory") -}}
+true
+{{- end -}}
 {{- end -}}
 
 {{/* The env var a named feed store's URL is read from: FAUCET_FEED_STORE_<NAME>. */}}

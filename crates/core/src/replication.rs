@@ -8,6 +8,9 @@ use serde_json::Value;
 use std::cmp::Ordering;
 
 pub mod cursor;
+mod pass;
+
+pub use pass::{PassEnd, ResumeRules, Truncation, bookmark_after_pass};
 
 /// Determines how records are replicated from the source.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]

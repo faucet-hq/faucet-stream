@@ -1,9 +1,10 @@
 //! [`WriteSettings`] and [`FileWriter`]: the part of a file sink that does not
 //! depend on where files are stored.
 
-use super::backend::{Area, StorageBackend};
+use super::backend::{Area, SideCreate, StorageBackend};
 use super::encode::{Closed, Ctx, Failure, OpenFile, remove_fetched};
 use super::layout::{NameTemplate, OLD_ROLE, tmp_path};
+use super::lock::{Acquired, LockGuard, Purpose};
 use super::options::{FileWriteMode, IfExists, JsonLinesOptions, ParquetCodec, ParquetOptions};
 use faucet_core::{Compression, FaucetError, FileFormat, FormatOptions};
 use futures::stream::{self, StreamExt};
@@ -30,6 +31,13 @@ pub const COMMIT_LEASE: std::time::Duration = std::time::Duration::from_secs(60 
 /// Files moved or deleted at once when an overwrite run's files are moved
 /// into place.
 const SWAP_CONCURRENCY: usize = 8;
+/// The side-file name prefix of a part claim: `claim-<file name>`.
+const CLAIM_PREFIX: &str = "claim-";
+/// Part numbers a numbered append tries before it gives up.
+const MAX_CLAIM_TRIES: u32 = 10_000;
+/// Age past which a claim whose part was never published (its writer
+/// crashed) is pruned.
+const CLAIM_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Everything the writer needs to know about the output, independent of
 /// storage. Build it from a sink config with
@@ -281,6 +289,9 @@ struct State {
     /// Whether a publish not yet settled carries data a caller was already
     /// told was written.
     pending_at_risk: bool,
+    /// The output lock an append that cannot add to the stored object per
+    /// flush holds until the writer is done.
+    append_hold: Option<LockGuard>,
 }
 
 impl State {
@@ -322,6 +333,8 @@ pub struct FileWriter {
     /// The overwrite run this writer belongs to (see
     /// [`join_overwrite_run`](Self::join_overwrite_run)).
     overwrite_run: std::sync::OnceLock<String>,
+    /// The run's call context: lock waits end on its cancel and deadline.
+    calls: std::sync::Mutex<faucet_core::io::CallContext>,
 }
 
 impl FileWriter {
@@ -345,7 +358,41 @@ impl FileWriter {
             state: tokio::sync::Mutex::new(State::default()),
             outputs: faucet_core::LocalOutputLog::new(),
             overwrite_run: std::sync::OnceLock::new(),
+            calls: std::sync::Mutex::new(faucet_core::io::CallContext::new()),
         })
+    }
+
+    /// Install the run's call context: waits for the output lock end when it
+    /// is cancelled or its deadline passes.
+    pub fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
+        *self.calls.lock().unwrap_or_else(|p| p.into_inner()) = ctx;
+    }
+
+    /// The name of this output in lock messages, and the key of its lock in
+    /// this process.
+    fn lock_label(&self) -> String {
+        self.backend
+            .describe(Area::Destination, &self.template.name)
+    }
+
+    async fn lock(
+        &self,
+        purpose: Purpose,
+        wait: std::time::Duration,
+    ) -> Result<Acquired, FaucetError> {
+        let ctx = self.calls.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        super::lock::acquire(&self.backend, &self.lock_label(), purpose, wait, &ctx).await
+    }
+
+    /// Whether an append adds to one shared line file per flush: the scratch
+    /// file holds only this writer's new lines, and each publish appends them
+    /// to the stored object under the output lock, so concurrent appenders
+    /// interleave by flush and lose nothing.
+    fn rebases(&self) -> bool {
+        self.settings.if_exists == IfExists::Append
+            && !self.template.numbered()
+            && self.settings.line_based()
+            && !self.settings.encrypted()
     }
 
     /// Join overwrite run `token`
@@ -460,12 +507,47 @@ impl FileWriter {
                 1
             };
         }
+        if append && self.template.numbered() {
+            self.claim_part(st, area).await?;
+        }
         let name = self.template.file_name(st.next_part);
+        if self.settings.if_exists == IfExists::Error {
+            self.claim_name(area, &name).await?;
+        }
+        let rebase = self.rebases();
+        if append && !self.template.numbered() && !rebase && st.append_hold.is_none() {
+            let wait = super::lock::timings().wait_max;
+            match self.lock(Purpose::Append, wait).await? {
+                Acquired::Held(g) => st.append_hold = Some(g),
+                Acquired::Unsupported => {}
+                Acquired::Busy => return Err(self.busy_error(wait, "nothing was written")),
+            }
+        }
+        if rebase && let Some(dest) = self.backend.local_path(area, &name) {
+            let label = self.backend.describe(area, &name);
+            let lines = self.settings.codec == Compression::None;
+            tokio::task::spawn_blocking(move || match dest.try_exists() {
+                Ok(true) => super::encode::refuse_encrypted(&dest, &label, lines),
+                _ => Ok(()),
+            })
+            .await
+            .map_err(|e| {
+                FaucetError::Sink(format!("file sink: a file-system task did not finish: {e}"))
+            })??;
+        }
         let exists = match self.settings.if_exists {
             IfExists::Replace => false,
+            IfExists::Append if rebase => false,
             IfExists::Append | IfExists::Error => self.backend.exists(area, &name).await?,
         };
         if exists && self.settings.if_exists == IfExists::Error {
+            if let Err(e) = self
+                .backend
+                .delete_side_file(&format!("{CLAIM_PREFIX}{name}"))
+                .await
+            {
+                tracing::warn!(error = %e, "file sink: could not drop the claim of a refused file; a later run prunes it");
+            }
             return Err(FaucetError::Sink(format!(
                 "file sink: '{}' already exists and `if_exists` is `error`",
                 self.backend.describe(area, &name)
@@ -483,7 +565,7 @@ impl FileWriter {
         } else {
             None
         };
-        let part_size = if self.can_stream() && existing.is_none() {
+        let part_size = if self.can_stream() && existing.is_none() && !rebase {
             self.backend.part_size()
         } else {
             None
@@ -497,8 +579,186 @@ impl FileWriter {
         }
         let mut file = opened?;
         file.first_call = call;
+        file.rebase = rebase;
         st.current = Some(file);
         Ok(())
+    }
+
+    fn busy_error(&self, wait: std::time::Duration, outcome: &str) -> FaucetError {
+        FaucetError::Sink(format!(
+            "file sink: another run held '{}' for {}s; {outcome}",
+            self.lock_label(),
+            wait.as_secs()
+        ))
+    }
+
+    fn claim_body() -> String {
+        format!(
+            "owner={} wall={}",
+            uuid::Uuid::new_v4().simple(),
+            unix_secs()
+        )
+    }
+
+    /// A numbered append: claim the next part no other writer has, so two
+    /// runs appending at once never publish the same name. A claimed number
+    /// whose file already exists (a claim pruned after its part landed) is
+    /// skipped too.
+    async fn claim_part(&self, st: &mut State, area: Area) -> Result<(), FaucetError> {
+        for _ in 0..MAX_CLAIM_TRIES {
+            let name = self.template.file_name(st.next_part);
+            match self
+                .backend
+                .create_side_file(&format!("{CLAIM_PREFIX}{name}"), &Self::claim_body())
+                .await?
+            {
+                SideCreate::Unsupported => return Ok(()),
+                SideCreate::Created if !self.backend.exists(area, &name).await? => return Ok(()),
+                _ => st.next_part += 1,
+            }
+        }
+        Err(FaucetError::Sink(format!(
+            "file sink: no free part number for '{}' after {MAX_CLAIM_TRIES} tries",
+            self.lock_label()
+        )))
+    }
+
+    /// `if_exists: error`: claim `name`, so of two runs that both find it
+    /// absent only one writes it. A claim older than [`COMMIT_LEASE`] whose
+    /// file never landed was left by a run that is gone, and is taken over.
+    async fn claim_name(&self, area: Area, name: &str) -> Result<(), FaucetError> {
+        let claim = format!("{CLAIM_PREFIX}{name}");
+        if self
+            .backend
+            .create_side_file(&claim, &Self::claim_body())
+            .await?
+            != SideCreate::Exists
+        {
+            return Ok(());
+        }
+        let stale = self
+            .backend
+            .read_side_file(&claim)
+            .await?
+            .and_then(|b| claim_wall(&b))
+            .is_none_or(|w| unix_secs().saturating_sub(w) >= COMMIT_LEASE.as_secs());
+        if stale && !self.backend.exists(area, name).await? {
+            return self
+                .backend
+                .write_side_file(&claim, &Self::claim_body())
+                .await;
+        }
+        Err(FaucetError::Sink(format!(
+            "file sink: '{}' is being written by another run and `if_exists` is `error`",
+            self.backend.describe(area, name)
+        )))
+    }
+
+    /// Delete the part claims whose files landed, and those older than
+    /// [`CLAIM_MAX_AGE`] (left by runs that crashed). Best effort.
+    async fn prune_claims(&self) -> Result<(), FaucetError> {
+        let claims = self.backend.list_side_files(CLAIM_PREFIX).await?;
+        if claims.is_empty() {
+            return Ok(());
+        }
+        let landed: std::collections::HashSet<String> = self
+            .backend
+            .list(Area::Destination)
+            .await?
+            .into_iter()
+            .collect();
+        let now = unix_secs();
+        for claim in claims {
+            let name = claim.strip_prefix(CLAIM_PREFIX).unwrap_or_default();
+            let gone = landed.contains(name)
+                || self
+                    .backend
+                    .read_side_file(&claim)
+                    .await?
+                    .and_then(|b| claim_wall(&b))
+                    .is_some_and(|w| now.saturating_sub(w) >= CLAIM_MAX_AGE.as_secs());
+            if gone {
+                self.backend.delete_side_file(&claim).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish a [`rebases`](Self::rebases) file: under the output lock, add
+    /// this writer's new lines to the stored object (or create it).
+    async fn publish_rebased(&self, f: &mut OpenFile) -> Result<(), FaucetError> {
+        let wait = super::lock::timings().wait_max;
+        let guard = match self.lock(Purpose::Append, wait).await? {
+            Acquired::Held(g) => Some(g),
+            Acquired::Unsupported => None,
+            Acquired::Busy => {
+                return Err(self.busy_error(wait, "nothing of this flush was published"));
+            }
+        };
+        let target = Rebase {
+            area: f.area,
+            name: f.name.clone(),
+            tmp: f.tmp.clone(),
+            label: f.label.clone(),
+            old: f.fetch_path(),
+        };
+        let result = fenced(guard.as_ref(), self.add_to_stored(target)).await;
+        if let Some(g) = guard {
+            g.release().await;
+        }
+        result
+    }
+
+    async fn add_to_stored(&self, f: Rebase) -> Result<(), FaucetError> {
+        let pretty =
+            self.settings.format == FileFormat::JsonLines && self.settings.json_lines.pretty;
+        let plain = self.settings.codec == Compression::None;
+        let Rebase {
+            area,
+            name,
+            tmp,
+            label,
+            old,
+        } = f;
+        if let Some(dest) = self.backend.local_path(area, &name)
+            && self.ctx().appends_in_place()
+        {
+            if dest.exists() {
+                return blocking(|| {
+                    super::encode::refuse_encrypted(&dest, &label, plain)?;
+                    super::encode::cut_torn_line(&dest, pretty)?;
+                    super::encode::append_published(&tmp, &dest, &label)
+                });
+            }
+            return self.backend.publish(&tmp, area, &name).await;
+        }
+        if !self.backend.exists(area, &name).await? {
+            self.backend.publish(&tmp, area, &name).await?;
+            return self.backend.settle().await;
+        }
+        self.backend.fetch(area, &name, &old).await?;
+        let joined = blocking(|| {
+            super::encode::refuse_encrypted(&old, &label, plain)?;
+            if plain {
+                super::encode::cut_torn_line(&old, pretty)?;
+            }
+            let mut out = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&old)
+                .map_err(|e| super::layout::io_err("opening", &old, e))?;
+            let mut src =
+                std::fs::File::open(&tmp).map_err(|e| super::layout::io_err("opening", &tmp, e))?;
+            std::io::copy(&mut src, &mut out)
+                .map_err(|e| super::layout::io_err("appending to", &old, e))?;
+            Ok::<_, FaucetError>(())
+        });
+        if let Err(e) = joined {
+            let _ = std::fs::remove_file(&old);
+            return Err(e);
+        }
+        let _ = std::fs::remove_file(&tmp);
+        self.backend.publish(&old, area, &name).await?;
+        self.backend.settle().await
     }
 
     /// A local copy of the published file when the next write continues it.
@@ -595,6 +855,7 @@ impl FileWriter {
         let ctx = self.ctx();
         match blocking(|| f.close(&ctx))? {
             Closed::Nothing => {}
+            Closed::File if f.rebase => self.publish_rebased(f).await?,
             Closed::File => match f.delta.clone() {
                 Some(dest) => {
                     let (tmp, label) = (f.tmp.clone(), f.label.clone());
@@ -820,10 +1081,18 @@ impl FileWriter {
     /// template's files the run did not write (parts left by a longer
     /// earlier run). Skipped when the template's names are unique to the run.
     pub async fn complete(&self) -> Result<(), FaucetError> {
-        if self.settings.if_exists != IfExists::Replace
-            || self.overwriting()
-            || !self.settings.prune_stale
-        {
+        let hold = self.state.lock().await.append_hold.take();
+        if let Some(g) = hold {
+            g.release().await;
+        }
+        if self.settings.if_exists != IfExists::Replace {
+            self.backend.settle().await?;
+            if let Err(e) = self.prune_claims().await {
+                tracing::warn!(error = %e, "file sink: could not prune part claims; they are pruned by a later run");
+            }
+            return Ok(());
+        }
+        if self.overwriting() || !self.settings.prune_stale {
             return Ok(());
         }
         let st = self.state.lock().await;
@@ -848,8 +1117,21 @@ impl FileWriter {
     /// then start with an empty swap area.
     pub async fn begin_overwrite(&self) -> Result<(), FaucetError> {
         self.backend.prepare(Area::Destination).await?;
-        self.finish_interrupted_move().await?;
-        self.finish_other_runs_moves().await?;
+        if self.needs_recovery().await? {
+            let wait = super::lock::timings().wait_max;
+            let guard = match self.lock(Purpose::Commit, wait).await? {
+                Acquired::Held(g) => Some(g),
+                Acquired::Unsupported => None,
+                Acquired::Busy => {
+                    return Err(self.busy_error(wait, "this overwrite run did not start"));
+                }
+            };
+            let recovered = self.recover(guard.as_ref()).await;
+            if let Some(g) = guard {
+                g.release().await;
+            }
+            recovered?;
+        }
         self.clear_swap().await?;
         self.sweep_swap_areas().await?;
         self.backend.prepare(Area::Swap).await?;
@@ -864,7 +1146,67 @@ impl FileWriter {
     /// records.
     pub async fn commit_overwrite(&self) -> Result<(), FaucetError> {
         self.backend.settle().await?;
-        match self.finish_interrupted_move().await? {
+        let wait = super::lock::timings().wait_max;
+        let guard = match self.lock(Purpose::Commit, wait).await? {
+            Acquired::Held(g) => Some(g),
+            Acquired::Unsupported => None,
+            Acquired::Busy => {
+                return Err(FaucetError::Sink(format!(
+                    "file sink: another run is still committing '{}'; nothing was moved",
+                    self.lock_label()
+                )));
+            }
+        };
+        let result = self.commit_locked(guard.as_ref()).await;
+        if let Some(g) = guard {
+            g.release().await;
+        }
+        result
+    }
+
+    /// Whether a begin or abort has a commit to finish or drop: this run's
+    /// own, or one whose owner is gone. A live commit is left alone, so a
+    /// begin does not wait behind it.
+    async fn needs_recovery(&self) -> Result<bool, FaucetError> {
+        if self.backend.exists(Area::Swap, COMMIT_MARKER).await? {
+            return Ok(true);
+        }
+        let Some(own) = self.overwrite_run.get() else {
+            return Ok(false);
+        };
+        let mut runs: Vec<Option<String>> = vec![None];
+        runs.extend(
+            self.backend
+                .swap_runs()
+                .await?
+                .into_iter()
+                .filter(|t| t != own)
+                .map(Some),
+        );
+        let now = unix_secs();
+        for run in runs {
+            if let Some(text) = self
+                .backend
+                .read_swap_run_marker(run.as_deref(), COMMIT_MARKER)
+                .await?
+                && !CommitMarker::parse(&text).owner_alive(now)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Under the output lock: finish this run's interrupted move, then the
+    /// commits other runs left. Every read is made after the lock is taken.
+    async fn recover(&self, g: Option<&LockGuard>) -> Result<OwnMove, FaucetError> {
+        let own = self.finish_interrupted_move(g).await?;
+        self.finish_other_runs_moves(g).await?;
+        Ok(own)
+    }
+
+    async fn commit_locked(&self, g: Option<&LockGuard>) -> Result<(), FaucetError> {
+        match self.finish_interrupted_move(g).await? {
             OwnMove::None => {}
             OwnMove::Finished => return Ok(()),
             OwnMove::Superseded => {
@@ -896,7 +1238,9 @@ impl FileWriter {
             names,
         };
         self.put_marker(COMMIT_MARKER, &marker.render()).await?;
-        let result = self.move_into_place(marker.seq, marker.names.clone()).await;
+        let result = self
+            .move_into_place(marker.seq, marker.names.clone(), g)
+            .await;
         if result.is_err() {
             self.release_marker(marker).await;
         }
@@ -920,10 +1264,33 @@ impl FileWriter {
     pub async fn abort_overwrite(&self) -> Result<(), FaucetError> {
         self.discard().await;
         self.backend.cancel().await;
-        if self.finish_interrupted_move().await? != OwnMove::None {
-            return Ok(());
+        if self.needs_recovery().await? {
+            let guard = match self
+                .lock(Purpose::Commit, super::lock::timings().abort_wait)
+                .await?
+            {
+                Acquired::Held(g) => Some(g),
+                Acquired::Unsupported => None,
+                Acquired::Busy => {
+                    tracing::info!(
+                        output = %self.lock_label(),
+                        "file sink: another run is committing this output; leaving the \
+                         recovery of interrupted commits to the next run"
+                    );
+                    if self.backend.exists(Area::Swap, COMMIT_MARKER).await? {
+                        return Ok(());
+                    }
+                    return self.clear_swap().await;
+                }
+            };
+            let recovered = self.recover(guard.as_ref()).await;
+            if let Some(g) = guard {
+                g.release().await;
+            }
+            if recovered? != OwnMove::None {
+                return Ok(());
+            }
         }
-        self.finish_other_runs_moves().await?;
         self.clear_swap().await
     }
 
@@ -947,6 +1314,9 @@ impl FileWriter {
                 s.abort().await;
             }
             f.discard();
+        }
+        if let Some(g) = st.append_hold.take() {
+            g.release().await;
         }
     }
 
@@ -975,7 +1345,12 @@ impl FileWriter {
 
     /// Record that the commit with sequence `seq` finished, unless the ledger
     /// already holds a later one.
-    async fn record_commit(&self, seq: u128) -> Result<(), FaucetError> {
+    async fn record_commit(&self, seq: u128, g: Option<&LockGuard>) -> Result<(), FaucetError> {
+        verify(g).await?;
+        fenced(g, self.write_ledger(seq)).await
+    }
+
+    async fn write_ledger(&self, seq: u128) -> Result<(), FaucetError> {
         if self
             .last_commit_seq()
             .await?
@@ -1045,7 +1420,7 @@ impl FileWriter {
     /// commit would otherwise leave the destination part old, part new until
     /// the next successful overwrite, since every run stages in an area of
     /// its own.
-    async fn finish_other_runs_moves(&self) -> Result<(), FaucetError> {
+    async fn finish_other_runs_moves(&self, g: Option<&LockGuard>) -> Result<(), FaucetError> {
         let Some(own) = self.overwrite_run.get() else {
             return Ok(());
         };
@@ -1097,14 +1472,18 @@ impl FileWriter {
                     .filter(|n| staged.contains(n.as_str()))
                     .cloned()
                     .collect();
+                verify(g).await?;
                 let moves = stream::iter(to_move)
-                    .map(|name| async move { self.backend.promote_from_swap_run(run, &name).await })
+                    .map(|name| async move {
+                        fenced(g, self.backend.promote_from_swap_run(run, &name)).await
+                    })
                     .buffer_unordered(SWAP_CONCURRENCY)
                     .collect::<Vec<_>>()
                     .await;
                 moves.into_iter().collect::<Result<Vec<()>, _>>()?;
-                self.delete_unlisted(&marker.names).await?;
-                self.record_commit(marker.seq).await?;
+                verify(g).await?;
+                fenced(g, self.delete_unlisted(&marker.names)).await?;
+                self.record_commit(marker.seq, g).await?;
             } else {
                 tracing::warn!(
                     run = run.unwrap_or("untokened"),
@@ -1113,7 +1492,7 @@ impl FileWriter {
                      half-way, since a later commit of this output replaced it"
                 );
             }
-            self.backend.drop_swap_run(run).await?;
+            fenced(g, self.backend.drop_swap_run(run)).await?;
         }
         Ok(())
     }
@@ -1121,7 +1500,7 @@ impl FileWriter {
     /// Finish the move this run's commit started, when its marker is there:
     /// [`OwnMove::Superseded`] (and the area dropped) when a later commit of
     /// the output has finished since.
-    async fn finish_interrupted_move(&self) -> Result<OwnMove, FaucetError> {
+    async fn finish_interrupted_move(&self, g: Option<&LockGuard>) -> Result<OwnMove, FaucetError> {
         if !self.backend.exists(Area::Swap, COMMIT_MARKER).await? {
             return Ok(OwnMove::None);
         }
@@ -1152,32 +1531,42 @@ impl FileWriter {
             files = marker.names.len(),
             "file sink: finishing an overwrite that stopped while moving its files into place"
         );
-        if let Err(e) = self.move_into_place(marker.seq, marker.names.clone()).await {
+        if let Err(e) = self
+            .move_into_place(marker.seq, marker.names.clone(), g)
+            .await
+        {
             self.release_marker(marker).await;
             return Err(e);
         }
         Ok(OwnMove::Finished)
     }
 
-    async fn move_into_place(&self, seq: u128, names: Vec<String>) -> Result<(), FaucetError> {
+    async fn move_into_place(
+        &self,
+        seq: u128,
+        names: Vec<String>,
+        g: Option<&LockGuard>,
+    ) -> Result<(), FaucetError> {
         let staged: std::collections::HashSet<String> =
             self.backend.list(Area::Swap).await?.into_iter().collect();
+        verify(g).await?;
         let to_move: Vec<String> = names
             .iter()
             .filter(|n| staged.contains(*n))
             .cloned()
             .collect();
         let moves = stream::iter(to_move)
-            .map(|name| async move { self.promote_own(&name).await })
+            .map(|name| async move { fenced(g, self.promote_own(&name)).await })
             .buffer_unordered(SWAP_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
         moves.into_iter().collect::<Result<Vec<()>, _>>()?;
-        self.delete_unlisted(&names).await?;
+        verify(g).await?;
+        fenced(g, self.delete_unlisted(&names)).await?;
         // Only an unfinished commit another run left can be replayed over
         // this one later, so the ledger is kept once one has been seen.
         if !self.other_commit_seqs().await?.is_empty() || self.last_commit_seq().await?.is_some() {
-            self.record_commit(seq).await?;
+            self.record_commit(seq, g).await?;
         }
         self.clear_swap().await?;
         self.backend.delete(Area::Swap, COMMIT_MARKER).await
@@ -1342,6 +1731,42 @@ impl Drop for FileWriter {
             f.discard();
         }
     }
+}
+
+/// Run `fut` within `g`'s hold (see [`LockGuard::fenced`]); without a lock,
+/// as is.
+async fn fenced<T>(
+    g: Option<&LockGuard>,
+    fut: impl std::future::Future<Output = Result<T, FaucetError>>,
+) -> Result<T, FaucetError> {
+    match g {
+        Some(g) => g.fenced(fut).await,
+        None => fut.await,
+    }
+}
+
+/// [`LockGuard::verify`] before a destructive phase; nothing without a lock.
+async fn verify(g: Option<&LockGuard>) -> Result<(), FaucetError> {
+    match g {
+        Some(g) => g.verify().await,
+        None => Ok(()),
+    }
+}
+
+/// Where a [`FileWriter::publish_rebased`] file is and goes.
+struct Rebase {
+    area: Area,
+    name: String,
+    tmp: PathBuf,
+    label: String,
+    old: PathBuf,
+}
+
+/// The `wall=` second a claim was written.
+fn claim_wall(body: &str) -> Option<u64> {
+    body.split_whitespace()
+        .find_map(|f| f.strip_prefix("wall="))
+        .and_then(|w| w.parse().ok())
 }
 
 fn estimate(v: &Value) -> usize {

@@ -327,26 +327,120 @@ fn mysql_value_to_json(
     {
         return json_text_to_value(&text, col_name, json);
     }
-    Ok(mysql_scalar_to_json(row, col_name, text_columns))
+    mysql_scalar_to_json(row, col_name, text_columns)
 }
 
 fn mysql_scalar_to_json(
     row: &sqlx::mysql::MySqlRow,
     col_name: &str,
     text_columns: &std::collections::HashSet<String>,
-) -> Value {
+) -> Result<Value, FaucetError> {
+    // sqlx reports a zero date as NULL; only an absent value is SQL NULL.
+    if row
+        .try_get_raw(col_name)
+        .is_ok_and(|raw| sqlx::ValueRef::is_null(&raw))
+    {
+        return Ok(row
+            .try_get_unchecked::<Vec<u8>, _>(col_name)
+            .ok()
+            .and_then(|bytes| mysql_invalid_date_text(&column_type(row, col_name), &bytes))
+            .map_or(Value::Null, Value::String));
+    }
+    mysql_decoded(row, col_name, text_columns)
+}
+
+/// A non-NULL cell as JSON, or an error naming the column when no decoder
+/// accepts it; `null` is only SQL NULL.
+fn mysql_decoded(
+    row: &sqlx::mysql::MySqlRow,
+    col_name: &str,
+    text_columns: &std::collections::HashSet<String>,
+) -> Result<Value, FaucetError> {
+    let value = mysql_scalar(row, col_name, text_columns);
+    if let Some(v) = value {
+        return Ok(v);
+    }
+    let ty = column_type(row, col_name);
+    if let Ok(bytes) = row.try_get_unchecked::<Vec<u8>, _>(col_name)
+        && let Some(text) = mysql_invalid_date_text(&ty, &bytes)
+    {
+        return Ok(Value::String(text));
+    }
+    Err(FaucetError::Source(format!(
+        "MySQL column {col_name} has type {ty} which the source cannot decode; convert it in \
+         the query (e.g. ST_AsText({col_name}) or CAST({col_name} AS CHAR))"
+    )))
+}
+
+fn column_type(row: &sqlx::mysql::MySqlRow, col_name: &str) -> String {
+    row.try_column(col_name)
+        .map(|c| sqlx::TypeInfo::name(c.type_info()).to_string())
+        .unwrap_or_default()
+}
+
+/// MySQL's own text for a `DATE` / `DATETIME` / `TIMESTAMP` value chrono
+/// cannot hold (a zero or invalid date), spelled as `mysql-cdc` spells it:
+/// `YYYY-MM-DD`, or `YYYY-MM-DD HH:MM:SS[.fff|.ffffff]`. `bytes` is the raw
+/// cell: the binary protocol's fields behind a length byte (0, 4, 7 or 11),
+/// or the text protocol's text, whose first byte is a digit. `None` for any
+/// other type or shape.
+fn mysql_invalid_date_text(ty: &str, bytes: &[u8]) -> Option<String> {
+    let binary = *bytes.first()? <= 11;
+    let date_only = ty.eq_ignore_ascii_case("DATE");
+    if !date_only && !ty.eq_ignore_ascii_case("DATETIME") && !ty.eq_ignore_ascii_case("TIMESTAMP") {
+        return None;
+    }
+    if !binary {
+        return std::str::from_utf8(bytes).ok().map(str::to_string);
+    }
+    let (&len, rest) = bytes.split_first()?;
+    let field = |i: usize| rest.get(i).copied().unwrap_or(0);
+    let (year, month, day) = if len >= 4 {
+        (u16::from_le_bytes([field(0), field(1)]), field(2), field(3))
+    } else {
+        (0, 0, 0)
+    };
+    if date_only {
+        return Some(format!("{year:04}-{month:02}-{day:02}"));
+    }
+    let (h, m, sec) = if len >= 7 {
+        (field(4), field(5), field(6))
+    } else {
+        (0, 0, 0)
+    };
+    let micros = if len >= 11 {
+        u32::from_le_bytes([field(7), field(8), field(9), field(10)])
+    } else {
+        0
+    };
+    let fraction = match micros {
+        0 => String::new(),
+        us if us.is_multiple_of(1000) => format!(".{:03}", us / 1000),
+        us => format!(".{us:06}"),
+    };
+    Some(format!(
+        "{year:04}-{month:02}-{day:02} {h:02}:{m:02}:{sec:02}{fraction}"
+    ))
+}
+
+/// The decoders in order; `None` when none accepts the cell.
+fn mysql_scalar(
+    row: &sqlx::mysql::MySqlRow,
+    col_name: &str,
+    text_columns: &std::collections::HashSet<String>,
+) -> Option<Value> {
     // Try common scalar types
     if let Ok(v) = row.try_get::<String, _>(col_name) {
-        return Value::String(v);
+        return Some(Value::String(v));
     }
     if let Ok(v) = row.try_get::<i64, _>(col_name) {
-        return Value::Number(v.into());
+        return Some(Value::Number(v.into()));
     }
     if let Ok(v) = row.try_get::<i32, _>(col_name) {
-        return Value::Number(v.into());
+        return Some(Value::Number(v.into()));
     }
     if let Ok(v) = row.try_get::<i16, _>(col_name) {
-        return Value::Number(v.into());
+        return Some(Value::Number(v.into()));
     }
     // UNSIGNED integer columns (#264). sqlx-mysql treats UNSIGNED as a
     // distinct type from the signed decoders above, so without these arms
@@ -360,16 +454,16 @@ fn mysql_scalar_to_json(
     // boolean is `TINYINT(1)`). `u64` fits `serde_json::Number` exactly, so
     // BIGINT UNSIGNED values above `i64::MAX` round-trip losslessly.
     if let Ok(v) = row.try_get::<u64, _>(col_name) {
-        return Value::Number(v.into());
+        return Some(Value::Number(v.into()));
     }
     if let Ok(v) = row.try_get::<u32, _>(col_name) {
-        return Value::Number(v.into());
+        return Some(Value::Number(v.into()));
     }
     if let Ok(v) = row.try_get::<u16, _>(col_name) {
-        return Value::Number(v.into());
+        return Some(Value::Number(v.into()));
     }
     if let Ok(v) = row.try_get::<u8, _>(col_name) {
-        return Value::Number(v.into());
+        return Some(Value::Number(v.into()));
     }
     // A FLOAT through `f32` (sqlx's `f64` also accepts FLOAT, widening it);
     // only a FLOAT — sqlx's `f32` also accepts DOUBLE, narrowing `1e300`
@@ -378,42 +472,42 @@ fn mysql_scalar_to_json(
         .try_column(col_name)
         .is_ok_and(|c| sqlx::TypeInfo::name(c.type_info()).eq_ignore_ascii_case("FLOAT"));
     if is_float && let Ok(v) = row.try_get::<f32, _>(col_name) {
-        return faucet_core::fidelity::float32(v);
+        return Some(faucet_core::fidelity::float32(v));
     }
     if let Ok(v) = row.try_get::<f64, _>(col_name) {
-        return faucet_core::fidelity::float64(v);
+        return Some(faucet_core::fidelity::float64(v));
     }
     if let Ok(v) = row.try_get::<bool, _>(col_name) {
-        return Value::Bool(v);
+        return Some(Value::Bool(v));
     }
 
     // Richer types that would otherwise silently decode to Null (#78/#43).
     if let Ok(v) =
         row.try_get::<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>, _>(col_name)
     {
-        return Value::String(v.to_rfc3339());
+        return Some(Value::String(v.to_rfc3339()));
     }
     if let Ok(v) = row.try_get::<sqlx::types::chrono::NaiveDateTime, _>(col_name) {
-        return Value::String(v.to_string());
+        return Some(Value::String(v.to_string()));
     }
     if let Ok(v) = row.try_get::<sqlx::types::chrono::NaiveDate, _>(col_name) {
-        return Value::String(v.to_string());
+        return Some(Value::String(v.to_string()));
     }
     // TIME is a duration (-838:59:59 … 838:59:59), not a time of day.
     if let Ok(v) = row.try_get::<sqlx::mysql::types::MySqlTime, _>(col_name) {
-        return Value::String(time_text(&v));
+        return Some(Value::String(time_text(&v)));
     }
     // DECIMAL → string, preserving exact precision, never in exponent form.
     if let Ok(v) = row.try_get::<sqlx::types::BigDecimal, _>(col_name) {
-        return Value::String(v.to_plain_string());
+        return Some(Value::String(v.to_plain_string()));
     }
     // BLOB / BINARY → base64; a text column with a binary collation arrives
     // as bytes too, but is text (#789 SQL-13).
     if let Ok(v) = row.try_get::<Vec<u8>, _>(col_name) {
-        return bytes_to_json(v, text_columns.contains(col_name));
+        return Some(bytes_to_json(v, text_columns.contains(col_name)));
     }
 
-    Value::Null
+    None
 }
 
 /// A `TIME` as `[-]HH:MM:SS[.fff|.ffffff]`, keeping its sign and hours of 24
@@ -696,6 +790,12 @@ fn descriptors_from_catalog(rows: Vec<CatalogRow>) -> Vec<faucet_core::DatasetDe
 
 /// Convert a single `MySqlRow` into a JSON object whose keys are the row's
 /// column names.
+/// A result whose columns repeat a name is refused: `row_to_json` reads each
+/// column by name, so the later one would silently repeat the earlier value.
+fn check_unique_columns(row: &sqlx::mysql::MySqlRow) -> Result<(), FaucetError> {
+    faucet_core::util::check_unique_columns("MySQL", row.columns().iter().map(|c| c.name()))
+}
+
 fn row_to_json(
     row: &sqlx::mysql::MySqlRow,
     text_columns: &std::collections::HashSet<String>,
@@ -776,6 +876,9 @@ impl faucet_core::Source for MysqlSource {
             )
             .await?;
 
+        if let Some(first) = rows.first() {
+            check_unique_columns(first)?;
+        }
         let records: Vec<Value> = rows
             .iter()
             .map(|r| row_to_json(r, &text_columns, &self.json_context()))
@@ -817,11 +920,16 @@ impl faucet_core::Source for MysqlSource {
             let initial_capacity = if batch_size == 0 { 1024 } else { batch_size };
             let mut buffer: Vec<Value> = Vec::with_capacity(initial_capacity);
             let mut total = 0usize;
+            let mut checked = false;
 
             while let Some(row) = steps
                 .call_once("query", bounded_read(self.config.read_timeout_secs, rows.try_next()))
                 .await?
             {
+                if !checked {
+                    check_unique_columns(&row)?;
+                    checked = true;
+                }
                 let record = row_to_json(&row, &text_columns, &self.json_context())?;
                 if tracker.as_mut().is_none_or(|t| t.admit(&record)) {
                     buffer.push(record);
@@ -1186,6 +1294,44 @@ fn key_discovery_error(e: sqlx::Error) -> FaucetError {
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_dates_render_as_mysql_text_in_both_protocols() {
+        let t = |ty, _binary: bool, bytes: &[u8]| mysql_invalid_date_text(ty, bytes);
+        assert_eq!(t("DATE", true, &[0]).as_deref(), Some("0000-00-00"));
+        assert_eq!(
+            t("DATETIME", true, &[0]).as_deref(),
+            Some("0000-00-00 00:00:00")
+        );
+        assert_eq!(
+            t("TIMESTAMP", true, &[4, 0xe8, 0x07, 2, 30]).as_deref(),
+            Some("2024-02-30 00:00:00")
+        );
+        assert_eq!(
+            t("DATETIME", true, &[7, 0xe8, 0x07, 0, 0, 10, 20, 30]).as_deref(),
+            Some("2024-00-00 10:20:30")
+        );
+        let us = 500_000u32.to_le_bytes();
+        let mut b = vec![11, 0, 0, 0, 0, 1, 2, 3];
+        b.extend_from_slice(&us);
+        assert_eq!(
+            t("DATETIME", true, &b).as_deref(),
+            Some("0000-00-00 01:02:03.500")
+        );
+        let us = 123_456u32.to_le_bytes();
+        let mut b = vec![11, 0, 0, 0, 0, 1, 2, 3];
+        b.extend_from_slice(&us);
+        assert_eq!(
+            t("DATETIME", true, &b).as_deref(),
+            Some("0000-00-00 01:02:03.123456")
+        );
+        assert_eq!(
+            t("DATETIME", false, b"0000-00-00 00:00:00").as_deref(),
+            Some("0000-00-00 00:00:00")
+        );
+        assert_eq!(t("GEOMETRY", true, &[0]), None);
+        assert_eq!(t("DATE", true, &[]), None);
+    }
 
     #[test]
     fn the_bookmark_token_is_replaced_only_as_a_whole_unquoted_word() {

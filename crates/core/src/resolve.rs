@@ -549,6 +549,46 @@ pub fn is_metadata_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// Whether `host` names this machine or its network: `localhost` and
+/// `*.localhost`, a loopback, unspecified, private (RFC 1918, IPv6 unique
+/// local), shared (RFC 6598, carrier-grade NAT), link-local or cloud
+/// instance-metadata address. Compared in its canonical form
+/// ([`canonical_host`]), so numeric spellings of an address match it.
+pub fn is_local_host(host: &str) -> bool {
+    let canonical = canonical_host(host);
+    let h = canonical.trim_start_matches('[').trim_end_matches(']');
+    if h == "localhost" || h.ends_with(".localhost") || is_metadata_host(host) {
+        return true;
+    }
+    match without_zone(h).parse::<std::net::IpAddr>() {
+        Ok(ip) => is_local_ip(ip),
+        Err(_) => false,
+    }
+}
+
+/// [`is_local_host`] for an address.
+pub fn is_local_ip(ip: std::net::IpAddr) -> bool {
+    let v4_local = |v4: std::net::Ipv4Addr| {
+        let o = v4.octets();
+        v4.is_loopback()
+            || v4.is_unspecified()
+            || v4.is_private()
+            || (o[0] == 100 && (o[1] & 0xc0) == 64)
+            || is_metadata_ip(std::net::IpAddr::V4(v4))
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => v4_local(v4),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || is_metadata_ip(ip)
+                || v6.to_ipv4_mapped().is_some_and(v4_local)
+                || embedded_ipv4(v6).is_some_and(v4_local)
+        }
+    }
+}
+
 /// The IPv4 address carried in an IPv4-compatible (`::a.b.c.d`) or NAT64
 /// well-known-prefix (`64:ff9b::a.b.c.d`) IPv6 address.
 fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
@@ -3117,6 +3157,39 @@ fn flagged_fields(schema: &Value, annotation: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_hosts_are_this_machine_and_its_network() {
+        for local in [
+            "localhost",
+            "api.localhost",
+            "127.0.0.1",
+            "2130706433",
+            "0.0.0.0",
+            "10.1.2.3",
+            "172.16.0.9",
+            "192.168.1.1",
+            "100.64.0.1",
+            "169.254.169.254",
+            "[::1]",
+            "::",
+            "fd12::1",
+            "fe80::1%eth0",
+            "::ffff:10.0.0.1",
+            "metadata.google.internal",
+        ] {
+            assert!(super::is_local_host(local), "{local}");
+        }
+        for remote in [
+            "example.com",
+            "8.8.8.8",
+            "100.128.0.1",
+            "2001:db8::1",
+            "172.32.0.1",
+        ] {
+            assert!(!super::is_local_host(remote), "{remote}");
+        }
+    }
+
     #[test]
     fn local_part_reads_bare_and_relative_file_authorities() {
         assert_eq!(local_part("file://localhost").as_deref(), Some(""));

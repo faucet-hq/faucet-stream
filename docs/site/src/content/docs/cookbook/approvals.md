@@ -103,6 +103,10 @@ anything material moved (a template version was launched in the meantime, the
 default config now points somewhere else), the request becomes `invalidated`
 with the difference spelled out and **nothing runs**: the approver reviewed
 something else. A rotated secret or a live probe result is not material.
+An approved launch launches exactly the version the reviewer saw, and only
+over the live version the reviewer saw: if another launch moves the live
+version while it executes, it is `invalidated` ("the template's live version
+changed since approval") and nothing is launched.
 
 Under `--auth-config` the requester is also checked again: if it is no longer
 a principal in the file, now holds a lower role than when it asked, or is
@@ -243,7 +247,8 @@ visible to every reviewer.
 The `budget` on a request (`max_records`, `max_bytes`, `max_duration_secs`,
 `allowed_sinks`) is merged into the run with the config's own
 [`budget:`](/faucet-stream/cookbook/usage/#run-budgets) block — the stricter of each ceiling wins —
-so an approved change can never move more than was agreed. The page that
+so an approved change can never move more than was agreed, across every row,
+fan-out child and shard of the run. The page that
 would cross a record or byte ceiling is refused whole (the bookmark stays
 put) and the run fails with `budget_exceeded`; an overwrite aborts cleanly
 rather than leaving a half-written table.

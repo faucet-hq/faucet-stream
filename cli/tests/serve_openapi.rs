@@ -149,6 +149,7 @@ async fn every_documented_route_is_wired_on_the_live_server() {
         preview_default_rows: 500,
         preview_max_rows: 5_000,
         lease_ttl_secs: 30,
+        metrics_idle_timeout_secs: 86_400,
         probe_timeout_secs: 5,
         env_file: None,
         no_env_file: true,

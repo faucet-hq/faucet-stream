@@ -469,3 +469,115 @@ async fn a_shortfall_the_sink_reports_as_skipped_completes_the_run() {
     assert_eq!(result.records_written, 4);
     assert!(store.stored("scripted:paged").is_some());
 }
+
+/// An idempotent sink whose first write of page 0 times out after another
+/// writer (an orphaned earlier attempt) committed page 0 — with this page's
+/// own token, or with a different bookmark.
+struct OrphanSink {
+    inner: ScriptedSink,
+    orphan_token_is_ours: bool,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+#[faucet_core::async_trait]
+impl Sink for OrphanSink {
+    faucet_core::forward_sink!(inner; except write_batch_idempotent, write_batch_idempotent_reported);
+
+    async fn write_batch_idempotent(
+        &self,
+        records: &[faucet_core::Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<usize, faucet_core::FaucetError> {
+        if !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let orphan = if self.orphan_token_is_ours {
+                token.to_string()
+            } else {
+                let (seq, _) = faucet_core::parse_token_parts(token).expect("token");
+                faucet_core::format_token_with_bookmark(
+                    seq,
+                    Some(&faucet_core::json!({"elsewhere": true})),
+                )
+            };
+            self.inner
+                .write_batch_idempotent(records, scope, &orphan)
+                .await?;
+            return Err(faucet_core::FaucetError::Timeout {
+                operation: "scripted write".into(),
+                after: std::time::Duration::from_millis(1),
+            });
+        }
+        self.inner
+            .write_batch_idempotent(records, scope, token)
+            .await
+    }
+
+    async fn write_batch_idempotent_reported(
+        &self,
+        records: &[faucet_core::Value],
+        scope: &str,
+        token: &str,
+    ) -> Result<faucet_core::WriteReport, faucet_core::FaucetError> {
+        self.write_batch_idempotent(records, scope, token)
+            .await
+            .map(faucet_core::WriteReport::accepted)
+    }
+}
+
+async fn run_with_orphan(
+    ours: bool,
+) -> (
+    Result<faucet_core::PipelineResult, faucet_core::FaucetError>,
+    EventLog,
+) {
+    let log = EventLog::new();
+    let sink = OrphanSink {
+        inner: ScriptedSink::new(log.clone()).idempotent(),
+        orphan_token_is_ours: ours,
+        fired: std::sync::atomic::AtomicBool::new(false),
+    };
+    let store = Arc::new(sink.inner.state_store());
+    let source = PagedSource::new(2, 2);
+    let retry = faucet_core::resilience::RetryPolicy {
+        max_attempts: 3,
+        base: std::time::Duration::from_millis(1),
+        max: std::time::Duration::from_millis(2),
+        jitter: false,
+        ..Default::default()
+    };
+    let result = Pipeline::new(&source, &sink)
+        .with_state_store(store)
+        .with_delivery(DeliveryMode::ExactlyOnce)
+        .with_resilience(faucet_core::resilience::ResiliencePolicy {
+            retry,
+            ..Default::default()
+        })
+        .run()
+        .await;
+    (result, log)
+}
+
+#[tokio::test]
+async fn a_retry_counts_an_earlier_attempts_commit_only_when_the_token_is_its_own() {
+    let (result, log) = run_with_orphan(true).await;
+    let result = result.expect("the earlier attempt committed this exact page");
+    assert_eq!(result.records_written, 4);
+    assert_eq!(log.records_written(), 4, "no page is written twice");
+}
+
+#[tokio::test]
+async fn a_retry_fails_when_another_writer_committed_the_page_with_another_token() {
+    let (result, log) = run_with_orphan(false).await;
+    let err = result.expect_err("another writer's commit is not this page's");
+    assert!(!err.is_retriable(), "{err:?}");
+    assert!(
+        err.to_string()
+            .contains("already holds a commit at or past page 1"),
+        "{err}"
+    );
+    assert_eq!(
+        log.records_written(),
+        2,
+        "only the other writer's page landed"
+    );
+}

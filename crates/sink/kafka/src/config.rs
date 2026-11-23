@@ -216,17 +216,18 @@ pub struct KafkaSinkConfig {
     /// `-1` means "use the broker default".
     #[serde(default = "default_commit_token_topic_replication")]
     pub commit_token_topic_replication: i32,
-    /// Raw librdkafka producer properties, applied **last** so they override
-    /// everything this config derives (`acks`, `enable.idempotence`,
-    /// `compression.type`, `linger.ms`, `message.timeout.ms`,
-    /// `queue.buffering.max.messages`). Empty by default.
+    /// Raw librdkafka producer properties, applied after everything this
+    /// config derives. Empty by default. The escape hatch for a knob faucet
+    /// does not model (`compression.level`, `batch.size`, …).
     ///
-    /// The escape hatch for a knob faucet does not model — and the sharp edge
-    /// that goes with it: overriding a safety property here can weaken
-    /// delivery guarantees. The only exceptions are the exactly-once
-    /// invariants (`transactional.id`, `enable.idempotence`, `acks=all`),
-    /// which the transactional producer force-sets on top so an override
-    /// cannot break EOS.
+    /// Options faucet derives from a typed field are refused when their
+    /// value disagrees with it: `bootstrap.servers` / `metadata.broker.list`
+    /// (use `brokers`), `acks` / `request.required.acks` (use `acks`) and
+    /// `enable.idempotence` (use `idempotent`). `transactional.id` is always
+    /// refused: faucet derives it per pipeline under `delivery:
+    /// exactly_once`. Restating faucet's own value is allowed. Other
+    /// overrides (`compression.type`, `linger.ms`, `message.timeout.ms`,
+    /// `queue.buffering.max.messages`, …) win over the typed fields.
     ///
     /// Keys that name a broker (`bootstrap.servers`, `metadata.broker.list`),
     /// a URL (`*.url`) or a local file (`*.location`, `*.file`,
@@ -278,6 +279,13 @@ pub enum KafkaSinkTopic {
         /// JSONPath to the topic name (first match wins). A record whose path
         /// does not resolve fails the batch. Must not be blank.
         path: String,
+        /// Let records name internal topics (names starting with `__`, such
+        /// as `__consumer_offsets`). Off by default: such a record fails its
+        /// row. The configured exactly-once commit-token topic is refused
+        /// either way, since a record written there would move another
+        /// pipeline's committed position.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_internal_topics: bool,
     },
 }
 
@@ -317,6 +325,14 @@ impl Acks {
             Acks::All => "all",
         }
     }
+}
+
+/// A comma-separated broker list, entries trimmed.
+fn broker_list(list: &str) -> Vec<&str> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .collect()
 }
 
 fn default_acks() -> Acks {
@@ -433,7 +449,7 @@ impl KafkaSinkConfig {
                     "kafka sink: topic.name must not be empty".into(),
                 ));
             }
-            KafkaSinkTopic::FromPath { path } if path.trim().is_empty() => {
+            KafkaSinkTopic::FromPath { path, .. } if path.trim().is_empty() => {
                 return Err(FaucetError::Config(
                     "kafka sink: topic.path must not be empty".into(),
                 ));
@@ -490,7 +506,82 @@ impl KafkaSinkConfig {
             ));
         }
         faucet_core::validate_batch_size(self.batch_size)?;
-        Ok(())
+        self.check_owned_client_keys()
+    }
+
+    /// Refuse `extra_client_config` entries that disagree with the options
+    /// faucet derives from the typed fields.
+    fn check_owned_client_keys(&self) -> Result<(), FaucetError> {
+        use faucet_common_kafka::OwnedKey;
+        let brokers = broker_list(&self.brokers);
+        let acks = self.acks;
+        let idempotent = self.idempotent;
+        let same_brokers = |v: &str| broker_list(v) == brokers;
+        let same_acks = |v: &str| {
+            let v = v.to_ascii_lowercase();
+            match acks {
+                Acks::All => v == "all" || v == "-1",
+                Acks::Leader => v == "1",
+                Acks::None => v == "0",
+            }
+        };
+        let same_idempotence =
+            |v: &str| v.eq_ignore_ascii_case(if idempotent { "true" } else { "false" });
+        let never = |_: &str| false;
+        faucet_common_kafka::check_owned_keys(
+            "kafka sink",
+            &self.extra_client_config,
+            &[
+                OwnedKey {
+                    keys: &["bootstrap.servers", "metadata.broker.list"],
+                    accepts: &same_brokers,
+                    owner: "set `brokers` instead",
+                },
+                OwnedKey {
+                    keys: &["acks", "request.required.acks"],
+                    accepts: &same_acks,
+                    owner: "set the typed `acks` field instead",
+                },
+                OwnedKey {
+                    keys: &["enable.idempotence"],
+                    accepts: &same_idempotence,
+                    owner: "set the typed `idempotent` field instead",
+                },
+                OwnedKey {
+                    keys: &["transactional.id"],
+                    accepts: &never,
+                    owner: "faucet derives it per pipeline under `delivery: exactly_once`",
+                },
+            ],
+        )
+    }
+
+    /// Refuse a topic a record names through `topic.path` when it is the
+    /// exactly-once commit-token topic, or an internal topic (`__…`) without
+    /// `allow_internal_topics`. A per-row error.
+    pub(crate) fn check_record_topic(&self, topic: &str) -> Result<(), FaucetError> {
+        let KafkaSinkTopic::FromPath {
+            allow_internal_topics,
+            ..
+        } = &self.topic
+        else {
+            return Ok(());
+        };
+        let reason = if topic == self.exactly_once_spec().commit_token_topic {
+            Some("it is the exactly-once commit-token topic")
+        } else if topic.starts_with("__") && !allow_internal_topics {
+            Some(
+                "topics starting with `__` are internal; set `topic.allow_internal_topics` to write there",
+            )
+        } else {
+            None
+        };
+        match reason {
+            None => Ok(()),
+            Some(reason) => Err(FaucetError::Sink(format!(
+                "kafka sink: topic '{topic}' from topic.path is not allowed ({reason})"
+            ))),
+        }
     }
 
     /// Set the in-flight send-window cap for
@@ -632,8 +723,60 @@ mod tests {
         let mut c = minimal();
         c.topic = KafkaSinkTopic::FromPath {
             path: String::new(),
+            allow_internal_topics: false,
         };
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn extra_client_config_may_not_disagree_with_owned_options() {
+        let with = |k: &str, v: &str| {
+            let mut c = minimal();
+            c.extra_client_config.insert(k.into(), v.into());
+            c.validate()
+        };
+        assert!(with("linger.ms", "50").is_ok());
+        assert!(with("acks", "-1").is_ok());
+        assert!(with("enable.idempotence", "true").is_ok());
+        assert!(with("bootstrap.servers", &minimal().brokers).is_ok());
+        assert!(with("acks", "0").is_err());
+        assert!(with("request.required.acks", "1").is_err());
+        assert!(with("enable.idempotence", "false").is_err());
+        assert!(with("transactional.id", "x").is_err());
+        assert!(with("metadata.broker.list", "elsewhere:9092").is_err());
+        let mut c = minimal();
+        c.idempotent = false;
+        c.acks = Acks::None;
+        c.extra_client_config.insert("acks".into(), "0".into());
+        c.extra_client_config
+            .insert("enable.idempotence".into(), "false".into());
+        assert!(c.validate().is_ok(), "typed acks: none restated");
+    }
+
+    #[test]
+    fn a_record_may_not_name_the_commit_token_or_an_internal_topic() {
+        let mut c = minimal();
+        assert!(
+            c.check_record_topic("__faucet_commit_token").is_ok(),
+            "fixed topic"
+        );
+        c.topic = KafkaSinkTopic::FromPath {
+            path: "$.dest".into(),
+            allow_internal_topics: false,
+        };
+        assert!(c.check_record_topic("orders").is_ok());
+        let err = c
+            .check_record_topic("__faucet_commit_token")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("commit-token"), "{err}");
+        assert!(c.check_record_topic("__consumer_offsets").is_err());
+        c.topic = KafkaSinkTopic::FromPath {
+            path: "$.dest".into(),
+            allow_internal_topics: true,
+        };
+        assert!(c.check_record_topic("__consumer_offsets").is_ok());
+        assert!(c.check_record_topic("__faucet_commit_token").is_err());
     }
 
     #[test]
@@ -662,6 +805,7 @@ mod tests {
     fn from_path_topic_round_trips() {
         let t = KafkaSinkTopic::FromPath {
             path: "$.dest".into(),
+            allow_internal_topics: false,
         };
         let v = serde_json::to_value(&t).unwrap();
         assert_eq!(v["type"], "from_path");

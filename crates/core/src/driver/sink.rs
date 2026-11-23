@@ -167,6 +167,13 @@ pub trait SchemaDriver: Send + Sync {
     /// there is none yet.
     async fn current_schema(&self, calls: &CallSlot) -> Result<Option<Value>, FaucetError>;
 
+    /// How a record field addresses a column of
+    /// [`current_schema`](Self::current_schema); see
+    /// [`Sink::column_matching`](crate::Sink::column_matching).
+    fn column_matching(&self) -> crate::ColumnMatching {
+        crate::ColumnMatching::Exact
+    }
+
     /// Whether [`evolve`](Self::evolve) is implemented.
     fn evolvable(&self) -> bool {
         false
@@ -639,6 +646,12 @@ impl<D: SinkDriver> Sink for DriverSink<D> {
             Some(s) => s.current_schema(&self.calls).await,
             None => Ok(None),
         }
+    }
+
+    fn column_matching(&self) -> crate::ColumnMatching {
+        self.driver
+            .schema()
+            .map_or(crate::ColumnMatching::Exact, SchemaDriver::column_matching)
     }
 
     fn supports_schema_evolution(&self) -> bool {

@@ -70,6 +70,7 @@ pub mod registry;
 pub mod registry_index;
 pub mod replication;
 pub mod requires;
+pub mod resources;
 pub mod rollback;
 pub mod run_deps;
 pub mod runtime;
@@ -86,6 +87,7 @@ pub mod sla;
 pub mod sql_bind;
 pub mod state;
 pub mod status;
+pub(crate) mod sub_run;
 pub mod template_tests;
 #[cfg(feature = "templates")]
 pub mod templates;
@@ -253,8 +255,18 @@ pub fn run_main(registry: PluginRegistry) -> std::process::ExitCode {
 /// integration tests can drive the exact same code path as [`run_main`] with a
 /// programmatically-built `Cli` (and a registry installed via
 /// [`PluginRegistry::install`]).
+///
+/// Notifications are delivered in the background; this waits for the pending
+/// ones (up to 30 s, 3 s after a Ctrl-C) before returning, on every outcome.
 pub async fn run_command(cli: Cli) -> CliResult<()> {
-    Box::pin(dispatch(cli)).await
+    let result = Box::pin(dispatch(cli)).await;
+    #[cfg(feature = "notify")]
+    notify::flush(match &result {
+        Err(CliError::Cancelled) => notify::queue::INTERRUPTED_FLUSH_TIMEOUT,
+        _ => notify::queue::FLUSH_TIMEOUT,
+    })
+    .await;
+    result
 }
 
 async fn dispatch(cli: Cli) -> CliResult<()> {
@@ -423,6 +435,16 @@ pub async fn run_from_yaml_str_selected(
     yaml: &str,
     selection: Option<&select::SelectionRequest>,
 ) -> CliResult<executor::RunSummary> {
+    let result = Box::pin(run_yaml_str(yaml, selection)).await;
+    #[cfg(feature = "notify")]
+    notify::flush(notify::queue::FLUSH_TIMEOUT).await;
+    result
+}
+
+async fn run_yaml_str(
+    yaml: &str,
+    selection: Option<&select::SelectionRequest>,
+) -> CliResult<executor::RunSummary> {
     // The same load a YAML file goes through.
     let cfg = config::PipelineConfig::from_text_async_with(
         yaml,
@@ -496,6 +518,7 @@ pub async fn run_from_yaml_str_selected(
             usage: usage::UsageOptions::from_spec(cfg.usage.as_ref(), None)
                 .map_err(CliError::Config)?,
             budget: cfg.budget.clone(),
+            budget_state: None,
             feed: Default::default(),
         },
     )

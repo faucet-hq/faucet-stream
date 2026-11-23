@@ -141,6 +141,36 @@ impl FileSource {
         codec
     }
 
+    /// In `by: name` mode without `stable_for_secs`, whether `file` changed
+    /// between the listing and the end of its read. Its bookmark must not be
+    /// written then: the next run would start after it and never read the
+    /// rest. The run stops at it instead and the next run reads it again.
+    async fn grew_while_read(&self, file: &Candidate) -> bool {
+        if self.by() != Some(IncrementalBy::Name)
+            || self.config.stable_for_secs.is_some()
+            || self.http.is_some()
+        {
+            return false;
+        }
+        let path = file.path.clone();
+        let now = tokio::task::spawn_blocking(move || plan::restat_local(&path))
+            .await
+            .ok()
+            .flatten();
+        let changed = plan::changed_since_listed(file, now.as_ref());
+        if changed {
+            tracing::warn!(
+                path = %file.path,
+                "file source: '{}' changed while it was read; the bookmark stays before it and \
+                 the next run reads it again from the start (a file appended to on every run is \
+                 re-read in full each time and holds back every later name) — set \
+                 `stable_for_secs` to the producer's write time",
+                file.path
+            );
+        }
+        changed
+    }
+
     /// The files this run reads, in order.
     async fn candidates(&self, apply_bookmark: bool) -> Result<Vec<Candidate>, FaucetError> {
         self.candidates_at(&self.config.path, apply_bookmark).await
@@ -155,24 +185,26 @@ impl FileSource {
             Some(http) => {
                 let needs_mtime = matches!(self.by(), Some(IncrementalBy::Mtime))
                     || self.config.stable_for_secs.is_some();
-                let mtime_ns = if needs_mtime {
+                let (mtime_ns, fingerprint) = if needs_mtime {
                     let meta = http
                         .head_in(root, &self.roundtrips, &self.calls.get())
                         .await?;
-                    Some(meta.last_modified_ns.ok_or_else(|| {
+                    let mtime = meta.last_modified_ns.ok_or_else(|| {
                         FaucetError::Source(format!(
                             "file source: {} sends no Last-Modified header, which `incremental: \
                              {{by: mtime}}` / `stable_for_secs` need",
                             root
                         ))
-                    })?)
+                    })?;
+                    (Some(mtime), meta.fingerprint())
                 } else {
-                    None
+                    (None, None)
                 };
                 vec![Candidate {
                     path: root.to_string(),
                     mtime_ns,
                     ctime_ns: None,
+                    fingerprint,
                 }]
             }
             None => {
@@ -600,6 +632,10 @@ impl faucet_core::Source for FileSource {
                     }
                 }
                 if let Some(by) = by {
+                    if self.grew_while_read(file).await {
+                        yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
+                        return;
+                    }
                     bookmark = Some(plan::advance(bookmark, by, file)?);
                     let mark = bookmark.as_ref().map(Bookmark::to_value);
                     yield StreamPage { records: std::mem::take(&mut buffer), bookmark: mark };
@@ -654,6 +690,12 @@ impl faucet_core::Source for FileSource {
                     }
                 }
                 join(handle).await?;
+                if by.is_some() && self.grew_while_read(file).await {
+                    if let Some(batch) = last {
+                        yield faucet_core::columnar::ColumnarPage::new(batch, None);
+                    }
+                    return;
+                }
                 let mark = match by {
                     Some(by) => {
                         bookmark = Some(plan::advance(bookmark, by, file)?);

@@ -419,7 +419,7 @@ fn shipped_masking_example_spec_passes() {
         .arg(&spec)
         .assert()
         .success()
-        .stdout(contains("3 tests, 3 passed, 0 failed"));
+        .stdout(contains("5 tests, 5 passed, 0 failed"));
 }
 
 #[cfg(feature = "transform-zip-columns")]

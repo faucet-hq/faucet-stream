@@ -93,7 +93,11 @@ pub async fn assert_concurrent_overwrites<R: Remote>(r: &R) {
     .await;
     seed(&base, vec![json!({"stale": "legacy"})]).await;
     let names = |objects: Vec<(String, Vec<u8>)>| -> Vec<String> {
-        objects.into_iter().map(|(n, _)| n).collect()
+        objects
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| !n.contains(".commits/"))
+            .collect()
     };
     assert_eq!(
         names(r.objects(prefix).await)
@@ -287,7 +291,13 @@ async fn read_back<R: Remote>(
     dir: &Path,
     enc: bool,
 ) -> Result<(Vec<Value>, Vec<Vec<u8>>), String> {
-    let objects = r.objects(prefix).await;
+    // A released output lock stays as a side file (`.commits/lock-<epoch>`).
+    let objects: Vec<_> = r
+        .objects(prefix)
+        .await
+        .into_iter()
+        .filter(|(n, _)| !n.contains(".commits/lock-"))
+        .collect();
     if objects.iter().any(|(n, _)| n.contains(".faucet-")) {
         return Err(format!(
             "scratch or staging objects left behind: {:?}",

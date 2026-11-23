@@ -523,6 +523,21 @@ pub async fn dedupe_replaces_an_expired_row(backend: &dyn Backend) {
             .expect("purge"),
         0
     );
+
+    // A purge removes at most `max_rows`, so a caller loops while it gets that many.
+    f.append(
+        &feed,
+        ["c", "d", "e"]
+            .into_iter()
+            .map(|k| event(k).dedupe_key(k))
+            .collect(),
+    )
+    .await;
+    f.wait(PAST_SHORT).await;
+    let purge = |n| f.store.purge_dedupe(&f.calls, &feed, n);
+    assert_eq!(purge(2).await.expect("purge"), 2, "capped at max_rows");
+    assert!(purge(100).await.expect("purge") >= 1);
+    assert_eq!(purge(100).await.expect("purge"), 0);
 }
 
 /// Concurrent retries carrying one key store one event.
@@ -588,6 +603,14 @@ pub async fn limits_refuse_and_store_nothing(backend: &dyn Backend) {
     assert_eq!(full_limit(refused), FullLimit::TenantBytes);
     let other_tenant = f.feed(quota.clone()).await;
     f.append(&other_tenant, vec![sized(90)]).await;
+    if let Some(held) = f
+        .store
+        .tenant_bytes(&f.calls, &tenant)
+        .await
+        .expect("tenant_bytes")
+    {
+        assert_eq!(held, 100, "the bytes the quota is checked against");
+    }
 
     let by_events = f.feed(StoreLimits::new().undelivered_max_events(3)).await;
     f.fill(&by_events, 5).await;
@@ -1554,9 +1577,16 @@ pub async fn state_survives_a_restart(backend: &dyn Backend) {
         .attach(&before.calls, &claim.id)
         .await
         .expect("attach");
+    let identity = before.store.store_id();
     drop(before);
 
     let after = Fixture::open(backend).await;
+    assert_eq!(
+        after.store.store_id(),
+        identity,
+        "the store keeps its identity"
+    );
+    assert!(identity.is_none_or(|id| id > 0));
     let head = after.head(&feed).await;
     assert_eq!((head.watermark, head.oldest), (Seq(3), Seq(1)));
     assert_eq!(head.bytes, sent.bytes());

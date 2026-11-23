@@ -39,6 +39,8 @@ pub enum TdsType {
         /// Digits after the decimal point.
         scale: u8,
     },
+    /// `DATE`, for a `Date` value.
+    Date,
 }
 
 /// One cell of a result row.
@@ -57,6 +59,8 @@ pub enum TdsValue {
     Float(f64),
     /// An unscaled decimal (`value × 10^-scale`), for a `Decimal` column.
     Decimal(i128),
+    /// Days since 0001-01-01, for a `Date` column.
+    Date(u32),
 }
 
 impl From<i64> for TdsValue {
@@ -384,6 +388,7 @@ fn type_info(t: TdsType) -> Vec<u8> {
         TdsType::Real => vec![0x6D, 4],
         TdsType::Decimal { scale } => vec![0x6C, 17, 38, scale],
         TdsType::NVarChar => vec![0xE7, 0x40, 0x1F, 0x09, 0x04, 0xD0, 0x00, 0x34],
+        TdsType::Date => vec![0x28],
     }
 }
 
@@ -421,6 +426,11 @@ fn cell(t: TdsType, v: &TdsValue) -> Vec<u8> {
         (TdsType::Decimal { .. }, TdsValue::Decimal(d)) => {
             let mut out = vec![17, u8::from(*d >= 0)];
             out.extend_from_slice(&d.unsigned_abs().to_le_bytes());
+            out
+        }
+        (TdsType::Date, TdsValue::Date(days)) => {
+            let mut out = vec![3];
+            out.extend_from_slice(&days.to_le_bytes()[..3]);
             out
         }
         (TdsType::NVarChar, TdsValue::Str(s)) => {
@@ -511,6 +521,8 @@ mod tests {
         assert_eq!(cell(TdsType::TinyInt, &5i64.into()), vec![1, 5]);
         assert_eq!(cell(TdsType::Int, &5i64.into()), vec![4, 5, 0, 0, 0]);
         assert_eq!(type_info(TdsType::Int), vec![0x26, 4]);
+        assert_eq!(type_info(TdsType::Date), vec![0x28]);
+        assert_eq!(cell(TdsType::Date, &TdsValue::Date(1)), vec![3, 1, 0, 0]);
         assert_eq!(type_info(TdsType::Bit), vec![0x68, 1]);
         assert_eq!(type_info(TdsType::Float), vec![0x6D, 8]);
         assert_eq!(type_info(TdsType::Real), vec![0x6D, 4]);

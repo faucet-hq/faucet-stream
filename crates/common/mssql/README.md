@@ -20,6 +20,7 @@ This is an internal building block. It holds the configuration the MSSQL [source
 | `with_statement_timeout` | async fn | Wraps a query future in a `tokio::time::timeout`. |
 | `quote_ident_mssql` | fn | `[bracket]` identifier quoting (doubles interior `]`). |
 | `PARAM_LIMIT` | const | `2100` — MSSQL's per-request bind-parameter ceiling. |
+| `temporal::decode_temporal` / `temporal::format_legacy_datetime` | fn | The one temporal-column decoder the `mssql` and `mssql-cdc` sources share (`DATETIME` / `SMALLDATETIME` with whole milliseconds). |
 | `MssqlPool` / `MssqlPooledConnection<'a>` | type alias | The `bb8` pool and a checked-out connection (derefs to `tiberius::Client`). |
 | `ConnectionManager` / `MssqlClient` | struct / type alias | The `bb8::ManageConnection` behind the pool: TCP connect with keepalive, the TDS handshake, one routing redirect followed; `is_valid` runs `SELECT 1`. `MssqlClient` is the pooled `tiberius::Client` type. |
 

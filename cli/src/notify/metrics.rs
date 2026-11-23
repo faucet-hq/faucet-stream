@@ -3,7 +3,11 @@
 //! - `faucet_notifications_sent_total{channel,event,outcome}` — deliveries
 //!   attempted; `outcome` ∈ `ok` | `error`.
 //! - `faucet_notifications_dropped_total{channel,reason}` — events not
-//!   delivered; `reason` ∈ `coalesced` | `channel_error`.
+//!   delivered; `reason` ∈ `coalesced` | `channel_error` | `queue_full` |
+//!   `deadline` (the last two with `channel="*"`: the background queue was
+//!   full, or a batch ran past its delivery deadline).
+//! - `faucet_notifications_pending` — notification batches queued or being
+//!   delivered in the background.
 //! - `faucet_notification_dispatch_duration_seconds{channel}` — per-delivery
 //!   latency.
 //!
@@ -11,7 +15,7 @@
 //! `faucet_pipeline_sla_*`): plain `metrics` macros, low-cardinality labels
 //! only (never pipeline/row/record values as labels — those stay in logs).
 
-use metrics::{counter, describe_counter, describe_histogram, histogram};
+use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use std::sync::Once;
 
 static DESCRIBE: Once = Once::new();
@@ -29,6 +33,10 @@ fn describe() {
         describe_histogram!(
             "faucet_notification_dispatch_duration_seconds",
             "Per-delivery notification dispatch latency in seconds"
+        );
+        describe_gauge!(
+            "faucet_notifications_pending",
+            "Notification batches queued or being delivered in the background"
         );
     });
 }
@@ -56,6 +64,12 @@ pub fn record_dropped(channel: &'static str, reason: &'static str) {
     .increment(1);
 }
 
+/// Set the number of notification batches pending in the background queue.
+pub fn set_pending(batches: usize) {
+    describe();
+    gauge!("faucet_notifications_pending").set(batches as f64);
+}
+
 /// Record per-delivery dispatch latency.
 pub fn record_duration(channel: &'static str, secs: f64) {
     describe();
@@ -72,5 +86,6 @@ mod tests {
         super::record_sent("slack", "run_failure", true);
         super::record_dropped("slack", "coalesced");
         super::record_duration("slack", 0.01);
+        super::set_pending(0);
     }
 }

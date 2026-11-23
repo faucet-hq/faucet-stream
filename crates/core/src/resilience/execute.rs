@@ -43,7 +43,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, FaucetError>>,
 {
-    run_with_policy(policy, cancel, None, None, None, op).await
+    run_with_policy(policy, cancel, None, None, None, None, op).await
 }
 
 /// Like [`execute_with_policy`], but reports source-side throttling to a
@@ -65,7 +65,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, FaucetError>>,
 {
-    run_with_policy(policy, cancel, None, recorder, None, op).await
+    run_with_policy(policy, cancel, None, recorder, None, None, op).await
 }
 
 /// Like [`execute_with_policy`], but emits the resilience metrics
@@ -84,7 +84,7 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, FaucetError>>,
 {
-    run_with_policy(policy, cancel, Some(metrics), None, None, op).await
+    run_with_policy(policy, cancel, Some(metrics), None, None, None, op).await
 }
 
 /// The runner behind [`CallContext::call`](crate::io::CallContext::call):
@@ -95,13 +95,35 @@ pub(crate) async fn run_call<F, Fut, T>(
     cancel: Option<&CancellationToken>,
     recorder: Option<&Arc<RoundtripRecorder>>,
     rate_limit_retries: Option<u32>,
+    retryable: Option<fn(&FaucetError) -> bool>,
     op: F,
 ) -> Result<T, FaucetError>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, FaucetError>>,
 {
-    run_with_policy(policy, cancel, None, recorder, rate_limit_retries, op).await
+    run_with_policy(
+        policy,
+        cancel,
+        None,
+        recorder,
+        rate_limit_retries,
+        retryable,
+        op,
+    )
+    .await
+}
+
+/// Whether a failed attempt provably never took effect on the backend: an
+/// explicit decline (a rate limit, an HTTP `429`) or a failure to connect.
+/// The retry filter of a non-idempotent call.
+pub(crate) fn not_processed(e: &FaucetError) -> bool {
+    match e {
+        FaucetError::RateLimited(_) => true,
+        FaucetError::HttpStatus { status, .. } => *status == 429,
+        FaucetError::Http(e) => e.is_connect(),
+        _ => false,
+    }
 }
 
 /// Sleep `wait`, or return `false` as soon as `cancel` fires.
@@ -133,6 +155,7 @@ async fn run_with_policy<F, Fut, T>(
     metrics: Option<&RetryMetrics>,
     recorder: Option<&Arc<RoundtripRecorder>>,
     rate_limit_retries: Option<u32>,
+    retryable: Option<fn(&FaucetError) -> bool>,
     mut op: F,
 ) -> Result<T, FaucetError>
 where
@@ -176,7 +199,11 @@ where
         rate_limited = 0;
         match outcome {
             Ok(val) => return Ok(val),
-            Err(e) if policy.is_retriable(&e) && attempt + 1 < max_attempts => {
+            Err(e)
+                if policy.is_retriable(&e)
+                    && retryable.is_none_or(|f| f(&e))
+                    && attempt + 1 < max_attempts =>
+            {
                 let wait = match &e {
                     FaucetError::RateLimited(stated) => *stated,
                     _ => {
@@ -596,6 +623,7 @@ mod tests {
             Some(&token),
             Some(&rec),
             Some(5),
+            None,
             || async { Err::<i32, _>(FaucetError::RateLimited(Duration::from_secs(30))) },
         )
         .await;

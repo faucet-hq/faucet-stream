@@ -8,7 +8,7 @@ use faucet_core::shard::{
     PkShardBounds, ShardSpec, parse_pk_shard, pk_bounds_query, pk_shards_from_bounds,
 };
 use faucet_core::util::quote_ident;
-use faucet_core::{FaucetError, Stream, StreamPage};
+use faucet_core::{FaucetError, Stream, StreamPage, TimePrecision};
 use futures::TryStreamExt;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
@@ -29,6 +29,9 @@ pub struct PostgresSource {
     /// `NUMERIC` / `MONEY` columns of the query being read, which arrive as
     /// text and render as exact decimals (#885).
     decimal_columns: Mutex<std::collections::HashSet<String>>,
+    /// `time` columns, read as server text (`24:00:00` has no chrono value)
+    /// and rendered with six fraction digits.
+    time_columns: Mutex<std::collections::HashSet<String>>,
     /// Bookmark loaded via [`Source::apply_start_bookmark`](faucet_core::Source::apply_start_bookmark).
     start_bookmark: Mutex<Option<Value>>,
     /// The last statement described and its columns, so the declaration
@@ -65,6 +68,7 @@ impl PostgresSource {
             applied_shard: Mutex::new(None),
             json_warned: Mutex::new(Default::default()),
             decimal_columns: Mutex::new(Default::default()),
+            time_columns: Mutex::new(Default::default()),
             start_bookmark: Mutex::new(None),
             described: Mutex::new(None),
             calls: CallSlot::new(CallContext::new().without_timeout()),
@@ -199,6 +203,11 @@ impl PostgresSource {
                     .filter(|(_, t)| is_decimal_type(t))
                     .map(|(n, _)| n.clone())
                     .collect();
+                *self.time_columns.lock().expect("time columns") = columns
+                    .iter()
+                    .filter(|(_, t)| t.eq_ignore_ascii_case("TIME"))
+                    .map(|(n, _)| n.clone())
+                    .collect();
                 text_cast_query(&query, &columns).unwrap_or(query)
             }
             _ => query,
@@ -302,6 +311,7 @@ impl PostgresSource {
                 .lock()
                 .expect("decimal columns")
                 .clone(),
+            time: self.time_columns.lock().expect("time columns").clone(),
         }
     }
 
@@ -675,6 +685,9 @@ fn pg_value_to_json(
             return faucet_core::fidelity::decimal_text(&v)
                 .map_err(|e| FaucetError::Source(format!("PostgreSQL column {col_name}: {e}")));
         }
+        if json.time.contains(col_name) {
+            return Ok(time_text(v));
+        }
         return Ok(Value::String(v));
     }
     if let Ok(v) = row.try_get::<i64, _>(idx) {
@@ -707,16 +720,19 @@ fn pg_value_to_json(
     // Richer types that would otherwise silently decode to Null (#78/#43).
     // Timestamps → RFC3339 / ISO-8601 strings.
     if let Ok(v) = row.try_get::<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>, _>(idx) {
-        return Ok(Value::String(v.to_rfc3339()));
+        return Ok(faucet_core::fidelity::timestamp(&v, TimePrecision::Micros));
     }
     if let Ok(v) = row.try_get::<sqlx::types::chrono::NaiveDateTime, _>(idx) {
-        return Ok(Value::String(v.to_string()));
+        return Ok(faucet_core::fidelity::timestamp_naive(
+            &v,
+            TimePrecision::Micros,
+        ));
     }
     if let Ok(v) = row.try_get::<sqlx::types::chrono::NaiveDate, _>(idx) {
         return Ok(Value::String(v.to_string()));
     }
     if let Ok(v) = row.try_get::<sqlx::types::chrono::NaiveTime, _>(idx) {
-        return Ok(Value::String(v.to_string()));
+        return Ok(faucet_core::fidelity::time(&v, TimePrecision::Micros));
     }
     // UUID → canonical hyphenated string.
     if let Ok(v) = row.try_get::<sqlx::types::Uuid, _>(idx) {
@@ -1028,6 +1044,7 @@ struct JsonContext<'a> {
     mode: faucet_core::JsonBigNumbers,
     warned: &'a Mutex<std::collections::HashSet<String>>,
     decimal: std::collections::HashSet<String>,
+    time: std::collections::HashSet<String>,
 }
 
 fn row_to_json(row: &sqlx::postgres::PgRow, json: &JsonContext<'_>) -> Result<Value, FaucetError> {
@@ -1044,6 +1061,15 @@ fn row_to_json(row: &sqlx::postgres::PgRow, json: &JsonContext<'_>) -> Result<Va
         );
     }
     Ok(Value::Object(map))
+}
+
+/// A `time` value read as server text, with six fraction digits; text chrono
+/// cannot hold (`24:00:00`) is kept as the server spells it.
+fn time_text(text: String) -> Value {
+    match sqlx::types::chrono::NaiveTime::parse_from_str(&text, "%H:%M:%S%.f") {
+        Ok(t) => faucet_core::fidelity::time(&t, TimePrecision::Micros),
+        Err(_) => Value::String(text),
+    }
 }
 
 /// A result with two columns of the same name is refused, as the sqlite and
@@ -1638,6 +1664,14 @@ mod tests {
     }
 
     #[test]
+    fn time_text_renders_six_digits_and_keeps_what_chrono_cannot_hold() {
+        use serde_json::json;
+        assert_eq!(time_text("12:30:00".into()), json!("12:30:00.000000"));
+        assert_eq!(time_text("10:00:00.5".into()), json!("10:00:00.500000"));
+        assert_eq!(time_text("24:00:00".into()), json!("24:00:00"));
+    }
+
+    #[test]
     fn decimal_types_are_numeric_and_money() {
         let cols = |c: &[(&str, &str)]| -> Vec<(String, String)> {
             c.iter()
@@ -2097,6 +2131,7 @@ mod tests {
             applied_shard: Mutex::new(None),
             json_warned: Mutex::new(Default::default()),
             decimal_columns: Mutex::new(Default::default()),
+            time_columns: Mutex::new(Default::default()),
             described: Mutex::new(None),
             start_bookmark: Mutex::new(None),
             calls: CallSlot::new(CallContext::new().without_timeout()),

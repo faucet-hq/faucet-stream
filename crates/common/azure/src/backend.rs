@@ -147,6 +147,35 @@ impl ObjectClient for AzureObjects {
         file.flush().await.map_err(|e| err("download", key, e))
     }
 
+    fn supports_create_new(&self) -> bool {
+        true
+    }
+
+    async fn create_new(&self, key: &str, bytes: &[u8]) -> Result<bool, FaucetError> {
+        self.roundtrips.record("claim");
+        let opts = object_store::PutOptions {
+            mode: object_store::PutMode::Create,
+            ..Default::default()
+        };
+        match self
+            .store
+            .put_opts(
+                &ObjectPath::from(key),
+                bytes::Bytes::from(bytes.to_vec()).into(),
+                opts,
+            )
+            .within(&self.calls, "claim")
+            .await?
+        {
+            Ok(_) => Ok(true),
+            Err(
+                object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. },
+            ) => Ok(false),
+            Err(e) => Err(err("create object", key, e)),
+        }
+    }
+
     async fn upload(&self, from: &Path, key: &str) -> Result<(), FaucetError> {
         use tokio::io::AsyncReadExt as _;
         let path = ObjectPath::from(key);
@@ -756,6 +785,19 @@ mod tests {
                 assert!(e.contains("azure open local file error for key 'p'"), "{e}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn create_new_creates_only_when_absent() {
+        let mem: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let o = objects(mem, 1 << 20);
+        assert!(o.supports_create_new());
+        assert!(o.create_new("lock-1", b"a").await.unwrap());
+        assert!(!o.create_new("lock-1", b"b").await.unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let to = dir.path().join("got");
+        o.download("lock-1", &to).await.unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"a", "the first body stays");
     }
 
     #[tokio::test(flavor = "multi_thread")]

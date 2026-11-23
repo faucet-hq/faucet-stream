@@ -411,3 +411,36 @@ async fn check_fails_when_endpoint_unreachable() {
         other => panic!("expected a Fail probe, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn a_result_with_two_columns_of_one_name_is_refused_on_both_paths() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": "090001",
+            "statementHandle": "dup",
+            "resultSetMetaData": {
+                "rowType": [{"name": "ID", "type": "fixed"}, {"name": "ID", "type": "fixed"}],
+                "partitionInfo": [{"rowCount": 1}],
+            },
+            "data": [["1", "2"]],
+        })))
+        .mount(&server)
+        .await;
+    let src = build_source(cfg(), &server);
+    let err = src.fetch_all().await.expect_err("a column would vanish");
+    assert!(
+        err.to_string()
+            .contains("Snowflake query returns two columns named \"ID\""),
+        "{err}"
+    );
+    let err = src
+        .fetch_with_context(&HashMap::new())
+        .await
+        .expect_err("a column would vanish");
+    assert!(
+        err.to_string().contains("two columns named \"ID\""),
+        "{err}"
+    );
+}

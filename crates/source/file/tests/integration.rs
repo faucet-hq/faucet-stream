@@ -488,6 +488,50 @@ async fn columnar_incremental_pages_carry_bookmarks() {
     assert_eq!(marks, 2, "an empty file still advances the bookmark");
 }
 
+/// The columnar path also keeps the bookmark before a file that changed
+/// while it was read.
+#[tokio::test]
+async fn columnar_name_mode_does_not_bookmark_a_file_that_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = FormatOptions::default();
+    opts.avro.codec = faucet_core::AvroCodec::Null;
+    let rows: Vec<Value> = (0..3).map(|i| json!({"i": i})).collect();
+    let a = write(
+        dir.path(),
+        "a.avro",
+        &encode(&rows, FileFormat::Avro, &opts).unwrap(),
+    );
+    write(
+        dir.path(),
+        "b.avro",
+        &encode(&[json!({"i": 9})], FileFormat::Avro, &opts).unwrap(),
+    );
+    let mut cfg = FileSourceConfig::new(dir_str(dir.path()))
+        .format(FileSourceFormat::Avro)
+        .incremental(IncrementalBy::Name);
+    cfg.batch_size = 1;
+    let src = FileSource::new(cfg).unwrap();
+    let ctx = HashMap::new();
+    let mut batches = src.stream_batches(&ctx, 1);
+    let first = batches.next().await.unwrap().unwrap();
+    assert!(first.bookmark.is_none());
+    std::fs::File::options()
+        .write(true)
+        .open(&a)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(7))
+        .unwrap();
+    let mut rows = first.batch.num_rows();
+    let mut marks = 0;
+    while let Some(b) = batches.next().await {
+        let b = b.unwrap();
+        rows += b.batch.num_rows();
+        marks += usize::from(b.bookmark.is_some());
+    }
+    assert_eq!(marks, 0, "no bookmark past a file that changed");
+    assert_eq!(rows, 3, "b.avro waits for the next run");
+}
+
 #[tokio::test]
 async fn shards_partition_files_and_discover_lists_them() {
     let dir = tempfile::tempdir().unwrap();
@@ -662,10 +706,146 @@ async fn one_record_past_max_object_bytes_fails_a_streamed_file() {
     }
 }
 
+/// A file rewritten with the same modification time as the watermark is
+/// read again: its size, inode or change time differs.
+#[tokio::test]
+async fn a_rewrite_within_one_timestamp_tick_is_read_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let put = |body: &[u8]| {
+        let p = write(d, "a.jsonl", body);
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    };
+    put(b"{\"n\":1}\n");
+    let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+    let config = FileSourceConfig::new(dir_str(d)).incremental(IncrementalBy::Mtime);
+    let run = |store: Arc<dyn StateStore>| {
+        let config = config.clone();
+        async move {
+            let src = FileSource::new(config).unwrap();
+            let sink = Capture::default();
+            Pipeline::new(&src, &sink)
+                .with_state_store(store)
+                .run()
+                .await
+                .unwrap();
+            sink.0.lock().unwrap().clone()
+        }
+    };
+    assert_eq!(run(store.clone()).await, vec![json!({"n": 1})]);
+    assert!(run(store.clone()).await.is_empty(), "unchanged");
+    put(b"{\"n\":1}\n{\"n\":2}\n");
+    assert_eq!(
+        run(store.clone()).await,
+        vec![json!({"n": 1}), json!({"n": 2})],
+        "same mtime, different content"
+    );
+    assert!(run(store).await.is_empty());
+}
+
+/// In `by: name` mode without `stable_for_secs`, a file that grows while it
+/// is read keeps the bookmark before it and stops the run there; the next
+/// run reads it again, then the files after it.
+#[tokio::test]
+async fn name_mode_does_not_bookmark_a_file_that_grew_while_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let a = write(d, "a.jsonl", b"{\"n\":1}\n{\"n\":2}\n");
+    write(d, "b.jsonl", b"{\"n\":9}\n");
+    let mut cfg = FileSourceConfig::new(dir_str(d)).incremental(IncrementalBy::Name);
+    cfg.batch_size = 1;
+    let src = FileSource::new(cfg.clone()).unwrap();
+    let ctx = HashMap::new();
+    let mut pages = src.stream_pages(&ctx, 1);
+    let first = pages.next().await.unwrap().unwrap();
+    assert_eq!(first.records, vec![json!({"n": 1})]);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&a)
+        .unwrap()
+        .write_all(b"{\"n\":3}\n")
+        .unwrap();
+    let mut rest = Vec::new();
+    let mut marks = Vec::new();
+    while let Some(p) = pages.next().await {
+        let p = p.unwrap();
+        rest.extend(p.records);
+        marks.extend(p.bookmark);
+    }
+    drop(pages);
+    assert!(
+        marks.is_empty(),
+        "no bookmark past a file that changed: {marks:?}"
+    );
+    assert!(!rest.contains(&json!({"n": 9})), "b.jsonl waits: {rest:?}");
+
+    let again = read_all(&FileSource::new(cfg).unwrap()).await.unwrap();
+    assert_eq!(
+        again,
+        vec![
+            json!({"n": 1}),
+            json!({"n": 2}),
+            json!({"n": 3}),
+            json!({"n": 9})
+        ]
+    );
+}
+
 mod http {
     use super::*;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A remote file whose `Last-Modified` is unchanged but whose strong
+    /// `ETag` moved is read again.
+    #[tokio::test]
+    async fn a_new_etag_at_the_same_last_modified_is_read_again() {
+        let server = MockServer::start().await;
+        let lm = "Wed, 21 Oct 2026 07:28:00 GMT";
+        for (etag, n) in [("\"v1\"", 2u64), ("\"v2\"", 2)] {
+            Mock::given(method("HEAD"))
+                .and(path("/f.jsonl"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Last-Modified", lm)
+                        .insert_header("ETag", etag),
+                )
+                .up_to_n_times(n)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/f.jsonl"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"{\"r\":1}\n".to_vec()))
+            .mount(&server)
+            .await;
+        let store: Arc<dyn StateStore> = Arc::new(MemoryStateStore::new());
+        let config = FileSourceConfig::new(format!("{}/f.jsonl", server.uri()))
+            .incremental(IncrementalBy::Mtime);
+        let run = |store: Arc<dyn StateStore>| {
+            let config = config.clone();
+            async move {
+                let src = FileSource::new(config).unwrap();
+                let sink = Capture::default();
+                Pipeline::new(&src, &sink)
+                    .with_state_store(store)
+                    .run()
+                    .await
+                    .unwrap();
+                sink.0.lock().unwrap().len()
+            }
+        };
+        assert_eq!(run(store.clone()).await, 1, "first read");
+        assert_eq!(run(store.clone()).await, 0, "same ETag");
+        assert_eq!(run(store.clone()).await, 1, "new ETag, same Last-Modified");
+        assert_eq!(run(store).await, 0);
+    }
 
     #[tokio::test]
     async fn a_remote_gzipped_jsonl_file_streams_with_retries_and_headers() {
@@ -951,7 +1131,8 @@ async fn http_fetcher_get_and_head_without_a_call_context() {
         .and(path("/f.jsonl"))
         .respond_with(
             ResponseTemplate::new(200)
-                .insert_header("Last-Modified", "Thu, 01 Jan 1970 00:00:01 GMT"),
+                .insert_header("Last-Modified", "Thu, 01 Jan 1970 00:00:01 GMT")
+                .insert_header("ETag", "W/\"weak\""),
         )
         .mount(&server)
         .await;
@@ -973,6 +1154,7 @@ async fn http_fetcher_get_and_head_without_a_call_context() {
     assert_eq!(body, "{\"a\":1}\n");
     let meta = fetcher.head(&url, &slot).await.unwrap();
     assert_eq!(meta.last_modified_ns, Some(1_000_000_000));
+    assert_eq!(meta.etag, None, "a weak ETag is not a fingerprint");
     assert_eq!(
         meter.snapshot().roundtrips(faucet_core::UsageSide::Source),
         2

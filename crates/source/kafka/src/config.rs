@@ -65,8 +65,15 @@ pub struct KafkaSourceConfig {
     /// What a message that fails to decode does: fail the run (default), or
     /// skip the message and continue.
     pub on_decode_error: OnDecodeError,
-    /// Raw librdkafka client properties to pass through. Use with care —
-    /// these can override anything set by `auth` or the typed fields above.
+    /// Raw librdkafka client properties to pass through, applied after
+    /// `auth` and the typed fields. Use with care.
+    ///
+    /// Options faucet sets itself are refused when their value disagrees
+    /// with it: `bootstrap.servers` / `metadata.broker.list` (use `brokers`),
+    /// `group.id` (use `group_id`), `auto.offset.reset` (use
+    /// `auto_offset_reset`), `enable.auto.commit` (must stay `false`: offsets
+    /// are committed only after a page is written) and `isolation.level`
+    /// (must stay `read_committed`). Restating faucet's own value is allowed.
     ///
     /// Keys that name a broker (`bootstrap.servers`, `metadata.broker.list`),
     /// a URL (`*.url`) or a local file (`*.location`, `*.file`,
@@ -116,6 +123,14 @@ impl std::fmt::Debug for KafkaSourceConfig {
             &["password", "key_password", "extra_client_config"],
         )
     }
+}
+
+/// A comma-separated broker list, entries trimmed.
+fn broker_list(list: &str) -> Vec<&str> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .collect()
 }
 
 fn default_poll_timeout() -> Duration {
@@ -172,7 +187,60 @@ impl KafkaSourceConfig {
             ));
         }
         faucet_core::validate_batch_size(self.batch_size)?;
-        Ok(())
+        self.check_owned_client_keys()
+    }
+
+    /// Refuse `extra_client_config` entries that disagree with the options
+    /// faucet sets from the typed fields (or that delivery depends on).
+    fn check_owned_client_keys(&self) -> Result<(), FaucetError> {
+        use faucet_common_kafka::OwnedKey;
+        let brokers = broker_list(&self.brokers);
+        let group = self.group_id.trim();
+        let reset = self.auto_offset_reset;
+        let same_brokers = |v: &str| broker_list(v) == brokers;
+        let same_group = |v: &str| v == group;
+        let same_reset = |v: &str| {
+            let v = v.to_ascii_lowercase();
+            match reset {
+                OffsetReset::Earliest => {
+                    matches!(v.as_str(), "earliest" | "smallest" | "beginning")
+                }
+                OffsetReset::Latest => matches!(v.as_str(), "latest" | "largest" | "end"),
+            }
+        };
+        let no_auto_commit = |v: &str| v.eq_ignore_ascii_case("false");
+        let read_committed = |v: &str| v.eq_ignore_ascii_case("read_committed");
+        faucet_common_kafka::check_owned_keys(
+            "kafka source",
+            &self.extra_client_config,
+            &[
+                OwnedKey {
+                    keys: &["bootstrap.servers", "metadata.broker.list"],
+                    accepts: &same_brokers,
+                    owner: "set `brokers` instead",
+                },
+                OwnedKey {
+                    keys: &["group.id"],
+                    accepts: &same_group,
+                    owner: "set `group_id` instead",
+                },
+                OwnedKey {
+                    keys: &["auto.offset.reset"],
+                    accepts: &same_reset,
+                    owner: "set `auto_offset_reset` instead",
+                },
+                OwnedKey {
+                    keys: &["enable.auto.commit"],
+                    accepts: &no_auto_commit,
+                    owner: "faucet commits offsets only after a page is written, so it must stay `false`",
+                },
+                OwnedKey {
+                    keys: &["isolation.level"],
+                    accepts: &read_committed,
+                    owner: "faucet reads only committed transactional records, so it must stay `read_committed`",
+                },
+            ],
+        )
     }
 
     /// Set the per-page message count for
@@ -240,6 +308,29 @@ mod tests {
             extra_client_config: BTreeMap::new(),
             batch_size: DEFAULT_BATCH_SIZE,
         }
+    }
+
+    #[test]
+    fn extra_client_config_may_not_disagree_with_owned_options() {
+        let with = |k: &str, v: &str| {
+            let mut c = minimal_config();
+            c.extra_client_config.insert(k.into(), v.into());
+            c.validate()
+        };
+        assert!(with("fetch.min.bytes", "1").is_ok());
+        assert!(with("enable.auto.commit", "false").is_ok());
+        assert!(with("isolation.level", "READ_COMMITTED").is_ok());
+        assert!(with("group.id", &minimal_config().group_id).is_ok());
+        assert!(with("bootstrap.servers", &minimal_config().brokers).is_ok());
+        let err = with("enable.auto.commit", "true").unwrap_err().to_string();
+        assert!(
+            err.contains("extra_client_config.enable.auto.commit"),
+            "{err}"
+        );
+        assert!(with("isolation.level", "read_uncommitted").is_err());
+        assert!(with("group.id", "someone-else").is_err());
+        assert!(with("metadata.broker.list", "elsewhere:9092").is_err());
+        assert!(with("auto.offset.reset", "flip-a-coin").is_err());
     }
 
     #[test]

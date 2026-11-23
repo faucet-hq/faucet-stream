@@ -237,6 +237,21 @@ pub struct XmlStreamConfig {
     pub pagination: Option<XmlPagination>,
     /// Maximum number of pages to fetch.
     pub max_pages: Option<usize>,
+    /// Keep paging when a page holds the same records as an earlier,
+    /// non-adjacent page of the read, instead of failing the run — for feeds
+    /// whose pages can legitimately repeat. Requires `max_pages`, which then
+    /// bounds a server that cycles pages. A page identical to the one just
+    /// before it still ends paging, and a body cursor that repeats an earlier
+    /// one always fails.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_repeated_pages: bool,
+    /// Accept a response with no element on the path to the records (the
+    /// parent of the last `records_element_path` segment) as an empty page.
+    /// By default such a response fails the run: it is usually an error
+    /// document served with HTTP 200, or a renamed element. Set it for an API
+    /// that omits the container on an empty result.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_missing_records_path: bool,
     /// Query parameters to include in every request. Empty by default.
     ///
     /// The `#[serde(default)]` is load-bearing: without it the field was
@@ -312,6 +327,8 @@ impl XmlStreamConfig {
             records_element_path: None,
             pagination: None,
             max_pages: None,
+            allow_repeated_pages: false,
+            allow_missing_records_path: false,
             query_params: std::collections::HashMap::new(),
             decode: Vec::new(),
             batch_size: DEFAULT_BATCH_SIZE,
@@ -389,6 +406,19 @@ impl XmlStreamConfig {
     }
 
     /// Set the maximum number of pages.
+    /// Page past a page identical to an earlier, non-adjacent one (needs
+    /// `max_pages`).
+    pub fn allow_repeated_pages(mut self, allow: bool) -> Self {
+        self.allow_repeated_pages = allow;
+        self
+    }
+
+    /// Accept a response without the records' container as an empty page.
+    pub fn allow_missing_records_path(mut self, allow: bool) -> Self {
+        self.allow_missing_records_path = allow;
+        self
+    }
+
     pub fn max_pages(mut self, max: usize) -> Self {
         self.max_pages = Some(max);
         self
@@ -436,6 +466,13 @@ impl XmlStreamConfig {
                 ));
             }
         }
+        if self.allow_repeated_pages && self.max_pages.is_none() {
+            return Err(FaucetError::Config(
+                "xml: `allow_repeated_pages` needs `max_pages`: with repeated pages allowed, \
+                 only the page cap stops a server that cycles through the same pages"
+                    .into(),
+            ));
+        }
         if let Some(tls) = &self.tls {
             tls.validate()?;
         }
@@ -447,6 +484,14 @@ impl XmlStreamConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_pages_need_a_page_cap() {
+        let c = XmlStreamConfig::new("https://x", "/y").allow_repeated_pages(true);
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("needs `max_pages`"), "{err}");
+        assert!(c.max_pages(3).validate().is_ok());
+    }
 
     #[test]
     fn default_config() {

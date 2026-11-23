@@ -679,12 +679,23 @@ fn expand_glob(pattern: &str) -> Result<Vec<FileTarget>, FaucetError> {
     for entry in entries {
         let p = entry
             .map_err(|e| FaucetError::Source(format!("glob entry error for '{pattern}': {e}")))?;
-        if p.is_file() {
+        if p.is_file() && !is_file_sink_side_path(&p) {
             paths.push(p);
         }
     }
     paths.sort();
     Ok(paths.into_iter().map(FileTarget::Local).collect())
+}
+
+/// Whether `p` is a file sink's unfinished or hidden output: a scratch file,
+/// or anything under a `.faucet-overwrite-…` directory (swap areas, the
+/// commit ledger and lock, writers' scratch directories).
+fn is_file_sink_side_path(p: &std::path::Path) -> bool {
+    p.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|n| n.starts_with(".faucet-overwrite-") || n.contains(".faucet-tmp"))
+    })
 }
 
 /// List S3 objects under `prefix` and turn them into `FileTarget::S3` entries.
@@ -953,6 +964,21 @@ fn schema_mismatch_message_pair(
     };
 
     format!("parquet source: schema mismatch between '{first_path}' and '{other_path}'{detail}")
+}
+
+#[cfg(test)]
+mod side_path_tests {
+    #[test]
+    fn a_glob_skips_file_sink_side_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let side = dir.path().join(".faucet-overwrite-x.commits");
+        std::fs::create_dir(&side).unwrap();
+        std::fs::write(side.join("lock-1"), b"").unwrap();
+        std::fs::write(dir.path().join("a.parquet"), b"").unwrap();
+        std::fs::write(dir.path().join("a.parquet.faucet-tmp"), b"").unwrap();
+        let found = super::expand_glob(&format!("{}/**/*", dir.path().display())).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
 }
 
 #[cfg(test)]

@@ -7,7 +7,8 @@
 //! staging table. See `docs/superpowers/specs/2026-06-13-bigquery-upsert-design.md`.
 
 use crate::idempotent::{
-    FieldSpec, build_merge_token, column_expr, json_path_segment, quote_ident, sql_str, table_ref,
+    FieldSpec, build_merge_token, build_watermark_guard, column_expr, json_path_segment,
+    quote_ident, sql_str, table_ref,
 };
 use faucet_core::FaucetError;
 
@@ -173,7 +174,7 @@ pub(crate) fn build_upsert_idempotent_sql(
     dataset: &str,
     table: &str,
 ) -> String {
-    let mut stmts = Vec::new();
+    let mut stmts = vec![build_watermark_guard(project, dataset)];
     if has_upserts {
         stmts.push(build_merge_upsert(columns, key, project, dataset, table));
     }

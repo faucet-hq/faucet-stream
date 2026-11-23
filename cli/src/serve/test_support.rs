@@ -35,6 +35,7 @@ pub fn test_config() -> ServeConfig {
         local_output_in_flight_grace: Duration::from_secs(60),
         preview: crate::serve::preview::PreviewConfig::default(),
         lease_ttl: Duration::from_secs(30),
+        metrics_idle_timeout: None,
         probe_timeout: Duration::from_secs(10),
         env_file: None,
         no_env_file: true,
@@ -197,6 +198,10 @@ impl RunHistory for Flaky {
     async fn meta_put(&self, key: &str, value: &str) -> Result<(), HErr> {
         self.check()?;
         self.inner.meta_put(key, value).await
+    }
+    async fn meta_delete(&self, key: &str) -> Result<(), HErr> {
+        self.check()?;
+        self.inner.meta_delete(key).await
     }
     async fn meta_compare_and_set(
         &self,

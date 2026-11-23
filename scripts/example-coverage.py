@@ -74,14 +74,19 @@ def enum_variants(text, name, case=snake):
 def top_level_keys(text):
     keys = set()
     pending = None
+    skipped = False
     for line in struct_body(text, "PipelineConfig").splitlines():
         rename = re.search(r'rename\s*=\s*"([a-z_]+)"', line)
         if rename:
             pending = rename.group(1)
+        if re.search(r"serde\((?:[^)]*,\s*)?skip\s*[,)]", line):
+            skipped = True
         field = re.match(r"\s*pub ([a-z_]+):", line)
         if field:
-            keys.add(pending or field.group(1))
+            if not skipped:
+                keys.add(pending or field.group(1))
             pending = None
+            skipped = False
     return keys
 
 

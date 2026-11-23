@@ -32,12 +32,12 @@ pub use decorator::{InstrumentedSink, InstrumentedSource};
 pub use drift::schema_drift;
 #[cfg(all(feature = "observability-install", feature = "otel"))]
 pub use install::install_prometheus_with_otel_metrics;
-#[cfg(feature = "observability-install")]
-pub use install::with_default_buckets;
 pub use install::{
     InstallError, InstallReport, ObservabilityConfig, PrometheusConfig, TracingConfig,
     build_version, install_observability, register_build_info, set_build_version,
 };
+#[cfg(feature = "observability-install")]
+pub use install::{prune_idle_series, prune_interval, with_default_buckets, with_idle_timeout};
 pub use labels::Labels;
 #[cfg(feature = "masking")]
 pub use masking::instrumented_apply_masking;

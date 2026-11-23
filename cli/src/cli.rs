@@ -698,6 +698,20 @@ pub enum FeedCommand {
     /// Put a held delivery back on a valid position after its store was
     /// restored from a backup.
     Recover { name: String, delivery: String },
+    /// Start a feed whose definition now names another feed store than the
+    /// one holding its events empty in the store it names; its events in the
+    /// old store are not delivered. `--all` adopts every such feed (of the
+    /// store `--in` names).
+    AdoptStore {
+        /// The feed (omit with `--all`).
+        name: Option<String>,
+        /// Every feed whose events are in another store.
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
+        /// With `--all`: only feeds naming this store.
+        #[arg(long = "in", value_name = "STORE", requires = "all")]
+        in_store: Option<String>,
+    },
     /// List a feed's retained events (never their payloads), newest first.
     Events {
         name: String,
@@ -2563,6 +2577,17 @@ pub struct ReferenceArgs {
         env = "FAUCET_SERVE_ALLOW_LISTEN"
     )]
     pub allow_listen: Vec<String>,
+    /// Trust the sink `attributes` of submitted configs (and of template
+    /// sinks a caller's param values choose) for data-flow policy, as if the
+    /// operator wrote them. Default: untrusted — such attributes never
+    /// satisfy a policy `require` rule, and every `when.sink`-scoped rule
+    /// applies to such a sink. Only for a server whose every caller is the
+    /// policy owner.
+    #[arg(
+        long = "policy-trust-caller-attributes",
+        env = "FAUCET_SERVE_POLICY_TRUST_CALLER_ATTRIBUTES"
+    )]
+    pub policy_trust_caller_attributes: bool,
 }
 
 /// `faucet serve` arguments.
@@ -2747,6 +2772,16 @@ pub struct ServeArgs {
     /// Only relevant with a persistent (postgres/sqlite) history backend.
     #[arg(long, default_value_t = 30)]
     pub lease_ttl_secs: u64,
+    /// Drop counter and histogram series not updated for this many seconds
+    /// from `/metrics` until they are emitted again (gauges never expire).
+    /// Bounds the memory and scrape size of a long-running server. `0` keeps
+    /// every series.
+    #[arg(
+        long,
+        env = "FAUCET_SERVE_METRICS_IDLE_TIMEOUT_SECS",
+        default_value_t = 86_400
+    )]
+    pub metrics_idle_timeout_secs: u64,
     /// Per-probe timeout for `doctor_first` preflight (seconds).
     #[arg(long, default_value_t = 10)]
     pub probe_timeout_secs: u64,

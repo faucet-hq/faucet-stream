@@ -47,6 +47,7 @@ fn opts(name: &str, cfg: &PipelineConfig) -> ExecuteOptions {
         catalog: None,
         usage: Default::default(),
         budget: None,
+        budget_state: None,
         feed: Default::default(),
     }
 }
@@ -242,6 +243,46 @@ async fn verify_finds_and_repairs_injected_drift() {
         .await
         .unwrap();
     assert!(clean.report.equal(), "{clean:?}");
+}
+
+/// A repair of a row that follows another (`depends_on`) runs on its own.
+#[tokio::test]
+async fn verify_repairs_a_row_that_depends_on_another() {
+    let d = fresh().await;
+    exec(
+        &d.dst,
+        "CREATE TABLE first_dst (id INTEGER PRIMARY KEY, name TEXT, _faucet_run_id TEXT)",
+    )
+    .await;
+    let cfg = load(&config_yaml(
+        &d.src,
+        &d.dst,
+        &d.state,
+        "upsert",
+        "matrix:\n  - id: first\n    sink: { config: { table_name: first_dst } }\n  \
+         - id: second\n    depends_on: [first]",
+    ));
+    let summary = run(&cfg).await;
+    assert!(!summary.had_failures(), "{summary:?}");
+    exec(&d.dst, "DELETE FROM dst WHERE id = 3").await;
+    let repaired = faucet_cli::verify::verify(
+        &cfg,
+        &VerifySpec::default(),
+        VerifyInputs {
+            row: Some("second".into()),
+            repair: true,
+            allow_delete: false,
+            dry_run: false,
+            pipeline_name: "mirror".into(),
+            execution: None,
+            auth: Default::default(),
+            clock: chrono::Utc::now().fixed_offset(),
+        },
+    )
+    .await
+    .expect("the repair of a dependent row runs");
+    assert_eq!(repaired.report.repaired_upserts, Some(1), "{repaired:?}");
+    assert_eq!(rows(&d.dst).await.len(), 4);
 }
 
 #[tokio::test]

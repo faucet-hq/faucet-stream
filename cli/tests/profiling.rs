@@ -297,6 +297,7 @@ async fn dry_run_and_limit_do_not_touch_the_baseline() {
         catalog: None,
         usage: Default::default(),
         budget: None,
+        budget_state: None,
         feed: Default::default(),
     };
     faucet_cli::executor::run_expanded(nodes.clone(), opts(true, None))

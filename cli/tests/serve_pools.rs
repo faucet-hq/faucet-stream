@@ -52,6 +52,7 @@ fn args(port: u16, history: String, cluster: bool, pools: &[&str]) -> faucet_cli
         preview_default_rows: 500,
         preview_max_rows: 5_000,
         lease_ttl_secs: 3,
+        metrics_idle_timeout_secs: 86_400,
         probe_timeout_secs: 5,
         env_file: None,
         no_env_file: true,
@@ -647,6 +648,7 @@ async fn history_claims_filter_on_pool() {
         state_format: faucet_core::state_version::STATE_FORMAT,
         pools: vec!["a".into(), "gpu".into()],
         capabilities: Vec::new(),
+        clock_offset_ms: None,
     })
     .await
     .unwrap();

@@ -170,29 +170,17 @@ fn build_unit_node(
     range_hash: &str,
     time_mode: bool,
 ) -> CliResult<ExpandedNode> {
-    let mut n = root.clone();
-    n.id = unit_row_id(range_hash, &unit.id);
+    let mut n = crate::sub_run::derive(
+        root,
+        crate::sub_run::SubRun::Backfill,
+        unit_row_id(range_hash, &unit.id),
+    );
     if time_mode {
         substitute_unit_tokens(&mut n.source.config, unit)?;
         substitute_unit_tokens(&mut n.sink.config, unit)?;
         for t in &mut n.transforms {
             substitute_unit_tokens(&mut t.config, unit)?;
         }
-    }
-    n.delivery = faucet_core::DeliveryMode::AtLeastOnce;
-    if n.delivery_guarantee
-        != faucet_core::DeliveryGuarantee::EffectivelyOnce(
-            faucet_core::EffectivelyOnceMechanism::KeyedUpsert,
-        )
-    {
-        n.delivery_guarantee = faucet_core::DeliveryGuarantee::AtLeastOnce;
-    }
-    if n.cleanup_scope.take().is_some() {
-        tracing::warn!(
-            row = %root.id,
-            "backfill: the row's `complete_for` cleanup is skipped — a unit fetches one window, \
-             so a sweep would delete every in-scope row outside it"
-        );
     }
     Ok(n)
 }
@@ -318,6 +306,7 @@ fn make_opts(
         // A backfill is bounded by its window, not a budget; the ceilings a
         // `budget:` block sets describe the forward sync.
         budget: None,
+        budget_state: None,
         feed: Default::default(),
     }
 }
@@ -1151,7 +1140,12 @@ matrix:
             "tenant".to_string(),
             json!("t1"),
         )]));
+        scoped.legacy_state_ids = vec!["old".into()];
+        scoped.depends_on = vec!["other".into()];
+        scoped.sla = Some(serde_json::from_value(json!({"min_rows_per_run": 10})).unwrap());
         let node = build_unit_node(&scoped, &unit, "0123456789abcdef", true).unwrap();
+        assert!(node.legacy_state_ids.is_empty() && node.depends_on.is_empty());
+        assert!(node.sla.is_none() && node.profiling.is_none());
         assert!(
             node.cleanup_scope.is_none(),
             "a window must never sweep the scope (#789 CLI-24)"

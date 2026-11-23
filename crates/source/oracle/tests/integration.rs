@@ -291,6 +291,18 @@ async fn oracle_query_source_end_to_end() {
     let mut s = bad.stream_pages(&ctx, 0);
     let err = s.next().await.expect("an item").unwrap_err();
     assert!(err.to_string().contains("ORA-00942"), "{err}");
+    let dup = OracleSource::new(OracleSourceConfig::new(
+        conn.clone(),
+        "SELECT 1 AS ID, 2 AS ID FROM DUAL",
+    ))
+    .await
+    .unwrap();
+    let err = dup.fetch_all().await.expect_err("a column would vanish");
+    assert!(
+        err.to_string()
+            .contains("Oracle query returns two columns named \"ID\""),
+        "{err}"
+    );
     let native = OracleSource::new(OracleSourceConfig::new(conn, "SELECT DOC FROM T_TYPES"))
         .await
         .unwrap();

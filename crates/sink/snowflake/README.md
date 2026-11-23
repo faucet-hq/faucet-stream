@@ -205,7 +205,22 @@ Snowflake's SQL REST API may answer a submitted `INSERT` with **HTTP 202 Accepte
 
 `SnowflakeSink` implements `Sink::supports_idempotent_writes` (returns `true`) and the two companion hooks:
 
-- `write_batch_idempotent(records, scope, token)` — writes the page's records and MERGEs the `token` into a `_faucet_commit_token("scope" STRING PRIMARY KEY, "token" STRING, "updated_at" TIMESTAMP_NTZ)` watermark table in the target database/schema, all inside **one multi-statement transaction** (`BEGIN; INSERT; MERGE; COMMIT;` with `MULTI_STATEMENT_COUNT` set on the request), so both either commit together or neither does. The watermark table is created (`CREATE TABLE IF NOT EXISTS`) as its own request once per sink instance — Snowflake DDL auto-commits, so it can never ride inside the transaction. The SQL API accepts no bind variables in a multi-statement request, so the page's JSON, the scope and the token are inlined as escaped string literals (quotes and backslashes doubled). Snowflake recommends keeping one request's SQL text — inlined literals included — under **1 MB**: a larger transaction is truncated in query history and some deployments reject it (HTTP 413). The sink warns when an exactly-once page (or a `batch_size: 0` group split into several parts) goes over; keep such pages below ~1 MB of JSON by lowering the source's `batch_size`. With `create_table: true` the target table is created before the first page, as on the append path.
+- `write_batch_idempotent(records, scope, token)` — writes the page's records and MERGEs the `token` into a `_faucet_commit_token("scope" STRING PRIMARY KEY, "token" STRING, "updated_at" TIMESTAMP_NTZ)` watermark table in the target database/schema, all inside **one multi-statement transaction** (`BEGIN; UPDATE …; SELECT …; INSERT; MERGE; COMMIT;` with `MULTI_STATEMENT_COUNT` set on the request), so both either commit together or neither does. The watermark table is created (`CREATE TABLE IF NOT EXISTS`) as its own request once per sink instance — Snowflake DDL auto-commits, so it can never ride inside the transaction. The SQL API accepts no bind variables in a multi-statement request, so the page's JSON, the scope and the token are inlined as escaped string literals (quotes and backslashes doubled). Snowflake recommends keeping one request's SQL text — inlined literals included — under **1 MB**: a larger transaction is truncated in query history and some deployments reject it (HTTP 413). The sink warns when an exactly-once page (or a `batch_size: 0` group split into several parts) goes over; keep such pages below ~1 MB of JSON by lowering the source's `batch_size`. With `create_table: true` the target table is created before the first page, as on the append path.
+
+Every exactly-once page first checks the stored watermark **inside** its
+transaction: a no-op `UPDATE` of the scope's watermark row takes the table's
+lock (waiting for any writer still holding it), then a guard `SELECT` fails
+with `faucet-eo-watermark-ahead` in its error when the scope already holds a
+commit at or past the page's sequence (an earlier attempt that committed late
+— a statement that outlived its deadline, a lost response, a killed process),
+and nothing is written. The sink then reads the stored token: if it is this
+page's own token, the page counts as written; otherwise the run fails with
+*the destination already holds a commit at or
+past page N* and the next run resumes from the destination's watermark — no
+rows are written twice. Before upgrading from a release without this guard,
+let in-flight exactly-once jobs finish (or cancel them): a job from the older
+release that commits afterwards is not checked.
+
 - `last_committed_token(scope)` — reads the current watermark so the pipeline skips already-committed pages on resume.
 
 **The whole page is one atomic unit on this path** — `batch_size` re-chunking does not apply to `write_batch_idempotent` (core issues exactly one token per page; splitting the page across transactions would break the rows-plus-token atomicity). The page's JSON travels inside the statement text, so size the *source's* `batch_size` down if a page grows too large for a single SQL REST API request. An empty page still advances the watermark via a commit-only `BEGIN; MERGE; COMMIT;` transaction.

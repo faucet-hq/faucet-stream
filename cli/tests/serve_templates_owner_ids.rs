@@ -43,6 +43,7 @@ fn args(port: u16) -> ServeArgs {
         preview_default_rows: 500,
         preview_max_rows: 5_000,
         lease_ttl_secs: 30,
+        metrics_idle_timeout_secs: 86_400,
         probe_timeout_secs: 5,
         env_file: None,
         no_env_file: true,
@@ -173,4 +174,80 @@ async fn owner_ids_are_addressed_as_one_percent_encoded_segment() {
         .await
         .unwrap();
     assert!(!raw.status().is_success(), "{}", raw.status());
+}
+
+/// A community template (a synced version of an owner no origin vouches for)
+/// that names a local path is refused when triggered, even if it was synced
+/// before the rule: 403 naming the class of resource, never its value.
+#[cfg(all(
+    feature = "serve-history-sqlite",
+    feature = "source-csv",
+    feature = "sink-stdout"
+))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_synced_community_template_that_reads_this_machine_is_refused() {
+    use faucet_cli::serve::history::RunHistory;
+    use faucet_cli::serve::history::templates::{TemplateDraft, TemplateId};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("h.db");
+    let url = format!("sqlite:{}", db.display());
+    {
+        let h = faucet_cli::serve::history::sqlite::SqliteHistory::connect(
+            &url,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+            "seed".into(),
+        )
+        .await
+        .unwrap();
+        let body = "version: 1\nname: local\npipeline:\n  source: {type: csv, config: {path: \"/etc/hosts\"}}\n  sink: {type: stdout, config: {}}\n";
+        h.template_register(&TemplateDraft {
+            id: TemplateId::parse("beta/local").unwrap(),
+            name: Some("local".into()),
+            description: None,
+            body: body.into(),
+            format: faucet_cli::serve::load::ConfigFormat::Yaml,
+            params: Default::default(),
+            created_by: Some("sync:gone".into()),
+            kind: faucet_cli::hub::TemplateKind::Pipeline,
+        })
+        .await
+        .unwrap();
+    }
+    let port = free_port();
+    let mut a = args(port);
+    a.history = Some(url);
+    let mut config = ServeConfig::from_args(a).unwrap();
+    config.log_level = "warn".into();
+    tokio::spawn(async move {
+        let _ = faucet_cli::serve::run_server(config, Default::default()).await;
+    });
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    for _ in 0..400 {
+        if client
+            .get(format!("{base}/healthz"))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let r = client
+        .post(format!("{base}/v1/templates/beta%2Flocal/runs"))
+        .json(&json!({ "version": 1, "allow_untested": true }))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    let text = r.text().await.unwrap();
+    assert_eq!(status, 403, "{text}");
+    assert!(
+        text.contains("community template") && text.contains("local path"),
+        "{text}"
+    );
+    assert!(!text.contains("/etc/hosts"), "value-free: {text}");
 }

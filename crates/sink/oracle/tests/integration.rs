@@ -449,6 +449,14 @@ async fn oracle_sink_end_to_end() {
         docs,
         vec![Some("{\"a\":1}".into()), Some("{\"b\":[true]}".into())]
     );
+    // No per-field columns: drift has no schema to compare, so `ignore`
+    // cannot strip a record to `{}`.
+    assert_eq!(js.current_schema().await.unwrap(), None);
+    assert!(!js.supports_schema_evolution());
+    assert_eq!(
+        js.capabilities().schema_report(),
+        faucet_core::SchemaReport::Schemaless
+    );
     let upper = OracleSink::new(OracleSinkConfig {
         identifier_case: IdentifierCase::Upper,
         column_mapping: OracleColumnMapping::AutoColumns {
@@ -462,6 +470,10 @@ async fn oracle_sink_end_to_end() {
         .write_batch(&[json!({"id": 10, "code": "u"})])
         .await
         .unwrap();
+    assert_eq!(
+        upper.column_matching(),
+        faucet_core::ColumnMatching::UpperFold
+    );
     assert!(
         upper
             .write_batch(&[json!({"id": 11, "zzz": 1})])

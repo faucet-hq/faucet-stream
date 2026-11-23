@@ -308,6 +308,71 @@ pub struct PipelineConfig {
     #[cfg(feature = "catalog")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_outputs: Option<crate::local_outputs::LocalOutputsSpec>,
+
+    /// Whether the policy owner trusts the sink `attributes` this config
+    /// carries. Set by `faucet serve` when it loads a body; never read from a
+    /// document. Default: trusted (the local CLI, where the user owns the
+    /// config).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub attribute_trust: AttributeTrust,
+}
+
+/// Who wrote the sink `attributes` of a config `faucet serve` loaded, for
+/// data-flow policy: an attribute written by the caller of a run can neither
+/// satisfy a `require` rule nor take a sink out of a `when.sink` scope.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AttributeTrust {
+    /// The operator wrote every sink: the local CLI, a server file, a
+    /// registered template without caller-chosen sink values.
+    #[default]
+    Trusted,
+    /// The run's caller wrote the config: no sink's attributes are trusted.
+    Untrusted,
+    /// A trusted body holding caller-chosen values at these JSON pointers: a
+    /// sink (or DLQ) with one anywhere in its subtree is not trusted, since
+    /// the caller then chooses where its rows go.
+    CallerFields(Vec<String>),
+}
+
+impl PipelineConfig {
+    /// Whether the policy owner trusts topology sink node `node`'s
+    /// `attributes` (its template `template`) and the pipeline DLQ's.
+    pub fn topology_destination_trust(&self, node: &str, template: &str) -> (bool, bool) {
+        use crate::params::caller::child;
+        let mut sink = vec![
+            child("/pipeline/nodes", node),
+            child("/pipeline/sinks", template),
+        ];
+        if template == "default" {
+            sink.push("/pipeline/sink".to_owned());
+        }
+        (
+            self.attribute_trust.attests(&sink),
+            self.attribute_trust.attests(&["/pipeline/dlq".to_owned()]),
+        )
+    }
+}
+
+impl AttributeTrust {
+    /// Whether a destination declared at any of `bases` (JSON pointers of its
+    /// connector blocks) is trusted.
+    pub fn attests(&self, bases: &[String]) -> bool {
+        match self {
+            AttributeTrust::Trusted => true,
+            AttributeTrust::Untrusted => false,
+            AttributeTrust::CallerFields(pointers) => !pointers.iter().any(|p| {
+                bases.iter().any(|base| {
+                    p == base
+                        || p.strip_prefix(base.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                        || base
+                            .strip_prefix(p.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+            }),
+        }
+    }
 }
 
 /// The base pipeline definition. Each matrix row is resolved against the
@@ -948,6 +1013,47 @@ pub struct ExecutionSpec {
     /// (#644). Defaults to `declared` — today's behaviour, byte for byte.
     #[serde(default)]
     pub schedule: DispatchOrder,
+
+    /// Most records one parent invocation may hand its child rows (`parent:`
+    /// fan-out), default 1,000,000. Every captured record becomes one child
+    /// invocation, held in memory until its children run. A page that would
+    /// pass the cap is refused whole: the parent's own write of that page fails
+    /// with `budget exceeded: execution.max_fan_out_records` and its children
+    /// are skipped. Must be between 1 and 10,000,000. A warning is logged when
+    /// a fan-out passes 100,000 records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fan_out_records: Option<u64>,
+}
+
+/// The default of [`ExecutionSpec::max_fan_out_records`].
+pub const DEFAULT_MAX_FAN_OUT_RECORDS: u64 = 1_000_000;
+/// The largest accepted [`ExecutionSpec::max_fan_out_records`].
+pub const MAX_FAN_OUT_RECORDS_CEILING: u64 = 10_000_000;
+/// A parent fan-out past this many records logs a warning.
+pub const FAN_OUT_WARN_RECORDS: u64 = 100_000;
+
+impl ExecutionSpec {
+    /// The fan-out cap in force (the configured value or the default).
+    pub fn fan_out_cap(spec: Option<&ExecutionSpec>) -> u64 {
+        spec.and_then(|e| e.max_fan_out_records)
+            .unwrap_or(DEFAULT_MAX_FAN_OUT_RECORDS)
+    }
+
+    /// Refuse a `max_fan_out_records` of `0` or above the ceiling.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.max_fan_out_records {
+            Some(0) => Err(
+                "execution.max_fan_out_records must be at least 1 (the cap bounds \
+                 the memory a parent's fan-out holds; there is no unlimited setting)"
+                    .into(),
+            ),
+            Some(n) if n > MAX_FAN_OUT_RECORDS_CEILING => Err(format!(
+                "execution.max_fan_out_records is {n}; the largest accepted value is \
+                 {MAX_FAN_OUT_RECORDS_CEILING}"
+            )),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// How the executor orders ready sibling rows competing for permits (#644).
@@ -1044,6 +1150,13 @@ pub struct PrometheusSpec {
     /// buckets when `None`.
     #[serde(default)]
     pub buckets: Option<Vec<f64>>,
+
+    /// Drop counter and histogram series not updated for this many seconds
+    /// from `/metrics` until they are emitted again; gauges never expire. `0`
+    /// keeps every series. Defaults to 86400 (24 h) for `faucet schedule` and
+    /// `faucet mirror`, and to never for one-shot commands.
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
 }
 
 /// Tracing / log-level configuration.
@@ -1709,6 +1822,25 @@ pub fn parse_with_extension(text: &str, ext: &str) -> CliResult<PipelineConfig> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn attribute_trust_covers_a_destination_subtree() {
+        let bases = vec!["/pipeline/sinks/s".to_owned(), "/matrix/0/sink".to_owned()];
+        assert!(AttributeTrust::Trusted.attests(&bases));
+        assert!(!AttributeTrust::Untrusted.attests(&bases));
+        let at = |p: &str| AttributeTrust::CallerFields(vec![p.to_owned()]);
+        assert!(!at("/pipeline/sinks/s/config/bucket").attests(&bases));
+        assert!(!at("/pipeline/sinks/s").attests(&bases));
+        assert!(
+            !at("/pipeline/sinks").attests(&bases),
+            "a whole-block value covers it"
+        );
+        assert!(!at("/matrix/0/sink/attributes/residency").attests(&bases));
+        assert!(at("/pipeline/sinks/s2/config/path").attests(&bases));
+        assert!(at("/pipeline/sinks/s2").attests(&bases));
+        assert!(at("/matrix/1/sink").attests(&bases));
+        assert!(at("/pipeline/source/config/path").attests(&bases));
+    }
 
     #[test]
     fn parses_minimal_pipeline_yaml() {

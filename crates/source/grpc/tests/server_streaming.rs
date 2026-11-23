@@ -77,14 +77,19 @@ async fn server_streaming_stream_pages_yields_pages_of_batch_size() {
     let mut pages = stream.stream_pages(&ctx, 3);
     let mut total = 0usize;
     let mut page_sizes = Vec::new();
+    let mut last = 0u64;
     while let Some(page) = pages.next().await {
         let page = page.unwrap();
         page_sizes.push(page.records.len());
         total += page.records.len();
-        // All server-streaming pages carry no bookmark — the source has no
-        // native cursor and the test fixture has no resume token.
-        assert!(page.bookmark.is_none());
+        // Every page carries the flush-only bookmark, its count rising.
+        let received = page.bookmark.expect("a flush bookmark")["received"]
+            .as_u64()
+            .unwrap();
+        assert!(received > last, "{received} after {last}");
+        last = received;
     }
+    assert_eq!(last, 10);
     assert_eq!(total, 10);
     // 3 + 3 + 3 + 1 trailing
     assert_eq!(page_sizes, vec![3, 3, 3, 1]);
@@ -605,4 +610,101 @@ async fn metadata_keeps_repeated_keys_and_sends_binary_values() {
     });
     let records = GrpcStream::new(config).unwrap().fetch_all().await.unwrap();
     assert_eq!(records.len(), 1);
+}
+
+/// A sink counting `flush` calls.
+#[derive(Default)]
+struct FlushCounter {
+    rows: std::sync::atomic::AtomicUsize,
+    flushes: std::sync::atomic::AtomicUsize,
+}
+
+#[faucet_core::async_trait]
+impl faucet_core::Sink for FlushCounter {
+    async fn write_batch(
+        &self,
+        records: &[serde_json::Value],
+    ) -> Result<usize, faucet_core::FaucetError> {
+        self.rows.fetch_add(records.len(), Ordering::SeqCst);
+        Ok(records.len())
+    }
+
+    async fn flush(&self) -> Result<(), faucet_core::FaucetError> {
+        self.flushes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// The source under a fixed state key, as the CLI runs it.
+struct Keyed(GrpcStream);
+
+#[faucet_core::async_trait]
+impl Source for Keyed {
+    async fn fetch_with_context(
+        &self,
+        context: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<Vec<serde_json::Value>, faucet_core::FaucetError> {
+        Source::fetch_with_context(&self.0, context).await
+    }
+
+    fn stream_pages<'a>(
+        &'a self,
+        context: &'a std::collections::HashMap<String, serde_json::Value>,
+        batch_size: usize,
+    ) -> std::pin::Pin<
+        Box<
+            dyn futures::Stream<Item = Result<faucet_core::StreamPage, faucet_core::FaucetError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        self.0.stream_pages(context, batch_size)
+    }
+
+    async fn apply_start_bookmark(
+        &self,
+        bookmark: serde_json::Value,
+    ) -> Result<(), faucet_core::FaucetError> {
+        self.0.apply_start_bookmark(bookmark).await
+    }
+
+    fn connector_name(&self) -> &'static str {
+        self.0.connector_name()
+    }
+
+    fn state_key(&self) -> Option<String> {
+        Some("grpc-tail".into())
+    }
+}
+
+/// Each server-streaming page makes the pipeline flush the sink and store the
+/// flush bookmark; a later run ignores it and reads the feed from its start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_page_flushes_the_sink_and_a_stored_bookmark_is_not_resumed() {
+    let server = common::start_server().await;
+    let config = GrpcStreamConfig::new(
+        &server.endpoint,
+        "faucet.test.echo.EchoService",
+        "Tail",
+        common::descriptor_set_path(),
+    )
+    .request(json!({ "count": 10, "fail_after": 0 }))
+    .rpc_kind(RpcKind::ServerStreaming)
+    .with_batch_size(3);
+    let store: std::sync::Arc<dyn faucet_core::StateStore> =
+        std::sync::Arc::new(faucet_core::MemoryStateStore::new());
+
+    for _ in 0..2 {
+        let source = Keyed(GrpcStream::new(config.clone()).unwrap());
+        let sink = FlushCounter::default();
+        faucet_core::Pipeline::new(&source, &sink)
+            .with_state_store(store.clone())
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(sink.rows.load(Ordering::SeqCst), 10);
+        assert!(sink.flushes.load(Ordering::SeqCst) >= 4);
+        let stored = store.get("grpc-tail").await.unwrap().expect("stored");
+        assert!(stored.to_string().contains("received"), "{stored}");
+    }
 }

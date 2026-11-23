@@ -34,7 +34,7 @@ in alongside these fields. `tls` is `true` or a block with a private CA
 | field               | type             | default | description                                                        |
 |---------------------|------------------|---------|--------------------------------------------------------------------|
 | `subject`           | `String`         | —       | subject to subscribe to (`*`/`>` wildcards). Required.             |
-| `queue_group`       | `Option<String>` | —       | core-NATS queue group for load-balanced subscriptions.             |
+| `queue_group`       | `Option<String>` | —       | core-NATS queue group for load-balanced subscriptions. A member takes messages away from the group's other members (core NATS never redelivers), so such a source is treated like a queue consumer: preview, `plan --live`, `run --limit` / `--dry-run`, `fan_out` rows, `write_mode: overwrite` and output-replacing sinks refuse it. |
 | `jetstream_stream`  | `Option<String>` | —       | JetStream stream name (enables JetStream mode).                    |
 | `jetstream_consumer`| `Option<String>` | —       | durable pull-consumer name; required with `jetstream_stream`.      |
 | `max_messages`      | `Option<usize>`  | —       | stop after this many messages (> 0).                               |

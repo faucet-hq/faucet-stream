@@ -174,3 +174,16 @@ pub async fn column_types(conn: &SpannerConnection, table: &str) -> Vec<(String,
     }
     out
 }
+
+/// The first column of the first row `sql` returns, as text.
+#[allow(dead_code)] // used by the conformance battery only
+pub async fn first_string(conn: &SpannerConnection, sql: &str) -> Option<String> {
+    let client = conn.connect().await.expect("query client");
+    let mut tx = client.single().await.expect("single txn");
+    let mut iter = tx
+        .query(Statement::new(sql.to_string()))
+        .await
+        .expect("query");
+    let row = iter.next().await.expect("row")?;
+    row.column::<Option<String>>(0).expect("decode")
+}

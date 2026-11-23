@@ -62,6 +62,9 @@ type ScheduleMap = BTreeMap<String, super::schedules::ScheduleRecord>;
 type FeedMap = BTreeMap<String, super::feeds::FeedRecord>;
 type FeedTokenMap = BTreeMap<String, super::feeds::FeedTokenRecord>;
 
+/// Run id → (records, bytes) granted against a sharded run's budget.
+type RunBudgets = std::collections::HashMap<String, (u64, u64)>;
+
 pub struct MemoryHistory {
     runs: DashMap<String, RunRecord>,
     idem: DashMap<String, IdemEntry>,
@@ -121,6 +124,10 @@ pub struct MemoryHistory {
     run_secrets: Mutex<RunSecrets>,
     /// Data-flow policy versions (#1043): scope → version → record.
     policy_versions: Mutex<PolicyVersions>,
+    /// Run budget ledgers of sharded runs: run id → granted (records, bytes).
+    run_budgets: Mutex<RunBudgets>,
+    /// Template versions the server's own files pin.
+    file_pins: std::sync::RwLock<Vec<templates::Pin>>,
     /// Retention window for idempotency claims (separate from run retention).
     idem_retention: Duration,
 }
@@ -162,6 +169,12 @@ impl MemoryHistory {
         let e = w.entry(run_id.to_string()).or_insert((through, now));
         *e = (e.0.max(through), now);
         Ok(())
+    }
+
+    fn budgets(&self) -> Result<std::sync::MutexGuard<'_, RunBudgets>, HistoryError> {
+        self.run_budgets
+            .lock()
+            .map_err(|_| HistoryError::Backend("run budgets lock poisoned".into()))
     }
 
     fn secrets(&self) -> Result<std::sync::MutexGuard<'_, RunSecrets>, HistoryError> {
@@ -228,6 +241,8 @@ impl MemoryHistory {
             trigger_edges: Mutex::new(std::collections::HashMap::new()),
             run_secrets: Mutex::new(std::collections::HashMap::new()),
             policy_versions: Mutex::new(std::collections::HashMap::new()),
+            run_budgets: Mutex::new(std::collections::HashMap::new()),
+            file_pins: std::sync::RwLock::new(Vec::new()),
             idem_retention,
         }
     }
@@ -282,6 +297,16 @@ impl RunHistory for MemoryHistory {
                 Ok(Claim::Fresh)
             }
         }
+    }
+
+    fn set_file_pins(&self, pins: Vec<templates::Pin>) {
+        if let Ok(mut p) = self.file_pins.write() {
+            *p = pins;
+        }
+    }
+
+    fn file_pins(&self) -> Vec<templates::Pin> {
+        self.file_pins.read().map(|p| p.clone()).unwrap_or_default()
     }
 
     async fn upsert(&self, rec: &RunRecord) -> Result<(), HistoryError> {
@@ -355,6 +380,7 @@ impl RunHistory for MemoryHistory {
             return Ok(DeleteOutcome::StillRunning);
         }
         self.runs.remove(id);
+        self.budgets()?.remove(id);
         // Also drop this run's idempotency claim so a replay of the key starts a
         // fresh run instead of 404-ing on the now-deleted record until the claim
         // self-expires (#146 M8). Only remove it if the claim still points at
@@ -374,6 +400,9 @@ impl RunHistory for MemoryHistory {
                     .map(|f| !is_expired(f, now, retain_for))
                     .unwrap_or(true)
         });
+        if let Ok(mut budgets) = self.run_budgets.lock() {
+            budgets.retain(|id, _| self.runs.contains_key(id));
+        }
         // Also drop stale idempotency claims so the map stays bounded.
         self.idem
             .retain(|_, e| !is_expired(e.claimed_at, now, self.idem_retention));
@@ -1526,6 +1555,41 @@ impl RunHistory for MemoryHistory {
         Ok(())
     }
 
+    async fn budget_grant(
+        &self,
+        run_id: &str,
+        want: (u64, u64),
+        max: (Option<u64>, Option<u64>),
+    ) -> Result<faucet_core::BudgetGrant, HistoryError> {
+        let mut budgets = self.budgets()?;
+        let spent = budgets.entry(run_id.to_string()).or_insert((0, 0));
+        let grant = |have: u64, want: u64, max: Option<u64>| {
+            want.min(max.map_or(u64::MAX, |m| m.saturating_sub(have)))
+        };
+        let r = grant(spent.0, want.0, max.0);
+        let b = grant(spent.1, want.1, max.1);
+        spent.0 += r;
+        spent.1 += b;
+        Ok(faucet_core::BudgetGrant::new(r, b, spent.0, spent.1))
+    }
+
+    async fn budget_give_back(
+        &self,
+        run_id: &str,
+        records: u64,
+        bytes: u64,
+    ) -> Result<(), HistoryError> {
+        if let Some(spent) = self.budgets()?.get_mut(run_id) {
+            spent.0 = spent.0.saturating_sub(records);
+            spent.1 = spent.1.saturating_sub(bytes);
+        }
+        Ok(())
+    }
+
+    async fn budget_spent(&self, run_id: &str) -> Result<Option<(u64, u64)>, HistoryError> {
+        Ok(self.budgets()?.get(run_id).copied())
+    }
+
     async fn run_secrets_purge_terminal(&self) -> Result<usize, HistoryError> {
         let mut secrets = self.secrets()?;
         let before = secrets.len();
@@ -1844,6 +1908,14 @@ impl RunHistory for MemoryHistory {
         Ok(true)
     }
 
+    async fn meta_delete(&self, key: &str) -> Result<(), HistoryError> {
+        self.meta
+            .lock()
+            .map_err(|_| HistoryError::Backend("meta lock poisoned".into()))?
+            .remove(key);
+        Ok(())
+    }
+
     async fn meta_put(&self, key: &str, value: &str) -> Result<(), HistoryError> {
         let mut meta = self
             .meta
@@ -2015,12 +2087,13 @@ impl RunHistory for MemoryHistory {
         Ok(existed)
     }
 
-    async fn template_launch(
+    async fn template_launch_expecting(
         &self,
         id: &str,
         version: u32,
         launched_by: Option<&str>,
         evidence: Option<&templates::EvidenceClaim>,
+        expect_stable: Option<Option<u32>>,
     ) -> Result<Option<u32>, HistoryError> {
         let store = self
             .templates
@@ -2038,8 +2111,18 @@ impl RunHistory for MemoryHistory {
         let log = launches.entry(id.to_string()).or_default();
         // Re-launching what is already stable is a no-op: appending would make
         // `previous` a duplicate of `stable` and destroy the rollback target.
-        if templates::stable_version(log) == Some(version) {
+        let stable = templates::stable_version(log);
+        if stable == Some(version) {
             return Ok(None);
+        }
+        if let Some(expected) = expect_stable
+            && expected != stable
+        {
+            return Err(HistoryError::LaunchRaced {
+                id: id.to_string(),
+                expected,
+                found: stable,
+            });
         }
         if let Some(claim) = evidence {
             claim.check(&version_results(&tests, id, version))?;
@@ -2266,6 +2349,183 @@ fn version_results(
 
 #[cfg(test)]
 mod tests {
+    /// Pruning keeps every version something names by number: a stored
+    /// schedule (its own template and the sink it pairs with), a pending or
+    /// approved (deferred) launch, schedule and feed change, and the server's
+    /// own files; a channel pin and a run change pin nothing.
+    #[tokio::test]
+    async fn pruning_keeps_pinned_versions() {
+        use crate::serve::history::templates::{Pin, TemplateDraft, TemplateId, VERSION_RETAIN};
+        use serde_json::json;
+        let h = MemoryHistory::new(Duration::from_secs(60));
+        let draft = |id: &str| TemplateDraft {
+            id: TemplateId::parse(id).unwrap(),
+            name: None,
+            description: None,
+            body: "version: 1\n".into(),
+            format: crate::serve::load::ConfigFormat::Yaml,
+            params: Default::default(),
+            created_by: None,
+            kind: crate::hub::TemplateKind::Pipeline,
+        };
+        let schedule: crate::serve::history::schedules::ScheduleRecord =
+            serde_json::from_value(json!({
+                "id": "s1",
+                "spec": {
+                    "name": "nightly",
+                    "cron": "0 3 * * *",
+                    "template": {"id": "orders", "version": "3", "sink": "sink", "sink_version": "2"}
+                },
+                "created_at": "2026-01-01T00:00:00Z",
+                "created_by": "u",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "updated_by": "u",
+                "revision": 1
+            }))
+            .unwrap();
+        assert!(h.schedule_insert(&schedule).await.unwrap());
+        let change = |kind: &str,
+                      status: &str,
+                      payload: serde_json::Value|
+         -> crate::serve::changes::ChangeRequest {
+            serde_json::from_value(json!({
+                "id": uuid::Uuid::now_v7().to_string(),
+                "kind": kind,
+                "status": status,
+                "requester": "bob",
+                "requester_role": "operator",
+                "payload": payload,
+                "required_approvals": 1,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "expires_at": "2099-01-01T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        for c in [
+            change(
+                "template_launch",
+                "approved",
+                json!({"id": "orders", "version": 5}),
+            ),
+            change(
+                "schedule",
+                "pending",
+                json!({"action": "create", "name": "x",
+                "spec": {"template": {"id": "orders", "version": "7"}}}),
+            ),
+            change(
+                "feed",
+                "approved",
+                json!({"action": "create", "name": "f",
+                "spec": {"deliveries": [{"template": {"id": "orders", "version": 9}}]}}),
+            ),
+            change(
+                "schedule",
+                "pending",
+                json!({"action": "create", "name": "y",
+                "spec": {"template": {"id": "orders", "version": "stable"}}}),
+            ),
+            change(
+                "template_launch",
+                "executed",
+                json!({"id": "orders", "version": 4}),
+            ),
+        ] {
+            h.change_upsert(&c).await.unwrap();
+        }
+        h.set_file_pins(vec![Pin {
+            id: "orders".into(),
+            version: 1,
+        }]);
+        let total = VERSION_RETAIN as u32 + 12;
+        for _ in 0..total {
+            h.template_register(&draft("orders")).await.unwrap();
+        }
+        for _ in 0..(VERSION_RETAIN as u32 + 3) {
+            h.template_register(&draft("sink")).await.unwrap();
+        }
+        let kept = h.template_versions("orders").await.unwrap();
+        for v in [1, 3, 5, 7, 9] {
+            assert!(kept.contains(&v), "v{v} is pinned: {kept:?}");
+        }
+        for v in [2, 4, 6, 8] {
+            assert!(!kept.contains(&v), "v{v} pins nothing: {kept:?}");
+        }
+        assert!(
+            h.template_versions("sink").await.unwrap().contains(&2),
+            "a pin across ids"
+        );
+        assert_eq!(h.template_pins("other").await.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn template_references_pin_numbers_not_channels() {
+        use crate::serve::history::templates::{
+            Pin, change_references, pinned_versions, reference_pins,
+        };
+        use serde_json::json;
+        let pins = reference_pins(&json!({
+            "id": "a", "version": "3", "sink": "b", "sink_version": 4,
+            "overlay": "c", "overlay_version": "prod"
+        }));
+        assert_eq!(
+            pins,
+            vec![
+                Pin {
+                    id: "a".into(),
+                    version: 3
+                },
+                Pin {
+                    id: "b".into(),
+                    version: 4
+                }
+            ]
+        );
+        assert!(reference_pins(&json!({"id": "a"})).is_empty());
+        assert_eq!(
+            pinned_versions(&pins, "b").into_iter().collect::<Vec<_>>(),
+            vec![4]
+        );
+        assert_eq!(
+            change_references(&json!({"spec": {"template": {"id": "a"},
+                "deliveries": [{"template": {"id": "b"}}, {"name": "x"}]}}))
+            .len(),
+            2
+        );
+        assert!(change_references(&json!({"config": "x"})).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_degraded_history_prunes_nothing() {
+        use crate::serve::history::fallback::FallbackHistory;
+        use crate::serve::history::templates::{TemplateDraft, TemplateId, VERSION_RETAIN};
+        let h = FallbackHistory::healthy(
+            Box::new(MemoryHistory::new(Duration::from_secs(60))),
+            Duration::from_secs(60),
+            "test",
+        );
+        let draft = TemplateDraft {
+            id: TemplateId::parse("orders").unwrap(),
+            name: None,
+            description: None,
+            body: "version: 1\n".into(),
+            format: crate::serve::load::ConfigFormat::Yaml,
+            params: Default::default(),
+            created_by: None,
+            kind: crate::hub::TemplateKind::Pipeline,
+        };
+        for _ in 0..VERSION_RETAIN + 2 {
+            h.template_register(&draft).await.unwrap();
+        }
+        let before = h.template_versions("orders").await.unwrap();
+        h.mark_unreachable();
+        let all: Vec<u32> = (1..=VERSION_RETAIN as u32 + 2).collect();
+        assert!(h.prune_template_versions("orders", all).await.is_err());
+        assert!(h.try_recover().await);
+        assert_eq!(h.template_versions("orders").await.unwrap(), before);
+    }
+
     #[tokio::test]
     async fn a_deleted_version_number_is_never_reused() {
         use crate::serve::history::templates::{TemplateDraft, TemplateId};

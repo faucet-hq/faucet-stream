@@ -322,6 +322,16 @@ impl ObjectClient for SftpObjects {
             .await
     }
 
+    fn supports_create_new(&self) -> bool {
+        true
+    }
+
+    async fn create_new(&self, key: &str, bytes: &[u8]) -> Result<bool, FaucetError> {
+        self.calls
+            .call_once("claim", self.guarded(self.create_new_now(key, bytes)))
+            .await
+    }
+
     async fn delete(&self, key: &str) -> Result<(), FaucetError> {
         self.calls
             .call_once("delete", self.guarded(self.delete_now(key)))
@@ -439,6 +449,39 @@ impl SftpObjects {
             let _ = sftp.remove_file(tmp.as_str()).await;
         }
         result
+    }
+
+    /// Create `key` with `bytes` only when absent (`SSH_FXF_EXCL`). SFTP v3
+    /// reports an existing file as a generic failure, so a failed exclusive
+    /// open on a key that exists means "exists".
+    async fn create_new_now(&self, key: &str, bytes: &[u8]) -> Result<bool, FaucetError> {
+        let conn = self.connection().await?;
+        if let Some(dir) = parent(key) {
+            self.create_dirs(&conn, dir).await?;
+        }
+        let sftp = conn.session();
+        let mut remote = match sftp
+            .open_with_flags(
+                key,
+                OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+            )
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                return match sftp.try_exists(key).await {
+                    Ok(true) => Ok(false),
+                    _ => Err(err("create", key, e)),
+                };
+            }
+        };
+        remote
+            .write_all(bytes)
+            .await
+            .map_err(|e| err("write", key, e))?;
+        remote.flush().await.map_err(|e| err("flush", key, e))?;
+        remote.shutdown().await.map_err(|e| err("close", key, e))?;
+        Ok(true)
     }
 
     async fn list_dirs_now(&self, prefix: &str) -> Result<Vec<String>, FaucetError> {

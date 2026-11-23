@@ -225,7 +225,7 @@ pub async fn run(args: ScheduleArgs) -> CliResult<()> {
     let cron = spec.cron.clone();
     let timezone = spec.timezone.clone();
 
-    crate::obs::install(&cfg)?;
+    crate::obs::install_for(&cfg, true)?;
     let _otel = crate::obs::flush_on_exit();
 
     let pipeline_name = cfg.name.clone().unwrap_or_else(|| {
@@ -376,6 +376,7 @@ fn make_opts(
         catalog: catalog.clone(),
         usage: usage.clone(),
         budget: budget.clone(),
+        budget_state: None,
         feed: Default::default(),
     }
 }

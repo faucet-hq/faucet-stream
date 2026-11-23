@@ -221,7 +221,11 @@ impl Ctx<'_> {
 
     /// Refuse to add per-line sealed records to a file whose lines are not
     /// sealed, and plaintext records to one whose lines are.
-    fn check_line_sealing(&self, existing: &Path, label: &str) -> Result<(), FaucetError> {
+    pub(crate) fn check_line_sealing(
+        &self,
+        existing: &Path,
+        label: &str,
+    ) -> Result<(), FaucetError> {
         #[cfg(feature = "encryption")]
         {
             use std::io::BufRead as _;
@@ -245,7 +249,7 @@ impl Ctx<'_> {
 
     /// Refuse a stored file that is sealed whole when no `encryption` block
     /// is set. Reads only the file's first bytes.
-    fn check_unsealed(&self, existing: &Path, label: &str) -> Result<(), FaucetError> {
+    pub(crate) fn check_unsealed(&self, existing: &Path, label: &str) -> Result<(), FaucetError> {
         #[cfg(feature = "encryption")]
         {
             use std::io::Read as _;
@@ -313,6 +317,29 @@ impl Ctx<'_> {
         let _ = path;
         Ok(())
     }
+}
+
+/// Refuse a stored file that holds encrypted data (sealed whole, or sealed
+/// line by line when `lines`), for a writer adding plaintext lines to it.
+/// Reads only the file's first line.
+pub(crate) fn refuse_encrypted(stored: &Path, label: &str, lines: bool) -> Result<(), FaucetError> {
+    #[cfg(feature = "encryption")]
+    {
+        use std::io::{BufRead as _, Read as _};
+        let file = File::open(stored).map_err(|e| io_err("opening", stored, e))?;
+        let mut first = Vec::new();
+        std::io::BufReader::new(file.take(64 * 1024))
+            .read_until(b'\n', &mut first)
+            .map_err(|e| io_err("reading", stored, e))?;
+        if faucet_core::encryption::is_encrypted(&first[..first.len().min(64)]) {
+            return Err(mismatch(label, true));
+        }
+        if lines && line_is_sealed(String::from_utf8_lossy(&first).trim_end()) {
+            return Err(mismatch(label, true));
+        }
+    }
+    let _ = (stored, label, lines);
+    Ok(())
 }
 
 #[cfg(feature = "encryption")]
@@ -496,6 +523,10 @@ pub(crate) struct OpenFile {
     pub delta: Option<PathBuf>,
     /// Whether rewriting the whole file to continue it was warned about.
     pub rewrite_warned: bool,
+    /// Whether the scratch file holds only what this writer has not yet
+    /// published, which each publish adds to the stored object under the
+    /// output lock (an append to one shared line file).
+    pub rebase: bool,
 }
 
 impl OpenFile {
@@ -528,6 +559,7 @@ impl OpenFile {
             seal: None,
             delta: None,
             rewrite_warned: false,
+            rebase: false,
         };
         file.enc = match ctx.format {
             FileFormat::JsonLines | FileFormat::RawText => {
@@ -564,7 +596,7 @@ impl OpenFile {
             return false;
         }
         match &self.enc {
-            Enc::Lines(slot) => slot.is_none() && self.delta.is_none(),
+            Enc::Lines(slot) => slot.is_none() && self.delta.is_none() && !self.rebase,
             #[cfg(feature = "file-format-csv")]
             Enc::CsvSealed(_) => true,
             #[cfg(feature = "file-format-parquet")]
@@ -599,7 +631,7 @@ impl OpenFile {
         match &mut self.enc {
             Enc::Lines(slot) => {
                 if slot.is_none() {
-                    if self.delta.is_some() {
+                    if self.delta.is_some() || self.rebase {
                         let f = create_scratch(&tmp, ctx.private()).map_err(clean)?;
                         *slot = Some(Box::new(sync_compress_writer(
                             BufWriter::new(LineOut::File(f)),
@@ -839,7 +871,7 @@ pub(crate) fn pretty_record_end(raw: &[u8]) -> usize {
 /// Cut bytes after the last newline — a line torn by a run that stopped
 /// mid-write — so appended lines start on a line boundary. With `pretty`
 /// output a record spans lines, so the cut goes back to the last whole one.
-fn cut_torn_line(path: &Path, pretty: bool) -> Result<(), FaucetError> {
+pub(crate) fn cut_torn_line(path: &Path, pretty: bool) -> Result<(), FaucetError> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     let mut f = OpenOptions::new()
         .read(true)

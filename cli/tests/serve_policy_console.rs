@@ -100,6 +100,7 @@ fn serve_args(
         preview_default_rows: 500,
         preview_max_rows: 5_000,
         lease_ttl_secs: 30,
+        metrics_idle_timeout_secs: 86_400,
         probe_timeout_secs: 5,
         env_file: None,
         no_env_file: true,
@@ -125,7 +126,10 @@ fn serve_args(
         connect_providers: None,
         allow_subprocess_connectors: false,
         grafana_url: None,
-        references: Default::default(),
+        references: faucet_cli::cli::ReferenceArgs {
+            policy_trust_caller_attributes: true,
+            ..Default::default()
+        },
         pools: Default::default(),
     }
 }

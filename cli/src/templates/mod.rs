@@ -52,6 +52,7 @@
 
 pub mod bundle;
 pub mod metrics;
+pub mod provenance;
 pub mod revalidate;
 pub mod rows;
 pub mod store;
@@ -62,10 +63,11 @@ pub mod sync;
 pub use store::{
     LaunchOutcome, Materialize, MaterializedConfig, OverlayChoice, RegisterPreview,
     RegisterRequest, Registration, RegistrationStage, SinkChoice, TemplateStore,
-    deprecation_warning, launch, list_with_state, local_actor, materialize, materialize_for_run,
-    materialize_for_run_selected, materialize_pair, materialize_pair_overlaid, parse_body,
-    preview_register, promote, register, register_staged, register_tested, resolve_store_url,
-    resolve_version, rollback, run_gate, set_deprecated, set_version_deprecated, template_state,
+    deprecation_warning, launch, launch_expecting, list_with_state, local_actor, materialize,
+    materialize_for_run, materialize_for_run_selected, materialize_pair, materialize_pair_overlaid,
+    parse_body, preview_register, promote, register, register_staged, register_tested,
+    resolve_store_url, resolve_version, rollback, run_gate, set_deprecated, set_version_deprecated,
+    template_state,
 };
 
 use crate::error::{CliError, CliResult};

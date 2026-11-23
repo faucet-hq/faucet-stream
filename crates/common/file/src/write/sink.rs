@@ -194,6 +194,7 @@ impl<B: ObjectStoreDriver + ?Sized + 'static> SinkDriver for FileDriver<B> {
 
     fn set_call_context(&self, ctx: faucet_core::io::CallContext) {
         self.backend.set_call_context(ctx.clone());
+        self.writer.set_call_context(ctx.clone());
         self.identity.set_call_context(ctx);
     }
 

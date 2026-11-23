@@ -121,7 +121,7 @@ async fn another_runs_interrupted_overwrite_is_finished_by_the_next_run() {
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with('.') && !n.ends_with(".commits"))
+            .filter(|n| n.starts_with('.') && !n.ends_with(".commits") && !n.contains(".scratch-"))
             .collect();
         assert!(left.is_empty(), "{left:?}");
         let ledger = dir.path().join(".faucet-overwrite-o-_part_.jsonl.commits");
@@ -130,7 +130,14 @@ async fn another_runs_interrupted_overwrite_is_finished_by_the_next_run() {
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(kept, ["last"], "only the commit ledger stays");
+        let mut kept = kept;
+        kept.sort();
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert_eq!(kept[0], "last", "the commit ledger stays");
+        assert!(
+            kept[1].starts_with("lock-"),
+            "and the released output lock: {kept:?}"
+        );
     }
 }
 
@@ -196,4 +203,71 @@ async fn stuck_storage_io_does_not_block_a_timeout() {
         waited < std::time::Duration::from_secs(2),
         "the timeout fired on time, not after the I/O: {waited:?}"
     );
+}
+
+/// Two overwrite runs of one output committing at once: the output ends as
+/// exactly one run's files, never a mix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_overwrite_commits_never_blend() {
+    use faucet_core::idempotency::new_overwrite_run_token;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = json!({
+        "path": p(dir.path(), "o-{part}.jsonl"),
+        "write_mode": "overwrite",
+        "max_records_per_file": 1,
+    });
+    let mut staged = Vec::new();
+    for (n, from) in [(3, 0), (2, 100)] {
+        let token = new_overwrite_run_token();
+        let open = || sink(cfg.clone()).with_overwrite_run(&token).unwrap();
+        open().begin_overwrite().await.unwrap();
+        let w = open();
+        w.write_batch(&rows(from, n)).await.unwrap();
+        w.flush().await.unwrap();
+        staged.push(open());
+    }
+    let tasks: Vec<_> = staged
+        .into_iter()
+        .map(|s| tokio::spawn(async move { s.commit_overwrite().await }))
+        .collect();
+    for t in tasks {
+        t.await.unwrap().unwrap();
+    }
+    let mut names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.starts_with('.'))
+        .collect();
+    names.sort();
+    let all: Vec<Value> = names
+        .iter()
+        .flat_map(|n| lines(&dir.path().join(n)))
+        .collect();
+    assert!(
+        all == rows(0, 3) || all == rows(100, 2),
+        "one run's output, not a blend: {names:?} {all:?}"
+    );
+}
+
+/// Several runs appending to one JSON Lines file at once lose no line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_appends_to_one_file_keep_every_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = json!({"path": p(dir.path(), "log.jsonl"), "mode": "append"});
+    let tasks: Vec<_> = (0..3)
+        .map(|i| {
+            let s = sink(cfg.clone());
+            tokio::spawn(async move {
+                for j in 0..5 {
+                    s.write_batch(&rows(i * 10 + j, 1)).await.unwrap();
+                    s.flush().await.unwrap();
+                }
+            })
+        })
+        .collect();
+    for t in tasks {
+        t.await.unwrap();
+    }
+    assert_eq!(lines(&dir.path().join("log.jsonl")).len(), 15);
 }

@@ -300,7 +300,7 @@ impl faucet_core::Source for DeltaSource {
     ) -> Pin<Box<dyn Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>> {
         Box::pin(async_stream::try_stream! {
             let table = self.open().await?;
-            let (files, _schema, partition_cols) =
+            let (files, schema, partition_cols) =
                 self.calls.call_once("plan", self.resolve(&table)).await?;
             let reads = self.calls.get().with_roundtrip_metering(false);
             let store = table.object_store();
@@ -345,10 +345,12 @@ impl faucet_core::Source for DeltaSource {
                     let batch = batch.map_err(|e| {
                         FaucetError::Source(format!("delta: read error in '{}': {e}", file.path))
                     })?;
-                    let mut rows = record_batch_to_json(&batch)?;
-                    for row in &mut rows {
-                        merge_partitions(row, &file.partitions, requested);
+                    if batch.num_rows() == 0 {
+                        continue;
                     }
+                    let batch = append_partition_columns(batch, &file.partitions, &schema, requested)?;
+                    let batch = conform_to_table(batch, &schema, requested, &file.path)?;
+                    let mut rows = record_batch_to_json(&batch)?;
                     if self.config.batch_size == 0 {
                         whole_file.append(&mut rows);
                     } else if !rows.is_empty() {
@@ -442,12 +444,10 @@ impl faucet_core::Source for DeltaSource {
 }
 
 /// Append Hive partition columns to a data-file `RecordBatch` as constant
-/// columns, honoring the same `requested`-projection semantics as
-/// [`merge_partitions`] (add a partition column only when unprojected-away, and
-/// never shadow a real data column of the same name). Each constant column is
+/// columns: only the `requested` ones when a projection is set, and never
+/// shadowing a real data column of the same name. Each constant column is
 /// built through the core `Value → RecordBatch` shim with the table's declared
-/// Arrow type, so a partition value round-trips identically to the row path.
-#[cfg(feature = "arrow")]
+/// Arrow type, so the row and columnar paths render it identically.
 fn append_partition_columns(
     batch: arrow::array::RecordBatch,
     partitions: &HashMap<String, Value>,
@@ -475,7 +475,7 @@ fn append_partition_columns(
             continue;
         }
         if in_schema.field_with_name(k).is_ok() {
-            continue; // a real data column of this name wins (merge_partitions)
+            continue;
         }
         let field = table_schema
             .field_with_name(k)
@@ -499,9 +499,7 @@ fn append_partition_columns(
 /// table order (only the `requested` ones when a projection is set), a column
 /// the file lacks (added to the table after the file was written) as nulls,
 /// and a column the file stores at another physical type cast to the table's.
-/// The row path gives the same answer: absent requested columns are null and
-/// values decode to the table's types.
-#[cfg(feature = "arrow")]
+/// Both the row and the columnar path run every batch through it.
 fn conform_to_table(
     batch: arrow::array::RecordBatch,
     table_schema: &SchemaRef,
@@ -694,32 +692,6 @@ fn partition_binary(raw: &str) -> Option<Value> {
     Some(faucet_core::fidelity::binary(&bytes))
 }
 
-/// Merge partition values into a data row, then narrow to `requested` columns
-/// (when a projection is configured). Partition values fill keys not present in
-/// the data (the file never stores them).
-fn merge_partitions(
-    row: &mut Value,
-    partitions: &HashMap<String, Value>,
-    requested: Option<&[String]>,
-) {
-    if let Value::Object(map) = row {
-        for (k, v) in partitions {
-            match requested {
-                Some(cols) if !cols.iter().any(|c| c == k) => continue,
-                _ => {
-                    map.entry(k.clone()).or_insert_with(|| v.clone());
-                }
-            }
-        }
-        if let Some(cols) = requested {
-            map.retain(|k, _| cols.iter().any(|c| c == k));
-            for c in cols {
-                map.entry(c.clone()).or_insert(Value::Null);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,7 +710,6 @@ mod tests {
 
     /// A file column whose physical type cannot become the table's is
     /// refused, naming the column, the file and both types.
-    #[cfg(feature = "arrow")]
     #[test]
     fn a_file_column_that_cannot_cast_to_the_table_type_is_refused() {
         use arrow::array::{ArrayRef, Int64Array, RecordBatch, StructArray};
@@ -796,34 +767,53 @@ mod tests {
         assert_eq!(read_batch_size(10, 5_000), 10);
     }
 
+    fn conformed_rows(
+        partitions: &HashMap<String, Value>,
+        requested: Option<&[String]>,
+    ) -> Result<Vec<Value>, FaucetError> {
+        use arrow::array::{ArrayRef, Int32Array, RecordBatch};
+        let file_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+        let batch = RecordBatch::try_new(
+            file_schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+        )
+        .unwrap();
+        let s = schema();
+        let batch = append_partition_columns(batch, partitions, &s, requested)?;
+        let batch = conform_to_table(batch, &s, requested, &"part-0.parquet")?;
+        record_batch_to_json(&batch)
+    }
+
     #[test]
-    fn merge_injects_and_projects() {
-        let mut row = json!({"id": 1});
-        let mut parts = HashMap::new();
-        parts.insert("dt".to_string(), json!("2026-01-01"));
-        merge_partitions(&mut row, &parts, None);
-        assert_eq!(row["dt"], json!("2026-01-01"));
-        assert_eq!(row["id"], json!(1));
-
-        // With projection, only requested keys survive.
-        let mut row2 = json!({"id": 1, "name": "x"});
-        let cols = vec!["id".to_string(), "dt".to_string()];
-        merge_partitions(&mut row2, &parts, Some(&cols));
-        assert_eq!(row2["id"], json!(1));
-        assert_eq!(row2["dt"], json!("2026-01-01"));
-        assert!(row2.get("name").is_none());
-
-        let mut row3 = json!({"id": 1});
-        merge_partitions(
-            &mut row3,
-            &HashMap::new(),
-            Some(&["id".into(), "added".into()]),
-        );
+    fn rows_take_partitions_and_the_table_shape() {
+        let parts = HashMap::from([
+            ("dt".to_string(), json!("2026-01-01")),
+            ("part".to_string(), json!(7)),
+        ]);
+        let rows = conformed_rows(&parts, None).unwrap();
         assert_eq!(
-            row3,
-            json!({"id": 1, "added": null}),
+            rows[0],
+            json!({"id": 1, "dt": "2026-01-01", "region": null, "part": 7}),
+            "partition values filled, a column the file lacks is null, Int32 read as the table's Int64"
+        );
+
+        let cols = vec!["id".to_string(), "dt".to_string()];
+        let rows = conformed_rows(&parts, Some(&cols)).unwrap();
+        assert_eq!(rows[1], json!({"id": 2, "dt": "2026-01-01"}));
+
+        let cols = vec!["id".to_string(), "region".to_string()];
+        let rows = conformed_rows(&HashMap::new(), Some(&cols)).unwrap();
+        assert_eq!(
+            rows[0],
+            json!({"id": 1, "region": null}),
             "a requested column absent from a file is null"
         );
+    }
+
+    #[test]
+    fn a_partition_value_that_does_not_fit_its_column_fails_the_read() {
+        let parts = HashMap::from([("part".to_string(), json!("x"))]);
+        assert!(conformed_rows(&parts, None).is_err());
     }
 
     #[test]

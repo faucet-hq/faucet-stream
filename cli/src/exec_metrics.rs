@@ -10,6 +10,18 @@
 use metrics::{describe_histogram, histogram};
 use std::sync::Once;
 
+/// The `pipeline` label value every faucet metric carries: the pipeline name,
+/// or `{tenant}::{name}` for a tenant's run, the rendering of the tenant
+/// state-key namespace, so two tenants' equal names stay apart.
+pub fn pipeline_label(tenant: Option<&str>, pipeline: &str) -> String {
+    match tenant {
+        Some(_) => faucet_core::StateKey::pipeline(pipeline)
+            .with_tenant(tenant)
+            .namespace(),
+        None => pipeline.to_string(),
+    }
+}
+
 static DESCRIBE: Once = Once::new();
 
 fn describe() {

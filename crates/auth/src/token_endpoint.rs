@@ -136,20 +136,21 @@ impl TokenEndpointProvider {
     }
 
     async fn fetch(&self) -> Result<(String, Option<u64>), FaucetError> {
-        let reply = crate::retry::send_token_request(&self.http, || {
-            let mut req = self.http.request(self.method.clone(), &self.url);
-            if let Some(body) = &self.body {
-                req = match self.encoding {
-                    BodyEncoding::Json => req.json(body),
-                    // Form encoding requires a flat map of string→string pairs; the
-                    // OAuth token endpoints that need `encoding: form` always send
-                    // such a body (`grant_type`, `client_id`, `resource`, …).
-                    BodyEncoding::Form => req.form(&form_pairs(body)?),
-                };
-            }
-            Ok(req)
-        })
-        .await?;
+        let reply =
+            crate::retry::send_token_request(&self.http, crate::retry::Grant::Idempotent, || {
+                let mut req = self.http.request(self.method.clone(), &self.url);
+                if let Some(body) = &self.body {
+                    req = match self.encoding {
+                        BodyEncoding::Json => req.json(body),
+                        // Form encoding requires a flat map of string→string pairs; the
+                        // OAuth token endpoints that need `encoding: form` always send
+                        // such a body (`grant_type`, `client_id`, `resource`, …).
+                        BodyEncoding::Form => req.form(&form_pairs(body)?),
+                    };
+                }
+                Ok(req)
+            })
+            .await?;
         if !reply.is_success() {
             return Err(FaucetError::Auth(format!(
                 "token endpoint request failed (HTTP {}): {}",

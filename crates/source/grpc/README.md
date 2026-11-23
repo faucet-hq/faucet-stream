@@ -13,7 +13,7 @@ Reach for it when you need to pull data out of an internal gRPC API — a list/g
 
 - **Dynamic protobuf, zero codegen** — point the source at a `FileDescriptorSet` (`.bin`) produced by `protoc`; it resolves the service/method, maps your JSON `request` onto the protobuf message, and decodes responses back to JSON. No `.proto` compilation into your binary.
 - **Two RPC kinds** — `unary` (one request → one response) and `server_streaming` (one request → a stream of responses). Server-streaming is consumed message-by-message and emitted as records arrive.
-- **Native streaming for server-streaming RPCs** — `stream_pages` flushes a `StreamPage` each time `batch_size` messages accumulate, bounding **both** source-side and sink-side memory for unbounded feeds.
+- **Native streaming for server-streaming RPCs** — `stream_pages` yields a `StreamPage` each time `batch_size` messages accumulate (or after 5 s quiet with records buffered), bounding **both** source-side and sink-side memory for unbounded feeds; each page carries a flush-only bookmark, so the sink is flushed page by page.
 - **Resilient reconnect** — server-streaming reconnects on transient errors (dropped connections, stalls, `UNAVAILABLE`-class statuses) with exponential backoff (`reconnect_initial_backoff` → `reconnect_max_backoff`) and a finite attempt budget; permanent failures (auth, permissions, decode, bad `records_path`) fail the run at once. Delivery across a reconnect is at-least-once unless you opt into replay-prefix skipping.
 - **Timeouts** — `connect_timeout`, a unary / stream-start `timeout`, and a server-streaming `idle_timeout` between messages, so a stalled peer fails or reconnects instead of hanging.
 - **JSONPath record extraction** — `records_path` (e.g. `$.users[*]`) pulls a repeated field out of each response message; unset returns the whole response as a single record.
@@ -261,7 +261,7 @@ A unary RPC returns one response containing all records. `stream_pages` falls ba
 
 ### Server-streaming RPCs
 
-When `rpc_kind: server_streaming`, the source calls `tonic::client::Grpc::server_streaming` and consumes the response stream message-by-message. Each streamed `DynamicMessage` is decoded via `prost-reflect`, converted to JSON, and (if `records_path` is set) flattened per message. `stream_pages` flushes a page every `batch_size` records, bounding **both** source-side and sink-side memory — the right mode for unbounded feeds. `batch_size = 0` drains the whole stream into a single page (good for short streams). Pages carry `bookmark: None`.
+When `rpc_kind: server_streaming`, the source calls `tonic::client::Grpc::server_streaming` and consumes the response stream message-by-message. Each streamed `DynamicMessage` is decoded via `prost-reflect`, converted to JSON, and (if `records_path` is set) flattened per message. `stream_pages` flushes a page every `batch_size` records, bounding **both** source-side and sink-side memory — the right mode for unbounded feeds. `batch_size = 0` drains the whole stream into a single page (good for short streams). Every page carries the flush-only bookmark `{"received": n}` (messages received so far), so the pipeline flushes the sink after each page and, with a `state:` block, stores that value; a quiet stream still cuts a partial page after 5 s, so it flushes at most every 5 s. A sink that commits on every flush (Iceberg, Delta, the file family) then makes one commit per page: raise `batch_size` for those and expect small commits on a trickle feed.
 
 #### Reconnect on transient errors
 
@@ -273,7 +273,7 @@ No message within `idle_timeout` also reopens the stream, but a quiet feed is no
 
 Reconnect re-sends the *same* request (resolved once per run). By default every message the new stream delivers is emitted (at-least-once): a server that replays from message 0 produces duplicates, a live feed loses nothing. Set `reconnect_replay_from_start: true` only for a server known to re-stream the same messages in the same order from message 0; the source then skips as many messages as it already emitted. Against a live feed that sends new events after a resubscribe this drops that many new messages, so it is opt-in. For an exact resume, carry a resume token in the request (e.g. an `after_event_id` field you maintain) and deduplicate downstream with an upsert sink.
 
-> **Resume/state:** this source has no faucet-managed bookmark or `state:` resume. For a resumable feed, drive the cursor through the `request` (e.g. an `after_event_id` your config advances), not via a faucet state store.
+> **Resume/state:** the stored `{"received": n}` only marks a flush point; `apply_start_bookmark` ignores it, so the next run reads the feed from wherever the request starts it. For a resumable feed, drive the cursor through the `request` (e.g. an `after_event_id` your config advances), not via a faucet state store. Because the row's state key now holds a value owned by `grpc`, switching that row to another source kind later needs `faucet state reset` for the row first; otherwise the run refuses the stored state as incompatible.
 
 ## Config loading & schema introspection
 

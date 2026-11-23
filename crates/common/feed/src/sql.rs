@@ -83,7 +83,7 @@ impl Dialect {
                 .map(|n| matches!(n & 0xff, 5 | 6 | 13))
                 .unwrap_or(false),
             Dialect::Postgres => {
-                matches!(code, "55P03" | "25P03")
+                matches!(code, "55P03" | "25P03" | "25006")
                     || ["08", "40", "53", "57"].iter().any(|p| code.starts_with(p))
             }
         }
@@ -141,6 +141,13 @@ pub(crate) fn backend(dialect: Dialect, err: sqlx::Error) -> FeedError {
     } else {
         FeedError::Backend(err.to_string())
     }
+}
+
+/// A new store's identity: random, positive, never zero.
+pub(crate) fn fresh_store_id() -> i64 {
+    let bytes = uuid::Uuid::new_v4().into_bytes();
+    let n = u64::from_le_bytes(bytes[..8].try_into().unwrap_or_default()) >> 1;
+    i64::try_from(n).unwrap_or(i64::MAX).max(1)
 }
 
 pub(crate) fn millis(d: Duration) -> i64 {
@@ -266,7 +273,8 @@ macro_rules! impl_feed_store {
                 Self::lock(tx, &format!("feed:{feed}")).await
             }
 
-            pub(crate) async fn migrate(&self) -> $crate::Result<()> {
+            /// Create or check the schema; returns the store's identity.
+            pub(crate) async fn migrate(&self) -> $crate::Result<i64> {
                 use sqlx::Row;
                 use $crate::sql::{stmt, SCHEMA_VERSION};
                 let mut tx = self.begin().await?;
@@ -303,7 +311,22 @@ macro_rules! impl_feed_store {
                 .execute(&mut *tx)
                 .await
                 .map_err(Self::be)?;
-                tx.commit().await.map_err(Self::be)
+                sqlx::query(stmt!(
+                    Self::D,
+                    "INSERT INTO faucet_feed_meta (k, v) VALUES ('store_id', ?) \
+                     ON CONFLICT (k) DO NOTHING"
+                ))
+                .bind($crate::sql::fresh_store_id())
+                .execute(&mut *tx)
+                .await
+                .map_err(Self::be)?;
+                let row = sqlx::query("SELECT v FROM faucet_feed_meta WHERE k = 'store_id'")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(Self::be)?;
+                let id: i64 = row.try_get(0).map_err(Self::be)?;
+                tx.commit().await.map_err(Self::be)?;
+                Ok(id)
             }
 
             async fn load_head(
@@ -895,34 +918,44 @@ macro_rules! impl_feed_store {
                     .await
                     .map_err(Self::be)?;
                 }
-                tx.commit().await.map_err(Self::be)?;
-
-                let mut ack = AppendAck {
-                    first_seq: acked.first().map(|(s, _)| seq_of(*s)).transpose()?,
-                    last_seq: acked.last().map(|(s, _)| seq_of(*s)).transpose()?,
-                    ..AppendAck::default()
+                // From the commit on, a failure leaves it unknown whether the
+                // events were stored: never report it as a refusal.
+                let unknown = |e: FeedError| {
+                    FeedError::Unavailable(format!(
+                        "the append's outcome is unknown (it failed at or after its commit): {e}"
+                    ))
                 };
-                for slot in slots {
-                    match slot {
-                        Slot::Fresh(at) => {
-                            let (seq, id) = &acked[at];
-                            ack.events.push(Appended {
-                                id: id.clone(),
-                                seq: seq_of(*seq)?,
-                                duplicate: false,
-                            });
-                        }
-                        Slot::Stored(seq, id) => {
-                            ack.duplicates += 1;
-                            ack.events.push(Appended {
-                                id,
-                                seq: seq_of(seq)?,
-                                duplicate: true,
-                            });
+                tx.commit().await.map_err(Self::be).map_err(unknown)?;
+
+                let acknowledge = || -> $crate::Result<AppendAck> {
+                    let mut ack = AppendAck {
+                        first_seq: acked.first().map(|(s, _)| seq_of(*s)).transpose()?,
+                        last_seq: acked.last().map(|(s, _)| seq_of(*s)).transpose()?,
+                        ..AppendAck::default()
+                    };
+                    for slot in slots {
+                        match slot {
+                            Slot::Fresh(at) => {
+                                let (seq, id) = &acked[at];
+                                ack.events.push(Appended {
+                                    id: id.clone(),
+                                    seq: seq_of(*seq)?,
+                                    duplicate: false,
+                                });
+                            }
+                            Slot::Stored(seq, id) => {
+                                ack.duplicates += 1;
+                                ack.events.push(Appended {
+                                    id,
+                                    seq: seq_of(seq)?,
+                                    duplicate: true,
+                                });
+                            }
                         }
                     }
-                }
-                Ok(ack)
+                    Ok(ack)
+                };
+                acknowledge().map_err(unknown)
             }
 
             async fn do_heads(
@@ -1200,6 +1233,25 @@ macro_rules! impl_feed_store {
                 ))
                 .bind(feed.as_str())
                 .bind(seq_param(from)?)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(Self::be)?;
+                let bytes: i64 = row.try_get(0).map_err(Self::be)?;
+                Ok(Some(u64::try_from(bytes).unwrap_or(0)))
+            }
+
+            async fn do_tenant_bytes(
+                &self,
+                tenant: &$crate::TenantId,
+            ) -> $crate::Result<Option<u64>> {
+                use sqlx::Row;
+                use $crate::sql::stmt;
+                let row = sqlx::query(stmt!(
+                    Self::D,
+                    "SELECT CAST(COALESCE(SUM(bytes), 0) AS BIGINT) \
+                     FROM faucet_feed_heads WHERE tenant = ?"
+                ))
+                .bind(tenant.as_str())
                 .fetch_one(&self.pool)
                 .await
                 .map_err(Self::be)?;
@@ -1762,6 +1814,10 @@ macro_rules! impl_feed_store {
 
         #[async_trait::async_trait]
         impl $crate::FeedStore for $name {
+            fn store_id(&self) -> Option<i64> {
+                Some(self.store_id)
+            }
+
             async fn ensure_feed(
                 &self,
                 calls: &faucet_core::io::CallContext,
@@ -1856,6 +1912,14 @@ macro_rules! impl_feed_store {
                 from: $crate::Seq,
             ) -> $crate::Result<Option<u64>> {
                 $crate::sql::each(calls, "bytes_from", || self.do_bytes_from(feed, from)).await
+            }
+
+            async fn tenant_bytes(
+                &self,
+                calls: &faucet_core::io::CallContext,
+                tenant: &$crate::TenantId,
+            ) -> $crate::Result<Option<u64>> {
+                $crate::sql::each(calls, "tenant_bytes", || self.do_tenant_bytes(tenant)).await
             }
 
             async fn hourly_counts(
@@ -2005,3 +2069,19 @@ macro_rules! impl_feed_store {
     };
 }
 pub(crate) use impl_feed_store;
+
+#[cfg(test)]
+mod tests {
+    use super::Dialect;
+
+    #[test]
+    fn a_read_only_or_restarting_postgres_is_unavailable_not_a_refusal() {
+        for code in ["25006", "57P04", "55P03", "40001", "08006", "53300"] {
+            assert!(Dialect::Postgres.transient(code), "{code}");
+        }
+        for code in ["22021", "23505", "42501", "42P01"] {
+            assert!(!Dialect::Postgres.transient(code), "{code}");
+        }
+        assert!(Dialect::Sqlite.transient("5") && !Dialect::Sqlite.transient("19"));
+    }
+}

@@ -136,7 +136,13 @@ pub struct FeedView {
     /// When the newest retained event was received.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_event_at: Option<DateTime<Utc>>,
-    /// `receiving`, `stalled`, `held`, `full` or `paused`.
+    /// Worst first: `held`, `store_moved` (its events are in another feed
+    /// store than the one it names: nothing is received or delivered),
+    /// `secret_unreadable` (this server cannot open the signature secret, so
+    /// it refuses senders), `stalled`, `full` (an undelivered limit is
+    /// reached), `over_quota` (the tenant's feeds in this store hold its
+    /// whole byte quota, delivered events kept for replay included),
+    /// `paused` or `receiving`.
     pub status: String,
     /// The path senders post events to.
     pub ingest_path: String,
@@ -285,7 +291,7 @@ pub fn view(
     undelivered: Option<u64>,
     statuses: &std::collections::BTreeMap<String, DeliveryStatus>,
 ) -> FeedView {
-    let masked = secrets::masked(&feed.spec);
+    let masked = secrets::masked_feed(feed);
     let deliveries = masked
         .deliveries
         .iter()
@@ -392,9 +398,10 @@ pub async fn find(
                 .map_err(ServeError::Unavailable)?
                 .feed(tenant, name),
         };
-        return snapshot
-            .map(|feed| Found { feed, record: None })
-            .ok_or_else(|| ServeError::Unavailable("the feed is not ready yet; retry".into()));
+        let feed = snapshot
+            .ok_or_else(|| ServeError::Unavailable("the feed is not ready yet; retry".into()))?;
+        check_its_store(state, &feed).await;
+        return Ok(Found { feed, record: None });
     }
     let record = state
         .history()
@@ -404,10 +411,22 @@ pub async fn find(
         .filter(FeedRecord::live)
         .ok_or(ServeError::NotFound)?;
     let feed = feed_of_record(state, &record).map_err(ServeError::Internal)?;
+    check_its_store(state, &feed).await;
     Ok(Found {
         feed: Arc::new(feed),
         record: Some(record),
     })
+}
+
+/// Check, when not done yet, that `feed`'s store holds its rows, so the
+/// store is handed out for it (a failure is the store's to report later).
+async fn check_its_store(state: &ServerState, feed: &Feed) {
+    let rt = state.feeds();
+    if let Ok(store) = rt.stores().get(&feed.spec.store).await
+        && let Err(e) = rt.check_store(state, feed, &*store).await
+    {
+        tracing::debug!(feed = %feed.label(), error = %e, "the feed's store is not handed out");
+    }
 }
 
 fn read_only(found: &Found) -> Result<&FeedRecord, ServeError> {
@@ -505,9 +524,74 @@ const VIEWS_AT_ONCE: usize = 8;
 
 /// The views of `feeds`: one `heads` and one newest-event query per store,
 /// then each feed's statuses and last-24-hours figures side by side.
+/// The payload bytes all of `tenant`'s feeds hold in each store they are
+/// in: what its byte quota is checked against in that store (delivered
+/// events kept for replay included). A store that cannot be read is left
+/// out.
+async fn tenant_store_bytes(
+    state: &ServerState,
+    snapshot: &super::Snapshot,
+    tenant: &str,
+) -> BTreeMap<String, u64> {
+    let mut by_store: BTreeMap<&str, Vec<FeedUid>> = BTreeMap::new();
+    for f in snapshot.feeds.iter().filter(|f| f.tenant() == Some(tenant)) {
+        by_store
+            .entry(f.spec.store.as_str())
+            .or_default()
+            .push(f.uid.clone());
+    }
+    let Ok(id) = faucet_common_feed::TenantId::new(tenant) else {
+        return BTreeMap::new();
+    };
+    let calls = store_calls();
+    let mut out = BTreeMap::new();
+    for (name, uids) in by_store {
+        let Ok(store) = state.feeds().stores().get(name).await else {
+            continue;
+        };
+        let held = match store.tenant_bytes(&calls, &id).await {
+            Ok(Some(held)) => held,
+            Ok(None) => match store.heads(&calls, &uids).await {
+                Ok(heads) => heads.iter().map(|h| h.bytes).sum(),
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+        out.insert(name.to_string(), held);
+    }
+    out
+}
+
+/// The `(tenant, store)` pairs whose feeds hold the tenant's whole byte
+/// quota there, so they refuse new events.
+async fn over_quota(state: &ServerState, feeds: &[Arc<Feed>]) -> HashSet<(String, String)> {
+    let tenants: std::collections::BTreeSet<&str> =
+        feeds.iter().filter_map(|f| f.tenant()).collect();
+    let mut out = HashSet::new();
+    if tenants.is_empty() {
+        return out;
+    }
+    let snapshot = state.feeds().snapshot();
+    for t in tenants {
+        let Ok(Some(record)) = state.history().tenant_get(t).await else {
+            continue;
+        };
+        let Some(max) = record.limits.max_feed_bytes else {
+            continue;
+        };
+        for (store, held) in tenant_store_bytes(state, &snapshot, t).await {
+            if held >= max {
+                out.insert((t.to_string(), store));
+            }
+        }
+    }
+    out
+}
+
 async fn views(state: &ServerState, feeds: &[Arc<Feed>]) -> Result<Vec<FeedView>, ServeError> {
     use futures::StreamExt;
     let rt = state.feeds();
+    let over = &over_quota(state, feeds).await;
     let mut by_store: std::collections::BTreeMap<&str, Vec<FeedUid>> = Default::default();
     for f in feeds {
         by_store
@@ -546,6 +630,31 @@ async fn views(state: &ServerState, feeds: &[Arc<Feed>]) -> Result<Vec<FeedView>
                 _ => None,
             };
             let mut out = view(&feed, head, undelivered, &statuses(state, &feed).await?);
+            if let Some(moved) = state.feeds().moved_of(feed.uid.as_str()) {
+                if out.status != "held" {
+                    out.status = "store_moved".into();
+                }
+                out.warnings.push(format!(
+                    "{moved}; it receives and delivers nothing until its definition names the \
+                     old store again or an admin adopts the new one (adopt-store), which starts it \
+                     empty there"
+                ));
+            }
+            if let Some(why) = &feed.derived.signature_unreadable {
+                if !matches!(out.status.as_str(), "held" | "store_moved") {
+                    out.status = "secret_unreadable".into();
+                }
+                out.warnings.push(format!(
+                    "{why}; this server refuses every request to the feed with 503 until it \
+                     runs with the vault key the feed was made under or the secret is set again"
+                ));
+            }
+            if matches!(out.status.as_str(), "receiving" | "paused")
+                && let Some(t) = feed.tenant()
+                && over.contains(&(t.to_string(), feed.spec.store.clone()))
+            {
+                out.status = "over_quota".into();
+            }
             out.refused_recent = state.feeds().ingest().refusals(feed.uid.as_str()).len() as u64;
             let (Some(store), Some(head)) = (store, head) else {
                 return Ok(out);
@@ -620,10 +729,17 @@ async fn hourly_24h(state: &ServerState, feed: &Feed) -> Vec<u64> {
 #[derive(Debug, Clone, Serialize)]
 pub struct Quotas {
     pub tenant: String,
+    /// Every feed of the tenant, not only the listed page's.
     pub feeds: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_feeds: Option<u32>,
+    /// The bytes the tenant's feeds hold in the store where they hold the
+    /// most, delivered events kept for replay included: what
+    /// `max_feed_bytes` is checked against, per store.
     pub stored_bytes: u64,
+    /// The same, for each store, when the tenant's feeds are in more than one.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub stored_bytes_by_store: BTreeMap<String, u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_feed_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -688,11 +804,22 @@ pub async fn overview(
                 .map_err(ServeError::from)?
                 .map(|r| r.limits)
                 .unwrap_or_default();
+            let snapshot = listed(state).await?;
+            let by_store = tenant_store_bytes(state, &snapshot, t).await;
             Some(Quotas {
                 tenant: t.clone(),
-                feeds: feeds.len() as u64,
+                feeds: snapshot
+                    .feeds
+                    .iter()
+                    .filter(|f| f.tenant() == Some(t.as_str()))
+                    .count() as u64,
                 max_feeds: limits.max_feeds,
-                stored_bytes: feeds.iter().filter_map(|f| f.retained_bytes).sum(),
+                stored_bytes: by_store.values().copied().max().unwrap_or(0),
+                stored_bytes_by_store: if by_store.len() > 1 {
+                    by_store
+                } else {
+                    BTreeMap::new()
+                },
                 max_feed_bytes: limits.max_feed_bytes,
                 max_feed_events_per_sec: limits.max_feed_events_per_sec,
             })
@@ -1062,6 +1189,7 @@ async fn activity(state: &ServerState, feed: &Feed) -> Vec<FeedChange> {
                 by: e.principal,
                 action: e.action.trim_start_matches("feed.").to_string(),
                 detail,
+                change_id: None,
             })
         })
         .collect()
@@ -1334,6 +1462,7 @@ pub async fn check_file_deliveries(state: &ServerState) -> Result<(), String> {
             approved: true,
             revision: 0,
             ensured: false,
+            derived: Default::default(),
         };
         for d in spec.deliveries.iter().filter(|d| d.pipeline.is_some()) {
             check_delivery(state, &feed, d).await.map_err(|e| {
@@ -1606,7 +1735,12 @@ async fn commit_create(
     } = built;
     record.approved = approved;
     let feed = Feed { approved, ..feed };
-    let store = state.feeds().store_for(&feed).await.map_err(store_error)?;
+    let store = state
+        .feeds()
+        .stores()
+        .get(&feed.spec.store)
+        .await
+        .map_err(store_error)?;
     let history = state.history();
     if let Some(old) = history
         .feed_get(&record.key())
@@ -1630,10 +1764,15 @@ async fn commit_create(
             record.name()
         )));
     }
-    if let Err(e) = ensure_in_store(&*store, &feed, limits.as_ref()).await {
+    if let Err(e) = state
+        .feeds()
+        .ensure(state, &feed, &*store, limits.as_ref())
+        .await
+    {
         if let Err(undo) = state.history().feed_delete(&record.key()).await {
             tracing::error!(feed = %record.name(), error = %undo, "could not remove a feed whose store rows were not created");
         }
+        let _ = state.feeds().unbind(state, feed.uid.as_str()).await;
         return Err(store_error(e));
     }
     after_change(state).await;
@@ -1790,9 +1929,20 @@ async fn commit_update(
     {
         return Ok(None);
     }
-    ensure_in_store(&*store, &feed, limits.as_ref())
+    // The definition is in force from here: a store that is down only
+    // delays its rows, which the scheduler creates (the delivery shows
+    // `setting_up`). A refusal that waiting will not fix still fails.
+    match state
+        .feeds()
+        .ensure(state, &feed, &*store, limits.as_ref())
         .await
-        .map_err(store_error)?;
+    {
+        Ok(()) => {}
+        Err(e) if e.is_transient() => {
+            tracing::warn!(feed = %feed.label(), error = %e, "the feed is updated; its store rows are created when the store answers");
+        }
+        Err(e) => return Err(store_error(e)),
+    }
     if let Err(e) = finish_removed(state, &next).await {
         tracing::warn!(feed = %feed.label(), error = %e, "the delivery is removed; removing what it left will be retried");
     }
@@ -2057,7 +2207,9 @@ pub async fn finish_delete(state: &ServerState, record: &FeedRecord) -> Result<(
     let history = state.history();
     rt.stopped(StopAfter::Marked)?;
     let feed = cleanup_feed(state, record)?;
-    let store = rt.store_for(&feed).await?;
+    // The store the feed names, even when its events were left in another:
+    // what the feed has there goes.
+    let store = rt.stores().get(&feed.spec.store).await?;
     for d in &feed.spec.deliveries {
         if let Some(dref) = feed.delivery(&d.name) {
             remove_state(state, &feed, d, dref).await?;
@@ -2094,6 +2246,9 @@ pub async fn finish_delete(state: &ServerState, record: &FeedRecord) -> Result<(
         .feed_remove(record)
         .await
         .map_err(|e| e.to_string())?;
+    if let Err(e) = rt.unbind(state, &record.uid).await {
+        tracing::warn!(feed = %feed.label(), error = %e, "could not forget which store held a deleted feed");
+    }
     let names: Vec<String> = feed.deliveries.keys().cloned().collect();
     metrics::forget_feed(&feed.label(), &names);
     rt.ingest().forget_feed(feed.uid.as_str());
@@ -2105,8 +2260,9 @@ async fn mark_deleting(
     state: &ServerState,
     record: &FeedRecord,
     by: &str,
+    change_id: Option<&str>,
 ) -> Result<Option<FeedRecord>, ServeError> {
-    let marked = record.tombstoned(by, Utc::now());
+    let marked = record.tombstoned(by, Utc::now()).stamped(change_id);
     Ok(state
         .history()
         .feed_replace(record, &marked)
@@ -2121,6 +2277,7 @@ async fn delete_inner(
     tenant: Option<&str>,
     name: &str,
     expect_uid: Option<&str>,
+    change_id: Option<&str>,
 ) -> Result<(), ServeError> {
     crate::runtime::server::refuse_while_unavailable(state)?;
     let tenant = scope(actor, tenant)?;
@@ -2136,7 +2293,7 @@ async fn delete_inner(
     for (dname, meta) in &record.deliveries {
         refuse_live_claim(&*store, &feed, dname, &meta.uid).await?;
     }
-    let Some(marked) = mark_deleting(state, &record, &actor.principal).await? else {
+    let Some(marked) = mark_deleting(state, &record, &actor.principal, change_id).await? else {
         return Err(ServeError::Conflict(format!(
             "feed '{name}' changed while it was being deleted; retry"
         )));
@@ -2159,7 +2316,7 @@ pub async fn delete(
     tenant: Option<&str>,
     name: &str,
 ) -> Result<(), ServeError> {
-    delete_inner(state, actor, tenant, name, None).await
+    delete_inner(state, actor, tenant, name, None, None).await
 }
 
 // ── Changes ─────────────────────────────────────────────────────────────────
@@ -2425,6 +2582,7 @@ pub async fn apply(
     actor: &AuthContext,
     p: ChangePayload,
     approved: bool,
+    change_id: Option<&str>,
 ) -> Result<Option<FeedView>, ServeError> {
     if approved && p.feed_uid.is_none() {
         return Err(ServeError::Conflict(
@@ -2432,8 +2590,12 @@ pub async fn apply(
         ));
     }
     let out = match plan_inner(state, actor, &p, approved).await?.0 {
-        Planned::Create(b) => Some(commit_create(state, *b, approved).await?),
-        Planned::Update(b) => {
+        Planned::Create(mut b) => {
+            b.record = b.record.stamped(change_id);
+            Some(commit_create(state, *b, approved).await?)
+        }
+        Planned::Update(mut b) => {
+            b.next = b.next.stamped(change_id);
             Some(commit_update(state, *b, approved).await?.ok_or_else(|| {
                 ServeError::Conflict(format!("feed '{}' changed meanwhile", p.name))
             })?)
@@ -2445,23 +2607,57 @@ pub async fn apply(
                 p.tenant.as_deref(),
                 &p.name,
                 p.feed_uid.as_deref(),
+                change_id,
             )
             .await?;
             None
         }
     };
     if approved {
-        crate::serve::audit::write_target_detail(
-            state,
-            actor,
-            &format!("feed.{}", p.action.as_str()),
-            format!("feed:{}", label_of(p.tenant.as_deref(), &p.name)),
-            "an approved change request".into(),
-            "ok",
-        )
-        .await;
+        audit_approved(state, actor, &p, "an approved change request").await;
     }
     Ok(out)
+}
+
+/// The audit entry of an approved feed change carried out.
+pub async fn audit_approved(
+    state: &ServerState,
+    actor: &AuthContext,
+    p: &ChangePayload,
+    detail: &str,
+) {
+    crate::serve::audit::write_target_detail(
+        state,
+        actor,
+        &format!("feed.{}", p.action.as_str()),
+        format!("feed:{}", label_of(p.tenant.as_deref(), &p.name)),
+        detail.into(),
+        "ok",
+    )
+    .await;
+}
+
+/// Whether the approved feed change `change` is already in the run history:
+/// its execution was interrupted after its write. Proven only by the change
+/// id the write carries; a deleted feed already purged proves nothing.
+pub async fn already_applied(
+    state: &ServerState,
+    change: &crate::serve::changes::ChangeRequest,
+) -> Result<Option<ChangePayload>, ServeError> {
+    let Ok(p) = serde_json::from_value::<ChangePayload>(change.payload.clone()) else {
+        return Ok(None);
+    };
+    let Some(uid) = p.feed_uid.as_deref() else {
+        return Ok(None);
+    };
+    let record = state
+        .history()
+        .feed_get(&feed_key(p.tenant.as_deref(), &p.name))
+        .await
+        .map_err(ServeError::from)?;
+    Ok(record
+        .filter(|r| r.uid == uid && r.applied(&change.id))
+        .map(|_| p))
 }
 
 /// `<tenant>/<name>` for a tenant feed, else the name.
@@ -2529,7 +2725,7 @@ pub async fn change(
             .await
             .map(|v| Changed::Applied(Some(Box::new(v))));
     }
-    apply(state, actor, p, false)
+    apply(state, actor, p, false, None)
         .await
         .map(|v| Changed::Applied(v.map(Box::new)))
 }
@@ -2991,6 +3187,171 @@ pub async fn recover(
     })
 }
 
+/// Refuse to start while a `--feeds` file feed names another physical store
+/// than the one holding its events: the operator just edited the file, and
+/// running on would accept events into a store none of its old events are
+/// in. An unreachable history or store is checked later, at run time.
+pub async fn refuse_moved_file_feeds(state: &ServerState) -> Result<(), String> {
+    let rt = state.feeds();
+    if rt.file().feeds.is_empty() {
+        return Ok(());
+    }
+    let Ok(snapshot) = rt.refresh(state).await else {
+        return Ok(());
+    };
+    let moved: Vec<String> = snapshot
+        .feeds
+        .iter()
+        .filter(|f| f.source == Source::File)
+        .filter_map(|f| {
+            let m = f.derived.store_moved.as_ref()?;
+            let tenant = f
+                .tenant()
+                .map(|t| format!(" --tenant {t}"))
+                .unwrap_or_default();
+            Some(format!(
+                "feeds: '{}': {m}; point it back to store '{}', or run 'faucet feed adopt-store {}{tenant}' \
+                 (or 'faucet feed adopt-store --all') to start it empty in the new store",
+                f.label(),
+                m.recorded_store,
+                f.name()
+            ))
+        })
+        .collect();
+    if moved.is_empty() {
+        Ok(())
+    } else {
+        Err(moved.join("\n"))
+    }
+}
+
+/// What adopting a new store did for one feed.
+#[derive(Debug, Clone, Serialize)]
+pub struct Adopted {
+    pub feed: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    /// The store now holding the feed, empty.
+    pub store: String,
+    pub store_id: i64,
+    /// The store its events were left in; they are not delivered.
+    pub abandoned_store: String,
+    pub abandoned_store_id: i64,
+}
+
+/// Start `found`'s feed empty in the store its definition names, leaving
+/// its events in the store that held them: its deliveries' run state goes
+/// (their old positions mean nothing in the new store), then the store is
+/// recorded as the feed's and its rows are created at each delivery's start.
+async fn adopt_found(state: &ServerState, found: &Found) -> Result<Adopted, ServeError> {
+    let rt = state.feeds();
+    let feed = &found.feed;
+    let Some(moved) = rt.moved_of(feed.uid.as_str()) else {
+        return Err(ServeError::Conflict(format!(
+            "feed '{}' is in the store its definition names; there is nothing to adopt",
+            feed.label()
+        )));
+    };
+    let store = rt
+        .stores()
+        .get(&feed.spec.store)
+        .await
+        .map_err(store_error)?;
+    for d in &feed.spec.deliveries {
+        if let Some(dref) = feed.delivery(&d.name) {
+            remove_state(state, feed, d, dref)
+                .await
+                .map_err(ServeError::Unavailable)?;
+            status::clear(&*state.history(), feed.uid.as_str(), dref.uid.id())
+                .await
+                .map_err(ServeError::Unavailable)?;
+        }
+    }
+    rt.rebind(state, feed, &*store)
+        .await
+        .map_err(ServeError::Unavailable)?;
+    let limits = match feed.tenant() {
+        Some(t) => state
+            .history()
+            .tenant_get(t)
+            .await
+            .map_err(ServeError::from)?
+            .map(|r| r.limits),
+        None => None,
+    };
+    ensure_in_store(&*store, feed, limits.as_ref())
+        .await
+        .map_err(store_error)?;
+    tracing::warn!(feed = %feed.label(), abandoned = %moved.recorded_store, store = %moved.now_store, "the feed starts empty in the store its definition names; its events in the old store are not delivered");
+    Ok(Adopted {
+        feed: feed.name().to_string(),
+        tenant: feed.tenant().map(str::to_string),
+        store: moved.now_store,
+        store_id: moved.now_id,
+        abandoned_store: moved.recorded_store,
+        abandoned_store_id: moved.recorded_id,
+    })
+}
+
+/// `POST /v1/feeds/{name}/adopt-store`: start a feed whose events are in
+/// another store empty in the store its definition names.
+pub async fn adopt_store(
+    state: &ServerState,
+    actor: &AuthContext,
+    tenant: Option<&str>,
+    name: &str,
+) -> Result<Adopted, ServeError> {
+    crate::runtime::server::refuse_while_unavailable(state)?;
+    let tenant = scope(actor, tenant)?;
+    let _ = listed(state).await?;
+    let found = find(state, tenant.as_deref(), name).await?;
+    let adopted = adopt_found(state, &found).await?;
+    after_change(state).await;
+    Ok(adopted)
+}
+
+/// Adopt every feed whose events are in another store than the one it
+/// names (only those naming `store`, when given), so a store recreated
+/// empty does not need one command per feed. Feeds that fail are reported,
+/// the others adopted.
+pub async fn adopt_store_all(
+    state: &ServerState,
+    actor: &AuthContext,
+    store: Option<&str>,
+) -> Result<(Vec<Adopted>, Vec<String>), ServeError> {
+    crate::runtime::server::refuse_while_unavailable(state)?;
+    if actor.tenant.is_some() {
+        return Err(ServeError::Forbidden(
+            "adopting every feed of a store is for an operator not confined to a tenant".into(),
+        ));
+    }
+    let snapshot = state
+        .feeds()
+        .refresh_now(state)
+        .await
+        .map_err(ServeError::Unavailable)?;
+    let (mut done, mut failed) = (Vec::new(), Vec::new());
+    for feed in snapshot
+        .feeds
+        .iter()
+        .filter(|f| f.derived.store_moved.is_some() && store.is_none_or(|s| f.spec.store == s))
+    {
+        let found = match find(state, feed.tenant(), feed.name()).await {
+            Ok(found) => found,
+            Err(e) => {
+                failed.push(format!("{}: {}", feed.label(), e.api_error().error.message));
+                continue;
+            }
+        };
+        match adopt_found(state, &found).await {
+            Ok(a) => done.push(a),
+            Err(e) => failed.push(format!("{}: {}", feed.label(), e.api_error().error.message)),
+        }
+    }
+    after_change(state).await;
+    Ok((done, failed))
+}
+
 /// The SHA-256 of a token, lowercase hex: what the history stores and ingest
 /// looks up.
 pub fn token_hash(token: &str) -> String {
@@ -3222,7 +3583,7 @@ pub async fn purge_tenant(state: &ServerState, tenant: &str) -> Result<usize, St
             continue;
         }
         let by = format!("tenant:{tenant}:deleted");
-        match mark_deleting(state, &record, &by).await {
+        match mark_deleting(state, &record, &by, None).await {
             Ok(Some(m)) => marked.push(m),
             Ok(None) => return Err(format!("feed '{}' changed; retry", record.name())),
             Err(e) => return Err(e.api_error().error.message),

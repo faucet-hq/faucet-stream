@@ -22,6 +22,15 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_conf
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// How long buffered messages may wait for a full page before a partial one
+/// is yielded, so a slow feed still reaches the sink.
+const BUFFER_FLUSH_AFTER: Duration = Duration::from_secs(5);
+
+/// The flush-only bookmark every page carries: messages received so far.
+fn received(n: usize) -> Value {
+    serde_json::json!({ "received": n })
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -322,6 +331,7 @@ impl SourceDriver for WebsocketDriver {
             let mut buffer: Vec<Value> = Vec::new();
             let mut total: usize = 0;
             let mut last_message_at = Instant::now();
+            let mut buffered_at = Instant::now();
             let mut reconnect_attempts: usize = 0;
 
             'outer: loop {
@@ -380,10 +390,14 @@ impl SourceDriver for WebsocketDriver {
 
                 loop {
                     let idle_deadline = idle_timeout.map(|t| last_message_at + t);
-                    let poll_budget = match idle_deadline {
+                    let mut poll_budget = match idle_deadline {
                         Some(d) => d.saturating_duration_since(Instant::now()),
                         None => Duration::from_secs(3600),
                     };
+                    if !buffer.is_empty() {
+                        poll_budget = poll_budget
+                            .min((buffered_at + BUFFER_FLUSH_AFTER).saturating_duration_since(Instant::now()));
+                    }
 
                     // Flags collected from the select arms; `?` cannot cross
                     // the select match boundary into the try_stream! body.
@@ -407,6 +421,9 @@ impl SourceDriver for WebsocketDriver {
                         last_message_at = Instant::now();
                         match decode_frame(format, on_parse_error, payload) {
                             Ok(Some(v)) => {
+                                if buffer.is_empty() {
+                                    buffered_at = Instant::now();
+                                }
                                 let now = if envelope { now_unix_ms() } else { 0 };
                                 buffer.push(shape_record(v, envelope, &record_url, now));
                                 reconnect_attempts = 0;
@@ -502,14 +519,16 @@ impl SourceDriver for WebsocketDriver {
 
                     if let Some(e) = fatal {
                         if !buffer.is_empty() {
-                            yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
+                            yield StreamPage { records: std::mem::take(&mut buffer), bookmark: Some(received(total)) };
                         }
                         Err(e)?;
                     }
 
-                    if !buffer.is_empty() && buffer.len() >= page_chunk {
+                    if !buffer.is_empty()
+                        && (buffer.len() >= page_chunk || buffered_at.elapsed() >= BUFFER_FLUSH_AFTER)
+                    {
                         let page = std::mem::take(&mut buffer);
-                        yield StreamPage { records: page, bookmark: None };
+                        yield StreamPage { records: page, bookmark: Some(received(total)) };
                     }
 
                     if stop {
@@ -531,7 +550,7 @@ impl SourceDriver for WebsocketDriver {
                             continue 'outer;
                         }
                         if !buffer.is_empty() {
-                            yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
+                            yield StreamPage { records: std::mem::take(&mut buffer), bookmark: Some(received(total)) };
                         }
                         if reconnect {
                             Err(FaucetError::Source(format!(
@@ -548,7 +567,7 @@ impl SourceDriver for WebsocketDriver {
             }
 
             if !buffer.is_empty() {
-                yield StreamPage { records: buffer, bookmark: None };
+                yield StreamPage { records: buffer, bookmark: Some(received(total)) };
             }
 
             tracing::info!(messages = total, "websocket source: stream complete");
@@ -570,6 +589,12 @@ impl SourceDriver for WebsocketDriver {
 
     fn capabilities(&self, derived: faucet_core::Capabilities) -> faucet_core::Capabilities {
         derived.to_builder().read_side_effects(true).build()
+    }
+
+    /// The bookmark only marks a flush point; a live feed has no position to
+    /// resume from, so a stored one is ignored.
+    async fn resume_from(&self, _bookmark: Value) -> Result<(), FaucetError> {
+        Ok(())
     }
 
     fn connector_name(&self) -> &'static str {

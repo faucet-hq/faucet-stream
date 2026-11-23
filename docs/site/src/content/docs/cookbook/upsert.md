@@ -416,6 +416,13 @@ is `{index}-faucet-ovw-staging-<token>`, and the file sinks (`file`, `s3`, `gcs`
 runs of the same destination at once
 (two schedulers, a manual run during a scheduled one) never drop or share each
 other's staging: each swaps in exactly its own rows, and the last commit wins.
+On the file sinks the moves into place are also serialised by an output lock
+kept beside the destination: a commit that starts while another is moving
+files waits for it (failing after an hour, with nothing moved), so the
+output ends as exactly one run's files, never a mix. A run that crashed
+holding the lock delays the next commit by about two minutes. S3-compatible
+stores must honour `If-None-Match: *` for this; the sink warns once when one
+does not.
 
 Staging a crashed run left behind is cleaned up by a later run of the same
 table, with one rule: a run drops another run's staging only once that run's
@@ -447,7 +454,7 @@ gone. Library callers that drive the lifecycle without a token keep the single
 | `mssql` | one transaction: `DELETE` + `INSERT` (explicit non-IDENTITY column list) from a `SELECT … INTO … WHERE 1=0` clone + `DROP`; a target **other** tables reference by an enabled foreign key is refused before the run and again at the swap (a `NO ACTION` key is allowed while its table holds no row referencing the target; a cascading / `SET NULL` / `SET DEFAULT` one never is) |
 | `mongodb` | load a `{collection}__faucet_ovw_<token>` staging collection created with the target's options and secondary indexes, then atomic `renameCollection(dropTarget: true)` (needs the rename privilege; unsupported on sharded collections) |
 | `bigquery` | **bucket-free** — load a `LIKE` temp table via the query API, then `BEGIN TRANSACTION; TRUNCATE; INSERT … SELECT; COMMIT` (preserves the target's partitioning/clustering); no GCS staging bucket required |
-| `elasticsearch` | index into a fresh physical index `{index}-faucet-ovw-…` (mappings copied from the current target) through the marker alias `{index}-faucet-ovw-staging-<token>`, so any sink instance can commit; then an atomic `POST /_aliases` swap repoints the read alias and the old index is dropped |
+| `elasticsearch` | index into a fresh physical index `{index}-faucet-ovw-…` (mappings copied from the current target) through the marker alias `{index}-faucet-ovw-staging-<token>`, so any sink instance can commit; then an atomic `POST /_aliases` swap repoints the read alias; an old index is dropped when an earlier overwrite created it and no other alias uses it, otherwise it is left in place with a warning |
 | `oracle` | load a `CREATE TABLE … AS SELECT * FROM target WHERE 1 = 0` staging table, then one transaction: `DELETE` + `INSERT … SELECT` over the insertable columns + `DROP` (a first run renames staging into place); a target **other** tables reference by an enabled foreign key is refused before the run and again at the swap (an `INITIALLY DEFERRED` `NO ACTION` key is allowed: it is checked at the swap's commit) |
 | `databricks` | load a `CREATE TABLE … LIKE` staging Delta table, then one atomic `INSERT OVERWRITE target SELECT * FROM staging` + `DROP` (a first run renames staging into place) |
 | `file` | files written into a hidden `.faucet-overwrite-*.run-<token>` directory beside the destination, each renamed into place on commit; parts the run did not write are removed |

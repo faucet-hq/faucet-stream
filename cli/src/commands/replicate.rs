@@ -78,7 +78,7 @@ pub async fn run(args: ReplicateArgs) -> CliResult<()> {
     // Install observability before compiling the replication spec so the
     // tracing subscriber is live and `CompiledReplication::compile`'s
     // non-upsert-sink warning is actually emitted (it would be lost otherwise).
-    crate::obs::install(&cfg)?;
+    crate::obs::install_for(&cfg, true)?;
     let _otel = crate::obs::flush_on_exit();
 
     let compiled = CompiledReplication::compile(spec, &cfg)?;

@@ -272,6 +272,12 @@ pub struct ExecuteOptions {
     /// request — the stricter winning). `allowed_sinks` is checked before
     /// anything runs; the others by a sink decorator per invocation.
     pub budget: Option<faucet_core::BudgetSpec>,
+    /// The run's budget ledger: every invocation of the run (rows, fan-out
+    /// children, topology sinks) counts against it, and `max_duration_secs`
+    /// runs from its start. `None` makes [`run_expanded`] start one for the
+    /// run; a caller passes one to share it (a sharded run's ledger, a verify
+    /// repair inside its run).
+    pub budget_state: Option<std::sync::Arc<faucet_core::BudgetState>>,
     /// How a `feed` source of this run reads (#1034). Only the server's
     /// governed options set it; every other caller leaves the default, under
     /// which the source runs standalone.
@@ -718,6 +724,15 @@ async fn run_expanded_unredacted(
     opts: ExecuteOptions,
 ) -> CliResult<RunSummary> {
     check_budget_sinks(&nodes, opts.budget.as_ref())?;
+    let mut opts = opts;
+    if opts.budget_state.is_none()
+        && let Some(spec) = opts.budget.as_ref().filter(|b| !b.is_empty())
+    {
+        opts.budget_state = Some(std::sync::Arc::new(faucet_core::BudgetState::for_run(
+            spec,
+            std::time::SystemTime::now(),
+        )));
+    }
     // A root's state key depends only on the run's names, so an invalid one
     // fails the run before anything is written rather than mid-run.
     for node in nodes.iter().filter(|n| matches!(n.role, NodeRole::Root)) {
@@ -814,6 +829,12 @@ async fn run_expanded_unredacted(
     let mut completed: HashSet<String> = HashSet::new();
     let nodes_by_id: HashMap<String, ExpandedNode> =
         nodes.into_iter().map(|n| (n.id.clone(), n)).collect();
+    // One shared copy per row: every unit of the row (one per parent record or
+    // tuple) points at it instead of holding its own.
+    let shared_nodes: HashMap<String, Arc<ExpandedNode>> = nodes_by_id
+        .iter()
+        .map(|(id, n)| (id.clone(), Arc::new(n.clone())))
+        .collect();
 
     // Per-parent projection: what to keep from each captured record so the
     // fan-out buffer holds only the fields children reference (#160).
@@ -832,6 +853,20 @@ async fn run_expanded_unredacted(
     };
 
     while !remaining.is_empty() {
+        // An external cancel (serve cancel / timeout / drain, a schedule run
+        // timeout, Ctrl-C in backfill or mirror) starts nothing more: every row
+        // still waiting is reported skipped.
+        if cancel.is_cancelled() {
+            for id in bfs_order.iter().filter(|id| remaining.contains(*id)) {
+                outcomes.push(synthetic_outcome(
+                    id,
+                    None,
+                    CANCELLED_BEFORE_START.to_string(),
+                    InvocationErrorKind::Skipped,
+                ));
+            }
+            break;
+        }
         // Pick every remaining node whose parent (if any) and every
         // `depends_on` row are already terminal (completed or skipped), in
         // deterministic BFS order. Whether a skipped/failed prerequisite
@@ -968,12 +1003,13 @@ async fn run_expanded_unredacted(
                         .map(|id| key.clone().with_row(id.as_str()).render())
                         .collect();
                     units.push(Unit {
-                        node: node.clone(),
+                        node: Arc::clone(&shared_nodes[&node.id]),
                         parent_record: None,
                         state_key,
                         parent_record_key: None,
                         product_ctx: None,
                         legacy_state_keys,
+                        overwrite_run: None,
                     });
                 }
                 NodeRole::Discovery { dims, .. } => {
@@ -987,12 +1023,13 @@ async fn run_expanded_unredacted(
                             .with_row(node.id.as_str())
                             .render();
                         units.push(Unit {
-                            node: node.clone(),
+                            node: Arc::clone(&shared_nodes[&node.id]),
                             parent_record: None,
                             state_key,
                             parent_record_key: None,
                             product_ctx: None,
                             legacy_state_keys: Vec::new(),
+                            overwrite_run: None,
                         });
                     } else {
                         // Chained discovery (#531): fan out over the upstream
@@ -1023,12 +1060,13 @@ async fn run_expanded_unredacted(
                                 .with_sub(suffix.as_str())
                                 .render();
                             units.push(Unit {
-                                node: node.clone(),
+                                node: Arc::clone(&shared_nodes[&node.id]),
                                 parent_record: None,
                                 state_key,
                                 parent_record_key: Some(suffix),
                                 product_ctx: Some(ctx),
                                 legacy_state_keys: Vec::new(),
+                                overwrite_run: None,
                             });
                         }
                     }
@@ -1091,12 +1129,13 @@ async fn run_expanded_unredacted(
                             continue;
                         }
                         units.push(Unit {
-                            node: node.clone(),
+                            node: Arc::clone(&shared_nodes[&node.id]),
                             parent_record: None,
                             state_key,
                             parent_record_key: Some(suffix),
                             product_ctx: Some(ctx),
                             legacy_state_keys: Vec::new(),
+                            overwrite_run: None,
                         });
                     }
                 }
@@ -1152,12 +1191,13 @@ async fn run_expanded_unredacted(
                             continue;
                         }
                         units.push(Unit {
-                            node: node.clone(),
+                            node: Arc::clone(&shared_nodes[&node.id]),
                             parent_record: Some(record.clone()),
                             state_key,
                             parent_record_key: Some(pk_string),
                             product_ctx: None,
                             legacy_state_keys,
+                            overwrite_run: None,
                         });
                     }
                 }
@@ -1246,123 +1286,155 @@ async fn run_expanded_unredacted(
         // attributed to the right invocation.
         let mut task_meta: HashMap<tokio::task::Id, (String, Option<String>)> = HashMap::new();
         let mut not_run: HashSet<String> = HashSet::new();
-        for mut unit in units {
-            if level_cancel.is_cancelled() && matches!(on_error, OnError::Stop) {
-                not_run.insert(unit.node.id.clone());
-                // The level token also fires on an external cancel (serve
-                // cancel / timeout / drain), which no row failure caused.
+        // Units are dispatched in order as permits free up: a task exists only
+        // while it holds a permit, so at most `max_concurrent` invocations (and
+        // their futures) are alive at once however wide the fan-out.
+        let mut pending: std::collections::VecDeque<Unit> = units.into();
+        let mut stop_triggered = false;
+        let mut aborted = false;
+        let mut stop_deadline: Option<tokio::time::Instant> = None;
+        loop {
+            // A stopped or cancelled level starts nothing more: the units still
+            // waiting for a permit are reported skipped.
+            if level_cancel.is_cancelled() {
                 let why = if cancel.is_cancelled() {
                     CANCELLED_BEFORE_START
                 } else {
                     STOPPED_BEFORE_START
                 };
-                outcomes.push(synthetic_outcome(
-                    &unit.node.id,
-                    unit.parent_record_key.clone(),
-                    why.to_string(),
-                    InvocationErrorKind::Skipped,
-                ));
-                continue;
-            }
-            let group_key = (unit.node.id.clone(), unit.parent_record_key.clone());
-            if let Some(gi) = overwrite_task_group.get(&group_key) {
-                inject_overwrite_run(&mut unit.node.sink.config, &overwrite_groups[*gi].run_token);
-            }
-            if let Some(err) = overwrite_task_group
-                .get(&group_key)
-                .and_then(|gi| begin_failed.get(gi))
-            {
-                had_level_failure = true;
-                nodes_with_any_failure.insert(unit.node.id.clone());
-                outcomes.push(synthetic_outcome(
-                    &unit.node.id,
-                    unit.parent_record_key.clone(),
-                    err.clone(),
-                    InvocationErrorKind::Other,
-                ));
-                continue;
-            }
-            let sem = Arc::clone(&semaphore);
-            let opts2 = Arc::clone(&opts);
-            let captured = Arc::clone(&captured);
-            let discovered = Arc::clone(&discovered);
-            let collected = Arc::clone(&collected);
-            let capture = projections.get(&unit.node.id).cloned();
-            let meta = (unit.node.id.clone(), unit.parent_record_key.clone());
-            // #552: a unit whose destination is part of an executor-managed
-            // overwrite group runs with its per-invocation begin/commit/abort
-            // suppressed — the group's single lifecycle is driven here instead.
-            let suppress_overwrite = overwrite_task_group.contains_key(&meta);
-            // A *grouped* overwrite (>1 writer → one table) must stage; a solo
-            // one loads directly. Drives the bigquery `_overwrite_staging` flag.
-            let overwrite_grouped = overwrite_task_group
-                .get(&meta)
-                .is_some_and(|gi| overwrite_groups[*gi].members > 1);
-            // A child token per unit: a budget ceiling cancels its own unit
-            // only, never its siblings, while a level cancel still reaches all
-            // of them (#789 CLI-54).
-            let unit_cancel = level_cancel.child_token();
-            let dlq_sinks = Arc::clone(&dlq_sinks);
-            let state_stores = Arc::clone(&state_stores);
-            let untrusted = untrusted_targets();
-            let handle = joinset.spawn(
-                UNTRUSTED_TARGETS
-                    .scope(
-                        untrusted,
-                        faucet_core::http::inherit_reference_policy(STATE_STORES.scope(
-                            state_stores,
-                            DLQ_SINKS.scope(
-                                dlq_sinks,
-                                inherit_feed(Box::pin(async move {
-                                    let _permit =
-                                        sem.acquire().await.expect("semaphore not closed");
-                                    run_unit(
-                                        &unit,
-                                        capture,
-                                        &captured,
-                                        &discovered,
-                                        &collected,
-                                        &opts2,
-                                        unit_cancel,
-                                        suppress_overwrite,
-                                        overwrite_grouped,
-                                    )
-                                    .await
-                                })),
-                            ),
-                        )),
-                    )
-                    .in_current_span(),
-            );
-            task_meta.insert(handle.id(), meta);
-        }
-
-        let mut stop_triggered = false;
-        let mut aborted = false;
-        let mut stop_deadline: Option<tokio::time::Instant> = None;
-        loop {
-            // Once `on_error: stop` has cancelled the level, give in-flight
-            // invocations a bounded grace to flush cooperatively, then
-            // hard-abort the stragglers (the backstop for a sink stuck
-            // mid-write that can't reach a page boundary to observe the cancel).
-            let joined = match stop_deadline {
-                Some(deadline) if !aborted => {
-                    match tokio::time::timeout_at(deadline, joinset.join_next_with_id()).await {
-                        Ok(j) => j,
-                        Err(_) => {
-                            tracing::warn!(
-                                "on_error: stop — flush grace elapsed; aborting remaining \
-                                 in-flight invocations"
-                            );
-                            joinset.abort_all();
-                            aborted = true;
-                            continue;
-                        }
-                    }
+                for unit in pending.drain(..) {
+                    not_run.insert(unit.node.id.clone());
+                    outcomes.push(synthetic_outcome(
+                        &unit.node.id,
+                        unit.parent_record_key.clone(),
+                        why.to_string(),
+                        InvocationErrorKind::Skipped,
+                    ));
                 }
-                _ => joinset.join_next_with_id().await,
+            }
+            if pending.is_empty() && joinset.is_empty() {
+                break;
+            }
+            enum Step {
+                Joined(
+                    Box<
+                        Option<
+                            Result<(tokio::task::Id, InvocationOutcome), tokio::task::JoinError>,
+                        >,
+                    >,
+                ),
+                Permit(tokio::sync::OwnedSemaphorePermit),
+                GraceElapsed,
+            }
+            let grace = stop_deadline.filter(|_| !aborted);
+            let step = tokio::select! {
+                biased;
+                joined = joinset.join_next_with_id(), if !joinset.is_empty() => Step::Joined(Box::new(joined)),
+                _ = tokio::time::timeout_at(
+                    grace.unwrap_or_else(tokio::time::Instant::now),
+                    std::future::pending::<()>(),
+                ), if grace.is_some() && !joinset.is_empty() => Step::GraceElapsed,
+                permit = Arc::clone(&semaphore).acquire_owned(), if !pending.is_empty() => {
+                    Step::Permit(permit.expect("semaphore not closed"))
+                }
             };
-            let Some(joined) = joined else { break };
+            let joined = match step {
+                Step::GraceElapsed => {
+                    // Once `on_error: stop` has cancelled the level, in-flight
+                    // invocations get a bounded grace to flush cooperatively;
+                    // then the stragglers are hard-aborted (the backstop for a
+                    // sink stuck mid-write that can't reach a page boundary).
+                    tracing::warn!(
+                        "on_error: stop — flush grace elapsed; aborting remaining in-flight \
+                         invocations"
+                    );
+                    joinset.abort_all();
+                    aborted = true;
+                    continue;
+                }
+                Step::Permit(permit) => {
+                    let Some(unit) = pending.pop_front() else {
+                        continue;
+                    };
+                    if level_cancel.is_cancelled() {
+                        pending.push_front(unit);
+                        continue;
+                    }
+                    let mut unit = unit;
+                    let group_key = (unit.node.id.clone(), unit.parent_record_key.clone());
+                    if let Some(gi) = overwrite_task_group.get(&group_key) {
+                        unit.overwrite_run = Some(overwrite_groups[*gi].run_token.clone());
+                    }
+                    if let Some(err) = overwrite_task_group
+                        .get(&group_key)
+                        .and_then(|gi| begin_failed.get(gi))
+                    {
+                        had_level_failure = true;
+                        nodes_with_any_failure.insert(unit.node.id.clone());
+                        outcomes.push(synthetic_outcome(
+                            &unit.node.id,
+                            unit.parent_record_key.clone(),
+                            err.clone(),
+                            InvocationErrorKind::Other,
+                        ));
+                        continue;
+                    }
+                    let opts2 = Arc::clone(&opts);
+                    let captured = Arc::clone(&captured);
+                    let discovered = Arc::clone(&discovered);
+                    let collected = Arc::clone(&collected);
+                    let capture = projections.get(&unit.node.id).cloned();
+                    let meta = group_key;
+                    // #552: a unit whose destination is part of an executor-managed
+                    // overwrite group runs with its per-invocation begin/commit/abort
+                    // suppressed — the group's single lifecycle is driven here instead.
+                    let suppress_overwrite = overwrite_task_group.contains_key(&meta);
+                    // A *grouped* overwrite (>1 writer → one table) must stage; a solo
+                    // one loads directly. Drives the bigquery `_overwrite_staging` flag.
+                    let overwrite_grouped = overwrite_task_group
+                        .get(&meta)
+                        .is_some_and(|gi| overwrite_groups[*gi].members > 1);
+                    // A child token per unit: a budget ceiling cancels its own unit
+                    // only, never its siblings, while a level cancel still reaches all
+                    // of them (#789 CLI-54).
+                    let unit_cancel = level_cancel.child_token();
+                    let dlq_sinks = Arc::clone(&dlq_sinks);
+                    let state_stores = Arc::clone(&state_stores);
+                    let untrusted = untrusted_targets();
+                    let handle = joinset.spawn(
+                        UNTRUSTED_TARGETS
+                            .scope(
+                                untrusted,
+                                faucet_core::http::inherit_reference_policy(STATE_STORES.scope(
+                                    state_stores,
+                                    DLQ_SINKS.scope(
+                                        dlq_sinks,
+                                        inherit_feed(Box::pin(async move {
+                                            let _permit = permit;
+                                            run_unit(
+                                                &unit,
+                                                capture,
+                                                &captured,
+                                                &discovered,
+                                                &collected,
+                                                &opts2,
+                                                unit_cancel,
+                                                suppress_overwrite,
+                                                overwrite_grouped,
+                                            )
+                                            .await
+                                        })),
+                                    ),
+                                )),
+                            )
+                            .in_current_span(),
+                    );
+                    task_meta.insert(handle.id(), meta);
+                    continue;
+                }
+                Step::Joined(joined) => *joined,
+            };
+            let Some(joined) = joined else { continue };
             // A failure (an `Err` outcome or a panicked task) marks the level
             // failed and, under `on_error: stop`, stops the rest. A panicking
             // connector must NOT take down the whole process (#78/#24).
@@ -1402,6 +1474,13 @@ async fn run_expanded_unredacted(
                     }
                 }
             };
+            // A row that never ran is not a failure: it neither stops the level
+            // nor fails its overwrite group, but its subtree is skipped.
+            if outcome.error_kind == Some(InvocationErrorKind::Skipped) {
+                not_run.insert(outcome.row_id.clone());
+                outcomes.push(outcome);
+                continue;
+            }
 
             let elapsed_ms = outcome.metrics.as_ref().map_or(0, |m| m.duration_ms);
             if let Some(err) = &outcome.error {
@@ -1540,14 +1619,20 @@ async fn run_expanded_unredacted(
                 nodes_with_any_failure.insert(outcome.row_id.clone());
                 #[cfg(feature = "notify")]
                 if let Some(notifier) = &opts.notifier {
-                    notifier
-                        .emit(crate::notify::NotifyEvent::run_failure(
+                    crate::notify::dispatch(
+                        notifier,
+                        (
+                            opts.state_scope.namespace.clone(),
+                            opts.pipeline_name.clone(),
+                            outcome.row_id.clone(),
+                        ),
+                        vec![crate::notify::NotifyEvent::run_failure(
                             opts.pipeline_name.clone(),
                             outcome.row_id.clone(),
                             "overwrite_aborted",
                             msg.clone(),
-                        ))
-                        .await;
+                        )],
+                    );
                 }
             }
         }
@@ -1596,7 +1681,7 @@ const CANCELLED_BEFORE_START: &str = "skipped: the run was cancelled before this
 /// One scheduled invocation — a root runs once, a child runs once per parent
 /// record. Built by the level loop, consumed by [`run_unit`].
 struct Unit {
-    node: ExpandedNode,
+    node: Arc<ExpandedNode>,
     parent_record: Option<Arc<Value>>,
     state_key: String,
     parent_record_key: Option<String>,
@@ -1606,6 +1691,9 @@ struct Unit {
     /// Keys an earlier release stored this unit's state under (#862
     /// M-021/M-025): a bookmark found there moves to `state_key` when it is empty.
     legacy_state_keys: Vec<String>,
+    /// The run token of the executor-managed overwrite group the unit writes
+    /// into (#552), set into its own copy of the sink config.
+    overwrite_run: Option<String>,
 }
 
 /// Resolve the enumerated dimensions a `for_each`/chained-discovery row fans out
@@ -2017,6 +2105,18 @@ async fn run_unit(
     suppress_overwrite: bool,
     overwrite_grouped: bool,
 ) -> InvocationOutcome {
+    // An overwrite-group member writes into the group's shared run: its own
+    // copy of the row carries the token in the sink config.
+    let injected;
+    let node: &ExpandedNode = match &unit.overwrite_run {
+        Some(token) => {
+            let mut n = (*unit.node).clone();
+            inject_overwrite_run(&mut n.sink.config, token);
+            injected = n;
+            &injected
+        }
+        None => &unit.node,
+    };
     // A discovery row (#501) enumerates a value-set instead of running a
     // source→sink pipeline: build its source, drain it, project + dedup, and
     // publish the dimension for dependent `for_each` rows. No sink, no capture.
@@ -2027,10 +2127,10 @@ async fn run_unit(
         as_alias,
         collect,
         dims,
-    } = &unit.node.role
+    } = &node.role
     {
         return run_discovery(
-            &unit.node,
+            node,
             select,
             as_alias,
             *collect,
@@ -2055,7 +2155,7 @@ async fn run_unit(
     // reports and what `faucet state` refuses to change under a live run.
     let cancel_seen = cancel.clone();
     let (markers, refused) = match crate::pipeline_state::markers::RunMarkers::begin(
-        markers_store(&unit.node, opts).await,
+        markers_store(node, opts).await,
         &unit.state_key,
         &run_id,
         true,
@@ -2076,7 +2176,7 @@ async fn run_unit(
             let run_cancel = cancel.child_token();
             let _watch = markers.stop_on_lease_loss(&run_cancel);
             let result = boxed_run_one_invocation(
-                &unit.node,
+                node,
                 unit.parent_record.as_deref(),
                 unit.product_ctx.as_ref(),
                 &unit.state_key,
@@ -2115,10 +2215,10 @@ async fn run_unit(
             },
         )
         .await;
-    let row_id = unit.node.id.clone();
+    let row_id = node.id.clone();
     let parent_record_key = unit.parent_record_key.clone();
     let usage = build_usage_record(
-        &unit.node,
+        node,
         opts,
         &run_id,
         &meter,
@@ -2134,16 +2234,16 @@ async fn run_unit(
     // it as a histogram so per-matrix-row time is observable on a scrape, not just
     // in `--output json`.
     crate::exec_metrics::record_invocation(
-        &opts.pipeline_name,
+        &opts.metric_pipeline(),
         &row_id,
-        &unit.node.source.kind,
-        &unit.node.sink.kind,
+        &node.source.kind,
+        &node.sink.kind,
         result.is_ok(),
         duration_ms,
     );
     let base_metrics = || InvocationMetrics {
-        source_kind: unit.node.source.kind.clone(),
-        sink_kind: unit.node.sink.kind.clone(),
+        source_kind: node.source.kind.clone(),
+        sink_kind: node.sink.kind.clone(),
         duration_ms,
         batches: observers.batch_outcomes(),
         source_lag: observers.lag.last(),
@@ -2183,7 +2283,7 @@ async fn run_unit(
             if let CliError::Faucet(FaucetError::BudgetExceeded { budget, .. }) = &e {
                 metrics::counter!(
                     "faucet_budget_exceeded_total",
-                    "pipeline" => opts.pipeline_name.clone(),
+                    "pipeline" => opts.metric_pipeline(),
                     "row" => row_id.clone(),
                     "budget" => budget.clone(),
                 )
@@ -2198,7 +2298,7 @@ async fn run_unit(
                 error_kind: Some(classify_error(&e)),
                 metrics: Some(base_metrics()),
                 usage: Some(usage),
-                policy_denial: PolicyDenial::from_error(&e, &unit.node),
+                policy_denial: PolicyDenial::from_error(&e, node),
             }
         }
     }
@@ -2789,6 +2889,7 @@ async fn build_pipeline<'a>(
 ) -> CliResult<Pipeline<'a, dyn Source + 'a, dyn Sink + 'a>> {
     let mut pipeline = Pipeline::new(source, sink)
         .with_name(pipeline_name.to_owned())
+        .with_metric_name(opts.metric_pipeline())
         .with_row(row_id.to_owned())
         .with_run_id(run_id.to_owned())
         .with_usage_meter(observers.meter)
@@ -2914,7 +3015,6 @@ async fn run_one_invocation(
         Some(opts.run_id.clone().unwrap_or_else(|| run_id.clone())),
         Some(run_id.clone()),
     );
-    let invocation_clock = std::time::Instant::now();
     let pipeline_name = opts.pipeline_name.clone();
     let row_id = node.id.clone();
     #[cfg(feature = "lineage")]
@@ -2922,6 +3022,8 @@ async fn run_one_invocation(
     #[cfg(feature = "lineage")]
     let lineage_cfg = opts.lineage_cfg.clone();
     let obs_labels = Labels::new(pipeline_name.clone(), row_id.clone(), run_id.clone());
+    let metric_pipeline = opts.metric_pipeline();
+    let metric_labels = Labels::new(metric_pipeline.clone(), row_id.clone(), run_id.clone());
     // Whether this invocation records into the Data Movement Catalog (#279):
     // roots only, and never for dry-run / --limit / shard runs (their volumes
     // and datasets are partial or synthetic) — the same scoping as SLA.
@@ -2940,7 +3042,7 @@ async fn run_one_invocation(
         crate::governance::GovernanceRequest {
             node,
             opts,
-            pipeline: &pipeline_name,
+            pipeline: &metric_pipeline,
             row: &row_id,
             run_id: &run_id,
             cancel: &cancel,
@@ -3193,7 +3295,7 @@ async fn run_one_invocation(
                     source,
                     stages,
                     batch_fns,
-                    obs_labels.clone(),
+                    metric_labels.clone(),
                 )?
                 .with_row_accounts(Arc::clone(&row_accounts)),
             )
@@ -3206,7 +3308,7 @@ async fn run_one_invocation(
             source
         } else {
             Box::new(
-                faucet_core::TransformingSource::new(source, stages, obs_labels.clone())?
+                faucet_core::TransformingSource::new(source, stages, metric_labels.clone())?
                     .with_row_accounts(Arc::clone(&row_accounts)),
             )
         }
@@ -3299,6 +3401,10 @@ async fn run_one_invocation(
         .map(|p| (Arc::clone(&captured), Arc::clone(p)));
     let tap_limit = limit_left.clone();
     let tap_padded = Arc::clone(&observers.limit_padded);
+    let fan_out_cap = FanOutCap::new(
+        crate::config::ExecutionSpec::fan_out_cap(opts.execution.as_ref()),
+        &node.id,
+    );
     #[allow(unused_mut)]
     let mut builder = governance.sink_builder().inner_tap(move |s| {
         let s: Box<dyn Sink> = match &tap_limit {
@@ -3308,9 +3414,11 @@ async fn run_one_invocation(
             None => s,
         };
         match capture_sink {
-            Some((buf, projection)) => {
-                Box::new(CapturingSink::wrap(s, buf, projection).with_limit(tap_limit))
-            }
+            Some((buf, projection)) => Box::new(
+                CapturingSink::wrap(s, buf, projection)
+                    .with_limit(tap_limit)
+                    .with_fan_out_cap(fan_out_cap),
+            ),
             None => s,
         }
     });
@@ -3319,7 +3427,7 @@ async fn run_one_invocation(
         builder = builder.outer_tap(move |s| Box::new(faucet_lineage::SamplingSink::new(s, state)));
     }
     let governed = builder.build(sink);
-    let budget_state = governed.budget_state().cloned();
+    let budget_handle = governed.budget_handle();
     let sink: Box<dyn Sink> = Box::new(governed);
 
     // 5) Assemble the runtime pipeline. The whole `with_*` builder chain (state,
@@ -3403,15 +3511,22 @@ async fn run_one_invocation(
     // from this combined `result`, then `?`-propagated below — restoring the
     // original early-return behaviour while still firing the terminal event on
     // both success and error.
-    let result: Result<faucet_core::PipelineResult, FaucetError> =
-        match Box::pin(pipeline.run()).await {
-            Ok(r) => sink.flush().await.map(|_| r),
-            Err(e) => Err(e),
-        };
+    let ran = Box::pin(pipeline.run()).await;
+    // Whether the run's budget stopped this invocation is decided the moment
+    // its pipeline returns: a sibling spending the budget afterwards does not
+    // fail an invocation that already finished.
+    let budget_stopped = budget_handle.as_ref().and_then(|h| h.end());
+    let result: Result<faucet_core::PipelineResult, FaucetError> = match ran {
+        Ok(r) => sink.flush().await.map(|_| r),
+        Err(e) => Err(e),
+    };
     // A duration ceiling cancels cooperatively, so the pipeline returns `Ok`
     // with a partial result; the verdict turns it into the budget failure
     // (a records / bytes crossing already surfaced as the write error).
-    let result = match (&result, budget_state.as_ref().and_then(|s| s.verdict())) {
+    // A budget stop cancels cooperatively, so the pipeline returns `Ok` with
+    // a partial result; the handle turns it into the budget failure only for
+    // an invocation the budget actually stopped.
+    let result = match (&result, budget_stopped) {
         (Ok(_), Some(verdict)) => Err(verdict.error()),
         _ => result,
     };
@@ -3477,7 +3592,7 @@ async fn run_one_invocation(
                 repair: spec.repair,
                 allow_delete: spec.allow_delete,
                 dry_run: false,
-                pipeline_name: pipeline_name.clone(),
+                pipeline_name: metric_pipeline.clone(),
                 execution: opts.execution.clone(),
                 auth: opts.auth.clone(),
                 clock: opts.clock,
@@ -3489,13 +3604,8 @@ async fn run_one_invocation(
             // A repair is bounded by what is left of this run's budget, stops
             // with it, and retries like it (#871).
             let guards = crate::verify::RunGuards {
-                budget: opts.budget.as_ref().map(|spec| {
-                    crate::budget::remaining_budget(
-                        spec,
-                        budget_state.as_deref(),
-                        invocation_clock.elapsed(),
-                    )
-                }),
+                budget: opts.budget.clone(),
+                budget_state: opts.budget_state.clone(),
                 cancel: Some(cancel.clone()),
                 resilience: opts.resilience.clone(),
             };
@@ -3646,7 +3756,7 @@ async fn run_one_invocation(
             spec,
             sla_store.as_ref(),
             state_key,
-            &obs_labels.pipeline,
+            &metric_labels.pipeline,
             &obs_labels.row,
             outcome,
             chrono::Utc::now().timestamp(),
@@ -3654,7 +3764,7 @@ async fn run_one_invocation(
         .await;
         v.extend(crate::sla::evaluate_lag_post_run(
             spec,
-            &obs_labels.pipeline,
+            &metric_labels.pipeline,
             &obs_labels.row,
             observers.lag.last().as_ref(),
         ));
@@ -3676,7 +3786,7 @@ async fn run_one_invocation(
                     spec,
                     sla_store.as_ref(),
                     state_key,
-                    &obs_labels.pipeline,
+                    &metric_labels.pipeline,
                     &obs_labels.row,
                     &run_id,
                     profile,
@@ -3695,7 +3805,8 @@ async fn run_one_invocation(
     // ── Notifications (#280) ─────────────────────────────────────────────────
     // Fan run success/failure, SLA breach, circuit-open, contract-abort, and
     // DLQ-threshold out to the configured channels. Same root/real-run scoping
-    // as SLA; delivery is fire-and-forget and never fails the run.
+    // as SLA. The events are delivered in the background, in order per row:
+    // a slow channel never holds the run, and never fails it.
     #[cfg(feature = "notify")]
     if let Some(notifier) = &opts.notifier
         && is_notifiable_root
@@ -3706,49 +3817,42 @@ async fn run_one_invocation(
         // Closed once here, so every event from this invocation reports the same
         // terminal timestamp and duration.
         let run_ctx = notify_run.clone().finish(invocation_started);
+        let mut events = Vec::new();
         match &result {
             Ok(r) => {
-                notifier
-                    .emit(
-                        keep_sla_open(
-                            NotifyEvent::run_success(
-                                pipeline.clone(),
-                                row.clone(),
-                                r.records_written as u64,
-                            ),
-                            !sla_violations.is_empty(),
-                        )
-                        .with_run(run_ctx.clone()),
+                events.push(
+                    keep_sla_open(
+                        NotifyEvent::run_success(
+                            pipeline.clone(),
+                            row.clone(),
+                            r.records_written as u64,
+                        ),
+                        !sla_violations.is_empty(),
                     )
-                    .await;
+                    .with_run(run_ctx.clone()),
+                );
                 if let Some(dlq) = &r.dlq
                     && dlq.records_dlq > 0
                 {
-                    notifier
-                        .emit(
-                            NotifyEvent::dlq_threshold(
-                                pipeline.clone(),
-                                row.clone(),
-                                dlq.records_dlq as u64,
-                            )
-                            .with_run(run_ctx.clone()),
+                    events.push(
+                        NotifyEvent::dlq_threshold(
+                            pipeline.clone(),
+                            row.clone(),
+                            dlq.records_dlq as u64,
                         )
-                        .await;
+                        .with_run(run_ctx.clone()),
+                    );
                 }
             }
             Err(e) => {
-                notifier
-                    .emit(error_event(&pipeline, &row, e).with_run(run_ctx.clone()))
-                    .await;
+                events.push(error_event(&pipeline, &row, e).with_run(run_ctx.clone()));
             }
         }
         for v in &sla_violations {
-            notifier
-                .emit(
-                    NotifyEvent::sla_breach(pipeline.clone(), row.clone(), v.kind(), v.to_string())
-                        .with_run(run_ctx.clone()),
-                )
-                .await;
+            events.push(
+                NotifyEvent::sla_breach(pipeline.clone(), row.clone(), v.kind(), v.to_string())
+                    .with_run(run_ctx.clone()),
+            );
         }
         // Profile drift (#708): one event per finding under `notify` / `fail`
         // (`warn` stays log + metric only).
@@ -3756,20 +3860,23 @@ async fn run_one_invocation(
             && spec.on_drift != faucet_core::OnProfileDrift::Warn
         {
             for d in &o.drift {
-                notifier
-                    .emit(
-                        NotifyEvent::profile_drift(
-                            pipeline.clone(),
-                            row.clone(),
-                            &d.column,
-                            d.metric.as_str(),
-                            d.to_string(),
-                        )
-                        .with_run(run_ctx.clone()),
+                events.push(
+                    NotifyEvent::profile_drift(
+                        pipeline.clone(),
+                        row.clone(),
+                        &d.column,
+                        d.metric.as_str(),
+                        d.to_string(),
                     )
-                    .await;
+                    .with_run(run_ctx.clone()),
+                );
             }
         }
+        crate::notify::dispatch(
+            notifier,
+            (opts.state_scope.namespace.clone(), pipeline, row),
+            events,
+        );
     }
 
     // ── Data Movement Catalog (#279) ─────────────────────────────────────────
@@ -4656,9 +4763,72 @@ struct CapturingSink {
     captured: Arc<Mutex<Vec<Value>>>,
     projection: Arc<Projection>,
     limit: Option<Arc<AtomicUsize>>,
+    fan_out: Option<FanOutCap>,
+}
+
+/// `execution.max_fan_out_records` for one parent invocation's capture.
+struct FanOutCap {
+    limit: u64,
+    row: String,
+    warned: std::sync::atomic::AtomicBool,
+}
+
+impl FanOutCap {
+    fn new(limit: u64, row: &str) -> Self {
+        Self {
+            limit,
+            row: row.to_string(),
+            warned: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Refuse a page that would take the capture from `held` past the cap;
+    /// warn once past [`crate::config::FAN_OUT_WARN_RECORDS`].
+    fn admit(&self, held: usize, incoming: usize) -> Result<(), FaucetError> {
+        let total = (held + incoming) as u64;
+        if total > self.limit {
+            tracing::error!(
+                row = %self.row,
+                limit = self.limit,
+                records = total,
+                "parent fan-out would pass execution.max_fan_out_records: the page is refused \
+                 (the parent's own write of it fails too) and the row's children are skipped"
+            );
+            return Err(FaucetError::BudgetExceeded {
+                budget: "execution.max_fan_out_records".into(),
+                limit: self.limit,
+                actual: total,
+            });
+        }
+        if total > crate::config::FAN_OUT_WARN_RECORDS && !self.warned.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                row = %self.row,
+                records = total,
+                limit = self.limit,
+                "parent fan-out holds more than {} records in memory, one child invocation each",
+                crate::config::FAN_OUT_WARN_RECORDS
+            );
+        }
+        Ok(())
+    }
 }
 
 impl CapturingSink {
+    /// Check the fan-out cap before writing a page that would capture
+    /// `incoming` more rows.
+    async fn admit(&self, incoming: usize) -> Result<(), FaucetError> {
+        match &self.fan_out {
+            Some(cap) => cap.admit(self.captured.lock().await.len(), incoming),
+            None => Ok(()),
+        }
+    }
+
+    fn with_fan_out_cap(mut self, cap: FanOutCap) -> Self {
+        self.fan_out = Some(cap);
+        self
+    }
+
     /// How many leading rows of a `len`-row page fit under the `--limit` cap
     /// the wrapped [`LimitedSink`] shares; read before the write.
     fn within_cap(&self, len: usize) -> usize {
@@ -4694,6 +4864,7 @@ impl CapturingSink {
             captured,
             projection,
             limit: None,
+            fan_out: None,
         }
     }
 
@@ -4718,6 +4889,7 @@ impl Sink for CapturingSink {
         records: &[Value],
     ) -> Result<faucet_core::WriteReport, FaucetError> {
         let take = self.within_cap(records.len());
+        self.admit(take).await?;
         let report = self.inner.write_batch_reported(records).await?;
         self.capture(records, take, &report).await;
         Ok(report)
@@ -4728,12 +4900,14 @@ impl Sink for CapturingSink {
         page: &faucet_core::governance::GovernedPage<'_>,
     ) -> Result<faucet_core::WriteReport, FaucetError> {
         let take = self.within_cap(page.len());
+        self.admit(take).await?;
         let report = self.inner.write_governed(page).await?;
         self.capture(page.records(), take, &report).await;
         Ok(report)
     }
 
     async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        self.admit(self.within_cap(records.len())).await?;
         let written = self.inner.write_batch(records).await?;
         // Capture only what actually landed (LimitedSink may have dropped some),
         // projected to the fields children reference (#160).
@@ -4754,6 +4928,7 @@ impl Sink for CapturingSink {
         records: &[Value],
     ) -> Result<Vec<faucet_core::RowOutcome>, FaucetError> {
         let take = self.within_cap(records.len());
+        self.admit(take).await?;
         let outcomes = self.inner.write_batch_partial(records).await?;
         let mut buf = self.captured.lock().await;
         buf.extend(
@@ -4773,6 +4948,7 @@ impl Sink for CapturingSink {
         scope: &str,
         token: &str,
     ) -> Result<usize, FaucetError> {
+        self.admit(self.within_cap(records.len())).await?;
         let written = self
             .inner
             .write_batch_idempotent(records, scope, token)
@@ -4795,6 +4971,7 @@ impl Sink for CapturingSink {
         token: &str,
     ) -> Result<faucet_core::WriteReport, FaucetError> {
         let take = self.within_cap(records.len());
+        self.admit(take).await?;
         let report = self
             .inner
             .write_batch_idempotent_reported(records, scope, token)
@@ -4974,6 +5151,17 @@ fn value_to_string_brief(v: &Value) -> String {
     }
 }
 
+impl ExecuteOptions {
+    /// The `pipeline` label value of this run's metrics:
+    /// [`crate::exec_metrics::pipeline_label`] of the tenant scope and name.
+    pub fn metric_pipeline(&self) -> String {
+        crate::exec_metrics::pipeline_label(
+            self.state_scope.namespace.as_deref(),
+            &self.pipeline_name,
+        )
+    }
+}
+
 #[cfg(test)]
 impl ExecuteOptions {
     /// Plain options for a unit test: no budget, cancel, resilience or
@@ -5009,6 +5197,7 @@ impl ExecuteOptions {
             catalog: None,
             usage: Default::default(),
             budget: None,
+            budget_state: None,
             feed: Default::default(),
         }
     }
@@ -5226,6 +5415,8 @@ mod tests {
         fn node(id: &str, weight: Option<f64>) -> ExpandedNode {
             ExpandedNode {
                 opt_outs: Vec::new(),
+                sink_attested: true,
+                dlq_attested: true,
                 id: id.into(),
                 row_index: 0,
                 weight,
@@ -5589,6 +5780,7 @@ mod tests {
             metadata_columns: None,
             #[cfg(feature = "catalog")]
             local_outputs: None,
+            attribute_trust: Default::default(),
             selection: None,
             observability: None,
             delivery: faucet_core::DeliveryMode::default(),
@@ -5659,6 +5851,7 @@ mod tests {
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )
@@ -5708,6 +5901,7 @@ mod tests {
             catalog: None,
             usage: Default::default(),
             budget: None,
+            budget_state: None,
             feed: Default::default(),
         }
     }
@@ -5875,12 +6069,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let opts = exec_opts("t");
         let mk = |node: &ExpandedNode, pid: &str, id: i64| Unit {
-            node: node.clone(),
+            node: std::sync::Arc::new(node.clone()),
             parent_record: Some(std::sync::Arc::new(json!({ "id": id }))),
             state_key: format!("t::c::{pid}"),
             parent_record_key: Some(pid.to_string()),
             product_ctx: None,
             legacy_state_keys: Vec::new(),
+            overwrite_run: None,
         };
 
         // Shared destination (fixed table) → ONE group across both parents, so
@@ -6106,12 +6301,13 @@ mod tests {
             "run_one_invocation future is {size} bytes; box the newest pass (see boxed_run_one_invocation)"
         );
         let unit = Unit {
-            node: nodes[0].clone(),
+            node: std::sync::Arc::new(nodes[0].clone()),
             parent_record: None,
             state_key: "size::row".into(),
             parent_record_key: None,
             product_ctx: None,
             legacy_state_keys: Vec::new(),
+            overwrite_run: None,
         };
         let captured: CapturedRecords = Default::default();
         let discovered: DiscoveredDims = Default::default();
@@ -6433,6 +6629,7 @@ matrix:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )
@@ -6700,6 +6897,7 @@ matrix:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )
@@ -6952,6 +7150,7 @@ execution:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )
@@ -7045,6 +7244,66 @@ execution:
         assert!(summary.skipped_count() >= 2);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tenant_run_labels_core_and_cli_metrics_tenant_name() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _local = ::metrics::set_default_local_recorder(&recorder);
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("in.csv");
+        std::fs::write(&csv, "x\n1\n2\n").unwrap();
+        let yaml = format!(
+            r#"version: 1
+pipeline:
+  source: {{ type: csv, config: {{ path: {csv} }} }}
+  sink:   {{ type: jsonl, config: {{ path: {out} }} }}
+"#,
+            csv = csv.display(),
+            out = dir.path().join("out.jsonl").display(),
+        );
+        let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
+        let mut opts = ExecuteOptions::for_tests("labelled");
+        opts.state_scope.namespace = Some("acme".into());
+        assert_eq!(opts.metric_pipeline(), "acme::labelled");
+        let summary = run_expanded(expand(&cfg).unwrap(), opts).await.unwrap();
+        assert_eq!(summary.failure_count(), 0, "{summary:?}");
+        let pipelines = |name: &str| -> Vec<String> {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter(|(k, ..)| k.key().name() == name)
+                .flat_map(|(k, ..)| {
+                    k.key()
+                        .labels()
+                        .filter(|l| l.key() == "pipeline")
+                        .map(|l| l.value().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        for metric in [
+            "faucet_pipeline_runs_total",
+            "faucet_source_records_total",
+            "faucet_pipeline_invocation_duration_seconds",
+            "faucet_usage_bytes_total",
+        ] {
+            let got = pipelines(metric);
+            assert!(!got.is_empty(), "{metric} not emitted");
+            assert!(
+                got.iter().all(|p| p == "acme::labelled"),
+                "{metric}: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_metric_pipeline_is_the_name_without_a_tenant() {
+        assert_eq!(crate::exec_metrics::pipeline_label(None, "p"), "p");
+        assert_eq!(crate::exec_metrics::pipeline_label(Some("t"), "p"), "t::p");
+    }
+
     #[tokio::test]
     async fn invalid_pipeline_name_with_state_errors_up_front() {
         // A pipeline name that can't form a valid state key must fail up front
@@ -7098,6 +7357,7 @@ pipeline:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )
@@ -7170,6 +7430,7 @@ matrix:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )
@@ -7256,6 +7517,7 @@ execution:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )
@@ -7338,6 +7600,7 @@ matrix:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )
@@ -7444,6 +7707,8 @@ matrix:
         fn child(id: &str, parent: &str, parent_key: &str, refs: &[(&str, &str)]) -> ExpandedNode {
             ExpandedNode {
                 opt_outs: Vec::new(),
+                sink_attested: true,
+                dlq_attested: true,
                 id: id.into(),
                 row_index: 0,
                 weight: None,
@@ -7536,6 +7801,8 @@ matrix:
         use crate::expand::{DeferredRef, ExpandedNode, NodeRole};
         let c = ExpandedNode {
             opt_outs: Vec::new(),
+            sink_attested: true,
+            dlq_attested: true,
             id: "c".into(),
             row_index: 0,
             weight: None,
@@ -7633,6 +7900,7 @@ matrix:
             catalog: None,
             usage: Default::default(),
             budget: None,
+            budget_state: None,
             feed: Default::default(),
         }
     }
@@ -7954,6 +8222,8 @@ matrix:
         use crate::config::ConnectorSpec;
         ExpandedNode {
             opt_outs: Vec::new(),
+            sink_attested: true,
+            dlq_attested: true,
             id: "n".into(),
             row_index: 0,
             weight: None,
@@ -8245,6 +8515,8 @@ matrix:
         use crate::config::ConnectorSpec;
         let orphan = ExpandedNode {
             opt_outs: Vec::new(),
+            sink_attested: true,
+            dlq_attested: true,
             id: "orphan".into(),
             row_index: 0,
             weight: None,
@@ -8361,12 +8633,13 @@ matrix:
         let dir = tempfile::tempdir().unwrap();
         let opts = exec_opts("t");
         let mk = |node: &ExpandedNode, pid: &str, id: i64| Unit {
-            node: node.clone(),
+            node: std::sync::Arc::new(node.clone()),
             parent_record: Some(std::sync::Arc::new(json!({ "id": id }))),
             state_key: format!("t::c::{pid}"),
             parent_record_key: Some(pid.to_string()),
             product_ctx: None,
             legacy_state_keys: Vec::new(),
+            overwrite_run: None,
         };
         let shared = overwrite_child_node(dir.path(), "orders");
         let units = vec![mk(&shared, "1", 1), mk(&shared, "2", 2)];
@@ -8402,12 +8675,13 @@ matrix:
         let dir = tempfile::tempdir().unwrap();
         let opts = exec_opts("t");
         let mk = |node: &ExpandedNode, pid: &str, id: i64| Unit {
-            node: node.clone(),
+            node: std::sync::Arc::new(node.clone()),
             parent_record: Some(std::sync::Arc::new(json!({ "id": id }))),
             state_key: format!("t::c::{pid}"),
             parent_record_key: Some(pid.to_string()),
             product_ctx: None,
             legacy_state_keys: Vec::new(),
+            overwrite_run: None,
         };
         // Shared destination across two parents ⇒ members == 2.
         let shared = overwrite_child_node(dir.path(), "orders");
@@ -8436,12 +8710,13 @@ matrix:
         b.id = "c2".into();
         b.sink.config["batch_size"] = json!(17);
         let mk = |node: &ExpandedNode| Unit {
-            node: node.clone(),
+            node: std::sync::Arc::new(node.clone()),
             parent_record: Some(std::sync::Arc::new(json!({ "id": 1 }))),
             state_key: format!("t::{}::1", node.id),
             parent_record_key: Some("1".into()),
             product_ctx: None,
             legacy_state_keys: Vec::new(),
+            overwrite_run: None,
         };
         let (groups, task_group) = plan_overwrite_groups(&[mk(&a), mk(&b)], &opts)
             .await
@@ -8693,11 +8968,34 @@ matrix:
         assert_eq!(resolve_parent_key(&r, "tags.notanindex"), None);
     }
 
+    /// A source that cancels `token` when it is read, then returns its
+    /// records: the run is cancelled while this invocation is in flight.
+    struct CancelOnRead {
+        token: CancellationToken,
+        records: Vec<Value>,
+    }
+
+    #[async_trait]
+    impl Source for CancelOnRead {
+        async fn fetch_with_context(
+            &self,
+            _context: &HashMap<String, Value>,
+        ) -> Result<Vec<Value>, FaucetError> {
+            self.token.cancel();
+            Ok(self.records.clone())
+        }
+
+        fn connector_name(&self) -> &'static str {
+            "cancel-on-read"
+        }
+
+        fn config_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+    }
+
     #[tokio::test]
-    async fn cooperative_cancel_returns_partial_ok() {
-        // A pre-cancelled token makes the run stop at the first page boundary
-        // and flush — returning Ok with a partial (possibly empty) result
-        // rather than erroring. Covers the cancel-threading path.
+    async fn a_pre_cancelled_run_starts_no_row() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.csv");
         let output = dir.path().join("out.jsonl");
@@ -8705,7 +9003,40 @@ matrix:
         let cfg = cfg_csv_to_jsonl(&input, &output);
         let nodes = expand(&cfg).unwrap();
         let token = CancellationToken::new();
-        token.cancel(); // already cancelled before the run starts
+        token.cancel();
+        let mut o = opts("cancel");
+        o.cancel = Some(token);
+        let summary = run_expanded(nodes, o).await.unwrap();
+        assert_eq!(summary.invocations.len(), 1);
+        let only = &summary.invocations[0];
+        assert_eq!(
+            only.error_kind,
+            Some(InvocationErrorKind::Skipped),
+            "{only:?}"
+        );
+        assert_eq!(only.error.as_deref(), Some(CANCELLED_BEFORE_START));
+        assert!(!summary.had_failures(), "{summary:?}");
+        assert!(!output.exists(), "nothing ran");
+    }
+
+    #[tokio::test]
+    async fn cooperative_cancel_returns_partial_ok() {
+        // A cancel while the invocation runs stops it at the next page
+        // boundary and flushes — returning Ok with a partial (possibly empty)
+        // result rather than erroring.
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.csv");
+        let output = dir.path().join("out.jsonl");
+        std::fs::write(&input, "name\nalice\nbob\n").unwrap();
+        let cfg = cfg_csv_to_jsonl(&input, &output);
+        let mut nodes = expand(&cfg).unwrap();
+        let token = CancellationToken::new();
+        nodes[0].source_override = Some(crate::dlq_replay::reader::SourceOverride::new(Box::new(
+            CancelOnRead {
+                token: token.clone(),
+                records: vec![json!({"name": "alice"})],
+            },
+        )));
         let mut o = opts("cancel");
         o.cancel = Some(token);
         #[cfg(feature = "observability")]
@@ -8722,6 +9053,7 @@ matrix:
         // The single root invocation completes (Ok) — it is not reported as a
         // failure even though it was cancelled.
         assert_eq!(summary.invocations.len(), 1);
+        assert!(summary.invocations[0].error.is_none(), "{summary:?}");
         assert!(
             !summary.had_failures(),
             "a cooperatively-cancelled run is Ok, not a failure: {summary:?}"
@@ -8735,6 +9067,224 @@ matrix:
                 "a cancelled invocation is not logged as completed (#907): {logs}"
             );
             assert!(!logs.contains("pipeline invocation completed"), "{logs}");
+        }
+    }
+
+    /// Under `on_error: continue`, a cancel while a row runs starts nothing
+    /// else: a root still waiting for a permit and a `depends_on` row of the
+    /// cut-short row are skipped, and their sources are never built.
+    #[tokio::test]
+    async fn a_cancel_mid_run_skips_rows_that_had_not_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.csv");
+        std::fs::write(&input, "name\nalice\n").unwrap();
+        let yaml = format!(
+            r#"version: 1
+name: cancelled
+pipeline:
+  source: {{ type: csv, config: {{ path: {input} }} }}
+  sink:   {{ type: jsonl, config: {{ path: {dir}/a.jsonl }} }}
+matrix:
+  - id: a
+  - id: c
+    sink: {{ config: {{ path: {dir}/c.jsonl }} }}
+  - id: b
+    depends_on: [a]
+    sink: {{ config: {{ path: {dir}/b.jsonl }} }}
+execution:
+  max_concurrent: 1
+  on_error: continue
+"#,
+            input = input.display(),
+            dir = dir.path().display(),
+        );
+        let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
+        let mut nodes = expand(&cfg).unwrap();
+        let token = CancellationToken::new();
+        let mut untouched = Vec::new();
+        for n in &mut nodes {
+            let source: Box<dyn Source> = if n.id == "a" {
+                Box::new(CancelOnRead {
+                    token: token.clone(),
+                    records: vec![json!({"name": "a"})],
+                })
+            } else {
+                Box::new(CancelOnRead {
+                    token: CancellationToken::new(),
+                    records: Vec::new(),
+                })
+            };
+            let cell = crate::dlq_replay::reader::SourceOverride::new(source);
+            if n.id != "a" {
+                untouched.push((n.id.clone(), cell.clone()));
+            }
+            n.source_override = Some(cell);
+        }
+        let mut o = opts("cancelled");
+        o.execution = cfg.execution.clone();
+        o.cancel = Some(token);
+        let summary = run_expanded(nodes, o).await.unwrap();
+        let by_row = |row: &str| {
+            summary
+                .invocations
+                .iter()
+                .find(|i| i.row_id == row)
+                .unwrap_or_else(|| panic!("no outcome for {row}: {summary:?}"))
+        };
+        assert!(by_row("a").error.is_none(), "{summary:?}");
+        for row in ["b", "c"] {
+            let o = by_row(row);
+            assert_eq!(o.error_kind, Some(InvocationErrorKind::Skipped), "{o:?}");
+            assert_eq!(o.error.as_deref(), Some(CANCELLED_BEFORE_START), "{o:?}");
+        }
+        assert!(
+            !summary.had_failures(),
+            "skips are not failures: {summary:?}"
+        );
+        for (row, cell) in untouched {
+            assert!(cell.take().is_some(), "row {row} must not have been built");
+        }
+    }
+
+    /// Fan-out dispatch hands out permits one unit at a time: every child of a
+    /// wide parent still runs under a small `max_concurrent`.
+    #[tokio::test]
+    async fn every_child_of_a_wide_fan_out_runs_under_a_small_permit_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.csv");
+        let mut csv = String::from("id\n");
+        for i in 0..50 {
+            csv.push_str(&format!("{i}\n"));
+        }
+        std::fs::write(&input, csv).unwrap();
+        std::fs::create_dir_all(dir.path().join("kids")).unwrap();
+        let yaml = format!(
+            r#"version: 1
+name: fan
+pipeline:
+  source: {{ type: csv, config: {{ path: {input} }} }}
+  sink:   {{ type: jsonl, config: {{ path: {dir}/parent.jsonl }} }}
+matrix:
+  - id: p
+  - id: kid
+    parent: p
+    sink: {{ config: {{ path: "{dir}/kids/${{p.id}}.jsonl" }} }}
+execution:
+  max_concurrent: 2
+"#,
+            input = input.display(),
+            dir = dir.path().display(),
+        );
+        let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
+        let mut o = opts("fan");
+        o.execution = cfg.execution.clone();
+        let summary = run_expanded(expand(&cfg).unwrap(), o).await.unwrap();
+        assert!(!summary.had_failures(), "{summary:?}");
+        let kids = summary
+            .invocations
+            .iter()
+            .filter(|i| i.row_id == "kid" && i.error.is_none())
+            .count();
+        assert_eq!(kids, 50, "{summary:?}");
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("kids")).unwrap().count(),
+            50
+        );
+    }
+
+    /// `execution.max_fan_out_records` refuses the page that would pass it:
+    /// the parent fails with a typed budget error naming the field, and its
+    /// children are skipped.
+    #[tokio::test]
+    async fn a_fan_out_past_its_cap_fails_the_parent_and_skips_the_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.csv");
+        let mut csv = String::from("id\n");
+        for i in 0..25 {
+            csv.push_str(&format!("{i}\n"));
+        }
+        std::fs::write(&input, csv).unwrap();
+        let yaml = format!(
+            r#"version: 1
+name: capped
+pipeline:
+  source: {{ type: csv, config: {{ path: {input} }} }}
+  sink:   {{ type: jsonl, config: {{ path: {dir}/parent.jsonl }} }}
+matrix:
+  - id: p
+  - id: kid
+    parent: p
+    sink: {{ config: {{ path: "{dir}/kid-${{p.id}}.jsonl" }} }}
+execution:
+  max_fan_out_records: 10
+"#,
+            input = input.display(),
+            dir = dir.path().display(),
+        );
+        let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
+        let mut o = opts("capped");
+        o.execution = cfg.execution.clone();
+        let summary = run_expanded(expand(&cfg).unwrap(), o).await.unwrap();
+        let parent = summary
+            .invocations
+            .iter()
+            .find(|i| i.row_id == "p")
+            .unwrap();
+        let err = parent.error.as_deref().unwrap_or_default();
+        assert!(err.contains("execution.max_fan_out_records"), "{parent:?}");
+        assert_eq!(parent.error_kind, Some(InvocationErrorKind::BudgetExceeded));
+        assert!(
+            summary
+                .invocations
+                .iter()
+                .filter(|i| i.row_id == "kid")
+                .all(|i| i.error_kind == Some(InvocationErrorKind::Skipped)),
+            "{summary:?}"
+        );
+        assert!(!dir.path().join("kid-0.jsonl").exists());
+    }
+
+    #[test]
+    fn max_fan_out_records_is_bounded_at_load() {
+        for (value, ok) in [
+            (0u64, false),
+            (1, true),
+            (10_000_000, true),
+            (10_000_001, false),
+        ] {
+            let yaml = format!(
+                "version: 1\npipeline:\n  source: {{ type: csv, config: {{ path: in.csv }} }}\n  \
+                 sink: {{ type: jsonl, config: {{ path: out.jsonl }} }}\nexecution:\n  \
+                 max_fan_out_records: {value}\n"
+            );
+            let cfg = crate::config::parse_with_extension(&yaml, "yaml").unwrap();
+            let got = expand(&cfg);
+            assert_eq!(got.is_ok(), ok, "{value}: {:?}", got.err());
+            if let Err(e) = got {
+                assert!(e.to_string().contains("max_fan_out_records"), "{e}");
+            }
+        }
+        assert_eq!(
+            crate::config::ExecutionSpec::fan_out_cap(None),
+            crate::config::DEFAULT_MAX_FAN_OUT_RECORDS
+        );
+    }
+
+    #[test]
+    fn the_fan_out_cap_refuses_past_its_limit_and_warns_once() {
+        let cap = FanOutCap::new(150_000, "p");
+        assert!(cap.admit(0, 150_000).is_ok());
+        assert!(cap.warned.load(Ordering::Relaxed));
+        match cap.admit(149_999, 2) {
+            Err(FaucetError::BudgetExceeded {
+                budget,
+                limit,
+                actual,
+            }) => {
+                assert_eq!(budget, "execution.max_fan_out_records");
+                assert_eq!((limit, actual), (150_000, 150_001));
+            }
+            other => panic!("{other:?}"),
         }
     }
 
@@ -8816,6 +9366,7 @@ matrix:
                 catalog: None,
                 usage: Default::default(),
                 budget: None,
+                budget_state: None,
                 feed: Default::default(),
             },
         )

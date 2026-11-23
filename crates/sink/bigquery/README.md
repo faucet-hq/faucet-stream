@@ -302,6 +302,8 @@ See the [Effectively-once delivery cookbook](https://faucet-hq.github.io/faucet-
 
 `BigQuerySink` reports its live destination schema via `current_schema()` (a schema-only `tables.get`; a missing table → `None`, so every page column reads as new), so the pipeline-level `schema:` policy can detect drift between an incoming page's top-level shape and the real table. All five `on_drift` modes (`warn` / `ignore` / `quarantine` / `fail` / `evolve`) work against this sink.
 
+Column names match ignoring case (`column_matching()` is `CaseInsensitive`, an exactly-named field winning over a case variant), as BigQuery resolves them. The streaming and load-job paths resolve names server-side; the `MERGE`, effectively-once and overwrite paths read each column from a JSON payload by path, so the sink first renames every record field to its column's spelling. A field `email` for column `Email` therefore lands on every path, and drift does not report it.
+
 Under `on_drift: evolve`, `BigQuerySink::evolve_schema()` applies `ALTER TABLE` DDL, each statement run as its own `jobs.query` job and verified to completion:
 
 - **New columns** → `ADD COLUMN IF NOT EXISTS <col> <type>` (idempotent).
@@ -556,6 +558,22 @@ target. An aborted transaction commits nothing, so the sink re-submits it
 (up to 6 attempts, jittered backoff, a fresh `requestId` each time) instead of
 failing the run. Upsert `MERGE`s and the scoped-cleanup `DELETE` are retried
 the same way.
+
+Every exactly-once page first checks the stored watermark **inside** its
+transaction: when the scope already holds a commit at or past the page's
+sequence (an earlier attempt that committed late — a job that outlived its
+deadline, a lost response, a killed process), the transaction rolls back and raises
+`faucet-eo-watermark-ahead` and writes nothing. The sink then reads the
+stored token: if it is this page's own token, the page counts as written;
+otherwise the run fails with *the destination already holds a commit at or
+past page N* and the next run resumes from the destination's watermark — no
+rows are written twice. Before upgrading from a release without this guard,
+let in-flight exactly-once jobs finish (or cancel them): a job from the older
+release that commits afterwards is not checked.
+
+When two writers pass the check at once, BigQuery aborts the second for the
+concurrent update on the watermark table, and its retry sees the first commit.
+
 
 ## Column types the client does not know
 

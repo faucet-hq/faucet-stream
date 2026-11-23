@@ -103,6 +103,7 @@ impl ElasticsearchSource {
     /// both lose it silently and make a page of such hits look like the end
     /// of the scroll.
     fn extract_hits(body: &Value) -> Result<Vec<Value>, FaucetError> {
+        check_complete(body)?;
         let Some(hits) = body
             .get("hits")
             .and_then(|h| h.get("hits"))
@@ -577,6 +578,66 @@ fn descriptor_for_index(
     descriptor
 }
 
+/// Longest `reason` text kept per shard failure: it can quote document values.
+const SHARD_REASON_MAX: usize = 200;
+
+/// Fail a search or scroll response the cluster reports as incomplete — a
+/// timed-out search or failed shards — instead of emitting the partial hits
+/// as if they were the whole result. Skipped shards are not failures.
+fn check_complete(body: &Value) -> Result<(), FaucetError> {
+    if body.get("timed_out").and_then(Value::as_bool) == Some(true) {
+        return Err(FaucetError::Source(
+            "elasticsearch: the search timed out on the cluster, so the result is incomplete; \
+             raise the query timeout or retry"
+                .into(),
+        ));
+    }
+    let shards = body.get("_shards");
+    let failed = shards
+        .and_then(|s| s.get("failed"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if failed == 0 {
+        return Ok(());
+    }
+    let total = shards
+        .and_then(|s| s.get("total"))
+        .and_then(Value::as_u64)
+        .map_or_else(|| "?".to_string(), |t| t.to_string());
+    let reasons: Vec<String> = shards
+        .and_then(|s| s.get("failures"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(3)
+        .map(|f| {
+            let reason = f.get("reason");
+            let kind = reason
+                .and_then(|r| r.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let index = f.get("index").and_then(Value::as_str).unwrap_or("?");
+            let text: String = reason
+                .and_then(|r| r.get("reason"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .chars()
+                .take(SHARD_REASON_MAX)
+                .collect();
+            faucet_core::redact::redact(&format!("{kind} on {index}: {text}"))
+        })
+        .collect();
+    Err(FaucetError::Source(format!(
+        "elasticsearch: {failed} of {total} shard(s) failed ({}); the result is incomplete, \
+         so the read stops",
+        if reasons.is_empty() {
+            "no reason given".to_string()
+        } else {
+            reasons.join("; ")
+        }
+    )))
+}
+
 /// RAII guard that owns the active scroll id and clears it on drop.
 ///
 /// Holds a pre-resolved [`ElasticsearchAuth`] (not `AuthSpec`) so the drop-path
@@ -673,6 +734,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_incomplete_response_names_its_failures() {
+        assert!(
+            check_complete(&json!({"_shards": {"total": 3, "failed": 0, "skipped": 2}})).is_ok()
+        );
+        let long = "x".repeat(500);
+        let err = check_complete(&json!({"_shards": {"total": 3, "failed": 1, "failures": [
+            {"index": "logs", "reason": {"type": "search_phase_execution_exception", "reason": long}}
+        ]}}))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("1 of 3 shard(s) failed (search_phase_execution_exception on logs: "),
+            "{err}"
+        );
+        assert!(!err.contains(&"x".repeat(201)), "{err}");
+        let err = check_complete(&json!({"timed_out": true}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timed out"), "{err}");
+        let err = check_complete(&json!({"_shards": {"failed": 2}}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("2 of ? shard(s) failed (no reason given)"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn context_values_are_path_encoded_and_non_strings_rendered() {
         let ctx: std::collections::HashMap<String, Value> = [
             ("a".to_string(), serde_json::json!("x/y")),
@@ -691,7 +781,7 @@ mod tests {
         let mut config = ElasticsearchSourceConfig::new("http://localhost:9200", "idx");
         config.batch_size = faucet_core::MAX_BATCH_SIZE + 1;
         match ElasticsearchSource::new(config) {
-            Err(FaucetError::Config(m)) => assert!(m.contains("batch_size"), "got: {m}"),
+            Err(FaucetError::Config(m)) => assert!(m.contains("batch_size")),
             _ => panic!("expected a batch_size Config error"),
         }
     }

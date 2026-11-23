@@ -702,3 +702,99 @@ async fn a_connection_write_racing_a_tenant_delete_leaves_nothing() {
         );
     }
 }
+
+/// The database clock, conditional launches, a fenced run start and an atomic
+/// split on Postgres.
+#[tokio::test]
+async fn postgres_db_clock_fenced_start_and_atomic_split() {
+    use faucet_cli::serve::history::{CoordinateOutcome, HistoryError, ShardInsert};
+    let Some((_pg, url)) = postgres().await else {
+        return;
+    };
+    let connect = |me: &str| {
+        let url = url.clone();
+        let me = me.to_string();
+        async move {
+            PostgresHistory::connect(&url, Duration::from_secs(60), Duration::from_secs(30), me)
+                .await
+                .unwrap()
+        }
+    };
+    let a = connect("pg-a").await;
+    let b = connect("pg-b").await;
+    let db = a.db_now().await.unwrap();
+    assert!((db - Utc::now()).num_seconds().abs() < 10, "{db}");
+
+    let mut r = rec("pg-split", RunStatus::Running);
+    a.upsert(&r).await.unwrap();
+    assert!(a.start_owned(&r).await.unwrap());
+    assert!(!b.start_owned(&r).await.unwrap());
+    r.status = RunStatus::Sharded;
+    let shard = |id: &str| ShardInsert {
+        shard_id: id.into(),
+        descriptor: serde_json::json!({ "id": id }),
+        size_estimate: None,
+    };
+    assert!(
+        a.coordinate_shards(&r, &[shard("0"), shard("0")])
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        a.get("pg-split").await.unwrap().unwrap().status,
+        RunStatus::Running
+    );
+    assert_eq!(
+        b.coordinate_shards(&r, &[shard("0")]).await.unwrap(),
+        CoordinateOutcome::NotOwner
+    );
+    let many: Vec<ShardInsert> = (0..700).map(|i| shard(&i.to_string())).collect();
+    assert_eq!(
+        a.coordinate_shards(&r, &many).await.unwrap(),
+        CoordinateOutcome::Sharded { inserted: 700 }
+    );
+    assert_eq!(
+        a.coordinate_shards(&r, &many).await.unwrap(),
+        CoordinateOutcome::Sharded { inserted: 0 }
+    );
+    a.request_cancel("pg-split").await.unwrap();
+    assert_eq!(a.shard_progress("pg-split").await.unwrap().cancelled, 700);
+    assert_eq!(
+        a.cancel_flagged_shards().await.unwrap(),
+        0,
+        "nothing left pending"
+    );
+
+    let rep = a.reclaim_orphans(3).await.unwrap();
+    assert_eq!(
+        (rep.requeued, rep.failed),
+        (0, 0),
+        "a live lease on the database clock"
+    );
+
+    let draft = faucet_cli::serve::history::templates::TemplateDraft {
+        id: faucet_cli::serve::history::templates::TemplateId::parse("pg-launch").unwrap(),
+        kind: faucet_cli::hub::TemplateKind::Pipeline,
+        name: None,
+        description: None,
+        body: "version: 1\n".into(),
+        format: faucet_cli::serve::load::ConfigFormat::Yaml,
+        params: Default::default(),
+        created_by: None,
+    };
+    for _ in 0..2 {
+        a.template_register(&draft).await.unwrap();
+    }
+    a.template_launch("pg-launch", 1, None, None).await.unwrap();
+    assert!(matches!(
+        a.template_launch_expecting("pg-launch", 2, None, None, Some(None))
+            .await,
+        Err(HistoryError::LaunchRaced { found: Some(1), .. })
+    ));
+    assert_eq!(
+        a.template_launch_expecting("pg-launch", 2, None, None, Some(Some(1)))
+            .await
+            .unwrap(),
+        Some(2)
+    );
+}

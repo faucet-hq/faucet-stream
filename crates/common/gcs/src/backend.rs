@@ -52,6 +52,14 @@ fn status_of(e: &google_cloud_storage::Error) -> Option<u16> {
     })
 }
 
+/// Whether a client error means a request precondition (such as
+/// "only when absent") did not hold.
+fn is_precondition_failure(e: &google_cloud_storage::Error) -> bool {
+    e.http_status_code() == Some(412)
+        || e.status()
+            .is_some_and(|s| s.code == google_cloud_gax::error::rpc::Code::FailedPrecondition)
+}
+
 /// Whether a client error means "no such object".
 fn is_not_found(e: &google_cloud_storage::Error) -> bool {
     e.http_status_code() == Some(404)
@@ -136,6 +144,31 @@ impl ObjectClient for GcsObjects {
                 .map_err(|e| err("download", key, e))?;
         }
         file.flush().await.map_err(|e| err("download", key, e))
+    }
+
+    fn supports_create_new(&self) -> bool {
+        true
+    }
+
+    async fn create_new(&self, key: &str, bytes: &[u8]) -> Result<bool, FaucetError> {
+        self.roundtrips.record("claim");
+        let sent = self
+            .storage
+            .write_object(
+                self.bucket_path(),
+                key.to_string(),
+                String::from_utf8_lossy(bytes).into_owned(),
+            )
+            .set_content_type("text/plain")
+            .set_if_generation_match(0)
+            .send_buffered()
+            .within(&self.calls, "claim")
+            .await?;
+        match sent {
+            Ok(_) => Ok(true),
+            Err(e) if is_precondition_failure(&e) => Ok(false),
+            Err(e) => Err(self.gcs_err("create object", key, e)),
+        }
     }
 
     async fn upload(&self, from: &Path, key: &str) -> Result<(), FaucetError> {
@@ -433,6 +466,32 @@ mod tests {
     /// #803: the upload's CRC32C travels in the object metadata, and the
     /// request carries exactly the metadata and media parts — no trailing
     /// checksum part a two-part server would store as content.
+    #[tokio::test]
+    async fn create_new_asks_for_generation_zero_and_reads_412_as_exists() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/upload/storage/v1/b/b/o"))
+            .and(query_param("ifGenerationMatch", "0"))
+            .and(query_param("name", "taken"))
+            .respond_with(ResponseTemplate::new(412))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/upload/storage/v1/b/b/o"))
+            .and(query_param("ifGenerationMatch", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "bucket": "b", "name": "new",
+            })))
+            .mount(&server)
+            .await;
+        let o = objects(&server.uri()).await;
+        assert!(o.supports_create_new());
+        assert!(!o.create_new("taken", b"x").await.unwrap());
+        assert!(o.create_new("new", b"x").await.unwrap());
+    }
+
     #[tokio::test]
     async fn uploads_send_the_crc32c_in_the_metadata_part() {
         use base64::Engine as _;

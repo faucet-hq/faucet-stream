@@ -298,10 +298,14 @@ impl DeltaDriver {
             return Ok(0);
         }
         self.ensure_open(calls, state, records).await?;
+        let mut rehexed = None;
         if let Some(integral) = &state.integral {
             faucet_core::check_integral(records, integral)
                 .map_err(|e| FaucetError::Sink(format!("delta: {e}")))?;
+            rehexed = faucet_core::binary_values_for_arrow_json(records, integral)
+                .map_err(|e| FaucetError::Sink(format!("delta: {e}")))?;
         }
+        let records = rehexed.as_deref().unwrap_or(records);
         let schema = state.schema.clone().expect("schema set");
         let chunk = if chunk == 0 { records.len() } else { chunk };
         let batches = records

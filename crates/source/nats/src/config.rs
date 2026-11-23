@@ -33,7 +33,9 @@ pub struct NatsSourceConfig {
 
     /// Optional queue group for core-NATS load-balanced subscriptions — all
     /// subscribers sharing a group split the subject's messages. Ignored in
-    /// JetStream mode.
+    /// JetStream mode. A queue-group member takes messages from the group's
+    /// other members, so preview, `--limit`, `plan --live`, fan-out rows,
+    /// overwrite and output-replacing sinks refuse such a source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_group: Option<String>,
 
@@ -155,6 +157,13 @@ impl NatsSourceConfig {
         self.jetstream_stream.is_some()
     }
 
+    /// Whether reading takes messages away for good: a JetStream consumer
+    /// acknowledges them, and a core queue-group member receives messages the
+    /// group's other members then never see.
+    pub fn consumes_destructively(&self) -> bool {
+        self.is_jetstream() || self.queue_group.is_some()
+    }
+
     /// Validate the config at construction time.
     pub fn validate(&self) -> Result<(), FaucetError> {
         self.connection.validate()?;
@@ -214,6 +223,21 @@ impl NatsSourceConfig {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_queue_group_or_jetstream_consumes_destructively() {
+        let mut c = NatsSourceConfig::new("events.>");
+        assert!(!c.consumes_destructively());
+        c.queue_group = Some("workers".into());
+        assert!(c.consumes_destructively());
+        let caps =
+            |v: serde_json::Value| crate::DESCRIPTOR.capabilities(&v).consumes_destructively();
+        assert!(caps(json!({"subject": "a", "queue_group": "w"})));
+        assert!(caps(json!({"subject": "a", "jetstream_stream": "S"})));
+        assert!(!caps(json!({"subject": "a"})));
+        assert!(!caps(json!({"subject": "a", "queue_group": null})));
+        assert!(caps(serde_json::Value::Null));
+    }
 
     #[test]
     fn validate_accepts_minimal() {

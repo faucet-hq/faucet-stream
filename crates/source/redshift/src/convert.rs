@@ -5,6 +5,7 @@
 //! are classified before binding so large integers keep full precision.
 
 use faucet_core::FaucetError;
+use faucet_core::TimePrecision;
 use serde_json::Value;
 use sqlx::{Column, Row};
 
@@ -79,16 +80,19 @@ pub(crate) fn pg_value_to_json(
     if let Ok(v) =
         row.try_get::<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>, _>(col_name)
     {
-        return Ok(Value::String(v.to_rfc3339()));
+        return Ok(faucet_core::fidelity::timestamp(&v, TimePrecision::Micros));
     }
     if let Ok(v) = row.try_get::<sqlx::types::chrono::NaiveDateTime, _>(col_name) {
-        return Ok(Value::String(v.to_string()));
+        return Ok(faucet_core::fidelity::timestamp_naive(
+            &v,
+            TimePrecision::Micros,
+        ));
     }
     if let Ok(v) = row.try_get::<sqlx::types::chrono::NaiveDate, _>(col_name) {
         return Ok(Value::String(v.to_string()));
     }
     if let Ok(v) = row.try_get::<NaiveTime, _>(col_name) {
-        return Ok(Value::String(v.to_string()));
+        return Ok(faucet_core::fidelity::time(&v, TimePrecision::Micros));
     }
     if let Ok(v) = row.try_get::<PgTimeTz<NaiveTime, FixedOffset>, _>(col_name) {
         return Ok(Value::String(format!("{}{}", v.time, v.offset)));

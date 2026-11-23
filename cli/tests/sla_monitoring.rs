@@ -233,6 +233,7 @@ async fn dry_run_skips_sla_evaluation() {
             catalog: None,
             usage: Default::default(),
             budget: None,
+            budget_state: None,
             feed: Default::default(),
         },
     )

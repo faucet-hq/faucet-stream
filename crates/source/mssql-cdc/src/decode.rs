@@ -10,7 +10,6 @@
 //! [`crate::change`]).
 
 use base64::Engine;
-use chrono::{FixedOffset, NaiveDate, NaiveDateTime, NaiveTime};
 use faucet_core::FaucetError;
 use serde_json::{Map, Value, json};
 use tiberius::numeric::Numeric;
@@ -88,31 +87,7 @@ fn scalar_to_json(data: &ColumnData<'_>) -> Option<Value> {
 }
 
 fn decode_temporal(row: &Row, idx: usize, data: &ColumnData<'_>) -> Result<Value, FaucetError> {
-    let conv = |e: tiberius::error::Error| {
-        FaucetError::Source(format!(
-            "mssql-cdc column {idx} temporal decode failed: {e}"
-        ))
-    };
-    let value = match data {
-        ColumnData::Date(_) => row
-            .try_get::<NaiveDate, _>(idx)
-            .map_err(conv)?
-            .map(|d| json!(d.to_string())),
-        ColumnData::Time(_) => row
-            .try_get::<NaiveTime, _>(idx)
-            .map_err(conv)?
-            .map(|t| json!(t.to_string())),
-        ColumnData::DateTime(_) | ColumnData::SmallDateTime(_) | ColumnData::DateTime2(_) => row
-            .try_get::<NaiveDateTime, _>(idx)
-            .map_err(conv)?
-            .map(|dt| json!(dt.format("%Y-%m-%dT%H:%M:%S%.f").to_string())),
-        ColumnData::DateTimeOffset(_) => row
-            .try_get::<chrono::DateTime<FixedOffset>, _>(idx)
-            .map_err(conv)?
-            .map(|dt| json!(dt.to_rfc3339())),
-        _ => unreachable!("decode_temporal called on a non-temporal column"),
-    };
-    Ok(value.unwrap_or(Value::Null))
+    faucet_common_mssql::temporal::decode_temporal(row, idx, data, "mssql-cdc")
 }
 
 /// An MSSQL DECIMAL/NUMERIC value as its exact digits at the column's scale.

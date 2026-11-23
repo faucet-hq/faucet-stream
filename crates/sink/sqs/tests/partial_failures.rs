@@ -310,3 +310,66 @@ async fn a_failed_legacy_part_keeps_the_parts_already_delivered() {
     assert!(err.contains("InvalidParameterValue"), "{err}");
     assert_eq!(server.received_requests().await.unwrap().len(), 4);
 }
+
+fn server_error() -> ResponseTemplate {
+    ResponseTemplate::new(500)
+        .insert_header("content-type", "application/x-amz-json-1.0")
+        .set_body_json(json!({
+            "__type": "com.amazonaws.sqs#InternalError",
+            "message": "down"
+        }))
+}
+
+/// A request SQS partly accepted whose retry then fails as a whole keeps the
+/// accepted messages delivered and fails only the one still open.
+#[tokio::test]
+async fn a_whole_request_failure_after_a_partial_success_keeps_the_accepted_messages() {
+    let server = MockServer::start().await;
+    let ok: Vec<String> = (0..9).map(|i| i.to_string()).collect();
+    let ok: Vec<&str> = ok.iter().map(String::as_str).collect();
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", TARGET))
+        .respond_with(reply(&ok, json!([failure("9", false)])))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", TARGET))
+        .respond_with(server_error())
+        .mount(&server)
+        .await;
+    let sink = SqsSink::new(config(&server.uri(), "orders", 10))
+        .await
+        .unwrap();
+
+    let rows: Vec<Value> = (0..10).map(|n| json!({"n": n})).collect();
+    let out = sink.write_batch_partial(&rows).await.unwrap();
+    assert!(out[..9].iter().all(Result::is_ok), "{out:?}");
+    assert!(out[9].is_err(), "{out:?}");
+}
+
+/// When nothing was decided before the request failed as a whole, every
+/// message of the request fails.
+#[tokio::test]
+async fn a_whole_request_failure_with_nothing_decided_fails_every_message() {
+    let server = MockServer::start().await;
+    let failed: Vec<Value> = (0..10).map(|i| failure(&i.to_string(), false)).collect();
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", TARGET))
+        .respond_with(reply(&[], json!(failed)))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(header("x-amz-target", TARGET))
+        .respond_with(server_error())
+        .mount(&server)
+        .await;
+    let sink = SqsSink::new(config(&server.uri(), "orders", 10))
+        .await
+        .unwrap();
+
+    let rows: Vec<Value> = (0..10).map(|n| json!({"n": n})).collect();
+    let out = sink.write_batch_partial(&rows).await.unwrap();
+    assert!(out.iter().all(Result::is_err), "{out:?}");
+}

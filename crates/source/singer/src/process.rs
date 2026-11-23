@@ -15,7 +15,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::config::SingerSourceConfig;
-use crate::message::{SingerMessage, parse_line};
+use crate::message::SingerMessage;
+use faucet_common_singer::{LineError, parse_tap_line};
 
 /// Bounded channel capacity between the stdout reader task and the stream. This
 /// is the backpressure knob: the reader blocks on a full channel, which in turn
@@ -34,6 +35,12 @@ const SIGTERM_GRACE: Duration = Duration::from_secs(5);
 pub enum Line {
     Parsed(SingerMessage),
     Malformed(String),
+    /// A `RECORD` / `STATE` / `SCHEMA` message that cannot be read (always
+    /// fatal: skipping it would lose a row or a checkpoint).
+    Broken {
+        message_type: Option<String>,
+        reason: String,
+    },
     /// A line longer than `max_line_bytes`; reading stops (always fatal).
     Overlong(usize),
 }
@@ -161,6 +168,7 @@ impl TapProcess {
             .ok_or_else(|| FaucetError::Source("tap stderr not captured".into()))?;
 
         let (tx, rx) = mpsc::channel::<Line>(CHANNEL_CAPACITY);
+        let non_finite = faucet_core::fidelity::NonFiniteCounter::current();
         let policy_reader = {
             let tx = tx.clone();
             let max_line = cfg.max_line_bytes;
@@ -173,9 +181,19 @@ impl TapProcess {
                             break;
                         }
                         Ok(faucet_common_singer::CappedLine::Line(line)) => {
-                            let item = match parse_line(&line) {
+                            let parsed = faucet_core::fidelity::propagate(&non_finite, || {
+                                parse_tap_line(&line)
+                            });
+                            let item = match parsed {
                                 Ok(msg) => Line::Parsed(msg),
-                                Err(reason) => Line::Malformed(reason),
+                                Err(LineError::Broken {
+                                    message_type,
+                                    reason,
+                                }) => Line::Broken {
+                                    message_type,
+                                    reason,
+                                },
+                                Err(e) => Line::Malformed(e.to_string()),
                             };
                             // `send().await` blocks on a full channel — this is
                             // the backpressure that bounds memory.

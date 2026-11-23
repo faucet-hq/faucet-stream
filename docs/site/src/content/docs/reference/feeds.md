@@ -26,7 +26,7 @@ Durations are whole seconds as a number, or text with a unit: `90s`, `15m`,
 | `name` | string | required | Unique per tenant. Letters, digits, `_` and `-`, at most 64 characters. Names the feed in URLs, metrics and the runs it starts. |
 | `description` | string | | What the feed is for. |
 | `tenant` | string | | The tenant the feed belongs to. Its deliveries run on behalf of that tenant. Through the API the tenant comes from `?tenant=` or the caller's own tenant. |
-| `store` | string | `default` | The server-defined store that holds the events. `default` follows the run history; other names come from `--feed-store`. |
+| `store` | string | `default` | The server-defined store that holds the events. `default` follows the run history; other names come from `--feed-store`. A feed stays in the physical store that first held it: see [Moving a feed's store](#moving-a-feeds-store). |
 | `ingest` | object | see below | How senders push events in. |
 | `retention` | object | see below | How long events are kept. |
 | `seal` | bool | on for a tenant's feed, else off | Seal event payloads with the server's vault key. |
@@ -39,7 +39,7 @@ Durations are whole seconds as a number, or text with a unit: `90s`, `15m`,
 | `auth.tokens` | `managed` | | Write-only feed tokens issued through the API, stored hashed. |
 | `auth.signature` | object | | An HMAC signature over the request body (below). |
 | `auth.allowed_addresses` | list of strings | `[]` (any) | Sender addresses or CIDR ranges that may push. |
-| `accept` | list of strings | `application/json`, `application/x-ndjson`, `application/x-www-form-urlencoded`, `text/plain` | Accepted request content types. |
+| `accept` | list of strings | `application/json`, `application/x-ndjson`, `application/x-www-form-urlencoded`, `text/plain` | Accepted request content types. A form's repeated key is delivered as an array of its values in the order sent. An event (JSON object, array element, NDJSON line or form) with a top-level `_feed` field is refused with `400`: the key is reserved for the delivery's metadata. |
 | `max_event_bytes` | size | `1MiB` | Largest single event. |
 | `max_request_bytes` | size | `10MiB` | Largest request body, after any gzip expansion. Capped by the server's `--feeds-max-request-bytes`. Must be at least `max_event_bytes`. |
 | `dedupe` | object | | Store a retried event once (below). |
@@ -55,7 +55,7 @@ request must satisfy both.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `header` | string | required | The request header that carries the signature. |
-| `secret` | string | required | The shared signing secret. In the feeds file, use a `${env:…}` or secret reference. Through the API it is sealed with the vault key (a server without one refuses it) and read back as `$sealed`; sending `$sealed` back keeps the stored secret. |
+| `secret` | string | required | The shared signing secret. In the feeds file, use a `${env:…}` or secret reference. Through the API it is sealed with the vault key (a server without one refuses it) and read back as `$sealed`; sending `$sealed` back keeps the stored secret. A server whose vault key cannot open the stored secret (another key, a key rotated without `--vault-previous-key`) still lists, edits and deletes the feed, shows it as `secret_unreadable`, and answers every ingest request to it with `503` (reason `seal`, with `Retry-After`) so senders retry against a server that can; for a feed with no token that answer is given before any check, so it tells a caller the feed exists. Sending `$sealed` back for such a feed is refused (`422`); send the secret itself to repair it. |
 | `algorithm` | `sha256` \| `sha512` | `sha256` | The HMAC digest. |
 | `encoding` | `hex` \| `base64` | `hex` | How the digest is written in the header. Hex is matched without regard to case. |
 | `prefix` | string | | Text before the digest in the header value, such as `sha256=`. |
@@ -82,8 +82,17 @@ create` prints it), and the feed is still created.
 | `on_duplicate` | `accept` \| `conflict` | `accept` | What the sender of a duplicate is told: `202` with `duplicate: true`, or `409`. |
 
 With `header`, a request of several events uses `<value>:<index>` as each
-event's key. A key longer than 256 characters is stored as its SHA-256. An
-event without a key is stored without dedupe.
+event's key. A key longer than 256 bytes, or holding a control character
+(a NUL, a tab, a newline), is stored as its SHA-256 (`sha256:<hex>`, also what
+the event browser shows); equal keys still match. An event without a key is
+stored without dedupe.
+
+Requests that arrive together are stored in one transaction. When the store
+refuses that transaction before committing it, each request is tried alone,
+so a request the store cannot take fails by itself (`503 store`) and the
+others are stored once. When the store fails at or after the commit (the
+outcome is unknown), every request of the transaction gets `503` and is
+retried by its sender.
 
 ### `retention`
 
@@ -93,6 +102,16 @@ event without a key is stored without dedupe.
 | `undelivered.max_age` | duration | `30d` | Oldest undelivered event. Past it the feed refuses new events. |
 | `undelivered.max_bytes` | size | `50GiB` | Most undelivered bytes. Past it the feed refuses new events. |
 | `warn_at` | list of fractions | `[0.5, 0.8]` | Ascending fractions (between 0 and 1) of the undelivered limits at which `feed_near_full` is sent. |
+
+Retention runs on every server beside the delivery scheduler (never inside its
+pass), for one feed at a time per feed (a claim in the feed store): once a
+minute it removes every event older than `max_age` below every delivery's
+position and every expired dedupe key, in calls of at most 1,000 rows. A pass
+works for at most 15 seconds over all feeds, starting where the last one
+stopped; a feed it could not finish is due again a second later, so
+retention keeps up with the feed's rate. `faucet_feed_maintenance_behind`
+(and the `FaucetFeedMaintenanceBehind` alert) report a feed whose retention
+keeps running out of time.
 
 ### Delivery
 
@@ -108,7 +127,7 @@ event without a key is stored without dedupe.
 | `max_batch.events` | integer | `10000` | Most events one run delivers. |
 | `max_batch.bytes` | size | `64MiB` | Most payload bytes one run delivers. |
 | `start` | string | `earliest` | Where a new delivery starts: `earliest` (the oldest retained event), `latest` (after the last stored event), `seq:<n>`, or `time:<RFC 3339>`. |
-| `retries` | integer | `5` | Failed runs of a single event before the delivery stalls. |
+| `retries` | integer | `5` | Failed runs in a row of a single event, with other events waiting behind it, before the delivery stalls; the failures must also span at least 10 minutes. |
 | `pool` | string | | The [execution pool](/faucet-stream/cookbook/cluster/) the runs go to. |
 | `timeout_secs` | integer | `3600` | Per-run timeout. |
 | `labels` | map | `{}` | Static labels added to every run. `feed`, `feed_delivery` and `feed_claim` are set by the server and cannot be used. |
@@ -120,7 +139,7 @@ event without a key is stored without dedupe.
 |---|---|---|---|
 | `id` | string | required | Template id. |
 | `version` | number or channel | `stable` | A version number pins it; a channel is resolved at each run. |
-| `params` | map | `{}` | Values for the template's `params:`. Secret params are sealed with the vault key and read back as a marker. |
+| `params` | map | `{}` | Values for the template's `params:`. In an API feed, secret params are sealed with the vault key and read back as a marker. In a `--feeds` file they stay in the file (not sealed): a param the template declares secret is shown as the same marker (every param, when the template cannot be read) and its value is scrubbed from the logs, and any string of the file's feed that held a `${…}` reference is shown as the reference (`${env:API_KEY}`), never its value. |
 | `sink`, `sink_version` | string, number or channel | | For a source template: the sink template to compose in. |
 | `overlay`, `overlay_version` | string, number or channel | | A registered deployment overlay. |
 
@@ -321,7 +340,7 @@ The [MCP server](/faucet-stream/cookbook/mcp/) has two read tools,
 |---|---|---|
 | `ok` | Delivering. | yes |
 | `failing` | Three or more runs in a row failed. It keeps retrying with a smaller batch. | yes |
-| `stalled` | Runs of a single event failed `retries` times. | no, until resume, skip or replay |
+| `stalled` | Runs of a single event that held other events back failed `retries` times in a row, over at least 10 minutes. A lone pending event that keeps failing shows `failing` and keeps being retried instead. | no, until resume, skip or replay |
 | `held` | Its bookmark and the feed store disagree (a restored store). | no, until recover |
 | `paused` | Paused by an operator, by its definition, or because its run was cancelled or rolled back. | no, until resume |
 | `needs_approval` | The server requires approval for runs and this delivery has none (or follows a channel). | no |
@@ -330,9 +349,13 @@ The [MCP server](/faucet-stream/cookbook/mcp/) has two read tools,
 A delivery's last run has one of these outcomes: `delivered`, `failed`,
 `refused`, `cancelled`, `claim_lost`, `held`.
 
-**A feed** shows the worst of its deliveries: `held`, then `stalled`, then
+**A feed** shows the worst of its deliveries: `held`, then
+`secret_unreadable` (this server cannot open the feed's signature secret and
+refuses its senders with `503`), then `stalled`, then
 `full` (an undelivered limit is reached and new events are refused), then
-`paused` (every delivery is paused), else `receiving`.
+`over_quota` (its tenant's feeds in this feed store hold the tenant's whole
+`max_feed_bytes`, delivered events kept for replay included, so new events
+are refused), then `paused` (every delivery is paused), else `receiving`.
 
 A feed reports two sizes. `retained_bytes` is every event it still holds,
 including delivered events kept for replay. `undelivered_bytes` is what its
@@ -346,6 +369,28 @@ On a feed's own page (`GET /v1/feeds/{name}`) each delivery also carries
 when the store cannot count them), `last_delivered_at` (when a run last
 moved its position) and, while it waits out a back-off after a failed or
 refused run, `next_run_at` (no run starts before it).
+
+### Moving a feed's store
+
+Each feed store records an identity when its schema is first created (a
+restored backup keeps it; a database recreated empty gets a new one), and the
+server records which store holds each feed's rows. When a feed's definition
+(a `--feeds` file's `store:`), or the `--feed-store` mapping of its store
+name, comes to name a different physical store, the feed is not re-created
+there empty: it shows the status `store_moved` (worst after `held`), its
+senders get `503` (reason `store_moved`, with `Retry-After`), nothing is
+delivered or created for it, `/readyz` lists it under `store_moved` and
+`faucet_feed_store_moved` is `1` (alert `FaucetFeedStoreMoved`). A server
+whose `--feeds` file has such a feed refuses to start, naming it.
+
+Point the definition back at the old store, or adopt the new one:
+`faucet feed adopt-store <feed>` or `POST /v1/feeds/{name}/adopt-store`
+(admin, audited as `feed.adopt_store`) starts the feed empty in the store it
+names: its deliveries' run state is removed and each starts at its `start`.
+Its events in the old store are not delivered. `faucet feed adopt-store
+--all [--in <store>]` adopts every such feed at once, for a store that was
+lost and recreated. A store that keeps no identity (a third-party backend)
+cannot be checked; the server logs that once.
 
 **Self-repair.** On every pass the scheduler compares each feed's store rows
 with its definition: a delivery position no definition lists (a change that
@@ -403,11 +448,12 @@ the file.
 | `replay <feed> <delivery> --to-seq <n>` \| `--to-time <RFC 3339>` | Move a delivery back. |
 | `skip <feed> <delivery> --reason <text> [--to <n>]` | Move a delivery forward, leaving a gap. |
 | `recover <feed> <delivery>` | Put a held delivery back on a valid position. |
+| `adopt-store <feed>` \| `adopt-store --all [--in <store>]` | Start a feed whose events are in another feed store empty in the store it names (one feed, or every such feed of the server or of one store). Its events in the old store are not delivered. |
 | `events <feed> [--before <n>] [--from <n>] [--limit <n>]` | List retained events, never their payloads. |
 | `tail <feed> [-n <N>] [--follow] [--interval-secs <n>] [--payload]` | Print the newest retained events, oldest first (10 by default, at most 200). `--follow` keeps printing new ones, looking every `--interval-secs` (default 2); use it on a PostgreSQL feed store, because nothing else can write to a SQLite store while `tail` holds it. `--payload` prints payloads too, never a sealed event's. |
 | `stats <feed>` | The feed's size, what the last 24 hours brought, and each delivery's backlog. |
 | `cursor <feed> [<delivery>]` | Where each delivery reads next: position, epoch, pending events, live claim and gaps. Read-only. |
-| `push <feed> [<file>] [--content-type <type>] [--dedupe-key <key>]` | Append events from a file or stdin straight to the feed's store, with the checks, dedupe and sealing the ingest route applies. No sender credential, rate limit or tenant quota applies. |
+| `push <feed> [<file>] [--content-type <type>] [--dedupe-key <key>]` | Append events from a file or stdin straight to the feed's store, with the checks, dedupe and sealing the ingest route applies. No sender credential or rate limit applies; the tenant's byte quota and the feed's undelivered limits do (the store checks them). |
 | `send --url <ingest URL> …` | Post events to a running server over HTTP, as a sender does. Needs no `--store`. |
 | `token create <feed> <token name> [--expires-at <RFC 3339>]` | Issue a token; its text is printed once. |
 | `token list <feed>` | The feed's tokens, never their text. |
@@ -415,7 +461,8 @@ the file.
 
 `send` goes through the ingest route, so the feed's credential, limits, rate
 limit and tenant quota all apply; `push` writes to the store directly and
-skips the credential, the rate limit and the tenant quota. `send` flags: `-f <file>` (default stdin), `--content-type` (default
+skips the credential and the rate limits (the tenant's byte quota and the
+feed's undelivered limits are checked by the store, so they still apply). `send` flags: `-f <file>` (default stdin), `--content-type` (default
 `application/json`), `--token-env <VAR>` (or `--token`, which other processes
 on the host can see), `--signature-secret-env <VAR>` with
 `--signature-header <name>` and, to match the feed's signature settings,
@@ -447,7 +494,7 @@ The `feed` label is the feed's name, `<tenant>/<name>` for a tenant's feed.
 | Metric | Type | Meaning |
 |---|---|---|
 | `faucet_feed_ingest_requests_total{feed,status}` | counter | Ingest requests by HTTP status. A request for an unknown feed has an empty `feed`. |
-| `faucet_feed_ingest_refused_total{feed,reason}` | counter | Refused requests by reason: `unauthorized`, `malformed`, `too_large`, `timeout`, `content_type`, `content_encoding`, `rate_limited`, `tenant_rate_limited`, `full`, `store`, `seal`, `busy`, `definitions_stale`, `draining`. |
+| `faucet_feed_ingest_refused_total{feed,reason}` | counter | Refused requests by reason: `unauthorized`, `malformed`, `too_large`, `timeout`, `content_type`, `content_encoding`, `rate_limited`, `tenant_rate_limited`, `full`, `store`, `store_moved`, `seal`, `busy`, `definitions_stale`, `draining`. |
 | `faucet_feed_events_total{feed}` | counter | Events stored. |
 | `faucet_feed_bytes_total{feed}` | counter | Payload bytes stored. |
 | `faucet_feed_dedupe_hits_total{feed}` | counter | Events not stored because their key was already seen. |
@@ -456,16 +503,18 @@ The `feed` label is the feed's name, `<tenant>/<name>` for a tenant's feed.
 | `faucet_feed_orphan_deliveries_total{feed}` | counter | Delivery positions deleted from the store because no definition listed them. |
 | `faucet_feed_append_duration_seconds{feed}` | histogram | Time of one store transaction. |
 | `faucet_feed_append_group_requests{feed}` | histogram | Requests stored together in one transaction. |
-| `faucet_feed_store_errors_total{feed}` | counter | Feed store failures. |
-| `faucet_feed_depth{feed}` | gauge | Retained events. |
+| `faucet_feed_store_errors_total{feed}` | counter | Ingest appends the feed store failed (senders got `503 store`). |
+| `faucet_feed_depth{feed}` | gauge | Events the feed's slowest delivery has not delivered yet. |
 | `faucet_feed_undelivered_ratio{feed}` | gauge | Undelivered bytes or age as a fraction of the feed's limits (the larger). At 1 the feed refuses new events. |
 | `faucet_feed_delivery_lag{feed,delivery}` | gauge | Events the delivery has not read. |
 | `faucet_feed_oldest_undelivered_seconds{feed,delivery}` | gauge | Age of the oldest undelivered event. |
 | `faucet_feed_runs_total{feed,delivery,outcome}` | counter | Delivery runs by outcome: `delivered`, `failed`, `refused`, `cancelled`, `claim_lost`, `held`, `needs_approval`. |
 | `faucet_feed_delivery_stalled{feed,delivery}` | gauge | `1` while the delivery is stalled. |
 | `faucet_feed_held{feed}` | gauge | Held deliveries of the feed. |
+| `faucet_feed_store_moved{feed}` | gauge | `1` while the feed's events are in another feed store than the one it names. |
 | `faucet_feed_gaps_total{feed}` | counter | Gaps recorded by a skip or a recover. |
 | `faucet_feed_trimmed_events_total{feed}` | counter | Events removed by retention. |
+| `faucet_feed_maintenance_behind{feed}` | gauge | `1` while the feed's last retention pass ran out of time with expired events or dedupe keys left. |
 | `faucet_feed_scheduler_restarts_total` | counter | Times the delivery scheduler was restarted after it failed. |
 
 A deleted feed's or delivery's gauges go back to zero, so its alerts clear.
@@ -479,6 +528,8 @@ The shipped rules (`observability/prometheus/alerts.yml`, group
 |---|---|---|
 | `FaucetFeedDeliveryStalled` | `faucet_feed_delivery_stalled == 1` for 1 minute | critical |
 | `FaucetFeedDeliveryHeld` | `faucet_feed_held > 0` for 1 minute | critical |
+| `FaucetFeedStoreMoved` | `faucet_feed_store_moved == 1` for 1 minute | critical |
+| `FaucetFeedMaintenanceBehind` | `faucet_feed_maintenance_behind == 1` for 15 minutes | warning |
 | `FaucetFeedDeliveryLagging` | The oldest undelivered event has waited more than 10 minutes, for 10 minutes | warning |
 | `FaucetFeedNearFull` | `faucet_feed_undelivered_ratio >= 0.8` for 5 minutes | warning |
 | `FaucetFeedRunsFailing` | Three or more runs failed or were refused in 30 minutes | warning |
@@ -492,8 +543,9 @@ admitted (an unknown feed or a credential no feed accepts).
 ### `/readyz`
 
 `/readyz` has a `feeds` object: `started` (a feed exists, so the scheduler
-runs here), `store_ok`, `feeds` (how many), and the `stalled` and `held`
-deliveries by name. An unreachable feed store sets `store_ok: false`; it does
+runs here), `store_ok`, `feeds` (how many), the `stalled` and `held`
+deliveries by name, and `secret_unreadable` (feeds whose signature secret this
+server cannot open) when there are any. An unreachable feed store sets `store_ok: false`; it does
 not fail the readiness check.
 
 ## Where the data lives
