@@ -1080,7 +1080,9 @@ mod tests {
                 Ok(r.len())
             }
         }
-        let sink = Governance::default().sink_builder().build(Box::new(Accepts));
+        let sink = Governance::default()
+            .sink_builder()
+            .build(Box::new(Accepts));
         assert_eq!(sink.finish(Ok::<_, FaucetError>(7)).unwrap(), 7);
     }
     use crate::traits::Source;

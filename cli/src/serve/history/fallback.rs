@@ -1358,6 +1358,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_budgets_and_file_pins_reach_the_primary() {
+        let h = FallbackHistory::healthy(
+            Box::new(super::super::memory::MemoryHistory::new(
+                Duration::from_secs(60),
+            )),
+            Duration::from_secs(60),
+            "test",
+        );
+        let g = h.budget_grant("r", (3, 0), (Some(5), None)).await.unwrap();
+        assert_eq!(g.records, 3);
+        h.budget_give_back("r", 1, 0).await.unwrap();
+        assert_eq!(h.budget_spent("r").await.unwrap(), Some((2, 0)));
+        h.set_file_pins(Vec::new());
+        assert!(h.file_pins().is_empty());
+    }
+
+    #[tokio::test]
     async fn a_saturated_pool_is_an_error_not_a_degraded_server() {
         let h = FallbackHistory::healthy(
             Box::new(Saturated(pool_timeout)),
