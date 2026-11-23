@@ -781,7 +781,7 @@ mod tests {
         let mut config = ElasticsearchSourceConfig::new("http://localhost:9200", "idx");
         config.batch_size = faucet_core::MAX_BATCH_SIZE + 1;
         match ElasticsearchSource::new(config) {
-            Err(FaucetError::Config(m)) => assert!(m.contains("batch_size"), "got: {m}"),
+            Err(FaucetError::Config(m)) => assert!(m.contains("batch_size")),
             _ => panic!("expected a batch_size Config error"),
         }
     }
