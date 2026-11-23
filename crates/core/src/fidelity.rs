@@ -642,7 +642,10 @@ fn rewrite_non_finite(text: &str) -> (String, usize) {
 pub fn from_slice(bytes: &[u8]) -> Result<Value, serde_json::Error> {
     match std::str::from_utf8(bytes) {
         Ok(text) => from_str(text),
-        Err(_) => serde_json::from_slice(bytes),
+        Err(e) => Err(serde::de::Error::custom(format!(
+            "invalid UTF-8 in JSON at byte {}",
+            e.valid_up_to()
+        ))),
     }
 }
 
@@ -739,6 +742,13 @@ pub fn unscoped_non_finite() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_slice_refuses_a_body_that_is_not_utf8() {
+        let e = from_slice(b"{\"a\": \"\xff\"}").unwrap_err().to_string();
+        assert!(e.contains("invalid UTF-8 in JSON at byte 7"), "{e}");
+        assert_eq!(from_slice(b"[1]").unwrap(), serde_json::json!([1]));
+    }
 
     #[tokio::test]
     async fn bare_non_finite_tokens_become_counted_nulls() {
