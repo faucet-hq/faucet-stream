@@ -126,7 +126,10 @@ fn serve_args(
         connect_providers: None,
         allow_subprocess_connectors: false,
         grafana_url: None,
-        references: Default::default(),
+        references: faucet_cli::cli::ReferenceArgs {
+            policy_trust_caller_attributes: true,
+            ..Default::default()
+        },
         pools: Default::default(),
     }
 }
