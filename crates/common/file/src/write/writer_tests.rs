@@ -2037,9 +2037,13 @@ async fn concurrent_appends_to_one_remote_line_file_keep_every_line() {
     let text = mem.text("pre/log.jsonl");
     assert_eq!(text.lines().count(), 16, "{text}");
     assert!(text.starts_with("{\"old\":1}\n"));
+    let lines: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
     for i in 0..3 {
         for j in 0..5 {
-            assert!(text.contains(&format!("{{\"j\":{j},\"w\":{i}}}")), "{text}");
+            assert!(lines.contains(&json!({"w": i, "j": j})), "{text}");
         }
     }
 }

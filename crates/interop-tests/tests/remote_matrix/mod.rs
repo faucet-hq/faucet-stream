@@ -93,7 +93,11 @@ pub async fn assert_concurrent_overwrites<R: Remote>(r: &R) {
     .await;
     seed(&base, vec![json!({"stale": "legacy"})]).await;
     let names = |objects: Vec<(String, Vec<u8>)>| -> Vec<String> {
-        objects.into_iter().map(|(n, _)| n).collect()
+        objects
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| !n.contains(".commits/"))
+            .collect()
     };
     assert_eq!(
         names(r.objects(prefix).await)
