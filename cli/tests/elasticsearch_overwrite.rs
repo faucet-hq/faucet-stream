@@ -98,11 +98,22 @@ async fn an_overwrite_run_replaces_the_alias_and_leaves_no_staging_behind() {
         vec![json!({"id": "1"}), json!({"id": "2"})]
     );
     assert_eq!(fake.alias_names(), vec!["orders".to_string()]);
-    assert_eq!(fake.index_names().len(), 1);
+    let indices = fake.index_names();
+    assert_eq!(indices.len(), 2, "{indices:?}");
+    assert!(
+        indices.contains(&"orders-old".to_string()),
+        "a hand-built index is kept, detached: {indices:?}"
+    );
 
     std::fs::write(&csv, "id\n3\n").unwrap();
     let summary = run(&csv, &server.uri()).await;
     assert!(!summary.had_failures(), "{summary:?}");
     assert_eq!(fake.alias_docs("orders"), vec![json!({"id": "3"})]);
-    assert_eq!(fake.index_names().len(), 1);
+    let indices = fake.index_names();
+    assert_eq!(
+        indices.len(),
+        2,
+        "the first run's index is dropped, the hand-built one kept: {indices:?}"
+    );
+    assert!(indices.contains(&"orders-old".to_string()), "{indices:?}");
 }
