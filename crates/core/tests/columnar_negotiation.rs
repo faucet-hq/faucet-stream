@@ -1239,3 +1239,59 @@ async fn a_cancelled_columnar_run_writes_nothing() {
     assert_eq!(result.records_written, 0);
     assert_eq!(rows.load(Ordering::SeqCst), 0);
 }
+
+#[cfg(feature = "quality")]
+#[tokio::test]
+async fn the_total_dlq_budget_aborts_on_the_columnar_path() {
+    use faucet_core::dlq::DlqConfig;
+    use faucet_core::quality::{CompiledQuality, OnFailure, QualitySpec, RecordCheck};
+
+    struct CapturingDlq {
+        seen: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+    #[async_trait]
+    impl Sink for CapturingDlq {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            self.seen.lock().unwrap().extend_from_slice(records);
+            Ok(records.len())
+        }
+        fn connector_name(&self) -> &'static str {
+            "capturing-dlq"
+        }
+    }
+
+    let source = ColumnarOnlySource {
+        rows: vec![
+            json!({"id": 1, "email": null}),
+            json!({"id": 2, "email": null}),
+        ],
+    };
+    let sink = ColumnarOnlySink::new(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let dlq_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let spec = QualitySpec {
+        record: vec![RecordCheck::NotNull {
+            field: "email".into(),
+            treat_missing_as_null: true,
+            on_failure: OnFailure::Quarantine,
+        }],
+        batch: vec![],
+    };
+    let mut dlq = DlqConfig::new(Arc::new(CapturingDlq {
+        seen: Arc::clone(&dlq_seen),
+    }));
+    dlq.max_failures_total = Some(1);
+
+    let err = Pipeline::new(&source, &sink)
+        .with_quality(Arc::new(CompiledQuality::compile(&spec).unwrap()))
+        .with_dlq(dlq)
+        .run()
+        .await
+        .expect_err("exceeding the budget must abort");
+    assert!(err.to_string().contains("budget exceeded"), "{err}");
+    assert_eq!(
+        dlq_seen.lock().unwrap().len(),
+        2,
+        "the overshoot is written before aborting — losing those rows would be worse"
+    );
+}
