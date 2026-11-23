@@ -4455,3 +4455,36 @@ async fn retention_removes_everything_due_in_one_pass() {
         .await;
     assert_eq!(again.maintained, 0);
 }
+
+/// A feed another server is maintaining is left to it; a pass already out
+/// of time leaves the feed behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn maintenance_held_by_another_server_is_left_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &[]).await;
+    srv.state.feeds().stop_scheduling();
+    let spec: FeedSpec = serde_json::from_value(json!({
+        "name": "held",
+        "ingest": {"auth": {"tokens": "managed"}},
+        "retention": {"max_age": "1h"}
+    }))
+    .unwrap();
+    service::create(&srv.state, &admin(), None, spec)
+        .await
+        .unwrap();
+    let (store, uid) = srv.store("held").await;
+    let feed = srv.state.feeds().snapshot().feed(None, "held").unwrap();
+    let rt = srv.state.feeds();
+    let later = std::time::Instant::now() + Duration::from_secs(30);
+    let other = faucet_common_feed::ClaimOwner::new("serve:other").unwrap();
+    assert!(
+        store
+            .maintenance(&store_calls(), &uid, &other, Duration::from_secs(600))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        runner::maintain_feed(&rt, &*store, &feed, later).await,
+        runner::Maintained::NotOwner
+    );
+}

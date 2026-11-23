@@ -696,3 +696,21 @@ fn a_store_failure_waiting_may_fix_is_told_from_a_refusal() {
         "delivery 'lake': feed store error: permission denied"
     );
 }
+
+#[test]
+fn a_moved_store_is_not_transient_and_says_where_the_events_are() {
+    let moved = EnsureError::Moved(StoreMoved {
+        recorded_store: "a".into(),
+        recorded_id: 1,
+        now_store: "b".into(),
+        now_id: 2,
+    });
+    assert!(!moved.is_transient());
+    assert!(!moved.to_string().is_empty());
+    let busy = EnsureError::Store {
+        transient: true,
+        message: "busy".into(),
+    };
+    assert!(busy.is_transient());
+    assert_eq!(busy.to_string(), "busy");
+}

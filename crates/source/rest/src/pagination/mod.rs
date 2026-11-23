@@ -907,6 +907,34 @@ mod new_style_tests {
     }
 
     #[test]
+    fn every_style_has_a_config_name() {
+        for (cfg, name) in [
+            (json!({"type": "None"}), "None"),
+            (json!({"type": "LinkHeader"}), "LinkHeader"),
+            (
+                json!({"type": "NextLinkInBody", "next_link_path": "$.next"}),
+                "NextLinkInBody",
+            ),
+            (
+                json!({"type": "PageNumber", "param_name": "page", "start_page": 1}),
+                "PageNumber",
+            ),
+            (
+                json!({"type": "Offset", "offset_param": "o", "limit_param": "l", "limit": 2}),
+                "Offset",
+            ),
+            (
+                json!({"type": "CursorInBody", "next_token_path": "$.n", "body_cursor_field": "c"}),
+                "CursorInBody",
+            ),
+        ] {
+            let style: PaginationStyle = serde_json::from_value(cfg).unwrap();
+            assert_eq!(style.style_name(), name);
+        }
+        assert_eq!(offset_in_body().style_name(), "OffsetInBody");
+    }
+
+    #[test]
     fn an_absent_token_never_repeats() {
         let mut state = PaginationState::default();
         assert_eq!(state.classify_token(None, None), TokenSeen::New);

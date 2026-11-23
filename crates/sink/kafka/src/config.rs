@@ -751,6 +751,9 @@ mod tests {
         c.extra_client_config
             .insert("enable.idempotence".into(), "false".into());
         assert!(c.validate().is_ok(), "typed acks: none restated");
+        c.acks = Acks::Leader;
+        c.extra_client_config.insert("acks".into(), "1".into());
+        assert!(c.validate().is_ok(), "typed acks: leader restated");
     }
 
     #[test]
