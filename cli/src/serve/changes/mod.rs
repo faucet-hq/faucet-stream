@@ -1656,6 +1656,34 @@ async fn execute(
         record_metric(change.kind, "executed");
         return Ok(change);
     }
+    // Likewise a feed change whose write carries this change's id.
+    #[cfg(feature = "feeds")]
+    if change.kind == ChangeKind::Feed
+        && let Some(p) = crate::serve::feeds::service::already_applied(state, &change).await?
+    {
+        crate::serve::feeds::service::audit_approved(
+            state,
+            &requester,
+            &p,
+            "an approved change request (recovered after an interrupted execution)",
+        )
+        .await;
+        change.status = ChangeStatus::Executed;
+        change.deferred = false;
+        change.touch();
+        save(state, &change).await?;
+        record_metric(change.kind, "executed");
+        crate::serve::audit::write(
+            state,
+            &audit_as(actor, &change),
+            "change.executed",
+            None,
+            Some(change.id.clone()),
+            "ok",
+        )
+        .await;
+        return Ok(change);
+    }
     // Re-plan against the world as it is now. A planning failure (the
     // template is gone, the config no longer loads) fails the request.
     let fresh = match plan_for(
@@ -1877,7 +1905,7 @@ async fn execute(
                     Ok(p) => p,
                     Err(e) => return finish_failed(state, actor, change, e.to_string()).await,
                 };
-            crate::serve::feeds::service::apply(state, &requester, p, true)
+            crate::serve::feeds::service::apply(state, &requester, p, true, Some(&change.id))
                 .await
                 .map(|_| (None, None))
         }

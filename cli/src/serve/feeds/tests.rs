@@ -673,3 +673,26 @@ async fn a_memory_history_takes_no_feed() {
     assert!(rt.stores().opened().is_empty());
     rt.notify();
 }
+
+#[test]
+fn a_store_failure_waiting_may_fix_is_told_from_a_refusal() {
+    use faucet_common_feed::FeedError;
+    let down = EnsureError::store(&FeedError::Unavailable("down".into()), None);
+    assert!(down.is_transient());
+    let timed_out = EnsureError::store(
+        &FeedError::Call(faucet_core::FaucetError::Cancelled {
+            operation: "ensure".into(),
+        }),
+        None,
+    );
+    assert!(timed_out.is_transient());
+    let refused = EnsureError::store(
+        &FeedError::Backend("permission denied".into()),
+        Some("delivery 'lake'"),
+    );
+    assert!(!refused.is_transient());
+    assert_eq!(
+        String::from(refused),
+        "delivery 'lake': feed store error: permission denied"
+    );
+}

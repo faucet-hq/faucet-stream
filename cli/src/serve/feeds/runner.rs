@@ -1102,7 +1102,9 @@ impl Scheduler {
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string()),
-            None => super::ensure_in_store(store, feed, tenant_limits).await,
+            None => super::ensure_in_store(store, feed, tenant_limits)
+                .await
+                .map_err(String::from),
         };
         match made {
             Ok(()) => {

@@ -1164,6 +1164,7 @@ async fn activity(state: &ServerState, feed: &Feed) -> Vec<FeedChange> {
                 by: e.principal,
                 action: e.action.trim_start_matches("feed.").to_string(),
                 detail,
+                change_id: None,
             })
         })
         .collect()
@@ -1893,9 +1894,16 @@ async fn commit_update(
     {
         return Ok(None);
     }
-    ensure_in_store(&*store, &feed, limits.as_ref())
-        .await
-        .map_err(store_error)?;
+    // The definition is in force from here: a store that is down only
+    // delays its rows, which the scheduler creates (the delivery shows
+    // `setting_up`). A refusal that waiting will not fix still fails.
+    match ensure_in_store(&*store, &feed, limits.as_ref()).await {
+        Ok(()) => {}
+        Err(e) if e.is_transient() => {
+            tracing::warn!(feed = %feed.label(), error = %e, "the feed is updated; its store rows are created when the store answers");
+        }
+        Err(e) => return Err(store_error(e)),
+    }
     if let Err(e) = finish_removed(state, &next).await {
         tracing::warn!(feed = %feed.label(), error = %e, "the delivery is removed; removing what it left will be retried");
     }
@@ -2208,8 +2216,9 @@ async fn mark_deleting(
     state: &ServerState,
     record: &FeedRecord,
     by: &str,
+    change_id: Option<&str>,
 ) -> Result<Option<FeedRecord>, ServeError> {
-    let marked = record.tombstoned(by, Utc::now());
+    let marked = record.tombstoned(by, Utc::now()).stamped(change_id);
     Ok(state
         .history()
         .feed_replace(record, &marked)
@@ -2224,6 +2233,7 @@ async fn delete_inner(
     tenant: Option<&str>,
     name: &str,
     expect_uid: Option<&str>,
+    change_id: Option<&str>,
 ) -> Result<(), ServeError> {
     crate::runtime::server::refuse_while_unavailable(state)?;
     let tenant = scope(actor, tenant)?;
@@ -2239,7 +2249,7 @@ async fn delete_inner(
     for (dname, meta) in &record.deliveries {
         refuse_live_claim(&*store, &feed, dname, &meta.uid).await?;
     }
-    let Some(marked) = mark_deleting(state, &record, &actor.principal).await? else {
+    let Some(marked) = mark_deleting(state, &record, &actor.principal, change_id).await? else {
         return Err(ServeError::Conflict(format!(
             "feed '{name}' changed while it was being deleted; retry"
         )));
@@ -2262,7 +2272,7 @@ pub async fn delete(
     tenant: Option<&str>,
     name: &str,
 ) -> Result<(), ServeError> {
-    delete_inner(state, actor, tenant, name, None).await
+    delete_inner(state, actor, tenant, name, None, None).await
 }
 
 // ── Changes ─────────────────────────────────────────────────────────────────
@@ -2528,6 +2538,7 @@ pub async fn apply(
     actor: &AuthContext,
     p: ChangePayload,
     approved: bool,
+    change_id: Option<&str>,
 ) -> Result<Option<FeedView>, ServeError> {
     if approved && p.feed_uid.is_none() {
         return Err(ServeError::Conflict(
@@ -2535,8 +2546,12 @@ pub async fn apply(
         ));
     }
     let out = match plan_inner(state, actor, &p, approved).await?.0 {
-        Planned::Create(b) => Some(commit_create(state, *b, approved).await?),
-        Planned::Update(b) => {
+        Planned::Create(mut b) => {
+            b.record = b.record.stamped(change_id);
+            Some(commit_create(state, *b, approved).await?)
+        }
+        Planned::Update(mut b) => {
+            b.next = b.next.stamped(change_id);
             Some(commit_update(state, *b, approved).await?.ok_or_else(|| {
                 ServeError::Conflict(format!("feed '{}' changed meanwhile", p.name))
             })?)
@@ -2548,23 +2563,57 @@ pub async fn apply(
                 p.tenant.as_deref(),
                 &p.name,
                 p.feed_uid.as_deref(),
+                change_id,
             )
             .await?;
             None
         }
     };
     if approved {
-        crate::serve::audit::write_target_detail(
-            state,
-            actor,
-            &format!("feed.{}", p.action.as_str()),
-            format!("feed:{}", label_of(p.tenant.as_deref(), &p.name)),
-            "an approved change request".into(),
-            "ok",
-        )
-        .await;
+        audit_approved(state, actor, &p, "an approved change request").await;
     }
     Ok(out)
+}
+
+/// The audit entry of an approved feed change carried out.
+pub async fn audit_approved(
+    state: &ServerState,
+    actor: &AuthContext,
+    p: &ChangePayload,
+    detail: &str,
+) {
+    crate::serve::audit::write_target_detail(
+        state,
+        actor,
+        &format!("feed.{}", p.action.as_str()),
+        format!("feed:{}", label_of(p.tenant.as_deref(), &p.name)),
+        detail.into(),
+        "ok",
+    )
+    .await;
+}
+
+/// Whether the approved feed change `change` is already in the run history:
+/// its execution was interrupted after its write. Proven only by the change
+/// id the write carries; a deleted feed already purged proves nothing.
+pub async fn already_applied(
+    state: &ServerState,
+    change: &crate::serve::changes::ChangeRequest,
+) -> Result<Option<ChangePayload>, ServeError> {
+    let Ok(p) = serde_json::from_value::<ChangePayload>(change.payload.clone()) else {
+        return Ok(None);
+    };
+    let Some(uid) = p.feed_uid.as_deref() else {
+        return Ok(None);
+    };
+    let record = state
+        .history()
+        .feed_get(&feed_key(p.tenant.as_deref(), &p.name))
+        .await
+        .map_err(ServeError::from)?;
+    Ok(record
+        .filter(|r| r.uid == uid && r.applied(&change.id))
+        .map(|_| p))
 }
 
 /// `<tenant>/<name>` for a tenant feed, else the name.
@@ -2632,7 +2681,7 @@ pub async fn change(
             .await
             .map(|v| Changed::Applied(Some(Box::new(v))));
     }
-    apply(state, actor, p, false)
+    apply(state, actor, p, false, None)
         .await
         .map(|v| Changed::Applied(v.map(Box::new)))
 }
@@ -3325,7 +3374,7 @@ pub async fn purge_tenant(state: &ServerState, tenant: &str) -> Result<usize, St
             continue;
         }
         let by = format!("tenant:{tenant}:deleted");
-        match mark_deleting(state, &record, &by).await {
+        match mark_deleting(state, &record, &by, None).await {
             Ok(Some(m)) => marked.push(m),
             Ok(None) => return Err(format!("feed '{}' changed; retry", record.name())),
             Err(e) => return Err(e.api_error().error.message),

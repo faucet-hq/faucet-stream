@@ -743,6 +743,10 @@ pub struct FeedChange {
     pub action: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detail: Vec<String>,
+    /// The approved change request that made this change, so an execution
+    /// interrupted after its write is recognised as done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<String>,
 }
 
 /// A feed made through the API or the console, as the run history keeps it.
@@ -783,6 +787,9 @@ pub struct FeedRecord {
 pub struct Deleting {
     pub at: DateTime<Utc>,
     pub by: String,
+    /// The approved change request that deleted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<String>,
 }
 
 /// A delivery dropped from a feed, kept until what it left is removed.
@@ -874,6 +881,7 @@ impl FeedRecord {
             by: by.to_string(),
             action: action.to_string(),
             detail,
+            change_id: None,
         });
         let over = self.changes.len().saturating_sub(CHANGE_LOG_RETAIN);
         self.changes.drain(..over);
@@ -916,8 +924,34 @@ impl FeedRecord {
         r.deleting = Some(Deleting {
             at: now,
             by: by.to_string(),
+            change_id: None,
         });
         r
+    }
+
+    /// Record that the newest change (or the deletion) was made by the
+    /// approved change request `change_id`.
+    pub fn stamped(mut self, change_id: Option<&str>) -> Self {
+        if let Some(id) = change_id {
+            if let Some(d) = self.deleting.as_mut() {
+                d.change_id = Some(id.to_string());
+            } else if let Some(last) = self.changes.last_mut() {
+                last.change_id = Some(id.to_string());
+            }
+        }
+        self
+    }
+
+    /// Whether the approved change request `change_id` was written to this
+    /// record (a change it made, or its deletion).
+    pub fn applied(&self, change_id: &str) -> bool {
+        self.deleting
+            .as_ref()
+            .is_some_and(|d| d.change_id.as_deref() == Some(change_id))
+            || self
+                .changes
+                .iter()
+                .any(|c| c.change_id.as_deref() == Some(change_id))
     }
 
     /// Whether the feed still exists for its users.
@@ -1043,6 +1077,33 @@ impl RunFeedBinding {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_change_request_id_is_stamped_on_the_write_it_made() {
+        let spec: FeedSpec = serde_json::from_value(json!({
+            "name": "orders", "ingest": {"auth": {"tokens": "managed"}}
+        }))
+        .unwrap();
+        let now = Utc::now();
+        let made = FeedRecord::new(spec.clone(), "alice", now).stamped(Some("chg-1"));
+        assert!(made.applied("chg-1") && !made.applied("chg-2"));
+        let (edited, _) = made.revised(spec, "bob", now, "updated", Vec::new());
+        assert!(!edited.clone().stamped(None).applied("chg-2"));
+        let edited = edited.stamped(Some("chg-2"));
+        assert!(
+            edited.applied("chg-1") && edited.applied("chg-2"),
+            "earlier stamps stay"
+        );
+        let gone = edited.tombstoned("carol", now).stamped(Some("chg-3"));
+        assert!(gone.applied("chg-3"));
+        assert_eq!(
+            gone.deleting.as_ref().unwrap().change_id.as_deref(),
+            Some("chg-3")
+        );
+        let old: FeedChange =
+            serde_json::from_value(json!({"at": now, "by": "x", "action": "created"})).unwrap();
+        assert_eq!(old.change_id, None);
+    }
 
     #[test]
     fn spans_and_sizes_read_numbers_and_text_and_write_the_largest_unit() {

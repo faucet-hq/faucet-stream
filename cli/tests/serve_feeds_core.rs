@@ -2412,6 +2412,70 @@ async fn under_feed_approval_every_change_waits_and_names_its_feed() {
     assert!(matches!(unknown, Err(ServeError::NotFound)));
 }
 
+/// An approved feed change whose write landed before its execution was
+/// interrupted (the change was never saved as executed) ends executed, with
+/// its audit entry, when it runs again, instead of invalidated by its own
+/// write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_approved_feed_change_interrupted_after_its_write_is_executed() {
+    use faucet_cli::serve::changes::{self, ChangeStatus};
+    use service::{ChangeAction, ChangePayload};
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &["--require-approval", "feed"]).await;
+    service::create(&srv.state, &admin(), None, feed_spec("orders", json!([])))
+        .await
+        .unwrap();
+    let mut edited = feed_spec("orders", json!([]));
+    edited.description = Some("edited".into());
+    for (action, spec) in [
+        (ChangeAction::Update, Some(edited)),
+        (ChangeAction::Delete, None),
+    ] {
+        let proposed = pending(
+            service::change(
+                &srv.state,
+                &admin(),
+                ChangePayload::new(action, None, "orders", spec),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        // The execution's write lands; the server stops before saving the
+        // change (a delete stops once the feed is marked deleted).
+        let p: ChangePayload = serde_json::from_value(proposed.payload.clone()).unwrap();
+        let deleting = matches!(p.action, ChangeAction::Delete);
+        if deleting {
+            srv.state
+                .feeds()
+                .stop_removals_after(Some(faucet_cli::serve::feeds::StopAfter::Marked));
+        }
+        let _ = service::apply(&srv.state, &admin(), p, true, Some(&proposed.id)).await;
+        srv.state.feeds().stop_removals_after(None);
+        let done = changes::approve(&srv.state, &bob(), &proposed.id, None)
+            .await
+            .unwrap();
+        assert_eq!(done.status, ChangeStatus::Executed, "{:?}", done.error);
+    }
+    assert!(service::find(&srv.state, None, "orders").await.is_err());
+    let audit = srv
+        .state
+        .history()
+        .list_audit(&faucet_cli::serve::history::AuditFilter {
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    for action in ["feed.update", "feed.delete"] {
+        assert!(
+            audit.iter().any(|e| e.action == action
+                && e.detail.as_deref().is_some_and(|d| d.contains("recovered"))),
+            "{action}: {audit:?}"
+        );
+    }
+}
+
 /// A stall and a crossing of a `warn_at` threshold each send one
 /// notification through the delivery template's `notifications:`, however
 /// often the scheduler looks again.

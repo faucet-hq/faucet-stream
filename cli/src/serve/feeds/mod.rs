@@ -832,19 +832,63 @@ impl FeedsRuntime {
     }
 }
 
+/// Why a feed's rows could not be created in its store.
+#[derive(Debug)]
+pub enum EnsureError {
+    /// The store failed or refused.
+    Store {
+        /// Waiting may fix it (the store is down, busy or timed out).
+        transient: bool,
+        message: String,
+    },
+}
+
+impl EnsureError {
+    fn store(e: &faucet_common_feed::FeedError, context: Option<&str>) -> Self {
+        EnsureError::Store {
+            transient: e.is_transient() || matches!(e, faucet_common_feed::FeedError::Call(_)),
+            message: match context {
+                Some(c) => format!("{c}: {e}"),
+                None => e.to_string(),
+            },
+        }
+    }
+
+    /// Whether waiting may fix it.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            EnsureError::Store { transient, .. } => *transient,
+        }
+    }
+}
+
+impl std::fmt::Display for EnsureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EnsureError::Store { message, .. } => f.write_str(message),
+        }
+    }
+}
+
+impl From<EnsureError> for String {
+    fn from(e: EnsureError) -> Self {
+        e.to_string()
+    }
+}
+
 /// Create `feed` and its deliveries in `store` when missing, and store its
 /// limits.
 pub async fn ensure_in_store(
     store: &dyn FeedStore,
     feed: &Feed,
     tenant_limits: Option<&TenantLimits>,
-) -> Result<(), String> {
+) -> Result<(), EnsureError> {
     let calls = store_calls();
     let tenant = feed
         .tenant()
         .map(TenantId::new)
         .transpose()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| EnsureError::store(&e, None))?;
     store
         .ensure_feed(
             &calls,
@@ -853,13 +897,13 @@ pub async fn ensure_in_store(
             &store_limits(&feed.spec, tenant_limits),
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| EnsureError::store(&e, None))?;
     for d in &feed.spec.deliveries {
         if let Some(r) = feed.delivery(&d.name) {
             store
                 .ensure_delivery(&calls, &r.uid, start_of(d.start))
                 .await
-                .map_err(|e| format!("delivery '{}': {e}", d.name))?;
+                .map_err(|e| EnsureError::store(&e, Some(&format!("delivery '{}'", d.name))))?;
         }
     }
     Ok(())
