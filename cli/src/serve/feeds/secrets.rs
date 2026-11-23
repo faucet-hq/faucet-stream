@@ -9,6 +9,7 @@ use crate::serve::history::feeds::{DeliveryTemplate, FeedSpec};
 use crate::serve::schedules::secrets::{SEALED, is_keep_marker, is_sealed};
 use crate::serve::state::ServerState;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 /// The text a stored signature secret starts with, and the whole text a view
 /// shows in its place; sending it back keeps the stored secret.
@@ -197,6 +198,67 @@ pub fn masked(spec: &FeedSpec) -> FeedSpec {
         }
     }
     out
+}
+
+/// `feed`'s definition as a response shows it: [`masked`], and for a
+/// `--feeds` file feed (whose values are held as written) each template
+/// param its template declares secret as the keep marker and each string
+/// that held a `${…}` reference as that reference's text.
+pub fn masked_feed(feed: &super::Feed) -> FeedSpec {
+    let mut out = masked(&feed.spec);
+    let derived = &feed.derived;
+    for d in &mut out.deliveries {
+        if let (Some(t), Some(secret)) = (d.template.as_mut(), derived.secret_params.get(&d.name)) {
+            crate::serve::schedules::secrets::mask_declared(&mut t.params, secret.as_deref());
+        }
+    }
+    if derived.references.is_empty() {
+        return out;
+    }
+    let Ok(mut value) = serde_json::to_value(&out) else {
+        return out;
+    };
+    let mut at = Vec::new();
+    pointers_of(&value, "", &derived.references, &mut at);
+    for (pointer, text) in at {
+        let mut candidate = value.clone();
+        if let Some(slot) = candidate.pointer_mut(&pointer) {
+            *slot = serde_json::Value::String(text);
+        }
+        if serde_json::from_value::<FeedSpec>(candidate.clone()).is_ok() {
+            value = candidate;
+        }
+    }
+    serde_json::from_value(value).unwrap_or(out)
+}
+
+/// The JSON pointers of the strings in `v` that are a resolved reference,
+/// with the reference's text.
+fn pointers_of(
+    v: &serde_json::Value,
+    at: &str,
+    references: &BTreeMap<String, String>,
+    out: &mut Vec<(String, String)>,
+) {
+    let escape = |k: &str| k.replace('~', "~0").replace('/', "~1");
+    match v {
+        serde_json::Value::String(s) => {
+            if let Some(text) = references.get(s) {
+                out.push((at.to_string(), text.clone()));
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                pointers_of(item, &format!("{at}/{i}"), references, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (k, item) in map {
+                pointers_of(item, &format!("{at}/{}", escape(k)), references, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Seal a delivery's values for the params `secret` names, in place. A keep

@@ -289,7 +289,7 @@ pub fn view(
     undelivered: Option<u64>,
     statuses: &std::collections::BTreeMap<String, DeliveryStatus>,
 ) -> FeedView {
-    let masked = secrets::masked(&feed.spec);
+    let masked = secrets::masked_feed(feed);
     let deliveries = masked
         .deliveries
         .iter()

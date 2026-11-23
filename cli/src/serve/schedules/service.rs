@@ -313,6 +313,21 @@ fn status_for(st: &ScheduleStatus, t: &str) -> ScheduleStatus {
     st.for_tenant(t)
 }
 
+/// A `--schedules` file schedule holds its params as written: show the ones
+/// its template declares secret as the keep marker (every one when the
+/// template cannot be read). A stored schedule's are sealed already.
+async fn shown_found(state: &ServerState, f: &Found) -> Found {
+    let mut out = f.clone();
+    if f.source == Source::File && !out.spec.template.params.is_empty() {
+        let t = &f.spec.template;
+        let secret = secrets::declared_secret_params(state, &t.id, t.version.as_deref())
+            .await
+            .ok();
+        secrets::mask_declared(&mut out.spec.template.params, secret.as_deref());
+    }
+    out
+}
+
 fn view(actor: &AuthContext, f: &Found, st: &ScheduleStatus, now: DateTime<Utc>) -> ScheduleView {
     let scoped;
     let st = match outsider(actor, f) {
@@ -465,7 +480,7 @@ pub async fn list(
         .collect()
         .await;
     for (f, st) in shown.iter().zip(&statuses) {
-        out.push(view(actor, f, st, now));
+        out.push(view(actor, &shown_found(state, f).await, st, now));
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     let max_schedules = match &scope {
@@ -714,7 +729,7 @@ pub async fn get(
     };
     let (resolved_version, template_kind) = resolved_target(state, &f.spec).await;
     Ok(Detail {
-        schedule: view(actor, &f, &raw, now),
+        schedule: view(actor, &shown_found(state, &f).await, &raw, now),
         next_ticks,
         recent_ticks: ticks(runs, &labels, &st, scope.as_deref()),
         runs_total,

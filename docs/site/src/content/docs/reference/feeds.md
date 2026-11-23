@@ -129,7 +129,7 @@ retried by its sender.
 |---|---|---|---|
 | `id` | string | required | Template id. |
 | `version` | number or channel | `stable` | A version number pins it; a channel is resolved at each run. |
-| `params` | map | `{}` | Values for the template's `params:`. Secret params are sealed with the vault key and read back as a marker. |
+| `params` | map | `{}` | Values for the template's `params:`. In an API feed, secret params are sealed with the vault key and read back as a marker. In a `--feeds` file they stay in the file (not sealed): a param the template declares secret is shown as the same marker (every param, when the template cannot be read) and its value is scrubbed from the logs, and any string of the file's feed that held a `${…}` reference is shown as the reference (`${env:API_KEY}`), never its value. |
 | `sink`, `sink_version` | string, number or channel | | For a source template: the sink template to compose in. |
 | `overlay`, `overlay_version` | string, number or channel | | A registered deployment overlay. |
 

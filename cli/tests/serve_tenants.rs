@@ -1540,6 +1540,50 @@ fn names(v: &Value) -> Vec<String> {
         .collect()
 }
 
+/// A `--schedules` file holds its params as written: a param the template
+/// declares secret is shown as the keep marker, never its value.
+#[cfg(feature = "schedule")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schedules_file_shows_its_secret_params_masked() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = rows_mock().await;
+    let out = dir.path().join("out.jsonl");
+    let file = dir.path().join("schedules.yaml");
+    std::fs::write(
+        &file,
+        "version: 1\nschedules:\n  - name: from-file\n    cron: \"0 3 * * *\"\n    template: { id: plain-sync, params: { token: file-literal-schedule-token, region: eu } }\n",
+    )
+    .unwrap();
+    let f = file.clone();
+    let api = spawn_tuned(dir.path(), None, &rows.uri(), None, Vec::new(), move |c| {
+        c.schedules.path = Some(f);
+    })
+    .await;
+    let template = plain_template(&rows.uri(), &out).replace(
+        "kind: pipeline\n",
+        "kind: pipeline\nparams:\n  token: { type: string, secret: true, default: none }\n  region: { type: string, default: us }\n",
+    );
+    let (code, reg) = api
+        .post(
+            "admin-tok",
+            "/v1/templates",
+            json!({"config": template, "launch": true}),
+        )
+        .await;
+    assert_eq!(code, 201, "{reg}");
+    let (code, list) = api.get("view-tok", "/v1/schedules").await;
+    assert_eq!(code, 200, "{list}");
+    assert!(
+        !list.to_string().contains("file-literal-schedule-token"),
+        "{list}"
+    );
+    let (code, one) = api.get("view-tok", "/v1/schedules/from-file").await;
+    assert_eq!(code, 200, "{one}");
+    let params = &one["schedule"]["template"]["params"];
+    assert_eq!(params["token"], json!({"$sealed": true}), "{one}");
+    assert_eq!(params["region"], "eu", "{one}");
+}
+
 /// #1044: create, read, edit, pause, resume, run now and delete a schedule
 /// over HTTP; a viewer reads but cannot write; a schedule from the
 /// `--schedules` file is read-only but can be run now.

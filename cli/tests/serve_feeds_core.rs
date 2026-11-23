@@ -1252,6 +1252,74 @@ async fn a_crash_between_submit_and_the_status_write_is_recovered_by_the_claim_l
     assert!(still.cursor == 4 && !still.claimed, "{still:?}");
 }
 
+/// A `--feeds` file holds its delivery params as written: views show a
+/// param its template declares secret as the keep marker and a string that
+/// held a `${…}` reference as the reference, and a file-read value is
+/// scrubbed from the logs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feeds_file_shows_its_secret_and_referenced_params_masked() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    unsafe { std::env::set_var("FEED_TEST_REGION", "region-from-env") };
+    let token_file = root.join("token");
+    std::fs::write(&token_file, "file-held-bearer-value").unwrap();
+    let feeds = root.join("feeds.yaml");
+    std::fs::write(
+        &feeds,
+        format!(
+            "version: 1\nfeeds:\n  - name: orders\n    ingest: {{ auth: {{ tokens: managed }} }}\n    deliveries:\n      - name: lake\n        template:\n          id: secret_lake\n          params:\n            out: \"{}\"\n            api_key: literal-api-key-value\n            region: \"${{env:FEED_TEST_REGION}}\"\n            header: \"Bearer ${{file:{}}}\"\n",
+            root.join("lake.jsonl").display(),
+            token_file.display()
+        ),
+    )
+    .unwrap();
+    let feeds_arg = feeds.display().to_string();
+    let history = format!("sqlite:{}", root.join("history.db").display());
+    let cfg = config(root, &history, &["--feeds", &feeds_arg]);
+    let srv = Srv::over(&cfg).await;
+    srv.state.feeds().stop_scheduling();
+    register_with_secret(&srv.state, "secret_lake", &root.join("state")).await;
+    srv.state.feeds().refresh(&srv.state).await.unwrap();
+
+    let view = service::get(&srv.state, &admin(), None, "orders")
+        .await
+        .unwrap();
+    let params = &view.feed.spec.deliveries[0]
+        .template
+        .as_ref()
+        .unwrap()
+        .params;
+    assert_eq!(params["api_key"], json!({"$sealed": true}));
+    assert_eq!(params["region"], json!("${env:FEED_TEST_REGION}"));
+    assert_eq!(
+        params["header"],
+        json!(format!("Bearer ${{file:{}}}", token_file.display()))
+    );
+    assert_eq!(
+        params["out"],
+        json!(root.join("lake.jsonl").display().to_string())
+    );
+    let shown = serde_json::to_string(&view).unwrap();
+    for value in [
+        "literal-api-key-value",
+        "region-from-env",
+        "file-held-bearer-value",
+    ] {
+        assert!(!shown.contains(value), "{value} in {shown}");
+    }
+    // What the delivery runs with is the resolved value.
+    let snapshot = srv.state.feeds().snapshot();
+    let feed = snapshot.feed(None, "orders").unwrap();
+    let runs_with = &feed.spec.deliveries[0].template.as_ref().unwrap().params;
+    assert_eq!(runs_with["region"], json!("region-from-env"));
+    for value in ["literal-api-key-value", "file-held-bearer-value"] {
+        assert!(
+            !faucet_cli::secrets::registry::redact(&format!("log {value}")).contains(value),
+            "{value} is scrubbed from logs"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_feeds_file_delivers_a_pipeline_file_and_is_read_only() {
     let dir = tempfile::tempdir().unwrap();

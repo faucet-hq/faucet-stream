@@ -73,7 +73,10 @@ vault key (`--vault-key`) and never shown again: responses carry
 stored value. A value is sealed to the schedule's stable id, its tenant and
 its template, so it opens for that schedule only: an edit that changes the
 template is refused with `422` naming the secret params to supply again. A
-server without a vault key refuses a schedule with a secret param.
+server without a vault key refuses a schedule with a secret param. A
+`--schedules` file is the operator's own file and is not sealed, but its
+secret params are shown the same way (`{"$sealed": true}`, every param when
+the template cannot be read) and their values are scrubbed from the logs.
 
 ### At most every 5 minutes
 

@@ -136,6 +136,13 @@ pub struct Derived {
     /// The sealed signature secret does not open with this server's vault
     /// key; the spec's secret is then empty and ingest refuses every request.
     pub signature_unreadable: Option<String>,
+    /// A `--feeds` file feed's strings that held a `${…}` reference: the
+    /// resolved value, and the text views show in its place.
+    pub references: BTreeMap<String, String>,
+    /// A `--feeds` file feed's template params each delivery's template
+    /// declares secret (shown as the keep marker); `None` when the template
+    /// could not be read, so every param is shown as the marker.
+    pub secret_params: BTreeMap<String, Option<Vec<String>>>,
 }
 
 impl Feed {
@@ -744,6 +751,27 @@ impl FeedsRuntime {
                 },
             );
         }
+        let mut derived = Derived {
+            references: self.file.references.get(key).cloned().unwrap_or_default(),
+            ..Derived::default()
+        };
+        for d in &spec.deliveries {
+            let Some(t) = &d.template else {
+                continue;
+            };
+            let secret = crate::serve::schedules::secrets::declared_secret_params(
+                state,
+                &t.id,
+                t.version.as_deref(),
+            )
+            .await
+            .ok();
+            crate::serve::schedules::secrets::mask_declared(
+                &mut t.params.clone(),
+                secret.as_deref(),
+            );
+            derived.secret_params.insert(d.name.clone(), secret);
+        }
         let mut feed = Feed {
             uid,
             spec: spec.clone(),
@@ -752,7 +780,7 @@ impl FeedsRuntime {
             approved: true,
             revision: 0,
             ensured: false,
-            derived: Derived::default(),
+            derived,
         };
         let already = self
             .ensured
