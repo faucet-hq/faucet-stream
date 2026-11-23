@@ -185,6 +185,44 @@ async fn float_and_decimal_change_cells_decode_exactly() {
     assert_eq!(row["big"], json!("123456789012345678901234567890"));
 }
 
+/// A DATE change cell decodes through the shared temporal decoder, as the
+/// query source spells it; a NULL one is `null`.
+#[tokio::test]
+async fn date_change_cells_decode_as_iso_dates() {
+    let server = TdsServer::start().await.unwrap();
+    preflight(&server, 1);
+    server.on(
+        CHANGES,
+        Reply::rows(
+            &[
+                ("__faucet_lsn", TdsType::NVarChar),
+                ("__faucet_seqval", TdsType::NVarChar),
+                ("__$operation", TdsType::Int),
+                ("day", TdsType::Date),
+                ("none", TdsType::Date),
+            ],
+            vec![vec![
+                LSN1.into(),
+                LSN1.into(),
+                TdsValue::Int(2),
+                TdsValue::Date(738_899),
+                TdsValue::Null,
+            ]],
+        ),
+    );
+    let source = MssqlCdcSource::new(cfg(&server, json!({}))).await.unwrap();
+    let records: Vec<Value> = pages(&source)
+        .await
+        .unwrap()
+        .into_iter()
+        .flat_map(|p| p.records)
+        .collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let row = records[0].get("after").unwrap_or(&records[0]);
+    assert_eq!(row["day"], json!("2024-01-15"), "{records:?}");
+    assert_eq!(row["none"], Value::Null);
+}
+
 #[tokio::test]
 async fn a_failed_change_query_replaces_every_connection() {
     let server = TdsServer::start().await.unwrap();
