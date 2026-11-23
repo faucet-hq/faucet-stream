@@ -62,5 +62,8 @@ async fn binary_collation_text_is_text_and_binary_is_base64() {
         .await
         .expect("source");
     let err = dup.fetch_all().await.expect_err("a column would vanish");
-    assert!(err.to_string().contains("two columns named \"raw\""), "{err}");
+    assert!(
+        err.to_string().contains("two columns named \"raw\""),
+        "{err}"
+    );
 }
