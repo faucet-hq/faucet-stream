@@ -7,7 +7,7 @@
 //! lineage transports).
 //!
 //! Everything here is pure data + validation. Dispatch lives in
-//! [`crate::notify::dispatch`]; rendering in [`crate::notify::render`].
+//! [`mod@crate::notify::dispatch`]; rendering in [`crate::notify::render`].
 
 use crate::error::{CliError, CliResult};
 use schemars::JsonSchema;

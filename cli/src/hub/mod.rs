@@ -618,7 +618,7 @@ pub(crate) fn untrusted_use(doc: &Value) -> Option<String> {
 }
 
 /// What in a community template's document reads the machine it runs on:
-/// [`untrusted_use`], then the resources its connectors, state and DLQ name
+/// `untrusted_use`, then the resources its connectors, state and DLQ name
 /// (local paths, local or private network addresses, `file:` URLs, programs,
 /// listeners, settings that turn off verification) and connectors that
 /// authenticate with this machine's own identity

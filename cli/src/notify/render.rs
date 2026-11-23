@@ -1,7 +1,7 @@
 //! Pure per-channel payload rendering (#280).
 //!
 //! Each function turns a [`NotifyEvent`] into the JSON body a channel expects.
-//! No I/O, no secrets — the caller ([`crate::notify::dispatch`]) owns the HTTP
+//! No I/O, no secrets — the caller ([`mod@crate::notify::dispatch`]) owns the HTTP
 //! client and injects credentials as headers / URL. Kept pure so the rendering
 //! is fully unit-testable.
 

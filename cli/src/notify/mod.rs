@@ -18,7 +18,7 @@
 //! - [`event`] — the channel-agnostic [`NotifyEvent`] + its constructors.
 //! - [`render`] — pure per-channel payload rendering.
 //! - [`channels`] — the one-request-each HTTP shims.
-//! - [`dispatch`] — the [`Notifier`]: match → coalesce → deliver → resolve.
+//! - [`mod@dispatch`] — the [`Notifier`]: match → coalesce → deliver → resolve.
 //! - [`metrics`] — the `faucet_notifications_*` surface.
 //!
 //! Channel secrets (Slack webhook URL, PD routing key, webhook HMAC secret)

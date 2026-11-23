@@ -3,7 +3,7 @@
 //! Thin I/O shims: take a rendered JSON body + the channel config, POST it, and
 //! map the HTTP outcome to `Result<(), String>` (the `Err` string is logged,
 //! never surfaced to the pipeline). All retry / timeout / dedupe policy lives in
-//! [`crate::notify::dispatch`]; these functions do exactly one request each.
+//! [`mod@crate::notify::dispatch`]; these functions do exactly one request each.
 
 use super::render::{self, PdAction};
 use super::spec::{PagerdutyConfig, SlackConfig, WebhookConfig};

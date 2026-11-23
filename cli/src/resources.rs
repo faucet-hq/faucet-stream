@@ -174,7 +174,7 @@ pub fn author_values(value: &str, params: Option<&Value>) -> Vec<String> {
 }
 
 /// The first resource in `doc` (a hub template or pipeline config) that a
-/// community template may not name, as `"<what> in `<where>`"`.
+/// community template may not name, as ``"<what> in `<where>`"``.
 pub fn community_resource_use(doc: &Value) -> Option<String> {
     let params = doc.get("params");
     let mut found = None;
