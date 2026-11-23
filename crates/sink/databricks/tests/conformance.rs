@@ -73,6 +73,15 @@ fn conformance_connector_name_nonempty() {
 }
 
 #[test]
+fn columns_match_case_insensitively_as_the_warehouse_does() {
+    let sink = DatabricksSink::new(config("https://x")).unwrap();
+    assert_eq!(
+        sink.column_matching(),
+        faucet_core::ColumnMatching::CaseInsensitive
+    );
+}
+
+#[test]
 fn conformance_batch_atomicity_declared() {
     let sink = DatabricksSink::new(config("https://x")).unwrap();
     assert_eq!(
