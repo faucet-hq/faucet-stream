@@ -10,7 +10,36 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
-pub use faucet_core::ColumnMatching;
+/// How a record field is compared with a table column name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ColumnMatching {
+    /// A field names a column only when spelled exactly the same
+    /// (PostgreSQL's quoted identifiers).
+    Exact,
+    /// The exactly-named field first, else the first field equal to the
+    /// column ignoring ASCII case (MySQL, SQLite).
+    CaseInsensitive,
+    /// A field with no exactly-named column folds to the one column equal to
+    /// it ignoring ASCII case, unless the record already carries that column
+    /// exactly or several columns match it (SQL Server's default collation).
+    FoldUnique,
+    /// The exactly-named field first, else the field whose upper-case form
+    /// names an all-upper-case column (Oracle stores unquoted identifiers
+    /// upper-cased).
+    UpperFold,
+}
+
+impl From<ColumnMatching> for faucet_core::ColumnMatching {
+    fn from(m: ColumnMatching) -> Self {
+        match m {
+            ColumnMatching::Exact => Self::Exact,
+            ColumnMatching::CaseInsensitive => Self::CaseInsensitive,
+            ColumnMatching::FoldUnique => Self::FoldUnique,
+            ColumnMatching::UpperFold => Self::UpperFold,
+        }
+    }
+}
 
 /// The column `field` addresses among `columns` under `matching`, looked up
 /// from the field's side ([`faucet_core::column_for_field`]).
@@ -19,7 +48,7 @@ pub fn column_for_field<'a>(
     columns: &'a [String],
     matching: ColumnMatching,
 ) -> Option<&'a str> {
-    faucet_core::column_for_field(field, columns, matching)
+    faucet_core::column_for_field(field, columns, matching.into())
 }
 
 /// One live column of a target table.
