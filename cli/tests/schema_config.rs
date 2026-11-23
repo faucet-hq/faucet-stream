@@ -136,34 +136,23 @@ fn committed_schema_covers_current_build() {
     let current = config_schema();
     let committed: Value = serde_json::from_str(include_str!("../../schemas/faucet.schema.json"))
         .expect("committed schema parses");
-    if let Err(path) = is_subset(&current, &committed, String::new()) {
-        // A bare JSON pointer costs a debugging round-trip when the divergence
-        // is inside an order-insensitive `oneOf` (the index is the *current*
-        // build's, which need not match the committed order). Print the node
-        // itself so the offending connector is named.
-        let node = path
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .try_fold(&current, |v: &Value, seg| match v {
-                Value::Object(m) => m.get(seg),
-                Value::Array(a) => seg.parse::<usize>().ok().and_then(|i| a.get(i)),
-                _ => None,
-            })
-            .map(|v| {
-                v.get("title")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| {
-                        let mut s = v.to_string();
-                        s.truncate(400);
-                        s
-                    })
-            })
-            .unwrap_or_else(|| "<node not found>".to_string());
-        eprintln!("divergent node at {path}: {node}");
+    let mut stale = Vec::new();
+    divergences(&current, &committed, String::new(), &mut stale);
+    if !stale.is_empty() {
+        // Every stale node in one run, each printed whole: a bare JSON
+        // pointer inside an order-insensitive `oneOf` names the *current*
+        // build's index, so the node itself says which connector it is.
+        for path in &stale {
+            let node = node_at(&current, path).map_or_else(
+                || "<node not found>".to_string(),
+                |v| serde_json::to_string(v).expect("serialize"),
+            );
+            eprintln!("divergent node at {path}: {node}");
+        }
         panic!(
-            "schemas/faucet.schema.json is stale at `{path}` — regenerate with \
-             `cargo run --all-features -- schema config > schemas/faucet.schema.json`"
+            "schemas/faucet.schema.json is stale at {} node(s): {stale:?} — regenerate with \
+             `cargo test -p faucet-cli --all-features --test schema_config -- --ignored regenerate`",
+            stale.len()
         );
     }
 }
@@ -178,49 +167,58 @@ fn committed_schema_has_nothing_the_full_build_dropped() {
     let current = config_schema();
     let committed: Value = serde_json::from_str(include_str!("../../schemas/faucet.schema.json"))
         .expect("committed schema parses");
-    if let Err(path) = is_subset(&committed, &current, String::new()) {
-        panic!(
-            "schemas/faucet.schema.json still carries `{path}`, which the full build no longer \
-             emits — regenerate with \
-             `cargo run --all-features -- schema config > schemas/faucet.schema.json`"
-        );
-    }
+    let mut dropped = Vec::new();
+    divergences(&committed, &current, String::new(), &mut dropped);
+    assert!(
+        dropped.is_empty(),
+        "schemas/faucet.schema.json still carries {dropped:?}, which the full build no longer \
+         emits — regenerate with \
+         `cargo test -p faucet-cli --all-features --test schema_config -- --ignored regenerate`"
+    );
 }
 
-/// Every node in `sub` must be present (deep-equal) in `sup`. Returns the JSON
-/// pointer of the first divergence on failure.
-fn is_subset(sub: &Value, sup: &Value, path: String) -> Result<(), String> {
+fn node_at<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .try_fold(root, |v: &Value, seg| match v {
+            Value::Object(m) => m.get(seg),
+            Value::Array(a) => seg.parse::<usize>().ok().and_then(|i| a.get(i)),
+            _ => None,
+        })
+}
+
+/// Every node in `sub` must be present (deep-equal) in `sup`. Collects the
+/// JSON pointer of every divergence.
+fn divergences(sub: &Value, sup: &Value, path: String, out: &mut Vec<String>) {
     match (sub, sup) {
         (Value::Object(a), Value::Object(b)) => {
             for (k, va) in a {
                 match b.get(k) {
-                    Some(vb) => is_subset(va, vb, format!("{path}/{k}"))?,
-                    None => return Err(format!("{path}/{k}")),
+                    Some(vb) => divergences(va, vb, format!("{path}/{k}"), out),
+                    None => out.push(format!("{path}/{k}")),
                 }
             }
-            Ok(())
         }
         (Value::Array(a), Value::Array(b)) => {
             // Order-insensitive containment: every element of `sub` must be a
-            // *subset* of some element of `sup` (handles connector `oneOf`).
-            //
-            // Subset, not deep equality — that was the bug this comment used
-            // to describe wrongly. The test's whole premise is that a smaller
-            // feature set than the one the file was generated under still
-            // passes, but an equality check fails the moment the committed
-            // node carries one extra feature-gated field (e.g. BigQuery's
-            // arrow-only `bulk_load`), which is exactly the situation the
-            // subset check exists for.
+            // *subset* of some element of `sup` (handles connector `oneOf`),
+            // so a smaller feature set than the one the file was generated
+            // under (fewer feature-gated fields) still passes.
             for (i, va) in a.iter().enumerate() {
-                if !b.iter().any(|vb| is_subset(va, vb, String::new()).is_ok()) {
-                    return Err(format!("{path}/{i}"));
+                if !b.iter().any(|vb| is_subset(va, vb)) {
+                    out.push(format!("{path}/{i}"));
                 }
             }
-            Ok(())
         }
-        _ if sub == sup => Ok(()),
-        _ => Err(path),
+        _ if sub == sup => {}
+        _ => out.push(path),
     }
+}
+
+fn is_subset(sub: &Value, sup: &Value) -> bool {
+    let mut out = Vec::new();
+    divergences(sub, sup, String::new(), &mut out);
+    out.is_empty()
 }
 
 /// Regenerate `schemas/faucet.schema.json` from **this test binary's** view of
