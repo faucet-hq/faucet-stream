@@ -37,6 +37,113 @@ async fn mount(
     Mock::given(m).respond_with(t).mount(server).await;
 }
 
+/// Serves the writer's lock side files under `.commits/` from memory, so a
+/// test can refuse the calls it is about while the lock still works.
+#[derive(Clone, Default)]
+struct SideFiles(std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>);
+
+impl SideFiles {
+    fn object(r: &Request) -> Option<String> {
+        let path = r.url.path();
+        let (_, name) = path.split_once(&format!("/b/{BUCKET}/o/"))?;
+        Some(name.replace("%2F", "/").replace("%2f", "/"))
+    }
+
+    fn matches(r: &Request) -> bool {
+        let named = |n: Option<String>| n.is_some_and(|n| n.contains(".commits/"));
+        named(Self::object(r)) || named(query(r, "name")) || named(query(r, "prefix"))
+    }
+
+    async fn mount(server: &MockServer) {
+        Mock::given(Self::matches)
+            .respond_with(Self::default())
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+
+    fn media(r: &Request) -> Vec<u8> {
+        let boundary = r
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split("boundary=").nth(1))
+            .map(|b| b.trim_matches('"').to_owned());
+        let Some(boundary) = boundary else {
+            return r.body.clone();
+        };
+        let body = String::from_utf8_lossy(&r.body).into_owned();
+        let part = body
+            .split(&format!("--{boundary}"))
+            .nth(2)
+            .unwrap_or_default();
+        let content = part.split_once("\r\n\r\n").map_or("", |(_, c)| c);
+        content
+            .strip_suffix("\r\n")
+            .unwrap_or(content)
+            .as_bytes()
+            .to_vec()
+    }
+
+    fn metadata(name: &str, size: usize) -> Value {
+        json!({"bucket": BUCKET, "name": name, "generation": "1",
+               "metageneration": "1", "size": size.to_string()})
+    }
+}
+
+impl wiremock::Respond for SideFiles {
+    fn respond(&self, r: &Request) -> ResponseTemplate {
+        let mut files = self.0.lock().unwrap();
+        let not_found = || {
+            ResponseTemplate::new(404)
+                .set_body_json(json!({"error": {"code": 404, "message": "not found"}}))
+        };
+        match (r.method.as_str(), Self::object(r), query(r, "name")) {
+            ("POST", _, Some(name)) => {
+                if query(r, "ifGenerationMatch").as_deref() == Some("0")
+                    && files.contains_key(&name)
+                {
+                    return ResponseTemplate::new(412).set_body_json(
+                        json!({"error": {"code": 412, "message": "Precondition Failed"}}),
+                    );
+                }
+                let media = Self::media(r);
+                let size = media.len();
+                files.insert(name.clone(), media);
+                ResponseTemplate::new(200).set_body_json(Self::metadata(&name, size))
+            }
+            ("GET", None, _) => {
+                let prefix = query(r, "prefix").unwrap_or_default();
+                let items: Vec<Value> = files
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(&prefix))
+                    .map(|(k, v)| Self::metadata(k, v.len()))
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(json!({"items": items}))
+            }
+            ("GET", Some(name), _) => match files.get(&name) {
+                None => not_found(),
+                Some(body) if query(r, "alt").as_deref() == Some("media") => {
+                    ResponseTemplate::new(200)
+                        .insert_header("x-goog-generation", "1")
+                        .insert_header("x-goog-metageneration", "1")
+                        .insert_header("x-goog-stored-content-length", body.len().to_string())
+                        .insert_header("x-goog-storage-class", "STANDARD")
+                        .set_body_raw(body.clone(), "text/plain")
+                }
+                Some(body) => {
+                    ResponseTemplate::new(200).set_body_json(Self::metadata(&name, body.len()))
+                }
+            },
+            ("DELETE", Some(name), _) => {
+                files.remove(&name);
+                ResponseTemplate::new(204)
+            }
+            _ => ResponseTemplate::new(400),
+        }
+    }
+}
+
 async fn sink(server: &MockServer, fields: Value) -> GcsSink {
     let base = GcsSinkConfig::new(BUCKET)
         .auth(GcsCredentials::Anonymous)
@@ -130,12 +237,10 @@ async fn aborting_an_overwrite_deletes_the_swap_marker() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_rewrite_fails_the_overwrite_commit() {
     let server = MockServer::start().await;
+    SideFiles::mount(&server).await;
     mount(
         &server,
-        |r: &Request| {
-            let path = r.url.path();
-            path.ends_with(".faucet-commit") || path.contains(".commits")
-        },
+        |r: &Request| r.url.path().ends_with(".faucet-commit"),
         ResponseTemplate::new(404),
     )
     .await;
