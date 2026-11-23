@@ -628,3 +628,67 @@ notifications:
         ]
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rows_routed_to_the_dlq_notify_the_threshold() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.csv");
+    std::fs::write(&input, "status\nopen\nlost\nshipped\nlost\n").unwrap();
+    let cfg = format!(
+        r#"version: 1
+name: dlq_notify
+pipeline:
+  source: {{ type: csv, config: {{ path: "{input}" }} }}
+  contract:
+    version: "1"
+    on_breach: quarantine
+    fields:
+      - {{ name: status, type: string, enum: [open, shipped] }}
+  dlq:
+    sink: {{ type: jsonl, config: {{ path: "{dlq}" }} }}
+  sink: {{ type: jsonl, config: {{ path: "{out}" }} }}
+notifications:
+  - name: hook
+    on: [dlq_threshold]
+    dlq_threshold: 2
+    channel:
+      type: webhook
+      config:
+        url: "{hook}/hook"
+"#,
+        input = input.display(),
+        dlq = dir.path().join("dlq.jsonl").display(),
+        out = dir.path().join("out.jsonl").display(),
+        hook = server.uri()
+    );
+    let cfg_path = dir.path().join("p.yaml");
+    std::fs::write(&cfg_path, cfg).unwrap();
+
+    tokio::task::spawn_blocking(move || {
+        Command::cargo_bin("faucet")
+            .unwrap()
+            .args(["run"])
+            .arg(&cfg_path)
+            .assert()
+            .success();
+    })
+    .await
+    .unwrap();
+
+    let events: Vec<Value> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["event"], "dlq_threshold");
+}
