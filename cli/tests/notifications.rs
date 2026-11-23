@@ -546,3 +546,85 @@ async fn a_failed_faucet_run_still_delivers_its_failure_notification() {
     let body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
     assert_eq!(body["event"], "run_failure");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_topology_run_notifies_per_sink_node() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.csv");
+    std::fs::write(&input, "name\nalice\nbob\n").unwrap();
+    let good = dir.path().join("good.jsonl");
+    let blocked = input.join("under-a-file.jsonl");
+    let cfg = format!(
+        r#"version: 1
+name: topo_notify
+pipeline:
+  sources:
+    src: {{ type: csv, config: {{ path: "{input}" }} }}
+  sinks:
+    good: {{ type: jsonl, config: {{ path: "{good}" }} }}
+    bad: {{ type: jsonl, config: {{ path: "{bad}" }} }}
+  nodes:
+    s: {{ kind: source, ref: src }}
+    fan: {{ kind: tee, fanout: 2 }}
+    ok: {{ kind: sink, ref: good }}
+    ko: {{ kind: sink, ref: bad }}
+  edges:
+    - {{ from: s, to: fan }}
+    - {{ from: fan, to: ok }}
+    - {{ from: fan, to: ko }}
+notifications:
+  - name: hook
+    on: [run_success, run_failure]
+    channel:
+      type: webhook
+      config:
+        url: "{hook}/hook"
+"#,
+        input = input.display(),
+        good = good.display(),
+        bad = blocked.display(),
+        hook = server.uri()
+    );
+    let cfg_path = dir.path().join("p.yaml");
+    std::fs::write(&cfg_path, cfg).unwrap();
+
+    tokio::task::spawn_blocking(move || {
+        Command::cargo_bin("faucet")
+            .unwrap()
+            .args(["run"])
+            .arg(&cfg_path)
+            .assert()
+            .failure();
+    })
+    .await
+    .unwrap();
+
+    let mut got: Vec<(String, String)> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let b: Value = serde_json::from_slice(&r.body).unwrap();
+            (
+                b["event"].as_str().unwrap_or_default().to_owned(),
+                b["row"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            ("run_failure".to_owned(), "ko".to_owned()),
+            ("run_success".to_owned(), "ok".to_owned())
+        ]
+    );
+}
