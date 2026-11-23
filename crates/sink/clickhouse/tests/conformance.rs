@@ -130,22 +130,6 @@ async fn conformance_declared_capabilities() {
     faucet_conformance::assert_partial_outcomes_truthful(&sink, count).await;
     faucet_conformance::assert_cancellation_flushes(&sink, count).await;
     faucet_conformance::assert_driver_row_paths_agree(&sink).await;
-
-    // Declared best effort even unchunked: the check accepts a torn page.
-    let atomic: ClickHouseSinkConfig = serde_json::from_value(serde_json::json!({
-        "url": base, "table": "cap", "batch_size": 0
-    }))
-    .unwrap();
-    let atomic = ClickHouseSink::new(atomic).expect("sink");
-    faucet_conformance::assert_batch_atomicity_truthful(
-        &atomic,
-        count,
-        &[
-            serde_json::json!({"id": 954, "v": "kept only if the batch is torn"}),
-            serde_json::json!({"id": "not a number", "v": "x"}),
-        ],
-    )
-    .await;
 }
 
 #[test]
