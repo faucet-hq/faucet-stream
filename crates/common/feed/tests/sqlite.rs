@@ -476,3 +476,17 @@ async fn the_stored_format_is_frozen() {
         serde_json::json!(faucet_common_feed::SCHEMA_VERSION)
     );
 }
+
+#[tokio::test]
+async fn a_store_that_keeps_no_identity_or_byte_totals_reports_none() {
+    let store = faucet_common_feed::StalledStore::new();
+    assert_eq!(store.store_id(), None);
+    let tenant = faucet_common_feed::TenantId::new("t-none".to_string()).expect("a tenant id");
+    assert_eq!(
+        store
+            .tenant_bytes(&faucet_core::io::CallContext::new(), &tenant)
+            .await
+            .unwrap(),
+        None
+    );
+}
