@@ -33,6 +33,16 @@ fn yaml(server: &MockServer, sink: &str) -> String {
     )
 }
 
+/// The entries of `dir` without the writer's lock side files (`.commits`)
+/// and live writers' scratch directories.
+fn visible(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| !n.ends_with(".commits") && !n.contains(".scratch-"))
+        .collect()
+}
+
 #[tokio::test]
 async fn rest_into_a_dated_directory() {
     let dir = tempfile::tempdir().unwrap();
@@ -70,19 +80,15 @@ async fn overwrite_replaces_the_previous_part_set() {
     faucet_cli::run_from_yaml_str(&yaml(&big, &sink))
         .await
         .unwrap();
-    assert_eq!(
-        std::fs::read_dir(dir.path().join("snap")).unwrap().count(),
-        3
-    );
+    assert_eq!(visible(&dir.path().join("snap")).len(), 3);
     let small = api(1).await;
     faucet_cli::run_from_yaml_str(&yaml(&small, &sink))
         .await
         .unwrap();
-    let names: Vec<String> = std::fs::read_dir(dir.path().join("snap"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .collect();
-    assert_eq!(names, vec!["rows-00001.jsonl".to_string()]);
+    assert_eq!(
+        visible(&dir.path().join("snap")),
+        vec!["rows-00001.jsonl".to_string()]
+    );
 }
 
 /// Each overwrite run stages in its own swap directory: a run leaves a
@@ -111,10 +117,7 @@ async fn an_overwrite_run_leaves_a_concurrent_runs_swap_area_alone() {
         .await
         .unwrap();
     assert_eq!(summary.failure_count(), 0);
-    let mut names: Vec<String> = std::fs::read_dir(&snap)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .collect();
+    let mut names = visible(&snap);
     names.sort();
     assert_eq!(names, vec![live.clone(), "rows.jsonl".to_string()]);
     let back = faucet_source_file::read_records(snap.join("rows.jsonl").to_string_lossy())

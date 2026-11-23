@@ -66,6 +66,74 @@ async fn mount(
     Mock::given(m).respond_with(t).mount(server).await;
 }
 
+/// Serves the writer's lock side files under `.commits/` from memory, so a
+/// test can refuse the calls it is about while the lock still works.
+#[derive(Clone, Default)]
+struct SideFiles(std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>);
+
+impl SideFiles {
+    fn key(r: &Request) -> String {
+        r.url
+            .path()
+            .trim_start_matches('/')
+            .trim_start_matches(BUCKET)
+            .trim_start_matches('/')
+            .to_owned()
+    }
+
+    fn matches(r: &Request) -> bool {
+        Self::key(r).contains(".commits/")
+            || query(r, "prefix").is_some_and(|p| p.contains(".commits/"))
+    }
+
+    async fn mount(server: &MockServer) -> Self {
+        let files = Self::default();
+        Mock::given(Self::matches)
+            .respond_with(files.clone())
+            .with_priority(1)
+            .mount(server)
+            .await;
+        files
+    }
+}
+
+impl wiremock::Respond for SideFiles {
+    fn respond(&self, r: &Request) -> ResponseTemplate {
+        let mut files = self.0.lock().unwrap();
+        let key = Self::key(r);
+        match r.method.as_str() {
+            "GET" if query(r, "prefix").is_some() => {
+                let prefix = query(r, "prefix").unwrap();
+                let keys: Vec<String> = files
+                    .keys()
+                    .filter(|k| k.starts_with(&prefix))
+                    .cloned()
+                    .collect();
+                listing(&keys)
+            }
+            "PUT" if r.headers.contains_key("if-none-match") && files.contains_key(&key) => {
+                ResponseTemplate::new(412)
+            }
+            "PUT" => {
+                files.insert(key, r.body.clone());
+                ResponseTemplate::new(200).insert_header("etag", "\"e\"")
+            }
+            "GET" | "HEAD" => match files.get(&key) {
+                Some(body) => ResponseTemplate::new(200).set_body_bytes(body.clone()),
+                None => ResponseTemplate::new(404).set_body_string(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                     <Error><Code>NoSuchKey</Code><Message>none</Message></Error>",
+                ),
+            },
+            "DELETE" => {
+                files.remove(&key);
+                ResponseTemplate::new(204)
+            }
+            _ => ResponseTemplate::new(400),
+        }
+    }
+}
+
 async fn sink(server: &MockServer, fields: Value) -> S3Sink {
     set_test_env();
     let mut cfg = json!({
@@ -247,6 +315,7 @@ async fn a_refused_delete_fails_the_overwrite_abort() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_copy_fails_the_overwrite_commit() {
     let server = MockServer::start().await;
+    SideFiles::mount(&server).await;
     mount(
         &server,
         |r: &Request| r.method.as_str() == "HEAD" && r.url.path().ends_with(".faucet-commit"),
