@@ -541,6 +541,13 @@ impl FileWriter {
             IfExists::Append | IfExists::Error => self.backend.exists(area, &name).await?,
         };
         if exists && self.settings.if_exists == IfExists::Error {
+            if let Err(e) = self
+                .backend
+                .delete_side_file(&format!("{CLAIM_PREFIX}{name}"))
+                .await
+            {
+                tracing::warn!(error = %e, "file sink: could not drop the claim of a refused file; a later run prunes it");
+            }
             return Err(FaucetError::Sink(format!(
                 "file sink: '{}' already exists and `if_exists` is `error`",
                 self.backend.describe(area, &name)

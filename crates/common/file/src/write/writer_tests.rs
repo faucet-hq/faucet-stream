@@ -2141,6 +2141,15 @@ async fn error_mode_claims_the_name_before_writing() {
     let c = remote(&mem, Some("e.jsonl"), s, 1);
     let e = c.write_rows(&rows(1)).await.unwrap_err().to_string();
     assert!(e.contains("already exists"), "{e}");
+    let claims: Vec<String> = mem
+        .keys()
+        .into_iter()
+        .filter(|k| k.contains(".commits/claim-"))
+        .collect();
+    assert!(
+        claims.is_empty(),
+        "a refused run drops its claim: {claims:?}"
+    );
 }
 
 /// A claim left by a run that died long ago does not block the name.
