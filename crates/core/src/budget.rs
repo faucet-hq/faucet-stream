@@ -1790,10 +1790,10 @@ mod tests {
                 .with_ledger(Arc::new(NoBytes)),
         );
         assert!(format!("{state:?}").contains("ledger: true"));
-        match state.reserve(&spec, 1, 10).await {
-            Err(ReserveError::Over(v)) => assert_eq!(v.kind, BudgetKind::Bytes),
-            _ => panic!("expected a bytes verdict"),
-        }
+        assert!(matches!(
+            state.reserve(&spec, 1, 10).await,
+            Err(ReserveError::Over(v)) if v.kind == BudgetKind::Bytes
+        ));
         assert!(matches!(
             state.reserve(&spec, 1, 1).await,
             Err(ReserveError::Over(_))
@@ -1833,6 +1833,7 @@ mod tests {
         assert!(e.to_string().contains("not now"), "{e}");
         assert_eq!(state.records(), 0);
         assert_eq!(sink.bytes_for(1, 4, 100), 25);
+        assert_eq!(RefusesPages.write_batch(&page(2)).await.unwrap(), 2);
         assert_eq!(sink.bytes_for(4, 4, 100), 100);
     }
 }

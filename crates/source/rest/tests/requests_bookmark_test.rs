@@ -177,3 +177,20 @@ async fn the_buffered_read_keeps_a_bookmark_per_entry() {
     assert_eq!(records.len(), 4);
     assert_eq!(bookmark, Some(json!({"requests": {EU: 100, US: 50}})));
 }
+
+/// A parent context with one `requests:` entry merges into that entry.
+#[tokio::test]
+async fn a_parent_context_merges_into_a_single_entry() {
+    let server = two_entry_feed().await;
+    let config = RestStreamConfig::new(&server.uri(), "/items/{region}")
+        .records_path("$.data[*]")
+        .pagination(PaginationStyle::None)
+        .add_partition(HashMap::from([("region".to_string(), json!("eu"))]));
+    let ctx: HashMap<String, Value> = HashMap::from([("parent".to_string(), json!(1))]);
+    let (records, _) = RestStream::new(config)
+        .unwrap()
+        .fetch_with_context_incremental(&ctx)
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 2);
+}

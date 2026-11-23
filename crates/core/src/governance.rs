@@ -1071,8 +1071,8 @@ impl Sink for DlqProofSink {
 mod tests {
     use super::*;
 
-    #[test]
-    fn finish_passes_the_result_through_without_a_budget() {
+    #[tokio::test]
+    async fn finish_passes_the_result_through_without_a_budget() {
         struct Accepts;
         #[async_trait::async_trait]
         impl Sink for Accepts {
@@ -1083,6 +1083,7 @@ mod tests {
         let sink = Governance::default()
             .sink_builder()
             .build(Box::new(Accepts));
+        assert_eq!(sink.write_batch(&[json!({"a": 1})]).await.unwrap(), 1);
         assert_eq!(sink.finish(Ok::<_, FaucetError>(7)).unwrap(), 7);
     }
     use crate::traits::Source;
