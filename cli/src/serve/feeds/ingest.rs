@@ -1601,6 +1601,24 @@ pub fn listener_router(state: ServerState, settings: &FeedSettings, listen: Sock
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_reserved_key_is_found_only_at_the_top_of_an_event() {
+        let key = RESERVED_KEY;
+        let body = format!(
+            r#"[1, -2, 1.5, true, null, "x", [{{"{key}": 1}}], {{"a": {{"{key}": 1}}}}, {{"{key}": 0}}]"#
+        );
+        assert_eq!(parses(body.as_bytes(), true), Ok(Some(8)));
+        for scalar in ["1", "-2", "1.5", "true", "null", "\"x\""] {
+            assert_eq!(parses(scalar.as_bytes(), true), Ok(None), "{scalar}");
+            assert_eq!(parses(scalar.as_bytes(), false), Ok(None), "{scalar}");
+        }
+        let one = format!(r#"{{"{key}": 1}}"#);
+        assert_eq!(parses(one.as_bytes(), true), Ok(Some(0)));
+        assert_eq!(parses(one.as_bytes(), false), Ok(Some(0)));
+        assert_eq!(parses(b"[1, 2]", false), Ok(None));
+        assert!(parses(b"[1,", true).is_err());
+    }
+
     fn gz(plain: &[u8]) -> Vec<u8> {
         use std::io::Write;
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
