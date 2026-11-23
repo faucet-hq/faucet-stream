@@ -434,6 +434,18 @@ fn undecided(connector: &str) -> FaucetError {
 /// The per-row copy of a whole-request failure (see
 /// [`RowOutcomes::fail_undecided`]).
 fn copy_cause(connector: &str, cause: &FaucetError) -> FaucetError {
+    row_failure(cause, |other| {
+        FaucetError::Sink(format!("{connector} publish: {other}"))
+    })
+}
+
+/// The error each row of a request that failed as a whole gets: a
+/// cancellation or timeout keeps its type (so retry and DLQ routing treat
+/// the row as the request was treated); any other error becomes `other(e)`.
+pub fn row_failure(
+    cause: &FaucetError,
+    other: impl FnOnce(&FaucetError) -> FaucetError,
+) -> FaucetError {
     match cause {
         FaucetError::Cancelled { operation } => FaucetError::Cancelled {
             operation: operation.clone(),
@@ -442,7 +454,7 @@ fn copy_cause(connector: &str, cause: &FaucetError) -> FaucetError {
             operation: operation.clone(),
             after: *after,
         },
-        other => FaucetError::Sink(format!("{connector} publish: {other}")),
+        e => other(e),
     }
 }
 

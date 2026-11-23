@@ -900,8 +900,8 @@ pub struct Stmts {
     /// Request cancellation of an in-flight run owned by another instance.
     pub request_cancel: String,
     pub cancel_pending_shards: String,
-    /// Cancel the pending shards of every `sharded` run whose cancel was
-    /// requested. Param: finished_at.
+    /// Cancel the pending shards of every running or `sharded` run whose
+    /// cancel was requested. Param: finished_at.
     pub cancel_flagged_pending_shards: String,
     /// Start a claimed run, owner-fenced. Params: body, lease, run_id, owner.
     pub start_owned: String,
@@ -1813,7 +1813,7 @@ impl Stmts {
                 SET status = 'cancelled', finished_at = $1 \
                 WHERE status = 'pending' AND run_id IN \
                 (SELECT run_id FROM faucet_serve_runs \
-                WHERE status = 'sharded' AND cancel_requested IS NOT NULL)"
+                WHERE status IN ('running', 'sharded') AND cancel_requested IS NOT NULL)"
                 .into(),
             start_owned: "UPDATE faucet_serve_runs SET body = $1, lease_expires_at = $2 \
                 WHERE run_id = $3 AND owner = $4 AND status = 'running'"
@@ -2539,7 +2539,7 @@ impl Stmts {
                 SET status = 'cancelled', finished_at = ? \
                 WHERE status = 'pending' AND run_id IN \
                 (SELECT run_id FROM faucet_serve_runs \
-                WHERE status = 'sharded' AND cancel_requested IS NOT NULL)"
+                WHERE status IN ('running', 'sharded') AND cancel_requested IS NOT NULL)"
                 .into(),
             start_owned: "UPDATE faucet_serve_runs SET body = ?, lease_expires_at = ? \
                 WHERE run_id = ? AND owner = ? AND status = 'running'"

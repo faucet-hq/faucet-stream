@@ -305,3 +305,37 @@ async fn a_cluster_refuses_a_sharded_run_that_sharding_would_break() {
     assert_eq!(status, 422, "{body}");
     assert!(body.to_string().contains("`shard:`"), "{body}");
 }
+
+#[tokio::test]
+async fn a_flagged_run_that_never_became_sharded_cancels_its_pending_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}", dir.path().join("h.db").display());
+    let history = SqliteHistory::connect(
+        &url,
+        Duration::from_secs(3600),
+        Duration::from_secs(3600),
+        "me".into(),
+    )
+    .await
+    .unwrap();
+    let mut run = RunRecord::queued(
+        "half".into(),
+        None,
+        Default::default(),
+        None,
+        chrono::Utc::now(),
+    );
+    run.status = RunStatus::Running;
+    history.upsert(&run).await.unwrap();
+    let shards: Vec<ShardInsert> = (0..2)
+        .map(|i| ShardInsert {
+            shard_id: i.to_string(),
+            descriptor: serde_json::json!({ "i": i }),
+            size_estimate: None,
+        })
+        .collect();
+    history.request_cancel("half").await.unwrap();
+    history.insert_shards("half", &shards).await.unwrap();
+    assert_eq!(history.cancel_flagged_shards().await.unwrap(), 2);
+    assert_eq!(history.cancel_flagged_shards().await.unwrap(), 0);
+}

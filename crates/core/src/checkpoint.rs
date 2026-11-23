@@ -143,19 +143,15 @@ impl<'a, Si: Sink + ?Sized> Checkpointer<'a, Si> {
         if self.hold == Hold::None {
             self.retried("flush", || self.sink.flush()).await?;
         }
-        let _dlq_flush_timer = match self.dlq {
-            Some(dlq) => {
-                let timer = crate::observability::DurationGuard::new(
-                    "faucet_sink_dlq_flush_duration_seconds",
-                    self.dlq_labels.clone(),
-                );
-                self.retried("flush", || dlq.flush())
-                    .await
-                    .map_err(|e| self.dlq_flush_error(e))?;
-                Some(timer)
-            }
-            None => None,
-        };
+        if let Some(dlq) = self.dlq {
+            let _timer = crate::observability::DurationGuard::new(
+                "faucet_sink_dlq_flush_duration_seconds",
+                self.dlq_labels.clone(),
+            );
+            self.retried("flush", || dlq.flush())
+                .await
+                .map_err(|e| self.dlq_flush_error(e))?;
+        }
         if self.hold == Hold::None {
             if let Some((store, key)) = self.state {
                 let value = match stored {
