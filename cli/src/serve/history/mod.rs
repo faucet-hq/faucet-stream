@@ -3246,6 +3246,23 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_bare_backend_keeps_no_budgets_pins_or_settings() {
+        let b = Bare;
+        assert_eq!(b.cancel_flagged_shards().await.unwrap(), 0);
+        assert!(b.budget_grant("r", (1, 1), (Some(5), None)).await.is_err());
+        b.budget_give_back("r", 1, 1).await.unwrap();
+        assert_eq!(b.budget_spent("r").await.unwrap(), None);
+        assert!(b.meta_delete("k").await.is_err());
+        b.set_file_pins(Vec::new());
+        assert!(b.file_pins().is_empty());
+        assert!(
+            b.template_launch_expecting("t", 1, None, None, None)
+                .await
+                .is_err()
+        );
+    }
+
     /// `Bare`, but its change list fails and template deletes are counted.
     struct UnreadableChanges(std::sync::atomic::AtomicUsize);
 

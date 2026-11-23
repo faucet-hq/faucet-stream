@@ -558,6 +558,16 @@ pub fn legacy_scope_key(scope: &str, max: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn an_unreadable_page_token_is_behind() {
+        use super::*;
+        let stored = format_token(3);
+        assert!(matches!(
+            check_watermark(Some(&stored), "not-a-token"),
+            WatermarkCheck::Behind
+        ));
+    }
+
+    #[test]
     fn resume_bookmark_peels_only_the_exactly_once_wrapper() {
         use super::resume_bookmark;
         use serde_json::json;

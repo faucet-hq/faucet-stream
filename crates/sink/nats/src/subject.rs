@@ -99,6 +99,12 @@ pub(crate) fn check_record_subject(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_wildcard_needs_a_token_to_match() {
+        assert!(!subject_matches("orders.*", "orders"));
+        assert!(subject_matches("orders.*", "orders.eu"));
+    }
+
     fn list(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
     }

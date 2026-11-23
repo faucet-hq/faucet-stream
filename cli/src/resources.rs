@@ -384,5 +384,27 @@ mod tests {
         assert!(r(ResourceKind::Command, "tap").is_some());
         assert!(r(ResourceKind::Listen, "0.0.0.0:80").is_some());
         assert!(r(ResourceKind::Key, "dir/file").is_none());
+        assert!(r(ResourceKind::Unverified, "true").is_some());
+        assert!(r(ResourceKind::HostCredentials, "default").is_some());
+    }
+
+    #[cfg(feature = "sink-s3")]
+    #[test]
+    fn host_credentials_are_found_through_template_references() {
+        let direct = json!({"sink": {"type": "s3", "config": {"bucket": "b"}}});
+        let found = community_resource_use(&direct).unwrap();
+        assert!(found.contains("own credentials"), "{found}");
+        let by_ref = json!({
+            "pipeline": {"sinks": {"t": {"type": "s3", "config": {"bucket": "b"}}}},
+            "matrix": [{"id": "r", "sink": {"ref": "t", "config": {"bucket": "c"}}}]
+        });
+        assert!(community_resource_use(&by_ref).is_some());
+        let by_default = json!({
+            "pipeline": {"sink": {"type": "s3", "config": {"bucket": "b"}}},
+            "matrix": [{"id": "r", "sink": {"config": {"bucket": "c"}}}]
+        });
+        assert!(community_resource_use(&by_default).is_some());
+        let unnamed = json!({"pipeline": {"nodes": {"n": {"config": {"bucket": "c"}}}}});
+        assert!(community_resource_use(&unnamed).is_none());
     }
 }

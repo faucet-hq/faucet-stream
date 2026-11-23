@@ -582,6 +582,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn side_file_failures_name_what_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend(dir.path(), true);
+        assert!(b.scratch_dir().starts_with(dir.path()));
+        let side = dir.path().join(template().commit_ledger_dir_name());
+        let e = b.create_side_file("missing/x", "t").await.unwrap_err();
+        assert!(e.to_string().contains("creating"), "{e}");
+        std::fs::create_dir_all(side.join("taken").join("inner")).unwrap();
+        let e = b.write_side_file("taken", "t").await.unwrap_err();
+        assert!(e.to_string().contains("writing"), "{e}");
+        let e = b.read_side_file("taken").await.unwrap_err();
+        assert!(e.to_string().contains("reading"), "{e}");
+        let e = b.delete_side_file("taken").await.unwrap_err();
+        assert!(e.to_string().contains("removing"), "{e}");
+        b.delete_side_file("absent").await.unwrap();
+        std::fs::remove_dir_all(&side).unwrap();
+        std::fs::write(&side, b"").unwrap();
+        let e = b.list_side_files("lock-").await.unwrap_err();
+        assert!(e.to_string().contains("listing"), "{e}");
+    }
+
+    #[tokio::test]
     async fn lists_files_only_and_tolerates_a_missing_directory() {
         let dir = tempfile::tempdir().unwrap();
         let b = backend(dir.path(), false);

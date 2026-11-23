@@ -526,16 +526,7 @@ fn merge_chunk(
 /// The error each entry of a request that failed as a whole gets: a timeout
 /// or cancel keeps its type, anything else its text.
 fn request_failure(e: &FaucetError) -> FaucetError {
-    match e {
-        FaucetError::Cancelled { operation } => FaucetError::Cancelled {
-            operation: operation.clone(),
-        },
-        FaucetError::Timeout { operation, after } => FaucetError::Timeout {
-            operation: operation.clone(),
-            after: *after,
-        },
-        other => FaucetError::Sink(other.to_string()),
-    }
+    faucet_core::driver::row_failure(e, |other| FaucetError::Sink(other.to_string()))
 }
 
 #[faucet_core::async_trait]

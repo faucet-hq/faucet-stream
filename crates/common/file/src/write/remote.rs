@@ -1441,6 +1441,25 @@ pub(crate) mod tests {
         p.rename("a", "b").await.unwrap();
         assert_eq!(p.0.text("b"), "x");
         assert!(!p.exists("a").await.unwrap());
+        assert!(!p.supports_create_new());
+        let e = p.create_new("c", b"x").await.unwrap_err();
+        assert!(
+            e.to_string().contains("cannot be created only when absent"),
+            "{e}"
+        );
+    }
+
+    #[tokio::test]
+    async fn side_file_reads_and_writes_report_their_failures() {
+        let mem = Arc::new(Mem::default());
+        let b = RemoteBackend::new(mem.clone(), "a/", &template("x"), None).unwrap();
+        let key = format!("a/{}/bad", template("x").commit_ledger_dir_name());
+        mem.objects.lock().unwrap().insert(key, vec![0xff, 0xfe]);
+        let e = b.read_side_file("bad").await.unwrap_err();
+        assert!(e.to_string().contains("reading the side file"), "{e}");
+        std::fs::remove_dir_all(b.scratch.path()).unwrap();
+        let e = b.write_side_file("lock-1", "x").await.unwrap_err();
+        assert!(e.to_string().contains("writing the side file"), "{e}");
     }
 
     #[test]

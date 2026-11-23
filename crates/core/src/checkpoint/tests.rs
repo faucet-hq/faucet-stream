@@ -209,3 +209,58 @@ async fn a_page_retries_a_transient_flush_but_finish_and_unwind_do_not() {
     ck.unwind(FaucetError::Source("o".into())).await;
     assert_eq!(events(&log), ["sink flush"]);
 }
+
+/// A state store whose writes take a while.
+struct SlowPut(MemoryStateStore);
+
+#[async_trait]
+impl StateStore for SlowPut {
+    async fn get(&self, key: &str) -> Result<Option<Value>, FaucetError> {
+        self.0.get(key).await
+    }
+    #[allow(clippy::disallowed_methods)] // a slow backend write
+    async fn put(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        self.0.put(key, value).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), FaucetError> {
+        self.0.delete(key).await
+    }
+}
+
+#[test]
+fn the_dlq_flush_timer_does_not_count_the_state_write() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let (_, sink, dlq, _) = fixture();
+    let store = SlowPut(MemoryStateStore::new());
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    metrics::with_local_recorder(&recorder, || {
+        rt.block_on(async {
+            let cp = Checkpointer::new(
+                &sink,
+                Some(&dlq),
+                Some((&store, "k")),
+                Hold::None,
+                ("p", "r", "run"),
+            );
+            cp.page(&json!(1), Stored::Bare).await.unwrap();
+        })
+    });
+    let seconds: Vec<f64> = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(k, _, _, _)| k.key().name() == "faucet_sink_dlq_flush_duration_seconds")
+        .flat_map(|(_, _, _, v)| match v {
+            DebugValue::Histogram(h) => h.into_iter().map(|x| x.into_inner()).collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+    assert_eq!(seconds.len(), 1, "{seconds:?}");
+    assert!(seconds[0] < 0.25, "{seconds:?}");
+}

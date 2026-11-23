@@ -248,6 +248,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn card_ranges_and_trailing_separators() {
+        let r = range(4, 4, 1, L16_19);
+        assert_eq!((r.lo, r.hi, r.prefix_len, r.lengths.len()), (4, 4, 1, 4));
+        assert!(card_digits("4111 1111 1111 1111").is_some());
+        assert!(card_digits("4111 1111 1111 1111 ").is_none());
+        assert!(card_digits("4111-1111-1111-1111-").is_none());
+    }
+
+    #[test]
     fn only_number_matching_detectors_match_numbers() {
         let numbers = [
             serde_json::json!(4111111111111111u64),

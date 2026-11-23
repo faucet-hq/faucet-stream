@@ -50,6 +50,20 @@ pub fn origin_trust(file: &crate::templates::sync::SyncFile) -> Vec<OriginTrust>
 mod tests {
     use super::*;
 
+    #[cfg(feature = "templates-sync")]
+    #[test]
+    fn origin_trust_reads_each_origin_of_a_sync_file() {
+        let file: crate::templates::sync::SyncFile = crate::yaml::from_str(
+            "version: 1\norigins:\n  - name: hub\n    source:\n      type: github\n      config:\n        repo: faucet-hq/template-hub\n        ref: main\n    prefix: \"\"\n    trust: [acme]\n",
+        )
+        .unwrap();
+        let t = origin_trust(&file);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].name, "hub");
+        assert!(t[0].official_repo);
+        assert_eq!(t[0].trust, ["acme"]);
+    }
+
     #[test]
     fn whose_a_template_is() {
         let origins = [

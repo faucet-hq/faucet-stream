@@ -476,6 +476,62 @@ async fn overwrite_moves_the_swap_area_into_place_and_removes_stale_parts() {
     assert!(e.to_string().contains("missing"), "{e}");
 }
 
+/// A store that cannot create only when absent commits without the lock.
+#[tokio::test]
+async fn an_overwrite_on_a_store_without_conditional_creates_commits_unlocked() {
+    let mem = Arc::new(Mem::default());
+    mem.no_create_new.store(true, SeqCst);
+    let w = overwrite_remote(&mem);
+    w.begin_overwrite().await.unwrap();
+    w.write_rows(&rows(1)).await.unwrap();
+    w.flush().await.unwrap();
+    w.commit_overwrite().await.unwrap();
+    assert_eq!(output_keys(&mem), ["pre/d/part-00001.jsonl"]);
+}
+
+/// A commit that cannot get the lock in time moves nothing.
+#[tokio::test]
+async fn a_commit_that_cannot_get_the_lock_moves_nothing() {
+    let mem = Arc::new(Mem::default());
+    let w = overwrite_remote(&mem);
+    w.begin_overwrite().await.unwrap();
+    w.write_rows(&rows(1)).await.unwrap();
+    w.flush().await.unwrap();
+    let holder = overwrite_remote(&mem);
+    let held = tokio::spawn(async move {
+        let g = holder
+            .lock(Purpose::Commit, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        drop(g);
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let e = w.commit_overwrite().await.unwrap_err().to_string();
+    assert!(e.contains("still committing"), "{e}");
+    held.abort();
+}
+
+/// Discarding a CSV appender releases the output it held.
+#[tokio::test]
+async fn discarding_an_appender_releases_its_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = WriteSettings::new(FileFormat::Csv, Compression::None);
+    s.if_exists = IfExists::Append;
+    let first = local(dir.path(), "d.csv", s.clone());
+    first.write_rows(&[json!({"a": 1})]).await.unwrap();
+    first.discard().await;
+    let path = dir.path().to_path_buf();
+    tokio::spawn(async move {
+        let second = local(&path, "d.csv", s);
+        second.write_rows(&[json!({"a": 2})]).await.unwrap();
+        second.flush().await.unwrap();
+        second.complete().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
 /// #783 C5: a move into place that stopped half-way is finished by the next
 /// run instead of being thrown away with the swap area.
 #[tokio::test]
@@ -2122,6 +2178,33 @@ async fn a_csv_appender_holds_the_output_until_it_is_done() {
     second.await.unwrap();
     let text = std::fs::read_to_string(dir.path().join("t.csv")).unwrap();
     assert_eq!(text, "a\n1\n3\n2\n");
+}
+
+/// A CSV appender that waits longer than the lock wait gives up and writes
+/// nothing.
+#[tokio::test]
+async fn an_appender_that_waits_too_long_gives_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = WriteSettings::new(FileFormat::Csv, Compression::None);
+    s.if_exists = IfExists::Append;
+    let first = local(dir.path(), "busy.csv", s.clone());
+    first.write_rows(&[json!({"a": 1})]).await.unwrap();
+    let path = dir.path().to_path_buf();
+    let e = tokio::spawn(async move {
+        let second = local(&path, "busy.csv", s);
+        second
+            .write_rows(&[json!({"a": 2})])
+            .await
+            .unwrap_err()
+            .to_string()
+    })
+    .await
+    .unwrap();
+    assert!(
+        e.contains("another run held") && e.contains("nothing was written"),
+        "{e}"
+    );
+    first.complete().await.unwrap();
 }
 
 /// Of two `if_exists: error` runs that both find a name absent, only one

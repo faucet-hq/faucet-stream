@@ -876,16 +876,16 @@ impl RestDriver {
     async fn fetch_entries(
         &self,
         context: &HashMap<String, Value>,
-    ) -> Result<Vec<(String, Vec<Value>)>, FaucetError> {
+    ) -> Result<Vec<(String, Vec<Value>, Option<Value>)>, FaucetError> {
         let mut out = Vec::with_capacity(self.config.partitions.len());
         for partition in &self.config.partitions {
             let mut merged = context.clone();
             merged.extend(partition.iter().map(|(k, v)| (k.clone(), v.clone())));
             let id = crate::requests_bookmark::entry_id(partition);
-            let records = self
-                .fetch_partition(Some(&merged), None, Some(id.clone()))
+            let (records, bookmark) = self
+                .fetch_partition_bookmarked(Some(&merged), None, Some(id.clone()))
                 .await?;
-            out.push((id, records));
+            out.push((id, records, bookmark));
         }
         Ok(out)
     }
@@ -2016,7 +2016,21 @@ impl RestDriver {
         max_records: Option<usize>,
         entry: Option<String>,
     ) -> Result<Vec<Value>, FaucetError> {
+        self.fetch_partition_bookmarked(context, max_records, entry)
+            .await
+            .map(|(records, _)| records)
+    }
+
+    /// [`fetch_partition`](Self::fetch_partition) with the pass bookmark the
+    /// streaming read would store.
+    async fn fetch_partition_bookmarked(
+        &self,
+        context: Option<&HashMap<String, Value>>,
+        max_records: Option<usize>,
+        entry: Option<String>,
+    ) -> Result<(Vec<Value>, Option<Value>), FaucetError> {
         let mut all_records = Vec::new();
+        let mut bookmark = None;
         let mut pages_fetched = 0usize;
         let mut pages =
             self.stream_pages_inner(context, None, faucet_core::DEFAULT_BATCH_SIZE, entry);
@@ -2031,6 +2045,9 @@ impl RestDriver {
             match page {
                 Some(Ok(page)) => {
                     pages_fetched += 1;
+                    if page.bookmark.is_some() {
+                        bookmark = page.bookmark;
+                    }
                     let records = page.records;
                     match max_records {
                         Some(limit) => {
@@ -2054,7 +2071,7 @@ impl RestDriver {
             pages = pages_fetched,
             "fetch complete"
         );
-        Ok(all_records)
+        Ok((all_records, bookmark))
     }
 
     /// Execute a request, transparently refreshing an inline OAuth2 /
@@ -3492,8 +3509,8 @@ impl SourceDriver for RestDriver {
             let mut ids = Vec::with_capacity(entries.len());
             let mut last = Vec::with_capacity(entries.len());
             let mut records = Vec::new();
-            for (id, rows) in entries {
-                last.push(self.page_replication_max(&rows, false));
+            for (id, rows, bookmark) in entries {
+                last.push(bookmark);
                 ids.push(id);
                 records.extend(rows);
             }
@@ -4020,7 +4037,7 @@ impl RestDriver {
         } else {
             // Both parent context and partitions — merge context into each partition
             let mut all_records = Vec::new();
-            for (_, records) in self.fetch_entries(context).await? {
+            for (_, records, _) in self.fetch_entries(context).await? {
                 all_records.extend(records);
             }
             Ok(all_records)

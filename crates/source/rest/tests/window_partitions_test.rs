@@ -207,3 +207,35 @@ async fn each_entry_keeps_its_own_numeric_string_bookmark() {
     values.sort_unstable();
     assert_eq!(values, vec!["10", "9"]);
 }
+
+/// The buffered read of several windowed `requests:` entries stores the same
+/// per-entry window ends the streaming read does.
+#[tokio::test]
+async fn the_buffered_and_streaming_reads_keep_the_same_window_ends() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/p/\d+$"))
+        .respond_with(EchoWindow)
+        .mount(&server)
+        .await;
+    let mut cfg = RestStreamConfig::new(&server.uri(), "/p/{n}")
+        .records_path("$.data[*]")
+        .replication_method(ReplicationMethod::Incremental)
+        .replication_key("updated_at")
+        .start_replication_value(json!("2024-01-01"))
+        .window(window());
+    cfg.partitions = (0..2)
+        .map(|n| HashMap::from([("n".to_string(), json!(n))]))
+        .collect();
+    let build = || {
+        RestStream::new(cfg.clone())
+            .unwrap()
+            .with_now_override_rfc3339("2024-01-04T00:00:00Z")
+    };
+    let (_, streamed) = drain(&build()).await;
+    let ctx: HashMap<String, Value> = HashMap::new();
+    let (records, buffered) = build().fetch_with_context_incremental(&ctx).await.unwrap();
+    assert_eq!(records.len(), 6);
+    assert!(streamed.is_some());
+    assert_eq!(buffered, streamed);
+}

@@ -2349,6 +2349,22 @@ fn version_results(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn settings_are_deleted_and_budgets_of_purged_runs_dropped() {
+        use super::MemoryHistory;
+        use crate::serve::history::RunHistory;
+        use std::time::Duration;
+        let h = MemoryHistory::new(Duration::from_secs(60));
+        h.meta_put("k", "v").await.unwrap();
+        h.meta_delete("k").await.unwrap();
+        assert_eq!(h.meta_get("k").await.unwrap(), None);
+        h.budget_grant("gone", (1, 0), (Some(5), None))
+            .await
+            .unwrap();
+        h.purge_expired(Duration::from_secs(60)).await.unwrap();
+        assert_eq!(h.budget_spent("gone").await.unwrap(), None);
+    }
+
     /// Pruning keeps every version something names by number: a stored
     /// schedule (its own template and the sink it pairs with), a pending or
     /// approved (deferred) launch, schedule and feed change, and the server's

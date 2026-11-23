@@ -636,6 +636,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check28_passes_trivially_for_an_exact_sink() {
+        let sink = TestSink::new();
+        assert_drift_resolves_like_writes(&sink, "existing", "EXISTING", |_| {
+            std::future::ready(None)
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn check15_passes_for_an_honest_per_row_sink() {
         let sink = PartialOutcomeSink::honest();
         assert_partial_outcomes_truthful(&sink, counter(&sink, PartialOutcomeSink::len)).await;

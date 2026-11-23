@@ -92,13 +92,14 @@ fn dispatch_with(
         (tx, state.tail.replace(rx))
     };
     let notifier = Arc::clone(notifier);
+    let release = Finish(lane);
     let task = async move {
+        let _release = release;
         if let Some(prev) = prev {
             let _ = prev.await;
         }
         deliver(&notifier, events, deadline).await;
         drop(done);
-        finish(&lane);
     };
     tokio::spawn(faucet_core::http::inherit_reference_policy(task).in_current_span());
     true
@@ -122,6 +123,16 @@ async fn deliver(notifier: &Notifier, events: Vec<NotifyEvent>, deadline: Durati
             );
             return;
         }
+    }
+}
+
+/// Releases a batch's lane and queue slot when its task ends, panics or is
+/// dropped.
+struct Finish(Lane);
+
+impl Drop for Finish {
+    fn drop(&mut self) {
+        finish(&self.0);
     }
 }
 
@@ -288,6 +299,62 @@ mod tests {
         ));
         assert_eq!(flush(Duration::from_secs(10)).await, 0);
         assert!(server.received_requests().await.unwrap().len() <= 1);
+    }
+
+    fn lane_is_free(l: &Lane) -> bool {
+        !QUEUE
+            .lanes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(l)
+    }
+
+    #[tokio::test]
+    async fn a_batch_task_that_panics_frees_its_lane() {
+        let l = lane("panics");
+        QUEUE
+            .lanes
+            .lock()
+            .unwrap()
+            .entry(l.clone())
+            .or_default()
+            .queued += 1;
+        QUEUE.pending.fetch_add(1, Ordering::SeqCst);
+        let release = Finish(l.clone());
+        let joined = tokio::spawn(async move {
+            let _release = release;
+            panic!("delivery failed");
+        })
+        .await;
+        assert!(joined.is_err());
+        assert!(lane_is_free(&l));
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // lets the batch task start before the runtime goes
+    fn a_batch_dropped_with_its_runtime_frees_its_lane() {
+        let host = tokio::runtime::Runtime::new().unwrap();
+        let (server, notifier) = host.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+                .mount(&server)
+                .await;
+            let notifier = webhook_notifier(&server).await;
+            (server, notifier)
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            assert!(dispatch(&notifier, lane("dropped"), events("dropped", 1)));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+        assert!(!lane_is_free(&lane("dropped")));
+        drop(rt);
+        assert!(lane_is_free(&lane("dropped")));
+        host.block_on(async move { drop(server) });
     }
 
     #[tokio::test]

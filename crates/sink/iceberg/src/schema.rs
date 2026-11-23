@@ -403,6 +403,13 @@ mod tests {
     }
 
     #[test]
+    fn json_to_record_batch_names_a_value_the_column_cannot_hold() {
+        let schema = infer_arrow_schema(&[json!({"n": 1})], 10).unwrap();
+        let e = json_to_record_batch(&[json!({"n": 1.5})], &schema).unwrap_err();
+        assert!(e.to_string().contains("iceberg: "), "{e}");
+    }
+
+    #[test]
     fn json_to_record_batch_single_record() {
         let records = vec![json!({"x": 42})];
         let schema = infer_arrow_schema(&records, 10).unwrap();

@@ -305,3 +305,143 @@ async fn a_cluster_refuses_a_sharded_run_that_sharding_would_break() {
     assert_eq!(status, 422, "{body}");
     assert!(body.to_string().contains("`shard:`"), "{body}");
 }
+
+#[tokio::test]
+async fn a_flagged_run_that_never_became_sharded_cancels_its_pending_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("sqlite:{}", dir.path().join("h.db").display());
+    let history = SqliteHistory::connect(
+        &url,
+        Duration::from_secs(3600),
+        Duration::from_secs(3600),
+        "me".into(),
+    )
+    .await
+    .unwrap();
+    let mut run = RunRecord::queued(
+        "half".into(),
+        None,
+        Default::default(),
+        None,
+        chrono::Utc::now(),
+    );
+    run.status = RunStatus::Running;
+    history.upsert(&run).await.unwrap();
+    let shards: Vec<ShardInsert> = (0..2)
+        .map(|i| ShardInsert {
+            shard_id: i.to_string(),
+            descriptor: serde_json::json!({ "i": i }),
+            size_estimate: None,
+        })
+        .collect();
+    history.request_cancel("half").await.unwrap();
+    history.insert_shards("half", &shards).await.unwrap();
+    assert_eq!(history.cancel_flagged_shards().await.unwrap(), 2);
+    assert_eq!(history.cancel_flagged_shards().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn a_budgeted_sharded_run_draws_on_one_run_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("src.db");
+    {
+        use sqlx::Connection as _;
+        let mut conn =
+            sqlx::SqliteConnection::connect(&format!("sqlite:{}?mode=rwc", db.display()))
+                .await
+                .unwrap();
+        sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        for i in 1..=20 {
+            sqlx::query("INSERT INTO t VALUES (?, 'x')")
+                .bind(i)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+    }
+    let out_db = dir.path().join("out.db");
+    let url = format!("sqlite:{}", dir.path().join("h.db").display());
+    let port = free_port();
+    let mut config = faucet_cli::serve::ServeConfig::from_args(args(port, url)).unwrap();
+    config.log_level = "warn".into();
+    tokio::spawn(async move {
+        let _ = faucet_cli::serve::run_server(config, Default::default()).await;
+    });
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    for _ in 0..1200 {
+        if client
+            .get(format!("{base}/healthz"))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let yaml = format!(
+        "version: 1\nname: sharded\nshard: {{ count: 2 }}\nbudget: {{ max_records: 1000 }}\npipeline:\n  \
+         source: {{ type: sqlite, config: {{ database_url: \"sqlite:{}\", query: \"SELECT id, v FROM t\", shard: {{ key: id }} }} }}\n  \
+         sink: {{ type: sqlite, config: {{ database_url: \"sqlite:{}?mode=rwc\", table_name: out, create_table: true, column_mapping: auto_map }} }}\n",
+        db.display(),
+        out_db.display(),
+    );
+    let resp: serde_json::Value = client
+        .post(format!("{base}/v1/runs"))
+        .json(&serde_json::json!({ "config": yaml }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = resp["run_id"].as_str().expect("run id").to_string();
+    let mut status = serde_json::Value::Null;
+    for _ in 0..400 {
+        let body: serde_json::Value = client
+            .get(format!("{base}/v1/runs/{id}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        status = body["status"].clone();
+        if matches!(status.as_str(), Some("completed" | "failed" | "cancelled")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(status, "completed");
+    let history = SqliteHistory::connect(
+        &format!("sqlite:{}", dir.path().join("h.db").display()),
+        Duration::from_secs(3600),
+        Duration::from_secs(3600),
+        "reader".into(),
+    )
+    .await
+    .unwrap();
+    let (records, _) = history
+        .budget_spent(&id)
+        .await
+        .unwrap()
+        .expect("a run ledger");
+    assert_eq!(records, 20, "the shards drew 20 records from one ledger");
+    // Both shards ran and the PK ranges partition the table: every id landed
+    // once, none twice, none lost at a range boundary.
+    use sqlx::Connection as _;
+    let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite:{}", out_db.display()))
+        .await
+        .unwrap();
+    let (rows, distinct, lo, hi): (i64, i64, i64, i64) =
+        sqlx::query_as("SELECT count(*), count(DISTINCT id), min(id), max(id) FROM out")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+    assert_eq!((rows, distinct, lo, hi), (20, 20, 1, 20));
+}

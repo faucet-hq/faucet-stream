@@ -829,8 +829,7 @@ async fn run_expanded_unredacted(
     let mut completed: HashSet<String> = HashSet::new();
     let nodes_by_id: HashMap<String, ExpandedNode> =
         nodes.into_iter().map(|n| (n.id.clone(), n)).collect();
-    // One shared copy per row: every unit of the row (one per parent record or
-    // tuple) points at it instead of holding its own.
+    // One shared node per row, not one copy per unit.
     let shared_nodes: HashMap<String, Arc<ExpandedNode>> = nodes_by_id
         .iter()
         .map(|(id, n)| (id.clone(), Arc::new(n.clone())))
@@ -853,9 +852,7 @@ async fn run_expanded_unredacted(
     };
 
     while !remaining.is_empty() {
-        // An external cancel (serve cancel / timeout / drain, a schedule run
-        // timeout, Ctrl-C in backfill or mirror) starts nothing more: every row
-        // still waiting is reported skipped.
+        // After an external cancel, rows still waiting are reported skipped.
         if cancel.is_cancelled() {
             for id in bfs_order.iter().filter(|id| remaining.contains(*id)) {
                 outcomes.push(synthetic_outcome(
@@ -1286,16 +1283,13 @@ async fn run_expanded_unredacted(
         // attributed to the right invocation.
         let mut task_meta: HashMap<tokio::task::Id, (String, Option<String>)> = HashMap::new();
         let mut not_run: HashSet<String> = HashSet::new();
-        // Units are dispatched in order as permits free up: a task exists only
-        // while it holds a permit, so at most `max_concurrent` invocations (and
-        // their futures) are alive at once however wide the fan-out.
+        // A task exists only while it holds a permit.
         let mut pending: std::collections::VecDeque<Unit> = units.into();
         let mut stop_triggered = false;
         let mut aborted = false;
         let mut stop_deadline: Option<tokio::time::Instant> = None;
         loop {
-            // A stopped or cancelled level starts nothing more: the units still
-            // waiting for a permit are reported skipped.
+            // A stopped level reports its waiting units skipped.
             if level_cancel.is_cancelled() {
                 let why = if cancel.is_cancelled() {
                     CANCELLED_BEFORE_START
@@ -1394,9 +1388,7 @@ async fn run_expanded_unredacted(
                     let overwrite_grouped = overwrite_task_group
                         .get(&meta)
                         .is_some_and(|gi| overwrite_groups[*gi].members > 1);
-                    // A child token per unit: a budget ceiling cancels its own unit
-                    // only, never its siblings, while a level cancel still reaches all
-                    // of them (#789 CLI-54).
+                    // A budget stop cancels this unit only.
                     let unit_cancel = level_cancel.child_token();
                     let dlq_sinks = Arc::clone(&dlq_sinks);
                     let state_stores = Arc::clone(&state_stores);
@@ -1474,8 +1466,7 @@ async fn run_expanded_unredacted(
                     }
                 }
             };
-            // A row that never ran is not a failure: it neither stops the level
-            // nor fails its overwrite group, but its subtree is skipped.
+            // A row that never ran is skipped, not failed.
             if outcome.error_kind == Some(InvocationErrorKind::Skipped) {
                 not_run.insert(outcome.row_id.clone());
                 outcomes.push(outcome);
@@ -2105,8 +2096,7 @@ async fn run_unit(
     suppress_overwrite: bool,
     overwrite_grouped: bool,
 ) -> InvocationOutcome {
-    // An overwrite-group member writes into the group's shared run: its own
-    // copy of the row carries the token in the sink config.
+    // A group member carries the group's overwrite run token.
     let injected;
     let node: &ExpandedNode = match &unit.overwrite_run {
         Some(token) => {
@@ -3512,20 +3502,13 @@ async fn run_one_invocation(
     // original early-return behaviour while still firing the terminal event on
     // both success and error.
     let ran = Box::pin(pipeline.run()).await;
-    // Whether the run's budget stopped this invocation is decided the moment
-    // its pipeline returns: a sibling spending the budget afterwards does not
-    // fail an invocation that already finished.
+    // Decided when the pipeline returns, so a later sibling cannot change it.
     let budget_stopped = budget_handle.as_ref().and_then(|h| h.end());
     let result: Result<faucet_core::PipelineResult, FaucetError> = match ran {
         Ok(r) => sink.flush().await.map(|_| r),
         Err(e) => Err(e),
     };
-    // A duration ceiling cancels cooperatively, so the pipeline returns `Ok`
-    // with a partial result; the verdict turns it into the budget failure
-    // (a records / bytes crossing already surfaced as the write error).
-    // A budget stop cancels cooperatively, so the pipeline returns `Ok` with
-    // a partial result; the handle turns it into the budget failure only for
-    // an invocation the budget actually stopped.
+    // A budget stop returns a partial `Ok`; report it as the budget failure.
     let result = match (&result, budget_stopped) {
         (Ok(_), Some(verdict)) => Err(verdict.error()),
         _ => result,
@@ -3805,8 +3788,7 @@ async fn run_one_invocation(
     // ── Notifications (#280) ─────────────────────────────────────────────────
     // Fan run success/failure, SLA breach, circuit-open, contract-abort, and
     // DLQ-threshold out to the configured channels. Same root/real-run scoping
-    // as SLA. The events are delivered in the background, in order per row:
-    // a slow channel never holds the run, and never fails it.
+    // as SLA, delivered in the background.
     #[cfg(feature = "notify")]
     if let Some(notifier) = &opts.notifier
         && is_notifiable_root
@@ -9021,9 +9003,7 @@ matrix:
 
     #[tokio::test]
     async fn cooperative_cancel_returns_partial_ok() {
-        // A cancel while the invocation runs stops it at the next page
-        // boundary and flushes — returning Ok with a partial (possibly empty)
-        // result rather than erroring.
+        // A cancel mid-run returns a partial Ok.
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in.csv");
         let output = dir.path().join("out.jsonl");

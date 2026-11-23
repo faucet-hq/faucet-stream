@@ -83,7 +83,7 @@ mod source;
 pub use http::{HttpBatching, HttpDriver, HttpSinkDriver};
 pub use message::{
     AckToken, InboundMessage, MessageConsumer, MessageDriver, MessageSinkDriver,
-    MessageSourceDriver, MessageTransactions, OutboundMessage, RowOutcomes,
+    MessageSourceDriver, MessageTransactions, OutboundMessage, RowOutcomes, row_failure,
 };
 #[cfg(feature = "arrow")]
 pub use sink::ColumnarDriver;
