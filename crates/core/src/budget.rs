@@ -1760,4 +1760,79 @@ mod tests {
         assert!(running.finish());
         assert!(!finished.was_stopped());
     }
+
+    /// Grants every record asked for and no bytes; cannot take allowance back.
+    struct NoBytes;
+    #[async_trait]
+    impl BudgetLedger for NoBytes {
+        async fn grant(&self, records: u64, _: u64) -> Result<BudgetGrant, FaucetError> {
+            Ok(BudgetGrant {
+                records,
+                bytes: 0,
+                total_records: records,
+                total_bytes: 0,
+            })
+        }
+        async fn give_back(&self, _: u64, _: u64) -> Result<(), FaucetError> {
+            Err(FaucetError::State("ledger gone".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ledger_short_on_bytes_stops_the_run_on_bytes() {
+        let spec = BudgetSpec {
+            max_records: Some(100),
+            max_bytes: Some(1000),
+            ..Default::default()
+        };
+        let state = Arc::new(
+            BudgetState::for_run(&spec, std::time::SystemTime::now())
+                .with_ledger(Arc::new(NoBytes)),
+        );
+        assert!(format!("{state:?}").contains("ledger: true"));
+        match state.reserve(&spec, 1, 10).await {
+            Err(ReserveError::Over(v)) => assert_eq!(v.kind, BudgetKind::Bytes),
+            _ => panic!("expected a bytes verdict"),
+        }
+        assert!(matches!(
+            state.reserve(&spec, 1, 1).await,
+            Err(ReserveError::Over(_))
+        ));
+        state.close().await;
+        state.close().await;
+        let handle = BudgetHandle::new(Arc::clone(&state), Arc::new(BudgetStop::default()));
+        assert!(Arc::ptr_eq(handle.state(), &state));
+        assert!(Unreachable.give_back(1, 1).await.is_ok());
+        let _timer = BudgetTimer::start_for(None, Arc::clone(&state), CancellationToken::new());
+    }
+
+    struct RefusesPages;
+    #[async_trait]
+    impl Sink for RefusesPages {
+        async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+            Ok(records.len())
+        }
+        async fn admit_page(&self, _: &[Value]) -> Result<(), FaucetError> {
+            Err(FaucetError::Sink("not now".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_page_the_destination_refuses_releases_its_reservation() {
+        let state = Arc::new(BudgetState::for_run(
+            &records_spec(5),
+            std::time::SystemTime::now(),
+        ));
+        let sink = BudgetSink::wrap_shared(
+            Box::new(RefusesPages),
+            records_spec(5),
+            Arc::clone(&state),
+            CancellationToken::new(),
+        );
+        let e = sink.admit_page(&page(3)).await.unwrap_err();
+        assert!(e.to_string().contains("not now"), "{e}");
+        assert_eq!(state.records(), 0);
+        assert_eq!(sink.bytes_for(1, 4, 100), 25);
+        assert_eq!(sink.bytes_for(4, 4, 100), 100);
+    }
 }

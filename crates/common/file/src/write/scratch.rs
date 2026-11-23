@@ -95,3 +95,43 @@ fn idle(dir: &Path) -> bool {
     }
     youngest.is_some_and(|a| a > UNOWNED_MAX_AGE)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_locked_pending_owner_file_refuses_a_second_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = std::fs::File::create(dir.path().join(".owner.pending")).unwrap();
+        held.lock().unwrap();
+        let e = lock_owner(dir.path()).unwrap_err();
+        assert!(e.to_string().contains("locked by another process"), "{e}");
+    }
+
+    #[test]
+    fn the_sweep_keeps_the_callers_own_directory_and_live_owners() {
+        let parent = tempfile::tempdir().unwrap();
+        let mine = parent.path().join("w.scratch-mine");
+        let live = parent.path().join("w.scratch-live");
+        let gone = parent.path().join("w.scratch-gone");
+        for d in [&mine, &live, &gone] {
+            std::fs::create_dir(d).unwrap();
+        }
+        std::fs::write(parent.path().join("w.scratch-file"), b"").unwrap();
+        let _live_owner = lock_owner(&live).unwrap().expect("locks are supported");
+        drop(lock_owner(&gone).unwrap());
+        sweep_orphaned(parent.path(), "w.scratch-", Some(&mine));
+        assert!(mine.exists());
+        assert!(live.exists());
+        assert!(!gone.exists());
+        assert!(parent.path().join("w.scratch-file").exists());
+    }
+
+    #[test]
+    fn an_unowned_directory_with_a_fresh_file_is_not_orphaned() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("part.faucet-tmp"), b"x").unwrap();
+        assert!(!is_orphaned(dir.path()));
+    }
+}
