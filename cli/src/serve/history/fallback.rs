@@ -1077,6 +1077,9 @@ impl RunHistory for FallbackHistory {
     async fn meta_put(&self, key: &str, value: &str) -> Result<(), HistoryError> {
         strict!(self, p => p.meta_put(key, value), f => f.meta_put(key, value))
     }
+    async fn meta_delete(&self, key: &str) -> Result<(), HistoryError> {
+        strict!(self, p => p.meta_delete(key), f => f.meta_delete(key))
+    }
     async fn schedule_insert(
         &self,
         schedule: &super::schedules::ScheduleRecord,

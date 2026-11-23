@@ -1284,6 +1284,7 @@ table with permissions, the definition's fields and every ingest status code.
 | `POST /v1/feeds/{name}/deliveries`, `PUT`/`DELETE …/deliveries/{delivery}` | Add, replace and remove one delivery. |
 | `POST …/deliveries/{delivery}/pause`, `/resume`, `/deliver-now` | Stop, restart, or start a run now. |
 | `POST …/deliveries/{delivery}/replay`, `/skip`, `/recover` | Move a delivery's position (admin). |
+| `POST /v1/feeds/{name}/adopt-store` | Start a feed whose events are in another feed store empty in the store it names (admin). |
 | `GET`/`POST /v1/feeds/{name}/tokens`, `DELETE …/tokens/{id}` | Ingest tokens. |
 | `GET /v1/feeds/{name}/events`, `/events/{seq}`, `/refusals` | Browse retained events (a payload needs admin) and recently refused requests. |
 | `POST /v1/feeds/{name}/events`, `POST /v1/tenants/{tenant}/feeds/{name}/events` | **Ingest.** Outside the bearer authentication: a feed token or a signature. `202` once the events are stored. |

@@ -153,6 +153,7 @@ pub fn build_router(
                 "/v1/feeds/{name}/deliveries/{delivery}/recover",
                 post(f::recover),
             )
+            .route("/v1/feeds/{name}/adopt-store", post(f::adopt_store))
             .route(
                 "/v1/feeds/{name}/tokens",
                 get(f::tokens).post(f::token_create),
@@ -1613,6 +1614,9 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
             stores,
         ));
         crate::serve::feeds::service::check_file_deliveries(&state)
+            .await
+            .map_err(CliError::Serve)?;
+        crate::serve::feeds::service::refuse_moved_file_feeds(&state)
             .await
             .map_err(CliError::Serve)?;
         state.feeds().lease_tick(&state).await;

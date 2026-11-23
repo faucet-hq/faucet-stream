@@ -102,7 +102,7 @@ const flabel = (f) => (f.tenant ? `${f.tenant}/${f.name}` : f.name);
 const lagOf = (f) => Math.max(0, ...f.deliveries.map((d) => d.lag || 0));
 const storeDown = (f) => f.watermark == null;
 const sickDelivery = (f) => f.deliveries.find((d) => ["stalled", "held", "failing", "needs_approval"].includes(d.status));
-const needsAttention = (f) => storeDown(f) || ["stalled", "held", "full"].includes(f.status) || !!sickDelivery(f);
+const needsAttention = (f) => storeDown(f) || ["stalled", "held", "full", "store_moved", "secret_unreadable", "over_quota"].includes(f.status) || !!sickDelivery(f);
 const version = (d) => (d.template && d.template.version) || "stable";
 const verLabel = (v) => (/^\d+$/.test(String(v)) ? `pin v${v}` : ["stable", "newest", "previous"].includes(v) ? v : `channel ${v}`);
 const signIn = (spec) => {
@@ -277,10 +277,13 @@ export async function renderFeeds(host, params) {
     let metaHtml;
     let tone = "ok";
     let shape = "";
-    if (storeDown(f)) { metaHtml = html`<b>store unreachable</b> · ${plural(n, "delivery", "deliveries")} holding`; tone = "bad"; }
+    if (f.status === "store_moved") { metaHtml = html`<b>store changed</b> · not receiving · needs adopt-store`; tone = "bad"; }
+    else if (storeDown(f)) { metaHtml = html`<b>store unreachable</b> · ${plural(n, "delivery", "deliveries")} holding`; tone = "bad"; }
+    else if (f.status === "secret_unreadable") { metaHtml = html`<b>secret unreadable</b> · senders get 503`; tone = "bad"; }
     else if (f.status === "held") { metaHtml = html`<b>held</b> · not receiving · needs recovery`; tone = "warn"; }
     else if (f.status === "stalled") { metaHtml = html`<b>delivery stalled</b> · ${sick ? sick.name : ""} · ${fmtInt(lag)} pending`; tone = "bad"; }
     else if (f.status === "full") { metaHtml = html`<b>refusing events</b> · undelivered limit reached`; tone = "bad"; }
+    else if (f.status === "over_quota") { metaHtml = html`<b>refusing events</b> · tenant byte quota reached`; tone = "bad"; }
     else if (sick && sick.status === "failing") { metaHtml = html`<b>delivery failing</b> · ${sick.name} · ${fmtInt(lag)} pending`; tone = "warn"; }
     else if (sick) { metaHtml = html`<b>needs approval</b> · ${sick.name} · ${fmtInt(lag)} pending`; tone = "warn"; }
     else if (f.status === "paused") { const p = f.deliveries.find((d) => d.paused_by); metaHtml = html`<b>delivery paused</b> · ${fmtInt(lag)} pending${p ? ` · by ${p.paused_by}` : ""}`; tone = ""; shape = "hollow"; }
@@ -363,10 +366,13 @@ export async function renderFeeds(host, params) {
     const sick = sickDelivery(f);
     const open = btn("Open", { icon: "right", href: sick ? deliveryHref(f, sick.name) : feedHref(f) });
     const openFeed = btn("Open", { icon: "right", href: feedHref(f) });
+    if (f.status === "store_moved") return alert(`${f.name} names another feed store than the one holding its events.`, "Senders get 503 and nothing is delivered until its store is pointed back or an admin adopts the new store (faucet feed adopt-store), which starts it empty there.", "bad", openFeed);
     if (storeDown(f)) return alert(`${f.name}’s store is not answering.`, "Senders get 503 with a retry time, and its deliveries wait.", "bad", openFeed);
+    if (f.status === "secret_unreadable") return alert(`${f.name}’s signature secret cannot be read on this server.`, "Senders get 503 with a retry time. Start the server with the vault key the feed was made under, or set the secret again.", "bad", openFeed);
     if (f.status === "held") return alert(`${f.name} is held.`, "Its store looks restored from a backup, so receiving and delivering are stopped until an admin recovers it.", "warn", openFeed);
     if (f.status === "stalled") return alert(`${f.name} has not delivered${sick && sick.oldest_undelivered_at ? ` for ${since(sick.oldest_undelivered_at)}` : ""}.`, `Its delivery ${sick ? sick.name : ""} is stalled on one event it cannot deliver. Events are still being stored.`, "bad", open);
     if (f.status === "full") return alert(`${f.name} is refusing new events.`, `It holds as many events that are not delivered yet as it may (${undelivered(f.spec)}), which is its limit.`, "bad", openFeed);
+    if (f.status === "over_quota") return alert(`${f.name} is refusing new events.`, "Its tenant's feeds hold the tenant's whole byte quota in this store, delivered events kept for replay included. Room frees up as retention removes old events.", "bad", openFeed);
     if (sick && sick.status === "failing") return alert(`${f.name}’s delivery ${sick.name} is failing.`, "Its runs fail and are tried again with smaller batches. Nothing is skipped.", "warn", open);
     if (sick) return alert(`${f.name}’s delivery ${sick.name} waits for approval.`, firstLine(sick.last_error), "warn", open);
     return "";
@@ -418,9 +424,11 @@ feeds:
     return html`${test}${btn("Edit", { icon: "edit", perm: "feed_write", data: { act: "edit" } })}${menu("more", [{ label: "Delete feed", icon: "trash", cls: "bad", perm: "feed_admin", data: { act: "delete" } }], { perm: "feed_admin" })}`;
   }
   function feedPill(f) {
+    if (f.status === "store_moved") return pill("Store changed", "bad", "alert");
     if (storeDown(f)) return pill("Store unreachable", "bad", "alert");
+    if (f.status === "secret_unreadable") return pill("Secret unreadable", "bad", "alert");
     if (f.status === "held") return pill("Held", "warn", "alert");
-    if (f.status === "full") return pill("Refusing events", "bad", "alert");
+    if (f.status === "full" || f.status === "over_quota") return pill("Refusing events", "bad", "alert");
     if (f.status === "stalled") return pill("Delivery stalled", "bad", "alert");
     if (f.status === "paused") return pill("Delivery paused", "", "pause");
     if (!f.last_event_at && !f.watermark) return pill("Waiting for the first event", "", "clock");

@@ -80,6 +80,7 @@ impl PostgresOptions {
 #[derive(Debug, Clone)]
 pub struct PostgresFeedStore {
     pool: PgPool,
+    store_id: i64,
 }
 
 impl PostgresFeedStore {
@@ -106,10 +107,13 @@ impl PostgresFeedStore {
             .connect_with(connect)
             .await
             .map_err(|e| backend(Dialect::Postgres, e))?;
-        let store = Self { pool };
-        if let Err(e) = store.migrate().await {
-            store.pool.close().await;
-            return Err(e);
+        let mut store = Self { pool, store_id: 0 };
+        match store.migrate().await {
+            Ok(id) => store.store_id = id,
+            Err(e) => {
+                store.pool.close().await;
+                return Err(e);
+            }
         }
         Ok(store)
     }

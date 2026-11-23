@@ -698,6 +698,20 @@ pub enum FeedCommand {
     /// Put a held delivery back on a valid position after its store was
     /// restored from a backup.
     Recover { name: String, delivery: String },
+    /// Start a feed whose definition now names another feed store than the
+    /// one holding its events empty in the store it names; its events in the
+    /// old store are not delivered. `--all` adopts every such feed (of the
+    /// store `--in` names).
+    AdoptStore {
+        /// The feed (omit with `--all`).
+        name: Option<String>,
+        /// Every feed whose events are in another store.
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
+        /// With `--all`: only feeds naming this store.
+        #[arg(long = "in", value_name = "STORE", requires = "all")]
+        in_store: Option<String>,
+    },
     /// List a feed's retained events (never their payloads), newest first.
     Events {
         name: String,

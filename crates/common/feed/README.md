@@ -50,6 +50,15 @@ faucet-common-feed = { version = "1", features = ["sqlite"] }   # or "postgres"
 - **Retention.** `trim` removes events that are older than the feed's
   `max_age` and below every delivery's cursor, in batches; a feed with no
   delivery is trimmed by age alone. Sequence numbers are never reused.
+- **An identity.** `store_id()` is a random number the store writes once,
+  when its schema is first created (inside the same locked transaction, so
+  two first opens agree), and reads back on every open: a restored backup
+  keeps it, a database recreated empty gets a new one. A caller records it to
+  tell whether a store name now points at another database. The SQL
+  backends have one; the trait default is `None`.
+- **Quota figures.** `tenant_bytes(tenant)` is what every feed of a tenant
+  holds in the store, delivered events kept for replay included: the figure
+  the tenant's stored-bytes quota is checked against.
 
 ## Example
 

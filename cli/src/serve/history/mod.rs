@@ -2525,6 +2525,15 @@ pub trait RunHistory: Send + Sync {
         ))
     }
 
+    /// Remove a server-wide setting; a missing one is not an error.
+    /// Default: unsupported.
+    async fn meta_delete(&self, key: &str) -> Result<(), HistoryError> {
+        let _ = key;
+        Err(HistoryError::Backend(
+            "this run-history backend does not store server settings".into(),
+        ))
+    }
+
     /// Store a server-wide setting. Default: unsupported.
     async fn meta_put(&self, key: &str, value: &str) -> Result<(), HistoryError> {
         let _ = (key, value);

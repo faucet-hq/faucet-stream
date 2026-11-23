@@ -776,3 +776,61 @@ fn feeds_of_the_feeds_file_are_found_with_the_feeds_flag() {
         missing.stderr
     );
 }
+
+/// `faucet feed adopt-store`: a feed whose store name now points to another
+/// database is started empty there, one feed or every such feed at once.
+#[test]
+fn adopt_store_starts_a_moved_feed_empty_in_its_new_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let named = |db: &str| format!("x=sqlite:{}", dir.join(db).display());
+    let spec = dir.join("orders.yaml");
+    std::fs::write(
+        &spec,
+        "name: orders\nstore: x\ningest: { auth: { tokens: managed } }\n",
+    )
+    .unwrap();
+    let spec_arg = spec.display().to_string();
+    passed(feed(
+        dir,
+        &["create", "-f", &spec_arg, "--feed-store", &named("x1.db")],
+    ));
+    let now = named("x2.db");
+    let unmoved = feed(
+        dir,
+        &["adopt-store", "orders", "--feed-store", &named("x1.db")],
+    );
+    assert!(
+        !unmoved.ok && unmoved.stderr.contains("nothing to adopt"),
+        "{}",
+        unmoved.stderr
+    );
+    let one = json_of(feed(
+        dir,
+        &["adopt-store", "orders", "--feed-store", &now, "--json"],
+    ));
+    assert_eq!(one["feed"], "orders");
+    assert_eq!(one["abandoned_store"], "x");
+    assert_ne!(one["store_id"], one["abandoned_store_id"]);
+    let none = passed(feed(dir, &["adopt-store", "--all", "--feed-store", &now]));
+    assert!(none.contains("no feed"), "{none}");
+    let all = json_of(feed(
+        dir,
+        &[
+            "adopt-store",
+            "--all",
+            "--in",
+            "x",
+            "--feed-store",
+            &named("x3.db"),
+            "--json",
+        ],
+    ));
+    assert_eq!(all["adopted"].as_array().unwrap().len(), 1, "{all}");
+    let neither = feed(dir, &["adopt-store", "--feed-store", &now]);
+    assert!(
+        !neither.ok && neither.stderr.contains("--all"),
+        "{}",
+        neither.stderr
+    );
+}

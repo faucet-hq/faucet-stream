@@ -145,6 +145,18 @@ async fn the_sqlite_store_is_not_cluster_safe() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_stores_have_different_identities() {
+    let (one, two) = (SqliteBackend::new(), SqliteBackend::new());
+    let (a, b) = (
+        one.open().await.expect("open"),
+        two.open().await.expect("open"),
+    );
+    let (a, b) = (a.store_id().expect("an id"), b.store_id().expect("an id"));
+    assert_ne!(a, b);
+    assert_eq!(one.open().await.expect("reopen").store_id(), Some(a));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_closed_store_answers_unavailable() {
     use faucet_common_feed::{FeedUid, StoreLimits};
     use faucet_core::io::CallContext;

@@ -142,6 +142,7 @@ const ROUTES_FEEDS: &[(&str, &str)] = &[
     ("POST", "/v1/feeds/{name}/deliveries/{delivery}/replay"),
     ("POST", "/v1/feeds/{name}/deliveries/{delivery}/skip"),
     ("POST", "/v1/feeds/{name}/deliveries/{delivery}/recover"),
+    ("POST", "/v1/feeds/{name}/adopt-store"),
     ("GET", "/v1/feeds/{name}/tokens"),
     ("POST", "/v1/feeds/{name}/tokens"),
     ("DELETE", "/v1/feeds/{name}/tokens/{id}"),

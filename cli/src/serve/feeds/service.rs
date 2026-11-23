@@ -136,8 +136,10 @@ pub struct FeedView {
     /// When the newest retained event was received.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_event_at: Option<DateTime<Utc>>,
-    /// Worst first: `held`, `secret_unreadable` (this server cannot open the
-    /// signature secret, so it refuses senders), `stalled`, `full` (an undelivered limit is
+    /// Worst first: `held`, `store_moved` (its events are in another feed
+    /// store than the one it names: nothing is received or delivered),
+    /// `secret_unreadable` (this server cannot open the signature secret, so
+    /// it refuses senders), `stalled`, `full` (an undelivered limit is
     /// reached), `over_quota` (the tenant's feeds in this store hold its
     /// whole byte quota, delivered events kept for replay included),
     /// `paused` or `receiving`.
@@ -396,9 +398,10 @@ pub async fn find(
                 .map_err(ServeError::Unavailable)?
                 .feed(tenant, name),
         };
-        return snapshot
-            .map(|feed| Found { feed, record: None })
-            .ok_or_else(|| ServeError::Unavailable("the feed is not ready yet; retry".into()));
+        let feed = snapshot
+            .ok_or_else(|| ServeError::Unavailable("the feed is not ready yet; retry".into()))?;
+        check_its_store(state, &feed).await;
+        return Ok(Found { feed, record: None });
     }
     let record = state
         .history()
@@ -408,10 +411,22 @@ pub async fn find(
         .filter(FeedRecord::live)
         .ok_or(ServeError::NotFound)?;
     let feed = feed_of_record(state, &record).map_err(ServeError::Internal)?;
+    check_its_store(state, &feed).await;
     Ok(Found {
         feed: Arc::new(feed),
         record: Some(record),
     })
+}
+
+/// Check, when not done yet, that `feed`'s store holds its rows, so the
+/// store is handed out for it (a failure is the store's to report later).
+async fn check_its_store(state: &ServerState, feed: &Feed) {
+    let rt = state.feeds();
+    if let Ok(store) = rt.stores().get(&feed.spec.store).await
+        && let Err(e) = rt.check_store(state, feed, &*store).await
+    {
+        tracing::debug!(feed = %feed.label(), error = %e, "the feed's store is not handed out");
+    }
 }
 
 fn read_only(found: &Found) -> Result<&FeedRecord, ServeError> {
@@ -615,8 +630,18 @@ async fn views(state: &ServerState, feeds: &[Arc<Feed>]) -> Result<Vec<FeedView>
                 _ => None,
             };
             let mut out = view(&feed, head, undelivered, &statuses(state, &feed).await?);
-            if let Some(why) = &feed.derived.signature_unreadable {
+            if let Some(moved) = state.feeds().moved_of(feed.uid.as_str()) {
                 if out.status != "held" {
+                    out.status = "store_moved".into();
+                }
+                out.warnings.push(format!(
+                    "{moved}; it receives and delivers nothing until its definition names the \
+                     old store again or an admin adopts the new one (adopt-store), which starts it \
+                     empty there"
+                ));
+            }
+            if let Some(why) = &feed.derived.signature_unreadable {
+                if !matches!(out.status.as_str(), "held" | "store_moved") {
                     out.status = "secret_unreadable".into();
                 }
                 out.warnings.push(format!(
@@ -1710,7 +1735,12 @@ async fn commit_create(
     } = built;
     record.approved = approved;
     let feed = Feed { approved, ..feed };
-    let store = state.feeds().store_for(&feed).await.map_err(store_error)?;
+    let store = state
+        .feeds()
+        .stores()
+        .get(&feed.spec.store)
+        .await
+        .map_err(store_error)?;
     let history = state.history();
     if let Some(old) = history
         .feed_get(&record.key())
@@ -1734,10 +1764,15 @@ async fn commit_create(
             record.name()
         )));
     }
-    if let Err(e) = ensure_in_store(&*store, &feed, limits.as_ref()).await {
+    if let Err(e) = state
+        .feeds()
+        .ensure(state, &feed, &*store, limits.as_ref())
+        .await
+    {
         if let Err(undo) = state.history().feed_delete(&record.key()).await {
             tracing::error!(feed = %record.name(), error = %undo, "could not remove a feed whose store rows were not created");
         }
+        let _ = state.feeds().unbind(state, feed.uid.as_str()).await;
         return Err(store_error(e));
     }
     after_change(state).await;
@@ -1897,7 +1932,11 @@ async fn commit_update(
     // The definition is in force from here: a store that is down only
     // delays its rows, which the scheduler creates (the delivery shows
     // `setting_up`). A refusal that waiting will not fix still fails.
-    match ensure_in_store(&*store, &feed, limits.as_ref()).await {
+    match state
+        .feeds()
+        .ensure(state, &feed, &*store, limits.as_ref())
+        .await
+    {
         Ok(()) => {}
         Err(e) if e.is_transient() => {
             tracing::warn!(feed = %feed.label(), error = %e, "the feed is updated; its store rows are created when the store answers");
@@ -2168,7 +2207,9 @@ pub async fn finish_delete(state: &ServerState, record: &FeedRecord) -> Result<(
     let history = state.history();
     rt.stopped(StopAfter::Marked)?;
     let feed = cleanup_feed(state, record)?;
-    let store = rt.store_for(&feed).await?;
+    // The store the feed names, even when its events were left in another:
+    // what the feed has there goes.
+    let store = rt.stores().get(&feed.spec.store).await?;
     for d in &feed.spec.deliveries {
         if let Some(dref) = feed.delivery(&d.name) {
             remove_state(state, &feed, d, dref).await?;
@@ -2205,6 +2246,9 @@ pub async fn finish_delete(state: &ServerState, record: &FeedRecord) -> Result<(
         .feed_remove(record)
         .await
         .map_err(|e| e.to_string())?;
+    if let Err(e) = rt.unbind(state, &record.uid).await {
+        tracing::warn!(feed = %feed.label(), error = %e, "could not forget which store held a deleted feed");
+    }
     let names: Vec<String> = feed.deliveries.keys().cloned().collect();
     metrics::forget_feed(&feed.label(), &names);
     rt.ingest().forget_feed(feed.uid.as_str());
@@ -3141,6 +3185,171 @@ pub async fn recover(
         to: to.get(),
         epoch: epoch.0,
     })
+}
+
+/// Refuse to start while a `--feeds` file feed names another physical store
+/// than the one holding its events: the operator just edited the file, and
+/// running on would accept events into a store none of its old events are
+/// in. An unreachable history or store is checked later, at run time.
+pub async fn refuse_moved_file_feeds(state: &ServerState) -> Result<(), String> {
+    let rt = state.feeds();
+    if rt.file().feeds.is_empty() {
+        return Ok(());
+    }
+    let Ok(snapshot) = rt.refresh(state).await else {
+        return Ok(());
+    };
+    let moved: Vec<String> = snapshot
+        .feeds
+        .iter()
+        .filter(|f| f.source == Source::File)
+        .filter_map(|f| {
+            let m = f.derived.store_moved.as_ref()?;
+            let tenant = f
+                .tenant()
+                .map(|t| format!(" --tenant {t}"))
+                .unwrap_or_default();
+            Some(format!(
+                "feeds: '{}': {m}; point it back to store '{}', or run 'faucet feed adopt-store {}{tenant}' \
+                 (or 'faucet feed adopt-store --all') to start it empty in the new store",
+                f.label(),
+                m.recorded_store,
+                f.name()
+            ))
+        })
+        .collect();
+    if moved.is_empty() {
+        Ok(())
+    } else {
+        Err(moved.join("\n"))
+    }
+}
+
+/// What adopting a new store did for one feed.
+#[derive(Debug, Clone, Serialize)]
+pub struct Adopted {
+    pub feed: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    /// The store now holding the feed, empty.
+    pub store: String,
+    pub store_id: i64,
+    /// The store its events were left in; they are not delivered.
+    pub abandoned_store: String,
+    pub abandoned_store_id: i64,
+}
+
+/// Start `found`'s feed empty in the store its definition names, leaving
+/// its events in the store that held them: its deliveries' run state goes
+/// (their old positions mean nothing in the new store), then the store is
+/// recorded as the feed's and its rows are created at each delivery's start.
+async fn adopt_found(state: &ServerState, found: &Found) -> Result<Adopted, ServeError> {
+    let rt = state.feeds();
+    let feed = &found.feed;
+    let Some(moved) = rt.moved_of(feed.uid.as_str()) else {
+        return Err(ServeError::Conflict(format!(
+            "feed '{}' is in the store its definition names; there is nothing to adopt",
+            feed.label()
+        )));
+    };
+    let store = rt
+        .stores()
+        .get(&feed.spec.store)
+        .await
+        .map_err(store_error)?;
+    for d in &feed.spec.deliveries {
+        if let Some(dref) = feed.delivery(&d.name) {
+            remove_state(state, feed, d, dref)
+                .await
+                .map_err(ServeError::Unavailable)?;
+            status::clear(&*state.history(), feed.uid.as_str(), dref.uid.id())
+                .await
+                .map_err(ServeError::Unavailable)?;
+        }
+    }
+    rt.rebind(state, feed, &*store)
+        .await
+        .map_err(ServeError::Unavailable)?;
+    let limits = match feed.tenant() {
+        Some(t) => state
+            .history()
+            .tenant_get(t)
+            .await
+            .map_err(ServeError::from)?
+            .map(|r| r.limits),
+        None => None,
+    };
+    ensure_in_store(&*store, feed, limits.as_ref())
+        .await
+        .map_err(store_error)?;
+    tracing::warn!(feed = %feed.label(), abandoned = %moved.recorded_store, store = %moved.now_store, "the feed starts empty in the store its definition names; its events in the old store are not delivered");
+    Ok(Adopted {
+        feed: feed.name().to_string(),
+        tenant: feed.tenant().map(str::to_string),
+        store: moved.now_store,
+        store_id: moved.now_id,
+        abandoned_store: moved.recorded_store,
+        abandoned_store_id: moved.recorded_id,
+    })
+}
+
+/// `POST /v1/feeds/{name}/adopt-store`: start a feed whose events are in
+/// another store empty in the store its definition names.
+pub async fn adopt_store(
+    state: &ServerState,
+    actor: &AuthContext,
+    tenant: Option<&str>,
+    name: &str,
+) -> Result<Adopted, ServeError> {
+    crate::runtime::server::refuse_while_unavailable(state)?;
+    let tenant = scope(actor, tenant)?;
+    let _ = listed(state).await?;
+    let found = find(state, tenant.as_deref(), name).await?;
+    let adopted = adopt_found(state, &found).await?;
+    after_change(state).await;
+    Ok(adopted)
+}
+
+/// Adopt every feed whose events are in another store than the one it
+/// names (only those naming `store`, when given), so a store recreated
+/// empty does not need one command per feed. Feeds that fail are reported,
+/// the others adopted.
+pub async fn adopt_store_all(
+    state: &ServerState,
+    actor: &AuthContext,
+    store: Option<&str>,
+) -> Result<(Vec<Adopted>, Vec<String>), ServeError> {
+    crate::runtime::server::refuse_while_unavailable(state)?;
+    if actor.tenant.is_some() {
+        return Err(ServeError::Forbidden(
+            "adopting every feed of a store is for an operator not confined to a tenant".into(),
+        ));
+    }
+    let snapshot = state
+        .feeds()
+        .refresh_now(state)
+        .await
+        .map_err(ServeError::Unavailable)?;
+    let (mut done, mut failed) = (Vec::new(), Vec::new());
+    for feed in snapshot
+        .feeds
+        .iter()
+        .filter(|f| f.derived.store_moved.is_some() && store.is_none_or(|s| f.spec.store == s))
+    {
+        let found = match find(state, feed.tenant(), feed.name()).await {
+            Ok(found) => found,
+            Err(e) => {
+                failed.push(format!("{}: {}", feed.label(), e.api_error().error.message));
+                continue;
+            }
+        };
+        match adopt_found(state, &found).await {
+            Ok(a) => done.push(a),
+            Err(e) => failed.push(format!("{}: {}", feed.label(), e.api_error().error.message)),
+        }
+    }
+    after_change(state).await;
+    Ok((done, failed))
 }
 
 /// The SHA-256 of a token, lowercase hex: what the history stores and ingest

@@ -1396,7 +1396,7 @@ faucet feed skip orders archive --reason "malformed order"
 ```
 
 The verbs are `list`, `show`, `create`, `apply`, `delete`, `pause`, `resume`,
-`deliver-now`, `replay`, `skip`, `recover`, `events`, `tail`, `stats`,
+`deliver-now`, `replay`, `skip`, `recover`, `adopt-store`, `events`, `tail`, `stats`,
 `cursor`, `push`, `send` and `token create|list|revoke`. `send` posts events
 to a running server over HTTP as a sender would and needs no `--store`. Every
 verb and flag is in the

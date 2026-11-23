@@ -66,6 +66,11 @@ pub fn describe() {
         "faucet_feed_held",
         "Deliveries of the feed that are held until an admin recovers them"
     );
+    describe_gauge!(
+        "faucet_feed_store_moved",
+        "1 while the feed's events are in another feed store than the one its definition \
+         names: it receives and delivers nothing until the store is pointed back or adopted"
+    );
     describe_counter!(
         "faucet_feed_ingest_requests_total",
         "Ingest requests by HTTP status (`feed` is empty for a request no feed admitted)"
@@ -73,8 +78,8 @@ pub fn describe() {
     describe_counter!(
         "faucet_feed_ingest_refused_total",
         "Refused ingest requests by reason: unauthorized, malformed, too_large, content_type, \
-         content_encoding, rate_limited, tenant_rate_limited, full, store, seal, busy, timeout, \
-         draining, definitions_stale"
+         content_encoding, rate_limited, tenant_rate_limited, full, store, store_moved, seal, \
+         busy, timeout, draining, definitions_stale"
     );
     describe_counter!("faucet_feed_events_total", "Events stored");
     describe_counter!("faucet_feed_bytes_total", "Payload bytes stored");
@@ -147,6 +152,14 @@ pub fn trimmed(feed: &str, events: u64) {
 
 pub fn gap(feed: &str) {
     counter!("faucet_feed_gaps_total", "feed" => feed.to_string()).increment(1);
+}
+
+pub fn store_moved(feed: &str, moved: bool) {
+    gauge!("faucet_feed_store_moved", "feed" => feed.to_string()).set(if moved {
+        1.0
+    } else {
+        0.0
+    });
 }
 
 pub fn held(feed: &str, deliveries: usize) {

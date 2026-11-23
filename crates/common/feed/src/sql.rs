@@ -143,6 +143,13 @@ pub(crate) fn backend(dialect: Dialect, err: sqlx::Error) -> FeedError {
     }
 }
 
+/// A new store's identity: random, positive, never zero.
+pub(crate) fn fresh_store_id() -> i64 {
+    let bytes = uuid::Uuid::new_v4().into_bytes();
+    let n = u64::from_le_bytes(bytes[..8].try_into().unwrap_or_default()) >> 1;
+    i64::try_from(n).unwrap_or(i64::MAX).max(1)
+}
+
 pub(crate) fn millis(d: Duration) -> i64 {
     i64::try_from(d.as_millis()).unwrap_or(MAX_MS).min(MAX_MS)
 }
@@ -266,7 +273,8 @@ macro_rules! impl_feed_store {
                 Self::lock(tx, &format!("feed:{feed}")).await
             }
 
-            pub(crate) async fn migrate(&self) -> $crate::Result<()> {
+            /// Create or check the schema; returns the store's identity.
+            pub(crate) async fn migrate(&self) -> $crate::Result<i64> {
                 use sqlx::Row;
                 use $crate::sql::{stmt, SCHEMA_VERSION};
                 let mut tx = self.begin().await?;
@@ -303,7 +311,22 @@ macro_rules! impl_feed_store {
                 .execute(&mut *tx)
                 .await
                 .map_err(Self::be)?;
-                tx.commit().await.map_err(Self::be)
+                sqlx::query(stmt!(
+                    Self::D,
+                    "INSERT INTO faucet_feed_meta (k, v) VALUES ('store_id', ?) \
+                     ON CONFLICT (k) DO NOTHING"
+                ))
+                .bind($crate::sql::fresh_store_id())
+                .execute(&mut *tx)
+                .await
+                .map_err(Self::be)?;
+                let row = sqlx::query("SELECT v FROM faucet_feed_meta WHERE k = 'store_id'")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(Self::be)?;
+                let id: i64 = row.try_get(0).map_err(Self::be)?;
+                tx.commit().await.map_err(Self::be)?;
+                Ok(id)
             }
 
             async fn load_head(
@@ -1791,6 +1814,10 @@ macro_rules! impl_feed_store {
 
         #[async_trait::async_trait]
         impl $crate::FeedStore for $name {
+            fn store_id(&self) -> Option<i64> {
+                Some(self.store_id)
+            }
+
             async fn ensure_feed(
                 &self,
                 calls: &faucet_core::io::CallContext,

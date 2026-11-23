@@ -26,7 +26,7 @@ Durations are whole seconds as a number, or text with a unit: `90s`, `15m`,
 | `name` | string | required | Unique per tenant. Letters, digits, `_` and `-`, at most 64 characters. Names the feed in URLs, metrics and the runs it starts. |
 | `description` | string | | What the feed is for. |
 | `tenant` | string | | The tenant the feed belongs to. Its deliveries run on behalf of that tenant. Through the API the tenant comes from `?tenant=` or the caller's own tenant. |
-| `store` | string | `default` | The server-defined store that holds the events. `default` follows the run history; other names come from `--feed-store`. |
+| `store` | string | `default` | The server-defined store that holds the events. `default` follows the run history; other names come from `--feed-store`. A feed stays in the physical store that first held it: see [Moving a feed's store](#moving-a-feeds-store). |
 | `ingest` | object | see below | How senders push events in. |
 | `retention` | object | see below | How long events are kept. |
 | `seal` | bool | on for a tenant's feed, else off | Seal event payloads with the server's vault key. |
@@ -360,6 +360,28 @@ when the store cannot count them), `last_delivered_at` (when a run last
 moved its position) and, while it waits out a back-off after a failed or
 refused run, `next_run_at` (no run starts before it).
 
+### Moving a feed's store
+
+Each feed store records an identity when its schema is first created (a
+restored backup keeps it; a database recreated empty gets a new one), and the
+server records which store holds each feed's rows. When a feed's definition
+(a `--feeds` file's `store:`), or the `--feed-store` mapping of its store
+name, comes to name a different physical store, the feed is not re-created
+there empty: it shows the status `store_moved` (worst after `held`), its
+senders get `503` (reason `store_moved`, with `Retry-After`), nothing is
+delivered or created for it, `/readyz` lists it under `store_moved` and
+`faucet_feed_store_moved` is `1` (alert `FaucetFeedStoreMoved`). A server
+whose `--feeds` file has such a feed refuses to start, naming it.
+
+Point the definition back at the old store, or adopt the new one:
+`faucet feed adopt-store <feed>` or `POST /v1/feeds/{name}/adopt-store`
+(admin, audited as `feed.adopt_store`) starts the feed empty in the store it
+names: its deliveries' run state is removed and each starts at its `start`.
+Its events in the old store are not delivered. `faucet feed adopt-store
+--all [--in <store>]` adopts every such feed at once, for a store that was
+lost and recreated. A store that keeps no identity (a third-party backend)
+cannot be checked; the server logs that once.
+
 **Self-repair.** On every pass the scheduler compares each feed's store rows
 with its definition: a delivery position no definition lists (a change that
 stopped halfway) is deleted unless a run holds it, a defined delivery with no
@@ -416,6 +438,7 @@ the file.
 | `replay <feed> <delivery> --to-seq <n>` \| `--to-time <RFC 3339>` | Move a delivery back. |
 | `skip <feed> <delivery> --reason <text> [--to <n>]` | Move a delivery forward, leaving a gap. |
 | `recover <feed> <delivery>` | Put a held delivery back on a valid position. |
+| `adopt-store <feed>` \| `adopt-store --all [--in <store>]` | Start a feed whose events are in another feed store empty in the store it names (one feed, or every such feed of the server or of one store). Its events in the old store are not delivered. |
 | `events <feed> [--before <n>] [--from <n>] [--limit <n>]` | List retained events, never their payloads. |
 | `tail <feed> [-n <N>] [--follow] [--interval-secs <n>] [--payload]` | Print the newest retained events, oldest first (10 by default, at most 200). `--follow` keeps printing new ones, looking every `--interval-secs` (default 2); use it on a PostgreSQL feed store, because nothing else can write to a SQLite store while `tail` holds it. `--payload` prints payloads too, never a sealed event's. |
 | `stats <feed>` | The feed's size, what the last 24 hours brought, and each delivery's backlog. |
@@ -461,7 +484,7 @@ The `feed` label is the feed's name, `<tenant>/<name>` for a tenant's feed.
 | Metric | Type | Meaning |
 |---|---|---|
 | `faucet_feed_ingest_requests_total{feed,status}` | counter | Ingest requests by HTTP status. A request for an unknown feed has an empty `feed`. |
-| `faucet_feed_ingest_refused_total{feed,reason}` | counter | Refused requests by reason: `unauthorized`, `malformed`, `too_large`, `timeout`, `content_type`, `content_encoding`, `rate_limited`, `tenant_rate_limited`, `full`, `store`, `seal`, `busy`, `definitions_stale`, `draining`. |
+| `faucet_feed_ingest_refused_total{feed,reason}` | counter | Refused requests by reason: `unauthorized`, `malformed`, `too_large`, `timeout`, `content_type`, `content_encoding`, `rate_limited`, `tenant_rate_limited`, `full`, `store`, `store_moved`, `seal`, `busy`, `definitions_stale`, `draining`. |
 | `faucet_feed_events_total{feed}` | counter | Events stored. |
 | `faucet_feed_bytes_total{feed}` | counter | Payload bytes stored. |
 | `faucet_feed_dedupe_hits_total{feed}` | counter | Events not stored because their key was already seen. |
@@ -478,6 +501,7 @@ The `feed` label is the feed's name, `<tenant>/<name>` for a tenant's feed.
 | `faucet_feed_runs_total{feed,delivery,outcome}` | counter | Delivery runs by outcome: `delivered`, `failed`, `refused`, `cancelled`, `claim_lost`, `held`, `needs_approval`. |
 | `faucet_feed_delivery_stalled{feed,delivery}` | gauge | `1` while the delivery is stalled. |
 | `faucet_feed_held{feed}` | gauge | Held deliveries of the feed. |
+| `faucet_feed_store_moved{feed}` | gauge | `1` while the feed's events are in another feed store than the one it names. |
 | `faucet_feed_gaps_total{feed}` | counter | Gaps recorded by a skip or a recover. |
 | `faucet_feed_trimmed_events_total{feed}` | counter | Events removed by retention. |
 | `faucet_feed_scheduler_restarts_total` | counter | Times the delivery scheduler was restarted after it failed. |
@@ -493,6 +517,7 @@ The shipped rules (`observability/prometheus/alerts.yml`, group
 |---|---|---|
 | `FaucetFeedDeliveryStalled` | `faucet_feed_delivery_stalled == 1` for 1 minute | critical |
 | `FaucetFeedDeliveryHeld` | `faucet_feed_held > 0` for 1 minute | critical |
+| `FaucetFeedStoreMoved` | `faucet_feed_store_moved == 1` for 1 minute | critical |
 | `FaucetFeedDeliveryLagging` | The oldest undelivered event has waited more than 10 minutes, for 10 minutes | warning |
 | `FaucetFeedNearFull` | `faucet_feed_undelivered_ratio >= 0.8` for 5 minutes | warning |
 | `FaucetFeedRunsFailing` | Three or more runs failed or were refused in 30 minutes | warning |

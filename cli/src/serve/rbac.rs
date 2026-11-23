@@ -714,6 +714,7 @@ pub fn required_permission(method: &Method, matched_path: &str) -> Option<Permis
         | (&Method::POST, "/v1/feeds/{name}/deliveries/{delivery}/replay")
         | (&Method::POST, "/v1/feeds/{name}/deliveries/{delivery}/skip")
         | (&Method::POST, "/v1/feeds/{name}/deliveries/{delivery}/recover")
+        | (&Method::POST, "/v1/feeds/{name}/adopt-store")
         | (&Method::GET, "/v1/feeds/{name}/events/{seq}") => Some(FeedAdmin),
         (&Method::POST, "/v1/triggers/{name}") => Some(TriggerFire),
         (&Method::PUT, "/v1/triggers/{name}") => Some(TriggerFire),
@@ -893,6 +894,7 @@ pub fn tenant_scope_decision(
         | (_, "/v1/feeds/{name}/deliveries/{delivery}/replay")
         | (_, "/v1/feeds/{name}/deliveries/{delivery}/skip")
         | (_, "/v1/feeds/{name}/deliveries/{delivery}/recover")
+        | (_, "/v1/feeds/{name}/adopt-store")
         | (_, "/v1/feeds/{name}/tokens")
         | (_, "/v1/feeds/{name}/tokens/{id}")
         | (_, "/v1/feeds/{name}/events")
@@ -959,6 +961,7 @@ pub fn audit_action(method: &Method, matched_path: &str) -> &'static str {
         (&Method::POST, "/v1/feeds/{name}/deliveries/{delivery}/replay") => "feed.replay",
         (&Method::POST, "/v1/feeds/{name}/deliveries/{delivery}/skip") => "feed.skip",
         (&Method::POST, "/v1/feeds/{name}/deliveries/{delivery}/recover") => "feed.recover",
+        (&Method::POST, "/v1/feeds/{name}/adopt-store") => "feed.adopt_store",
         (&Method::GET, "/v1/feeds/{name}/tokens") => "feed.token_list",
         (&Method::POST, "/v1/feeds/{name}/tokens") => "feed.token_create",
         (&Method::DELETE, "/v1/feeds/{name}/tokens/{id}") => "feed.token_revoke",

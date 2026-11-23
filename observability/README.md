@@ -57,6 +57,7 @@ exactly that (`examples/infra/grafana/`).
 | `FaucetServeConnectionsNeedReauth` | a tenant connection needs re-authorization ≥15 m | warning |
 | `FaucetFeedDeliveryStalled` | a feed delivery stalled on one event ≥1 m | critical |
 | `FaucetFeedDeliveryHeld` | a feed has a held delivery ≥1 m | critical |
+| `FaucetFeedStoreMoved` | a feed names another feed store than the one holding its events ≥1 m | critical |
 | `FaucetFeedDeliveryLagging` | oldest undelivered event waited >10 m, for 10 m | warning |
 | `FaucetFeedNearFull` | a feed at ≥80% of its undelivered limits for 5 m | warning |
 | `FaucetFeedRunsFailing` | ≥3 delivery runs failed or were refused in 30 m | warning |

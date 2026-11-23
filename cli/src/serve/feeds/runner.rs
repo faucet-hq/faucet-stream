@@ -909,7 +909,11 @@ impl Scheduler {
             report.removals = finish_removals(state, &snapshot).await;
         }
         let mut by_store: BTreeMap<&str, Vec<&Arc<Feed>>> = BTreeMap::new();
-        for f in snapshot.feeds.iter().filter(|f| f.ensured) {
+        for f in snapshot
+            .feeds
+            .iter()
+            .filter(|f| f.ensured && f.derived.store_moved.is_none())
+        {
             by_store.entry(f.spec.store.as_str()).or_default().push(f);
         }
         let now = Utc::now();
@@ -937,6 +941,10 @@ impl Scheduler {
             };
             let heads: HashMap<_, _> = heads.into_iter().map(|h| (h.feed.clone(), h)).collect();
             for feed in feeds {
+                if let Err(e) = rt.check_store(state, feed, &*store).await {
+                    tracing::debug!(feed = %feed.label(), error = %e, "not acting on the feed in this store");
+                    continue;
+                }
                 let Some(head) = heads.get(&feed.uid) else {
                     let limits = feed.tenant().and_then(|t| snapshot.tenant_limits.get(t));
                     self.set_up(state, &*store, feed, None, limits).await;
@@ -1095,6 +1103,10 @@ impl Scheduler {
         let Some(defined) = defined_ids(state, feed).await else {
             return;
         };
+        if let Err(e) = state.feeds().check_store(state, feed, store).await {
+            tracing::debug!(feed = %label, delivery = name, error = %e, "not creating it in this store");
+            return;
+        }
         let made = match target {
             Some((_, dref)) if !defined.contains(dref.uid.id()) => return,
             Some((d, dref)) => store
@@ -1300,6 +1312,7 @@ impl Scheduler {
             stalled,
             held,
             secret_unreadable: Vec::new(),
+            store_moved: Vec::new(),
         });
     }
 }

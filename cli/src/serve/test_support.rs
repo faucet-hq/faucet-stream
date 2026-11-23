@@ -199,6 +199,10 @@ impl RunHistory for Flaky {
         self.check()?;
         self.inner.meta_put(key, value).await
     }
+    async fn meta_delete(&self, key: &str) -> Result<(), HErr> {
+        self.check()?;
+        self.inner.meta_delete(key).await
+    }
     async fn meta_compare_and_set(
         &self,
         key: &str,

@@ -850,6 +850,53 @@ pub async fn run(args: FeedArgs) -> CliResult<()> {
                 format!("{name}/{delivery}: continues from event {}", moved.to)
             })
         }
+        FeedCommand::AdoptStore {
+            name,
+            all,
+            in_store,
+        } => {
+            let line = |a: &service::Adopted| {
+                format!(
+                    "{}: now empty in store '{}'; its events in store '{}' are not delivered",
+                    service::label_of(a.tenant.as_deref(), &a.feed),
+                    a.store,
+                    a.abandoned_store
+                )
+            };
+            if *all {
+                let (done, failed_feeds) =
+                    service::adopt_store_all(&state, &who, in_store.as_deref())
+                        .await
+                        .map_err(failed)?;
+                print(
+                    json,
+                    &serde_json::json!({"adopted": done, "failed": failed_feeds}),
+                    || {
+                        let mut out: Vec<String> = done.iter().map(line).collect();
+                        if out.is_empty() {
+                            out.push("no feed's events are in another store".into());
+                        }
+                        out.extend(failed_feeds.iter().map(|f| format!("failed: {f}")));
+                        out.join("\n")
+                    },
+                )?;
+                if !failed_feeds.is_empty() {
+                    return Err(CliError::Serve(format!(
+                        "{} feed(s) could not be adopted",
+                        failed_feeds.len()
+                    )));
+                }
+                Ok(())
+            } else {
+                let name = name
+                    .as_deref()
+                    .ok_or_else(|| CliError::Config("name the feed, or pass --all".into()))?;
+                let adopted = service::adopt_store(&state, &who, tenant, name)
+                    .await
+                    .map_err(failed)?;
+                print(json, &adopted, || line(&adopted))
+            }
+        }
         FeedCommand::Events {
             name,
             before,

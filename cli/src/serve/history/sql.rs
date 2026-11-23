@@ -1291,6 +1291,8 @@ pub struct Stmts {
     pub meta_insert_new: String,
     /// Replace a setting holding an expected value. Params: value, updated_at, key, expected.
     pub meta_replace: String,
+    /// Remove one server setting. Param: key.
+    pub meta_delete: String,
     /// The database's own clock, in epoch microseconds (`now_us`). Leases and
     /// expiry decisions read it so every replica compares against one clock.
     pub db_now: String,
@@ -2381,6 +2383,7 @@ impl Stmts {
             meta_replace: "UPDATE faucet_serve_meta SET value=$1, updated_at=$2 \
                 WHERE key=$3 AND value=$4"
                 .into(),
+            meta_delete: "DELETE FROM faucet_serve_meta WHERE key=$1".into(),
             db_now: "SELECT CAST(extract(epoch FROM clock_timestamp()) * 1000000 AS BIGINT) AS now_us"
                 .into(),
             instance_capabilities: "SELECT instance_id, capabilities FROM faucet_serve_instance_caps"
@@ -3103,6 +3106,7 @@ impl Stmts {
             meta_replace: "UPDATE faucet_serve_meta SET value=?, updated_at=? \
                 WHERE key=? AND value=?"
                 .into(),
+            meta_delete: "DELETE FROM faucet_serve_meta WHERE key=?".into(),
             db_now: "SELECT CAST(unixepoch('subsec') * 1000000 AS INTEGER) AS now_us".into(),
             instance_capabilities: "SELECT instance_id, capabilities FROM faucet_serve_instance_caps"
                 .into(),
@@ -7912,6 +7916,19 @@ macro_rules! impl_sql_history {
                 }
                 .map_err(backend)?;
                 Ok(done.rows_affected() == 1)
+            }
+
+            async fn meta_delete(
+                &self,
+                key: &str,
+            ) -> Result<(), $crate::serve::history::HistoryError> {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                sqlx::query(&self.stmts.meta_delete)
+                    .bind(key)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(backend)?;
+                Ok(())
             }
 
             async fn meta_put(

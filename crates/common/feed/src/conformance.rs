@@ -1562,9 +1562,16 @@ pub async fn state_survives_a_restart(backend: &dyn Backend) {
         .attach(&before.calls, &claim.id)
         .await
         .expect("attach");
+    let identity = before.store.store_id();
     drop(before);
 
     let after = Fixture::open(backend).await;
+    assert_eq!(
+        after.store.store_id(),
+        identity,
+        "the store keeps its identity"
+    );
+    assert!(identity.is_none_or(|id| id > 0));
     let head = after.head(&feed).await;
     assert_eq!((head.watermark, head.oldest), (Seq(3), Seq(1)));
     assert_eq!(head.bytes, sent.bytes());

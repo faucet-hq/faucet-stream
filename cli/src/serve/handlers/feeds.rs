@@ -12,6 +12,7 @@
 //! | `POST /v1/feeds/{name}/tokens`, `DELETE …/tokens/{id}` | `FeedWrite` | `feed.token_create`, `feed.token_revoke` |
 //! | `DELETE /v1/feeds/{name}` | `FeedAdmin` | `feed.delete` |
 //! | `POST …/deliveries/{delivery}/{replay,skip,recover}` | `FeedAdmin` | `feed.replay`, `feed.skip`, `feed.recover` |
+//! | `POST /v1/feeds/{name}/adopt-store` | `FeedAdmin` | `feed.adopt_store` |
 //! | `GET /v1/feeds/{name}/events/{seq}` (the payload) | `FeedAdmin` | `feed.events_read` |
 //!
 //! The ingest routes (`POST /v1/feeds/{name}/events` and the tenant form)
@@ -545,6 +546,35 @@ pub async fn recover(
     )
     .await;
     moved.map(Json)
+}
+
+/// Start a feed whose events are in another feed store empty in the store
+/// its definition names.
+pub async fn adopt_store(
+    State(state): State<ServerState>,
+    Extension(actor): Extension<AuthContext>,
+    Path(name): Path<String>,
+    Query(q): Query<Scope>,
+) -> Result<Json<service::Adopted>, ServeError> {
+    let adopted = service::adopt_store(&state, &actor, q.tenant.as_deref(), &name).await;
+    let detail = match &adopted {
+        Ok(a) => format!(
+            "now in store '{}' (id {}); its events in store '{}' (id {}) are abandoned",
+            a.store, a.store_id, a.abandoned_store, a.abandoned_store_id
+        ),
+        Err(_) => String::new(),
+    };
+    audit(
+        &state,
+        &actor,
+        &q,
+        "feed.adopt_store",
+        label(&actor, &q, &name),
+        detail,
+        &adopted,
+    )
+    .await;
+    adopted.map(Json)
 }
 
 pub async fn tokens(

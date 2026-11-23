@@ -382,6 +382,15 @@ curl -sX POST localhost:8080/v1/feeds/orders/deliveries/archive/recover -H "Auth
 
 Resume does not clear a hold; only recover does.
 
+A feed stays in the physical feed store that first held it. If its `store:`
+(or the `--feed-store` mapping of that name) comes to point at another
+database, the feed is blocked with status `store_moved` rather than started
+empty there, and a server whose `--feeds` file holds such a feed does not
+start. Point it back, or run `faucet feed adopt-store <feed>` (or
+`adopt-store --all` after a store was recreated) to start it empty in the new
+store; the events in the old one are not delivered. See the
+[reference](/faucet-stream/reference/feeds/#moving-a-feeds-store).
+
 ## Retention and a full feed
 
 A feed keeps two promises, and neither drops data silently:

@@ -1215,6 +1215,14 @@ async fn handle(
         ));
     };
     let refuse = |r: Refusal| (Some(feed.clone()), r);
+    if rt.moved_of(feed.uid.as_str()).is_some() {
+        return Err(refuse(Refusal::unavailable(
+            "store_moved",
+            "the feed's events are in another feed store than the one it names; it accepts \
+             nothing until an operator fixes that; retry later",
+            RETRY_STORE_SECS,
+        )));
+    }
     if feed.derived.signature_unreadable.is_some() {
         return Err(refuse(Refusal::unavailable(
             "seal",

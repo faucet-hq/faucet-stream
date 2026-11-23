@@ -1908,6 +1908,14 @@ impl RunHistory for MemoryHistory {
         Ok(true)
     }
 
+    async fn meta_delete(&self, key: &str) -> Result<(), HistoryError> {
+        self.meta
+            .lock()
+            .map_err(|_| HistoryError::Backend("meta lock poisoned".into()))?
+            .remove(key);
+        Ok(())
+    }
+
     async fn meta_put(&self, key: &str, value: &str) -> Result<(), HistoryError> {
         let mut meta = self
             .meta
