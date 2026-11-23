@@ -523,6 +523,21 @@ pub async fn dedupe_replaces_an_expired_row(backend: &dyn Backend) {
             .expect("purge"),
         0
     );
+
+    // A purge removes at most `max_rows`, so a caller loops while it gets that many.
+    f.append(
+        &feed,
+        ["c", "d", "e"]
+            .into_iter()
+            .map(|k| event(k).dedupe_key(k))
+            .collect(),
+    )
+    .await;
+    f.wait(PAST_SHORT).await;
+    let purge = |n| f.store.purge_dedupe(&f.calls, &feed, n);
+    assert_eq!(purge(2).await.expect("purge"), 2, "capped at max_rows");
+    assert!(purge(100).await.expect("purge") >= 1);
+    assert_eq!(purge(100).await.expect("purge"), 0);
 }
 
 /// Concurrent retries carrying one key store one event.

@@ -504,6 +504,19 @@ groups:
             probably restored from a backup). Nothing is delivered or skipped
             until an admin recovers the delivery.
 
+      - alert: FaucetFeedMaintenanceBehind
+        expr: faucet_feed_maintenance_behind == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "feed {{ $labels.feed }}'s retention is not keeping up"
+          description: >-
+            For 15 minutes every retention pass ran out of time with expired
+            events or dedupe keys still to remove, so the feed's store keeps
+            growing past retention.max_age and the dedupe window. Look at the
+            feed store's load, or lower the feed's rate.
+
       - alert: FaucetFeedStoreMoved
         expr: faucet_feed_store_moved == 1
         for: 1m

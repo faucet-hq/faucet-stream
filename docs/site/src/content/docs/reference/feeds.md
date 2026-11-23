@@ -103,6 +103,16 @@ retried by its sender.
 | `undelivered.max_bytes` | size | `50GiB` | Most undelivered bytes. Past it the feed refuses new events. |
 | `warn_at` | list of fractions | `[0.5, 0.8]` | Ascending fractions (between 0 and 1) of the undelivered limits at which `feed_near_full` is sent. |
 
+Retention runs on every server beside the delivery scheduler (never inside its
+pass), for one feed at a time per feed (a claim in the feed store): once a
+minute it removes every event older than `max_age` below every delivery's
+position and every expired dedupe key, in calls of at most 1,000 rows. A pass
+works for at most 15 seconds over all feeds, starting where the last one
+stopped; a feed it could not finish is due again a second later, so
+retention keeps up with the feed's rate. `faucet_feed_maintenance_behind`
+(and the `FaucetFeedMaintenanceBehind` alert) report a feed whose retention
+keeps running out of time.
+
 ### Delivery
 
 | Field | Type | Default | Meaning |
@@ -493,8 +503,8 @@ The `feed` label is the feed's name, `<tenant>/<name>` for a tenant's feed.
 | `faucet_feed_orphan_deliveries_total{feed}` | counter | Delivery positions deleted from the store because no definition listed them. |
 | `faucet_feed_append_duration_seconds{feed}` | histogram | Time of one store transaction. |
 | `faucet_feed_append_group_requests{feed}` | histogram | Requests stored together in one transaction. |
-| `faucet_feed_store_errors_total{feed}` | counter | Feed store failures. |
-| `faucet_feed_depth{feed}` | gauge | Retained events. |
+| `faucet_feed_store_errors_total{feed}` | counter | Ingest appends the feed store failed (senders got `503 store`). |
+| `faucet_feed_depth{feed}` | gauge | Events the feed's slowest delivery has not delivered yet. |
 | `faucet_feed_undelivered_ratio{feed}` | gauge | Undelivered bytes or age as a fraction of the feed's limits (the larger). At 1 the feed refuses new events. |
 | `faucet_feed_delivery_lag{feed,delivery}` | gauge | Events the delivery has not read. |
 | `faucet_feed_oldest_undelivered_seconds{feed,delivery}` | gauge | Age of the oldest undelivered event. |
@@ -504,6 +514,7 @@ The `feed` label is the feed's name, `<tenant>/<name>` for a tenant's feed.
 | `faucet_feed_store_moved{feed}` | gauge | `1` while the feed's events are in another feed store than the one it names. |
 | `faucet_feed_gaps_total{feed}` | counter | Gaps recorded by a skip or a recover. |
 | `faucet_feed_trimmed_events_total{feed}` | counter | Events removed by retention. |
+| `faucet_feed_maintenance_behind{feed}` | gauge | `1` while the feed's last retention pass ran out of time with expired events or dedupe keys left. |
 | `faucet_feed_scheduler_restarts_total` | counter | Times the delivery scheduler was restarted after it failed. |
 
 A deleted feed's or delivery's gauges go back to zero, so its alerts clear.
@@ -518,6 +529,7 @@ The shipped rules (`observability/prometheus/alerts.yml`, group
 | `FaucetFeedDeliveryStalled` | `faucet_feed_delivery_stalled == 1` for 1 minute | critical |
 | `FaucetFeedDeliveryHeld` | `faucet_feed_held > 0` for 1 minute | critical |
 | `FaucetFeedStoreMoved` | `faucet_feed_store_moved == 1` for 1 minute | critical |
+| `FaucetFeedMaintenanceBehind` | `faucet_feed_maintenance_behind == 1` for 15 minutes | warning |
 | `FaucetFeedDeliveryLagging` | The oldest undelivered event has waited more than 10 minutes, for 10 minutes | warning |
 | `FaucetFeedNearFull` | `faucet_feed_undelivered_ratio >= 0.8` for 5 minutes | warning |
 | `FaucetFeedRunsFailing` | Three or more runs failed or were refused in 30 minutes | warning |

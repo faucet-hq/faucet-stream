@@ -33,12 +33,16 @@ pub const TICK: Duration = Duration::from_secs(1);
 pub const CLAIM_TTL: Duration = Duration::from_secs(300);
 /// How often a live claim's run is looked at.
 pub const CLAIM_CHECK: Duration = Duration::from_secs(5);
-/// How often retention runs.
+/// How often retention runs for a feed that kept up.
 pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
-/// Most rows one retention call removes.
+/// How soon retention runs again for a feed it could not finish.
+pub const MAINTENANCE_RETRY: Duration = Duration::from_secs(1);
+/// Most rows one retention call removes: each call is a short transaction.
 pub const MAINTENANCE_ROWS: u32 = 1_000;
-/// Most retention calls per feed in one pass.
-const MAINTENANCE_PASSES: usize = 10;
+/// How long one maintenance pass may work, over every feed together.
+pub const MAINTENANCE_BUDGET: Duration = Duration::from_secs(15);
+/// How long the maintenance task waits between passes when nothing is due.
+const MAINTENANCE_IDLE: Duration = Duration::from_secs(1);
 /// Deliveries stepped side by side.
 pub const CONCURRENT_STEPS: usize = 16;
 /// The longest one delivery's step may take.
@@ -828,7 +832,6 @@ struct Local {
 pub struct Scheduler {
     local: HashMap<String, Local>,
     reload_at: Option<Instant>,
-    maintain_at: Option<Instant>,
     warned: HashMap<String, usize>,
     /// Per delivery: the retained bytes below its cursor, as last counted.
     below: HashMap<String, Below>,
@@ -919,7 +922,6 @@ impl Scheduler {
         let now = Utc::now();
         let mut work: Vec<(Work, Step)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        let mut maintain: Vec<(Arc<dyn FeedStore>, Arc<Feed>)> = Vec::new();
         let mut crossings: Vec<(Arc<Feed>, usize, f64)> = Vec::new();
         for (name, feeds) in by_store {
             let store = match rt.stores().get(name).await {
@@ -950,7 +952,6 @@ impl Scheduler {
                     self.set_up(state, &*store, feed, None, limits).await;
                     continue;
                 };
-                maintain.push((store.clone(), (*feed).clone()));
                 drop_orphans(state, &*store, feed, head).await;
                 let mut undelivered: HashMap<String, u64> = HashMap::new();
                 for dh in &head.deliveries {
@@ -1071,12 +1072,6 @@ impl Scheduler {
             self.crossed(state, feed, crossed, ratio).await;
         }
         self.readiness(&rt, &snapshot, report.store_ok);
-        if self.maintain_at.is_none_or(|t| t <= Instant::now()) {
-            for (store, feed) in maintain {
-                maintain_feed(&rt, &*store, &feed).await;
-            }
-            self.maintain_at = Some(Instant::now() + MAINTENANCE_INTERVAL);
-        }
         report
     }
 
@@ -1338,23 +1333,55 @@ async fn finish_removals(state: &ServerState, snapshot: &Snapshot) -> usize {
     finished
 }
 
-/// Retention for one feed, under its maintenance claim: at most
-/// [`MAINTENANCE_ROWS`] rows per call.
-async fn maintain_feed(rt: &FeedsRuntime, store: &dyn FeedStore, feed: &Feed) {
+/// How one feed's retention went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Maintained {
+    /// Everything due was removed.
+    Done,
+    /// The pass's time ran out with rows still due.
+    Behind,
+    /// Another server holds the feed's maintenance claim.
+    NotOwner,
+    /// A store call failed; tried again on the next interval.
+    Failed,
+}
+
+/// Retention for one feed, under its maintenance claim, until nothing is
+/// due or `deadline`: expired events (in calls of at most
+/// [`MAINTENANCE_ROWS`], each its own short transaction) and expired dedupe
+/// keys. The claim is renewed between calls when the work runs long.
+pub async fn maintain_feed(
+    rt: &FeedsRuntime,
+    store: &dyn FeedStore,
+    feed: &Feed,
+    deadline: Instant,
+) -> Maintained {
     let calls = store_calls();
-    match store
-        .maintenance(&calls, &feed.uid, rt.owner(), MAINTENANCE_INTERVAL * 2)
-        .await
-    {
+    let ttl = MAINTENANCE_INTERVAL * 2;
+    let claim = || store.maintenance(&calls, &feed.uid, rt.owner(), ttl);
+    match claim().await {
         Ok(true) => {}
-        Ok(false) => return,
+        Ok(false) => return Maintained::NotOwner,
         Err(e) => {
             tracing::warn!(feed = %feed.label(), error = %e, "feed maintenance claim failed");
-            return;
+            return Maintained::Failed;
         }
     }
+    let mut claimed_at = Instant::now();
+    let mut renew = async || -> bool {
+        if claimed_at.elapsed() < MAINTENANCE_INTERVAL / 2 {
+            return true;
+        }
+        claimed_at = Instant::now();
+        matches!(claim().await, Ok(true))
+    };
     let mut trimmed = 0;
-    for _ in 0..MAINTENANCE_PASSES {
+    let mut outcome = Maintained::Done;
+    loop {
+        if Instant::now() >= deadline {
+            outcome = Maintained::Behind;
+            break;
+        }
         match store.trim(&calls, &feed.uid, MAINTENANCE_ROWS).await {
             Ok(t) => {
                 trimmed += t.events;
@@ -1364,18 +1391,142 @@ async fn maintain_feed(rt: &FeedsRuntime, store: &dyn FeedStore, feed: &Feed) {
             }
             Err(e) => {
                 tracing::warn!(feed = %feed.label(), error = %e, "trimming a feed failed");
+                outcome = Maintained::Failed;
                 break;
             }
+        }
+        if !renew().await {
+            return Maintained::NotOwner;
         }
     }
     if trimmed > 0 {
         metrics::trimmed(&feed.label(), trimmed);
     }
-    if let Err(e) = store
-        .purge_dedupe(&calls, &feed.uid, MAINTENANCE_ROWS)
-        .await
-    {
-        tracing::warn!(feed = %feed.label(), error = %e, "purging a feed's dedupe keys failed");
+    if outcome != Maintained::Done {
+        return outcome;
+    }
+    loop {
+        if Instant::now() >= deadline {
+            return Maintained::Behind;
+        }
+        match store
+            .purge_dedupe(&calls, &feed.uid, MAINTENANCE_ROWS)
+            .await
+        {
+            Ok(removed) if removed < u64::from(MAINTENANCE_ROWS) => return Maintained::Done,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(feed = %feed.label(), error = %e, "purging a feed's dedupe keys failed");
+                return Maintained::Failed;
+            }
+        }
+        if !renew().await {
+            return Maintained::NotOwner;
+        }
+    }
+}
+
+/// Retention across feeds, beside the delivery scheduler (never inside its
+/// pass, so a long purge never delays claims or their renewals). Each pass
+/// works for at most [`MAINTENANCE_BUDGET`] in all, starting where the last
+/// one stopped, so one busy feed cannot starve the others; a feed left
+/// behind is due again after [`MAINTENANCE_RETRY`].
+#[derive(Debug, Default)]
+pub struct Maintenance {
+    due: HashMap<String, Instant>,
+    behind: HashSet<String>,
+    start: usize,
+}
+
+/// What one maintenance pass did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MaintenancePass {
+    pub maintained: usize,
+    pub behind: Vec<String>,
+}
+
+impl Maintenance {
+    /// One pass over the feeds that are due.
+    pub async fn pass(&mut self, state: &ServerState, budget: Duration) -> MaintenancePass {
+        let rt = state.feeds();
+        let snapshot = rt.snapshot();
+        let now = Instant::now();
+        let deadline = now + budget;
+        let mut feeds: Vec<&Arc<Feed>> = snapshot
+            .feeds
+            .iter()
+            .filter(|f| f.ensured && f.derived.store_moved.is_none())
+            .filter(|f| self.due.get(f.uid.as_str()).is_none_or(|t| *t <= now))
+            .collect();
+        feeds.sort_by_key(|f| f.key());
+        let mut out = MaintenancePass::default();
+        if feeds.is_empty() {
+            return out;
+        }
+        let first = self.start % feeds.len();
+        feeds.rotate_left(first);
+        let mut visited = 0;
+        for feed in feeds {
+            if Instant::now() >= deadline {
+                break;
+            }
+            visited += 1;
+            let uid = feed.uid.as_str().to_string();
+            let Ok(store) = rt.store_for(feed).await else {
+                self.due.insert(uid, Instant::now() + MAINTENANCE_INTERVAL);
+                continue;
+            };
+            let done = maintain_feed(&rt, &*store, feed, deadline).await;
+            out.maintained += 1;
+            let behind = done == Maintained::Behind;
+            if behind {
+                out.behind.push(feed.label());
+                if self.behind.insert(uid.clone()) {
+                    tracing::warn!(feed = %feed.label(), "retention could not remove everything due in its time; it continues on the next pass");
+                }
+            } else {
+                self.behind.remove(&uid);
+            }
+            metrics::maintenance_behind(&feed.label(), behind);
+            let wait = if behind {
+                MAINTENANCE_RETRY
+            } else {
+                MAINTENANCE_INTERVAL
+            };
+            self.due.insert(uid, Instant::now() + wait);
+        }
+        self.start = first + visited;
+        let live: HashSet<&str> = snapshot.feeds.iter().map(|f| f.uid.as_str()).collect();
+        self.due.retain(|uid, _| live.contains(uid.as_str()));
+        self.behind.retain(|uid| live.contains(uid.as_str()));
+        out
+    }
+
+    /// How long until a feed is due again (at most [`MAINTENANCE_IDLE`]).
+    fn wait(&self) -> Duration {
+        let now = Instant::now();
+        self.due
+            .values()
+            .map(|t| t.saturating_duration_since(now))
+            .min()
+            .unwrap_or(MAINTENANCE_IDLE)
+            .min(MAINTENANCE_IDLE)
+    }
+}
+
+/// Run retention passes until `shutdown`.
+#[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
+async fn maintain_loop(state: ServerState, shutdown: CancellationToken) {
+    let mut maintenance = Maintenance::default();
+    loop {
+        if shutdown.is_cancelled() {
+            return;
+        }
+        maintenance.pass(&state, MAINTENANCE_BUDGET).await;
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(maintenance.wait()) => {}
+        }
     }
 }
 
@@ -1384,6 +1535,8 @@ async fn maintain_feed(rt: &FeedsRuntime, store: &dyn FeedStore, feed: &Feed) {
 pub async fn run(state: ServerState, shutdown: CancellationToken) {
     let changed = state.feeds().changed();
     let mut scheduler = Scheduler::default();
+    let maintenance = tokio::spawn(maintain_loop(state.clone(), shutdown.clone()));
+    let _maintenance = AbortOnDrop(maintenance.abort_handle());
     loop {
         if shutdown.is_cancelled() {
             return;

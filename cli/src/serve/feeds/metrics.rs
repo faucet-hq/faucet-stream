@@ -67,6 +67,11 @@ pub fn describe() {
         "Deliveries of the feed that are held until an admin recovers them"
     );
     describe_gauge!(
+        "faucet_feed_maintenance_behind",
+        "1 while the feed's last retention pass ran out of time with expired events or \
+         dedupe keys still to remove"
+    );
+    describe_gauge!(
         "faucet_feed_store_moved",
         "1 while the feed's events are in another feed store than the one its definition \
          names: it receives and delivers nothing until the store is pointed back or adopted"
@@ -152,6 +157,14 @@ pub fn trimmed(feed: &str, events: u64) {
 
 pub fn gap(feed: &str) {
     counter!("faucet_feed_gaps_total", "feed" => feed.to_string()).increment(1);
+}
+
+pub fn maintenance_behind(feed: &str, behind: bool) {
+    gauge!("faucet_feed_maintenance_behind", "feed" => feed.to_string()).set(if behind {
+        1.0
+    } else {
+        0.0
+    });
 }
 
 pub fn store_moved(feed: &str, moved: bool) {

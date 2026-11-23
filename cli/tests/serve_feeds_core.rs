@@ -1437,7 +1437,14 @@ async fn a_feed_whose_store_changed_is_blocked_until_its_new_store_is_adopted() 
 
     // Deleting the feed forgets which store held it.
     let binding = format!("feed_store:{uid}");
-    assert!(srv.state.history().meta_get(&binding).await.unwrap().is_some());
+    assert!(
+        srv.state
+            .history()
+            .meta_get(&binding)
+            .await
+            .unwrap()
+            .is_some()
+    );
     service::delete(&srv.state, &admin(), None, "orders")
         .await
         .unwrap();
@@ -4385,4 +4392,66 @@ async fn a_feed_definition_and_its_tokens_round_trip_through_memory() {
         faucet_cli::serve::history::memory::MemoryHistory::new(Duration::from_secs(60)),
     ))
     .await;
+}
+
+/// Retention keeps up with a busy feed: one maintenance pass removes every
+/// expired event and dedupe key, in short calls, however many there are,
+/// and a pass that runs out of time leaves the feed due again soon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retention_removes_everything_due_in_one_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &[]).await;
+    srv.state.feeds().stop_scheduling();
+    let spec: FeedSpec = serde_json::from_value(json!({
+        "name": "busy",
+        "ingest": {"auth": {"tokens": "managed"}, "dedupe": {"header": "X-Event-Id", "window": "1s"}},
+        "retention": {"max_age": "0s"}
+    }))
+    .unwrap();
+    service::create(&srv.state, &admin(), None, spec)
+        .await
+        .unwrap();
+    let (store, uid) = srv.store("busy").await;
+    let calls = store_calls();
+    for chunk in 0..6u64 {
+        let events = (0..2_000u64)
+            .map(|i| {
+                NewEvent::new("application/json", b"{}".to_vec())
+                    .dedupe_key(format!("k{}", chunk * 2_000 + i))
+            })
+            .collect();
+        store.append(&calls, &uid, events).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    // Out of time: nothing is lost, the feed is behind and due again soon.
+    let feed = srv.state.feeds().snapshot().feed(None, "busy").unwrap();
+    let rt = srv.state.feeds();
+    assert_eq!(
+        runner::maintain_feed(&rt, &*store, &feed, std::time::Instant::now()).await,
+        runner::Maintained::Behind
+    );
+
+    let mut maintenance = runner::Maintenance::default();
+    let pass = maintenance
+        .pass(&srv.state, runner::MAINTENANCE_BUDGET)
+        .await;
+    assert_eq!((pass.maintained, pass.behind.len()), (1, 0), "{pass:?}");
+    let head = store
+        .heads(&calls, std::slice::from_ref(&uid))
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!((head.watermark.get(), head.oldest.get()), (12_000, 12_001));
+    assert_eq!(head.bytes, 0);
+    assert_eq!(
+        store.purge_dedupe(&calls, &uid, 100_000).await.unwrap(),
+        0,
+        "every expired dedupe key is gone"
+    );
+    // Kept up: not due again for a while.
+    let again = maintenance
+        .pass(&srv.state, runner::MAINTENANCE_BUDGET)
+        .await;
+    assert_eq!(again.maintained, 0);
 }

@@ -9,3 +9,4 @@ faucet_serve_clock_offset_seconds: a per-replica diagnostic for timestamps and t
 faucet_serve_runs_lost_ownership_total: a rare failover event (a replica found its claimed run owned by a peer before starting it); counted for investigation, nothing to trend
 faucet_serve_shard_coordinations_total: one increment per sharded run split; the outcome label is for investigating a lost or cancelled split, not for trending
 faucet_feed_store_moved: a per-feed 0/1 gauge for a misconfiguration (its events are in another feed store); alerted on by FaucetFeedStoreMoved and shown as the feed's status and on /readyz
+faucet_feed_maintenance_behind: a per-feed 0/1 gauge (retention ran out of time); alerted on by FaucetFeedMaintenanceBehind, read with faucet_feed_trimmed_events_total
