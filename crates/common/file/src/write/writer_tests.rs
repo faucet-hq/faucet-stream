@@ -2124,6 +2124,33 @@ async fn a_csv_appender_holds_the_output_until_it_is_done() {
     assert_eq!(text, "a\n1\n3\n2\n");
 }
 
+/// A CSV appender that waits longer than the lock wait gives up and writes
+/// nothing.
+#[tokio::test]
+async fn an_appender_that_waits_too_long_gives_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = WriteSettings::new(FileFormat::Csv, Compression::None);
+    s.if_exists = IfExists::Append;
+    let first = local(dir.path(), "busy.csv", s.clone());
+    first.write_rows(&[json!({"a": 1})]).await.unwrap();
+    let path = dir.path().to_path_buf();
+    let e = tokio::spawn(async move {
+        let second = local(&path, "busy.csv", s);
+        second
+            .write_rows(&[json!({"a": 2})])
+            .await
+            .unwrap_err()
+            .to_string()
+    })
+    .await
+    .unwrap();
+    assert!(
+        e.contains("another run held") && e.contains("nothing was written"),
+        "{e}"
+    );
+    first.complete().await.unwrap();
+}
+
 /// Of two `if_exists: error` runs that both find a name absent, only one
 /// writes it.
 #[tokio::test]
