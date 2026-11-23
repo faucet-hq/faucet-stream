@@ -43,6 +43,10 @@ pub struct PipelineConfig {
     pub replication: Option<ReplicationSpec>,
     #[cfg(feature = "policy")]
     pub policy: Option<PolicySpec>,
+    #[serde(skip)]
+    pub runtime_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept: Option<u8>,
 }
 """
 
@@ -67,8 +71,8 @@ class Parse(unittest.TestCase):
         self.assertEqual(ec.registered_kinds(REGISTRY, "builtin_source_descriptions"), {"rest", "postgres-cdc"})
         self.assertEqual(ec.registered_kinds(REGISTRY, "builtin_sink_descriptions"), {"file"})
 
-    def test_top_level_keys_honour_serde_rename(self):
-        self.assertEqual(ec.top_level_keys(CONFIG), {"name", "mirror", "policy"})
+    def test_top_level_keys_honour_serde_rename_and_skip(self):
+        self.assertEqual(ec.top_level_keys(CONFIG), {"name", "mirror", "policy", "kept"})
 
     def test_enum_variants_snake_case_or_verbatim(self):
         self.assertEqual(ec.enum_variants(ENUMS, "WriteMode"), {"append", "upsert"})
