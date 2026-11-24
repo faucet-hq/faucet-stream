@@ -19,12 +19,22 @@ const COLLECTION: &str = "docs";
 /// A single-node replica set: the module's own one for the default image,
 /// or `tag` started with `--replSet` and initiated here (the module waits for
 /// a log line newer servers no longer print).
-#[allow(clippy::disallowed_methods)] // a test's readiness poll
 async fn start(tag: Option<&'static str>) -> (ContainerAsync<Mongo>, String) {
+    start_with(tag, &[]).await
+}
+
+/// [`start`], with extra server arguments for a tagged image.
+#[allow(clippy::disallowed_methods)] // a test's readiness poll
+async fn start_with(
+    tag: Option<&'static str>,
+    args: &'static [&'static str],
+) -> (ContainerAsync<Mongo>, String) {
     let container: ContainerAsync<Mongo> = match tag {
         Some(tag) => {
             faucet_conformance::containers::start(|| {
-                Mongo::default().with_tag(tag).with_cmd(["--replSet", "rs"])
+                let mut cmd = vec!["--replSet", "rs"];
+                cmd.extend_from_slice(args);
+                Mongo::default().with_tag(tag).with_cmd(cmd)
             })
             .await
         }
@@ -292,5 +302,75 @@ async fn an_exactly_once_page_is_one_transaction_on_a_bulk_server() {
         after
             .iter()
             .any(|d| d.get_str("name").ok() == Some("renamed"))
+    );
+}
+
+/// Make the server answer `bulkWrite` with `CommandNotFound`, as a server
+/// whose wire version advertises the command but does not run it would.
+async fn refuse_bulk_write(uri: &str) {
+    Client::with_uri_str(uri)
+        .await
+        .expect("client")
+        .database("admin")
+        .run_command(doc! {
+            "configureFailPoint": "failCommand",
+            "mode": "alwaysOn",
+            "data": {"failCommands": ["bulkWrite"], "errorCode": 59},
+        })
+        .await
+        .expect("failpoint");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_refusing_the_command_gets_the_page_row_by_row() {
+    let (_new, uri) = start_with(Some("8.0"), &["--setParameter", "enableTestCommands=1"]).await;
+    refuse_bulk_write(&uri).await;
+    let sink = MongoSink::new(config(&uri)).await.expect("sink");
+    let mut counts = Vec::new();
+    for page in pages() {
+        counts.push(sink.write_batch(&page).await.expect("write"));
+    }
+    let (_old, row_uri) = start(None).await;
+    let row_sink = MongoSink::new(config(&row_uri)).await.expect("sink");
+    let mut row_counts = Vec::new();
+    for page in pages() {
+        row_counts.push(row_sink.write_batch(&page).await.expect("write"));
+    }
+    assert_eq!(counts, row_counts);
+    assert_eq!(collection(&uri).await, collection(&row_uri).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exactly_once_page_refused_as_a_command_fails_once_then_goes_row_by_row() {
+    let (_new, uri) = start_with(Some("8.0"), &["--setParameter", "enableTestCommands=1"]).await;
+    refuse_bulk_write(&uri).await;
+    let sink = MongoSink::new(config(&uri)).await.expect("sink");
+    let page: Vec<Value> = (0..50)
+        .map(|i| json!({"_id": i, "name": format!("n{i}"), "__op": "u"}))
+        .collect();
+    let err = sink
+        .write_batch_idempotent(&page, "pipe::row", "00000000000000000001")
+        .await
+        .expect_err("the transaction's bulkWrite is refused")
+        .to_string();
+    assert!(
+        err.contains("MongoDB bulk_write (exactly-once) failed"),
+        "{err}"
+    );
+    assert!(collection(&uri).await.is_empty());
+    assert_eq!(
+        sink.last_committed_token("pipe::row").await.expect("token"),
+        None
+    );
+    assert_eq!(
+        sink.write_batch_idempotent(&page, "pipe::row", "00000000000000000001")
+            .await
+            .expect("retried page"),
+        50
+    );
+    assert_eq!(collection(&uri).await.len(), 50);
+    assert_eq!(
+        sink.last_committed_token("pipe::row").await.expect("token"),
+        Some("00000000000000000001".to_string())
     );
 }

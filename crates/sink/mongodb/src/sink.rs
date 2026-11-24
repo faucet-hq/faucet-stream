@@ -99,7 +99,8 @@ fn hello_supports_bulk_write(reply: &Document) -> bool {
 
 /// How one failed `bulkWrite` of planned ops ends.
 enum BulkFailure {
-    /// The server does not take the command; nothing was sent.
+    /// The server does not take the command (the driver's version check, or
+    /// the server refusing it as unknown or unsupported); nothing was written.
     Unsupported(mongodb::error::Error),
     /// The op at this page-plan position was refused, with the error a
     /// single-document write would have returned.
@@ -114,6 +115,7 @@ fn classify_bulk_error(error: mongodb::error::Error) -> BulkFailure {
     use mongodb::error::{ErrorKind, WriteFailure};
     match *error.kind {
         ErrorKind::IncompatibleServer { .. } => BulkFailure::Unsupported(error),
+        ErrorKind::Command(ref c) if refuses_command(c.code) => BulkFailure::Unsupported(error),
         ErrorKind::BulkWrite(ref bulk) if !bulk.write_errors.is_empty() => {
             let Some((index, write_error)) = bulk
                 .write_errors
@@ -130,6 +132,12 @@ fn classify_bulk_error(error: mongodb::error::Error) -> BulkFailure {
         }
         _ => BulkFailure::Command(error),
     }
+}
+
+/// `CommandNotFound` (59) and `CommandNotSupported` (115): a server that
+/// does not run `bulkWrite` although its wire version says it could.
+fn refuses_command(code: i32) -> bool {
+    matches!(code, 59 | 115)
 }
 
 /// The models of one planned page, in plan order.
@@ -2107,6 +2115,35 @@ mod tests {
             classify_bulk_error(mongodb::error::Error::custom("transport")),
             BulkFailure::Command(_)
         ));
+    }
+
+    fn command_error(code: i32, code_name: &str) -> mongodb::error::Error {
+        let c: mongodb::error::CommandError =
+            bson::from_document(bson::doc! {"code": code, "codeName": code_name, "errmsg": "no"})
+                .unwrap();
+        mongodb::error::ErrorKind::Command(c).into()
+    }
+
+    #[test]
+    fn a_server_that_refuses_the_command_reads_as_unsupported() {
+        for (code, name) in [(59, "CommandNotFound"), (115, "CommandNotSupported")] {
+            assert!(
+                matches!(
+                    classify_bulk_error(command_error(code, name)),
+                    BulkFailure::Unsupported(_)
+                ),
+                "{name}"
+            );
+        }
+        for (code, name) in [(13, "Unauthorized"), (11600, "InterruptedAtShutdown")] {
+            assert!(
+                matches!(
+                    classify_bulk_error(command_error(code, name)),
+                    BulkFailure::Command(_)
+                ),
+                "{name}"
+            );
+        }
     }
 
     #[test]
