@@ -1119,31 +1119,19 @@ impl IcebergDriver {
         let arrow_schema = iceberg_to_arrow_schema(table.metadata().current_schema())?;
         state.warn_dropped_fields(&arrow_schema, records);
 
-        // Try to convert each record individually so we can give per-row errors.
-        let mut outcomes: Vec<faucet_core::RowOutcome> = Vec::with_capacity(records.len());
-        let mut good_records: Vec<Value> = Vec::with_capacity(records.len());
-        let mut good_indices: Vec<usize> = Vec::with_capacity(records.len());
-
-        for (i, record) in records.iter().enumerate() {
-            match json_to_record_batch(std::slice::from_ref(record), &arrow_schema) {
-                Ok(_) => {
-                    good_records.push(record.clone());
-                    good_indices.push(i);
-                    // We'll fill in Ok(()) after the batch write succeeds.
-                    outcomes.push(Ok(()));
-                }
-                Err(e) => {
-                    outcomes.push(Err(FaucetError::Sink(format!(
-                        "iceberg: row {i} failed Arrow conversion: {e}"
-                    ))));
-                }
-            }
+        let converted = faucet_core::columnar::convert_page_or_rows(records, |rows| {
+            json_to_record_batch(rows, &arrow_schema)
+        })?;
+        let mut outcomes: Vec<faucet_core::RowOutcome> = records.iter().map(|_| Ok(())).collect();
+        for (i, e) in converted.failed {
+            outcomes[i] = Err(FaucetError::Sink(format!(
+                "iceberg: row {i} failed Arrow conversion: {e}"
+            )));
         }
 
         // Write the good records as a batch (outer-Err on transport failure).
-        if !good_records.is_empty() {
+        if let Some(batch) = converted.batch {
             self.ensure_writer(calls, &mut state, &table).await?;
-            let batch = json_to_record_batch(&good_records, &arrow_schema)?;
             let writer = state.writer.as_mut().expect("writer set above");
             if let Err(e) = calls.call_once("write", writer.write(batch)).await {
                 state.poison(&e);

@@ -457,6 +457,14 @@ type Seal = crate::sealed_lines::LineSeal;
 #[cfg(not(feature = "encryption"))]
 type Seal = ();
 
+/// Records one whole-document file may hold before a warning names the
+/// memory it costs.
+pub(crate) const WHOLE_DOCUMENT_WARN_RECORDS: usize = 1_000_000;
+
+fn reaches_document_warning(before: usize, after: usize) -> bool {
+    before < WHOLE_DOCUMENT_WARN_RECORDS && after >= WHOLE_DOCUMENT_WARN_RECORDS
+}
+
 /// Format-specific state.
 enum Enc {
     /// JSON Lines and raw text: encoded bytes streamed through the codec.
@@ -660,7 +668,21 @@ impl OpenFile {
                 self.enc = Enc::Csv(Box::new(state));
                 written?;
             }
-            Enc::Doc(buf) => buf.extend_from_slice(records),
+            Enc::Doc(buf) => {
+                let before = buf.len();
+                buf.extend_from_slice(records);
+                if reaches_document_warning(before, buf.len()) {
+                    tracing::warn!(
+                        file = %self.label,
+                        format = ?ctx.format,
+                        records = buf.len(),
+                        "file sink: this format is written as one whole document, so every \
+                         record of the file is held in memory and encoded again at each flush; \
+                         add `{{part}}` to the path with `max_records_per_file`, or use a line \
+                         format, to bound memory"
+                    );
+                }
+            }
             #[cfg(feature = "file-format-parquet")]
             Enc::Parquet(state) => {
                 let batch = state.batch_for(ctx.parquet, records).map_err(clean)?;
@@ -1167,18 +1189,16 @@ impl CsvState {
                 self.add_column(&key);
             }
         }
+        let mut row = Vec::with_capacity(self.header.len());
         for r in records {
-            let row: Vec<String> = self
-                .header
-                .iter()
-                .map(|h| {
-                    r.get(h)
-                        .map(faucet_core::file_format::cell_text)
-                        .unwrap_or_default()
-                })
-                .collect();
+            row.clear();
+            row.extend(self.header.iter().map(|h| {
+                r.get(h)
+                    .map(faucet_core::file_format::cell_str)
+                    .unwrap_or_default()
+            }));
             self.body
-                .write_record(&row)
+                .write_record(row.iter().map(|c| c.as_bytes()))
                 .map_err(|e| dirty(csv_err(&self.body_path, e)))?;
             self.narrowest = self.narrowest.min(row.len());
         }
@@ -1298,5 +1318,14 @@ mod tests {
             0,
             "default permissions for a non-private file"
         );
+    }
+
+    #[test]
+    fn the_whole_document_warning_fires_on_the_write_that_crosses_the_mark() {
+        let mark = WHOLE_DOCUMENT_WARN_RECORDS;
+        assert!(!reaches_document_warning(0, mark - 1));
+        assert!(reaches_document_warning(mark - 1, mark));
+        assert!(reaches_document_warning(0, mark + 5));
+        assert!(!reaches_document_warning(mark, mark + 1000));
     }
 }

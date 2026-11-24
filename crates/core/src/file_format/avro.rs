@@ -787,7 +787,34 @@ fn root_from_json(v: &Value, schema: &Schema, names: &Names) -> Result<Av, Strin
     }
 }
 
-fn at(path: &str) -> String {
+#[derive(Clone, Copy)]
+enum AvPath<'a> {
+    Root(&'a str),
+    Key(&'a AvPath<'a>, &'a str),
+    Index(&'a AvPath<'a>, usize),
+}
+
+impl AvPath<'_> {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Root(p) => p.is_empty(),
+            Self::Key(..) | Self::Index(..) => false,
+        }
+    }
+}
+
+impl std::fmt::Display for AvPath<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Root(p) => f.write_str(p),
+            Self::Key(parent, k) if parent.is_empty() => f.write_str(k),
+            Self::Key(parent, k) => write!(f, "{parent}.{k}"),
+            Self::Index(parent, i) => write!(f, "{parent}[{i}]"),
+        }
+    }
+}
+
+fn at(path: AvPath<'_>) -> String {
     if path.is_empty() {
         "the record".into()
     } else {
@@ -819,6 +846,16 @@ fn from_json(
     text: BytesText,
     path: &str,
 ) -> Result<Av, String> {
+    from_json_at(v, schema, names, text, AvPath::Root(path))
+}
+
+fn from_json_at(
+    v: &Value,
+    schema: &Schema,
+    names: &Names,
+    text: BytesText,
+    path: AvPath<'_>,
+) -> Result<Av, String> {
     let s = resolve(schema, names).map_err(|e| e.to_string())?;
     let want = |what: &str| format!("{}: expected {what}, got {}", at(path), short(v));
     Ok(match s {
@@ -849,7 +886,7 @@ fn from_json(
                 items
                     .iter()
                     .enumerate()
-                    .map(|(i, x)| from_json(x, &a.items, names, text, &format!("{path}[{i}]")))
+                    .map(|(i, x)| from_json_at(x, &a.items, names, text, AvPath::Index(&path, i)))
                     .collect::<Result<_, _>>()?,
             )
         }
@@ -860,7 +897,7 @@ fn from_json(
                     .map(|(k, x)| {
                         Ok((
                             k.clone(),
-                            from_json(x, &m.types, names, text, &join(path, k))?,
+                            from_json_at(x, &m.types, names, text, AvPath::Key(&path, k))?,
                         ))
                     })
                     .collect::<Result<_, String>>()?,
@@ -874,15 +911,15 @@ fn from_json(
                 let fv = obj.get(key).unwrap_or(&Value::Null);
                 let datum = match (fv, accepts_null(&f.schema, names), &f.default) {
                     (Value::Null, false, Some(default)) => {
-                        from_json(default, &f.schema, names, text, &join(path, key))?
+                        from_json_at(default, &f.schema, names, text, AvPath::Key(&path, key))?
                     }
                     (Value::Null, false, None) => {
                         return Err(format!(
                             "{}: required field is missing or null",
-                            at(&join(path, key))
+                            at(AvPath::Key(&path, key))
                         ));
                     }
-                    _ => from_json(fv, &f.schema, names, text, &join(path, key))?,
+                    _ => from_json_at(fv, &f.schema, names, text, AvPath::Key(&path, key))?,
                 };
                 fields.push((f.name.clone(), datum));
             }
@@ -897,6 +934,14 @@ fn from_json(
             }
             // Exact JSON-type branches first, the lenient string branch last,
             // so `["string","long"]` writes 42 as a long, not as "42".
+            let mut branches = variants
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| !matches!(b, Schema::Null));
+            if let (Some((i, b)), None) = (branches.next(), branches.next()) {
+                return from_json_at(v, b, names, text, path)
+                    .map(|d| Av::Union(i as u32, Box::new(d)));
+            }
             let mut order: Vec<(u8, usize)> = variants
                 .iter()
                 .enumerate()
@@ -907,7 +952,7 @@ fn from_json(
             let mut last = None;
             for (_, i) in order {
                 let b = &variants[i];
-                match from_json(v, b, names, text, path) {
+                match from_json_at(v, b, names, text, path) {
                     Ok(d) => return Ok(Av::Union(i as u32, Box::new(d))),
                     Err(e) => last = Some(e),
                 }
@@ -1035,6 +1080,7 @@ fn accepts_null(s: &Schema, names: &Names) -> bool {
     }
 }
 
+#[cfg(test)]
 fn join(path: &str, k: &str) -> String {
     if path.is_empty() {
         k.to_string()
@@ -2047,5 +2093,90 @@ mod tests {
         .unwrap();
         let next: Value = serde_json::from_str(rows[0]["next"].as_str().unwrap()).unwrap();
         assert_eq!(next, json!({"v": 2, "next": null}));
+    }
+
+    #[test]
+    fn lazy_paths_spell_what_the_joined_strings_spelled() {
+        for root in ["", "top"] {
+            let r = AvPath::Root(root);
+            assert_eq!(r.to_string(), root);
+            let k = AvPath::Key(&r, "a");
+            assert_eq!(k.to_string(), join(root, "a"));
+            let i = AvPath::Index(&k, 3);
+            assert_eq!(i.to_string(), format!("{}[3]", join(root, "a")));
+            let deep = AvPath::Key(&i, "b");
+            assert_eq!(
+                deep.to_string(),
+                join(&format!("{}[3]", join(root, "a")), "b")
+            );
+            assert_eq!(at(deep), format!("`{deep}`"));
+            let top = AvPath::Index(&r, 0);
+            assert_eq!(top.to_string(), format!("{root}[0]"));
+            assert!(!top.is_empty());
+        }
+        assert_eq!(at(AvPath::Root("")), "the record");
+    }
+
+    #[test]
+    fn encode_errors_name_the_nested_path() {
+        let schema = Schema::parse_str(
+            r#"{"type":"record","name":"r","fields":[
+                {"name":"items","type":{"type":"array","items":{"type":"record","name":"i","fields":[
+                    {"name":"n","type":["null","int"]},
+                    {"name":"m","type":{"type":"map","values":"long"}}]}}}]}"#,
+        )
+        .unwrap();
+        let ok = datum_from_json(
+            &json!({"items": [{"n": 1, "m": {"k": 2}}, {"n": null, "m": {}}]}),
+            &schema,
+        );
+        assert!(ok.is_ok(), "{ok:?}");
+        let e = datum_from_json(
+            &json!({"items": [{"n": 1, "m": {}}, {"n": "x", "m": {}}]}),
+            &schema,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("`items[1].n`: expected an integer, got \"x\""),
+            "{e}"
+        );
+        let e = datum_from_json(&json!({"items": [{"n": 1, "m": {"k": "v"}}]}), &schema)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("`items[0].m.k`: expected an integer"), "{e}");
+        let e = datum_from_json(&json!({"items": [{"n": 1}]}), &schema)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("`items[0].m`: required field is missing or null"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_one_branch_union_writes_what_the_ranked_search_wrote() {
+        let names = Names::new();
+        let nullable = Schema::parse_str(r#"["null","string"]"#).unwrap();
+        assert!(matches!(
+            from_json(&json!("x"), &nullable, &names, BytesText::Hex, "u"),
+            Ok(Av::Union(1, b)) if *b == Av::String("x".into())
+        ));
+        assert!(matches!(
+            from_json(&json!(5), &nullable, &names, BytesText::Hex, "u"),
+            Ok(Av::Union(1, b)) if *b == Av::String("5".into())
+        ));
+        let only = Schema::parse_str(r#"["long"]"#).unwrap();
+        assert!(matches!(
+            from_json(&json!(5), &only, &names, BytesText::Hex, "u"),
+            Ok(Av::Union(0, b)) if *b == Av::Long(5)
+        ));
+        let e = from_json(&json!("x"), &only, &names, BytesText::Hex, "u").unwrap_err();
+        assert_eq!(e, "`u`: expected an integer, got \"x\"");
+        let two = Schema::parse_str(r#"["null","string","long"]"#).unwrap();
+        assert!(matches!(
+            from_json(&json!(42), &two, &names, BytesText::Hex, "u"),
+            Ok(Av::Union(2, b)) if *b == Av::Long(42)
+        ));
     }
 }

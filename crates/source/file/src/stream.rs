@@ -6,6 +6,7 @@ use crate::plan::{self, Bookmark, Candidate};
 use async_trait::async_trait;
 use faucet_common_file::{resolution_name, url_file_name};
 use faucet_core::compression::Compression;
+use faucet_core::file_format::JsonLineError;
 use faucet_core::observability::RecorderSlot;
 use faucet_core::shard::{HashShard, ShardSpec, parse_hash_shard, plan_hash_shards};
 use faucet_core::{FaucetError, FileFormat, FileInput, FormatOptions, Stream, StreamPage};
@@ -263,9 +264,10 @@ impl FileSource {
                     .map(|r| r.map_err(std::io::Error::other));
                 Box::pin(tokio_util::io::StreamReader::new(body))
             }
-            None => Box::pin(tokio::io::BufReader::new(tokio::fs::File::from_std(
-                open_local(path)?,
-            ))),
+            None => Box::pin(tokio::io::BufReader::with_capacity(
+                faucet_core::file_format::READ_BUFFER_BYTES,
+                tokio::fs::File::from_std(open_local(path)?),
+            )),
         })
     }
 
@@ -576,17 +578,14 @@ impl faucet_core::Source for FileSource {
                             // One line is bounded by `max_object_bytes`, so a
                             // body with no newline fails instead of being
                             // buffered whole.
-                            let mut lines = faucet_core::file_format::capped_lines(reader, self.config.max_object_bytes);
-                            let mut n = 0usize;
-                            while let Some(line) = lines.next_line().await.map_err(|e| read_err(path, e))? {
-                                n += 1;
-                                let line = line.trim();
-                                if line.is_empty() {
-                                    continue;
+                            let mut lines = faucet_core::file_format::json_lines(reader, self.config.max_object_bytes);
+                            while let Some(value) = lines.next_value().await.map_err(|e| match e {
+                                JsonLineError::Parse { line, error } => {
+                                    FaucetError::Source(format!("file source: '{path}' line {line}: {error}"))
                                 }
-                                buffer.push(faucet_core::fidelity::from_str(line).map_err(|e| {
-                                    FaucetError::Source(format!("file source: '{path}' line {n}: {e}"))
-                                })?);
+                                JsonLineError::Read(e) => read_err(path, e),
+                            })? {
+                                buffer.push(value);
                                 if buffer.len() >= chunk {
                                     yield StreamPage { records: std::mem::take(&mut buffer), bookmark: None };
                                 }
