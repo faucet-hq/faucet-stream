@@ -1,7 +1,9 @@
 //! RAII timer that records a histogram sample on `Drop`. Ensures duration
 //! samples are recorded even on future cancellation or panic unwind.
 
-use metrics::{KeyName, Label, SharedString, histogram};
+use crate::observability::handles::Cached;
+use metrics::{Histogram, KeyName, Label, SharedString, histogram};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// On `Drop`, records the elapsed time since construction into the named
@@ -9,17 +11,43 @@ use std::time::Instant;
 /// even if the surrounding future is cancelled or panics.
 #[must_use = "DurationGuard must be bound to a variable; otherwise it records elapsed=0"]
 pub struct DurationGuard {
-    name: KeyName,
-    labels: Vec<Label>,
+    series: Series,
     started_at: Instant,
     armed: bool,
+}
+
+enum Series {
+    Named { name: KeyName, labels: Vec<Label> },
+    Cached(Arc<Cached<Histogram>>),
+}
+
+impl Series {
+    fn record(&self, seconds: f64) {
+        match self {
+            Self::Named { name, labels } => {
+                histogram!(name.clone(), labels.clone()).record(seconds)
+            }
+            Self::Cached(handle) => handle.with(|h| h.record(seconds)),
+        }
+    }
 }
 
 impl DurationGuard {
     pub fn new(name: impl Into<KeyName>, labels: Vec<Label>) -> Self {
         Self {
-            name: name.into(),
-            labels,
+            series: Series::Named {
+                name: name.into(),
+                labels,
+            },
+            started_at: Instant::now(),
+            armed: true,
+        }
+    }
+
+    /// A guard recording into a histogram whose handle is kept between calls.
+    pub(crate) fn cached(histogram: Arc<Cached<Histogram>>) -> Self {
+        Self {
+            series: Series::Cached(histogram),
             started_at: Instant::now(),
             armed: true,
         }
@@ -44,7 +72,7 @@ impl DurationGuard {
             return;
         }
         let elapsed = self.started_at.elapsed().as_secs_f64();
-        histogram!(self.name.clone(), self.labels.clone()).record(elapsed);
+        self.series.record(elapsed);
         self.armed = false;
     }
 
@@ -72,7 +100,7 @@ impl Drop for DurationGuard {
             return;
         }
         let elapsed = self.started_at.elapsed().as_secs_f64();
-        histogram!(self.name.clone(), self.labels.clone()).record(elapsed);
+        self.series.record(elapsed);
     }
 }
 

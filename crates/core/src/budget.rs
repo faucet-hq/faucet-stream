@@ -28,7 +28,6 @@
 
 use crate::error::FaucetError;
 use crate::traits::{RowOutcome, Sink};
-use crate::usage::estimate_page_bytes;
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -715,7 +714,7 @@ impl BudgetSink {
 
     fn page_bytes(&self, records: &[Value]) -> u64 {
         if self.spec.max_bytes.is_some() {
-            estimate_page_bytes(records)
+            crate::usage::estimate_page_bytes_shared(records)
         } else {
             0
         }
@@ -959,6 +958,7 @@ impl Sink for BudgetSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usage::estimate_page_bytes;
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
 
