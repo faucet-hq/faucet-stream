@@ -9,6 +9,7 @@ mod cleanup;
 mod contract;
 pub(crate) mod decorator;
 mod drift;
+mod handles;
 mod install;
 mod labels;
 #[cfg(feature = "masking")]

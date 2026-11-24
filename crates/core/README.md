@@ -257,6 +257,17 @@ status-error shape. `faucet_core::batching` re-chunks under the `batch_size`
 contract (`chunks`, `into_chunks`) and bounds concurrency (`map_concurrent`,
 `for_each_concurrent`, `ConcurrencyLimit`).
 
+`batching::prefetch_ordered(items, concurrency, f)` fetches ahead on spawned
+tasks and yields results in input order: at most `concurrency` items are
+running or waiting to be yielded, the first error ends the stream and aborts
+the rest, a panic becomes an error, and dropping the stream aborts its tasks.
+The tasks keep running while the consumer writes the previous result, and
+carry the caller's span, reference policy and non-finite counter. Use it only
+for reads that are safe before the previous result is written (object bodies,
+result partitions); never for a source whose read acknowledges or commits
+(message consumers, a webhook answering on commit, feed deliveries, a Kafka
+group member).
+
 ### TLS: private CAs and client certificates
 
 `faucet_core::TlsOptions` is the shared `tls:` config block for connectors
@@ -919,7 +930,7 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `io` | `CallContext`, `CallSlot`, `DEFAULT_CALL_TIMEOUT` — the backend-call wrapper (#880); `CallContext::non_idempotent` retries only attempts that provably never took effect (a decline or a failed connect) |
 | `http` | `Client`, `ClientBuilder`, `status_error`, `is_cross_origin`, `strip_credentials`, `ResponseTooLarge` |
 | `tls` | `TlsOptions`, `LoadedTls`, `ClientPem` (server verification + client certificates), `TlsClientConfig` (HTTP-source mTLS), `ensure_crypto_provider` (the process-wide rustls provider) |
-| `batching` | `chunks`, `into_chunks`, `map_concurrent`, `for_each_concurrent`, `ConcurrencyLimit` |
+| `batching` | `chunks`, `into_chunks`, `map_concurrent`, `for_each_concurrent`, `prefetch_ordered`, `ConcurrencyLimit` |
 | `schema` | `infer_schema` from record samples |
 | `check` | `CheckContext`, `Probe`, `CheckReport` for `faucet doctor` |
 | `observability` | Pipeline-internal `tracing`/`metrics` decorators; `install_observability` |

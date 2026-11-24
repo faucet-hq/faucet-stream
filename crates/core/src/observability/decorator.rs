@@ -2,6 +2,7 @@
 //! source / sink trait call. See the design spec for the full vocabulary.
 
 use crate::error::FaucetError;
+use crate::observability::handles::Cached;
 use crate::observability::labels::Labels;
 use crate::observability::timer::DurationGuard;
 use crate::pipeline::StreamPage;
@@ -10,7 +11,7 @@ use crate::usage::{UsageMeter, estimate_page_bytes};
 use async_trait::async_trait;
 use futures::FutureExt;
 use futures_core::Stream;
-use metrics::{Label, SharedString, counter, gauge};
+use metrics::{Counter, Gauge, Histogram, Label, SharedString, counter, gauge};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -119,6 +120,67 @@ pub struct InstrumentedSource<'a, S: Source + ?Sized> {
     page_index: Arc<AtomicUsize>,
     /// The run's usage meter (#704); `None` = count nothing beyond metrics.
     meter: Option<Arc<UsageMeter>>,
+    /// The per-page series, looked up once and kept.
+    handles: Arc<SourceHandles>,
+}
+
+struct SourceHandles {
+    pages: Cached<Counter>,
+    records: Cached<Counter>,
+    bytes: Cached<Counter>,
+    page_duration: Arc<Cached<Histogram>>,
+}
+
+impl SourceHandles {
+    fn new(labels: &[Label]) -> Self {
+        Self {
+            pages: Cached::new("faucet_source_pages_total", labels.to_vec()),
+            records: Cached::new("faucet_source_records_total", labels.to_vec()),
+            bytes: Cached::new("faucet_source_bytes_total", labels.to_vec()),
+            page_duration: Arc::new(Cached::new(
+                "faucet_source_page_duration_seconds",
+                labels.to_vec(),
+            )),
+        }
+    }
+}
+
+struct SinkHandles {
+    in_flight: Cached<Gauge>,
+    writes: Cached<Counter>,
+    records: Cached<Counter>,
+    bytes: Cached<Counter>,
+    write_duration: Arc<Cached<Histogram>>,
+}
+
+impl SinkHandles {
+    fn new(labels: &[Label]) -> Self {
+        Self {
+            in_flight: Cached::new("faucet_sink_in_flight", labels.to_vec()),
+            writes: Cached::new("faucet_sink_writes_total", labels.to_vec()),
+            records: Cached::new("faucet_sink_records_total", labels.to_vec()),
+            bytes: Cached::new("faucet_sink_bytes_total", labels.to_vec()),
+            write_duration: Arc::new(Cached::new(
+                "faucet_sink_write_duration_seconds",
+                labels.to_vec(),
+            )),
+        }
+    }
+
+    /// Count one write in flight until the returned guard drops (also on a
+    /// panic or a cancelled future).
+    fn enter(&self) -> InFlight<'_> {
+        self.in_flight.with(|g| g.increment(1.0));
+        InFlight(&self.in_flight)
+    }
+}
+
+struct InFlight<'h>(&'h Cached<Gauge>);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.with(|g| g.decrement(1.0));
+    }
 }
 
 impl<'a, S: Source + ?Sized> InstrumentedSource<'a, S> {
@@ -130,6 +192,7 @@ impl<'a, S: Source + ?Sized> InstrumentedSource<'a, S> {
         );
         let connector: SharedString = SharedString::const_str(guarded_connector_name(raw));
         let base_labels = base_metric_labels(&labels, &connector);
+        let handles = Arc::new(SourceHandles::new(&base_labels));
         Self {
             inner,
             labels,
@@ -137,6 +200,7 @@ impl<'a, S: Source + ?Sized> InstrumentedSource<'a, S> {
             base_labels,
             page_index: Arc::new(AtomicUsize::new(0)),
             meter: None,
+            handles,
         }
     }
 
@@ -241,6 +305,7 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
         let page_index = Arc::clone(&self.page_index);
         let meter = self.meter.clone();
         let metric_labels = self.metric_labels();
+        let handles = Arc::clone(&self.handles);
         let pipeline = self.labels.pipeline.clone();
         let row = self.labels.row.clone();
 
@@ -271,10 +336,7 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
                 // still records the time spent. Disarmed on the terminal empty
                 // poll (`Ok(None)`) so end-of-stream doesn't record a spurious
                 // ~0 sample into the page-duration histogram.
-                let mut _timer = DurationGuard::new(
-                    "faucet_source_page_duration_seconds",
-                    metric_labels.clone(),
-                );
+                let mut _timer = DurationGuard::cached(Arc::clone(&handles.page_duration));
 
                 let next = AssertUnwindSafe(async {
                     use futures::StreamExt;
@@ -286,13 +348,11 @@ impl<'a, S: Source + ?Sized> Source for InstrumentedSource<'a, S> {
 
                 match next {
                     Ok(Some(Ok(page))) => {
-                        counter!("faucet_source_pages_total", metric_labels.clone()).increment(1);
-                        counter!("faucet_source_records_total", metric_labels.clone())
-                            .increment(page.records.len() as u64);
+                        handles.pages.with(|c| c.increment(1));
+                        handles.records.with(|c| c.increment(page.records.len() as u64));
                         if let Some(m) = &meter {
                             let bytes = estimate_page_bytes(&page.records);
-                            counter!("faucet_source_bytes_total", metric_labels.clone())
-                                .increment(bytes);
+                            handles.bytes.with(|c| c.increment(bytes));
                             m.add_read(page.records.len() as u64, bytes);
                         }
                         // Close the timing window BEFORE yielding: in an
@@ -369,6 +429,11 @@ pub struct InstrumentedSink<'a, S: Sink + ?Sized> {
     base_labels: Vec<Label>,
     /// The run's usage meter (#704); `None` = count nothing beyond metrics.
     meter: Option<Arc<UsageMeter>>,
+    /// The per-write series, looked up once and kept.
+    handles: SinkHandles,
+    /// Filled by a byte budget beneath this decorator with the size it worked
+    /// out for the page being written, so the meter does not walk it again.
+    page_bytes: crate::usage::PageBytesHint,
 }
 
 impl<'a, S: Sink + ?Sized> InstrumentedSink<'a, S> {
@@ -380,12 +445,15 @@ impl<'a, S: Sink + ?Sized> InstrumentedSink<'a, S> {
         );
         let connector: SharedString = SharedString::const_str(guarded_connector_name(raw));
         let base_labels = base_metric_labels(&labels, &connector);
+        let handles = SinkHandles::new(&base_labels);
         Self {
             inner,
             labels,
             connector,
             base_labels,
             meter: None,
+            handles,
+            page_bytes: crate::usage::PageBytesHint::default(),
         }
     }
 
@@ -427,21 +495,8 @@ impl<'a, S: Sink + ?Sized> InstrumentedSink<'a, S> {
             connector = %self.connector,
             records = records.len(),
         );
-        let metric_labels = self.metric_labels();
-        gauge!("faucet_sink_in_flight", metric_labels.clone()).increment(1.0);
-
-        // RAII guard ensures the gauge is decremented even if write_batch
-        // panics or the future is cancelled.
-        struct InFlightGuard(Vec<Label>);
-        impl Drop for InFlightGuard {
-            fn drop(&mut self) {
-                gauge!("faucet_sink_in_flight", self.0.clone()).decrement(1.0);
-            }
-        }
-        let _in_flight = InFlightGuard(metric_labels.clone());
-
-        let _timer =
-            DurationGuard::new("faucet_sink_write_duration_seconds", metric_labels.clone());
+        let _in_flight = self.handles.enter();
+        let _timer = DurationGuard::cached(Arc::clone(&self.handles.write_duration));
 
         let write = async {
             if let Some(page) = governed {
@@ -455,7 +510,8 @@ impl<'a, S: Sink + ?Sized> InstrumentedSink<'a, S> {
                     .map(crate::accounting::WriteReport::accepted)
             }
         };
-        let result = AssertUnwindSafe(write)
+        let hint = self.meter.as_ref().map(|_| self.page_bytes.clone());
+        let result = AssertUnwindSafe(crate::usage::with_page_bytes_hint(hint, write))
             .catch_unwind()
             .instrument(span)
             .await;
@@ -463,8 +519,8 @@ impl<'a, S: Sink + ?Sized> InstrumentedSink<'a, S> {
         match result {
             Ok(Ok(r)) => {
                 let n = r.accepted;
-                counter!("faucet_sink_writes_total", metric_labels.clone()).increment(1);
-                counter!("faucet_sink_records_total", metric_labels.clone()).increment(n as u64);
+                self.handles.writes.with(|c| c.increment(1));
+                self.handles.records.with(|c| c.increment(n as u64));
                 self.meter_written(records, n);
                 Ok(r)
             }
@@ -495,11 +551,13 @@ impl<'a, S: Sink + ?Sized> InstrumentedSink<'a, S> {
             return;
         };
         let bytes = if accepted >= records.len() {
-            estimate_page_bytes(records)
+            self.page_bytes
+                .take(records)
+                .unwrap_or_else(|| estimate_page_bytes(records))
         } else {
             estimate_page_bytes(&records[..accepted])
         };
-        counter!("faucet_sink_bytes_total", self.metric_labels()).increment(bytes);
+        self.handles.bytes.with(|c| c.increment(bytes));
         m.add_written(accepted as u64, bytes);
     }
 }
@@ -606,21 +664,8 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
             connector = %self.connector,
             records = records.len(),
         );
-        let metric_labels = self.metric_labels();
-        gauge!("faucet_sink_in_flight", metric_labels.clone()).increment(1.0);
-
-        // RAII guard ensures the gauge is decremented even if write_batch_partial
-        // panics or the future is cancelled.
-        struct InFlightGuard(Vec<Label>);
-        impl Drop for InFlightGuard {
-            fn drop(&mut self) {
-                gauge!("faucet_sink_in_flight", self.0.clone()).decrement(1.0);
-            }
-        }
-        let _in_flight = InFlightGuard(metric_labels.clone());
-
-        let _timer =
-            DurationGuard::new("faucet_sink_write_duration_seconds", metric_labels.clone());
+        let _in_flight = self.handles.enter();
+        let _timer = DurationGuard::cached(Arc::clone(&self.handles.write_duration));
 
         let result = AssertUnwindSafe(self.inner.write_batch_partial(records))
             .catch_unwind()
@@ -630,9 +675,10 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
         match result {
             Ok(Ok(outcomes)) => {
                 let success_count = outcomes.iter().filter(|o| o.is_ok()).count();
-                counter!("faucet_sink_writes_total", metric_labels.clone()).increment(1);
-                counter!("faucet_sink_records_total", metric_labels.clone())
-                    .increment(success_count as u64);
+                self.handles.writes.with(|c| c.increment(1));
+                self.handles
+                    .records
+                    .with(|c| c.increment(success_count as u64));
                 if let Some(m) = &self.meter {
                     let bytes: u64 = outcomes
                         .iter()
@@ -640,7 +686,7 @@ impl<'a, S: Sink + ?Sized> Sink for InstrumentedSink<'a, S> {
                         .filter(|(o, _)| o.is_ok())
                         .map(|(_, r)| crate::usage::estimate_json_bytes(r))
                         .sum();
-                    counter!("faucet_sink_bytes_total", metric_labels.clone()).increment(bytes);
+                    self.handles.bytes.with(|c| c.increment(bytes));
                     m.add_written(success_count as u64, bytes);
                 }
                 Ok(outcomes)
@@ -753,27 +799,19 @@ impl<'a, S: Sink + ?Sized> InstrumentedSink<'a, S> {
             connector = %self.connector,
             records = records.len(),
         );
-        let metric_labels = self.metric_labels();
-        gauge!("faucet_sink_in_flight", metric_labels.clone()).increment(1.0);
-        struct InFlightGuard(Vec<Label>);
-        impl Drop for InFlightGuard {
-            fn drop(&mut self) {
-                gauge!("faucet_sink_in_flight", self.0.clone()).decrement(1.0);
-            }
-        }
-        let _in_flight = InFlightGuard(metric_labels.clone());
-        let _timer =
-            DurationGuard::new("faucet_sink_write_duration_seconds", metric_labels.clone());
+        let _in_flight = self.handles.enter();
+        let _timer = DurationGuard::cached(Arc::clone(&self.handles.write_duration));
 
-        let result = AssertUnwindSafe(write)
+        let hint = self.meter.as_ref().map(|_| self.page_bytes.clone());
+        let result = AssertUnwindSafe(crate::usage::with_page_bytes_hint(hint, write))
             .catch_unwind()
             .instrument(span)
             .await;
         match result {
             Ok(Ok(out)) => {
                 let n = accepted(&out);
-                counter!("faucet_sink_writes_total", metric_labels.clone()).increment(1);
-                counter!("faucet_sink_records_total", metric_labels).increment(n as u64);
+                self.handles.writes.with(|c| c.increment(1));
+                self.handles.records.with(|c| c.increment(n as u64));
                 self.meter_written(records, n);
                 Ok(out)
             }
@@ -997,6 +1035,7 @@ pub(crate) mod source_tests {
             base_labels: Vec::new(),
             page_index: Arc::new(AtomicUsize::new(0)),
             meter: None,
+            handles: Arc::new(SourceHandles::new(&[])),
         };
         assert_eq!(
             Source::connector_name(&wrapped),
@@ -1332,6 +1371,8 @@ mod sink_tests {
             connector: SharedString::const_str("unknown"),
             base_labels: Vec::new(),
             meter: None,
+            handles: SinkHandles::new(&[]),
+            page_bytes: Default::default(),
         };
         assert_eq!(
             Sink::connector_name(&wrapped),
@@ -1701,6 +1742,72 @@ mod sink_tests {
         let probe = crate::forwarding::HookSink::default();
         let wrapped = InstrumentedSink::new(&probe, labels());
         crate::forwarding::assert_sink_forwards_every_hook(&wrapped, &probe, &[]).await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn the_meter_reuses_a_page_size_left_beneath_it_only_for_the_same_page() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _snap = snapshotter();
+        struct Leaves {
+            whole_page: bool,
+            accept: usize,
+        }
+        #[async_trait]
+        impl Sink for Leaves {
+            async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+                let seen = if self.whole_page {
+                    records
+                } else {
+                    &records[1..]
+                };
+                crate::usage::leave_page_bytes(seen, 999);
+                Ok(self.accept.min(records.len()))
+            }
+        }
+        let page = [json!({"a": 1}), json!({"b": "two"}), json!({"c": null})];
+        let real = estimate_page_bytes(&page);
+        let run = |row: &'static str, sink: Leaves, idempotent: bool| {
+            let page = page.clone();
+            async move {
+                let meter = Arc::new(UsageMeter::new());
+                let wrapped = InstrumentedSink::new(&sink, Labels::new("p", row, "rid"))
+                    .with_meter(Arc::clone(&meter));
+                if idempotent {
+                    #[allow(deprecated)]
+                    wrapped
+                        .write_batch_idempotent(&page, "s", "t")
+                        .await
+                        .unwrap();
+                } else {
+                    wrapped.write_batch(&page).await.unwrap();
+                }
+                let metric = counters_for(row)["faucet_sink_bytes_total"];
+                assert_eq!(metric, meter.snapshot().bytes_written);
+                metric
+            }
+        };
+        let whole = |accept| Leaves {
+            whole_page: true,
+            accept,
+        };
+        assert_eq!(run("hint-same", whole(3), false).await, 999);
+        assert_eq!(run("hint-same-eo", whole(3), true).await, 999);
+        let other = Leaves {
+            whole_page: false,
+            accept: 3,
+        };
+        assert_eq!(run("hint-other", other, false).await, real);
+        assert_eq!(
+            run("hint-prefix", whole(2), false).await,
+            estimate_page_bytes(&page[..2])
+        );
+
+        let sink = whole(3);
+        let unmetered = InstrumentedSink::new(&sink, Labels::new("p", "hint-none", "rid"));
+        unmetered.write_batch(&page).await.unwrap();
+        assert!(!counters_for("hint-none").contains_key("faucet_sink_bytes_total"));
+        assert_eq!(unmetered.page_bytes.take(&page), None, "no slot was opened");
     }
 
     #[allow(clippy::await_holding_lock)]

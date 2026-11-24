@@ -1181,11 +1181,7 @@ pub fn compile_stage(s: &TransformStage) -> Result<CompiledStage, FaucetError> {
 pub fn apply_stages(rec: Value, stages: &[CompiledStage]) -> Result<Vec<Value>, FaucetError> {
     let mut acc = vec![rec];
     for stage in stages {
-        let mut next: Vec<Value> = Vec::with_capacity(acc.len());
-        for r in acc {
-            next.extend(apply_one_stage(r, stage)?);
-        }
-        acc = next;
+        acc = apply_stage_to_records(acc, stage)?;
     }
     Ok(acc)
 }
@@ -1227,42 +1223,67 @@ pub fn apply_stages_to_page(
                 records = f(records)?;
             }
             per_record => {
-                let mut next = Vec::with_capacity(records.len());
-                for r in records {
-                    next.extend(apply_one_stage(r, per_record)?);
-                }
-                records = next;
+                records = apply_stage_to_records(records, per_record)?;
             }
         }
     }
     Ok(records)
 }
 
-fn apply_one_stage(rec: Value, stage: &CompiledStage) -> Result<Vec<Value>, FaucetError> {
+/// Run one per-record stage over `records`, in order, stopping at the first
+/// record it fails on. A 1→1 stage rewrites the records in place and a filter
+/// compacts them, so neither allocates per record.
+fn apply_stage_to_records(
+    mut records: Vec<Value>,
+    stage: &CompiledStage,
+) -> Result<Vec<Value>, FaucetError> {
     match stage {
-        CompiledStage::Map(t) => Ok(vec![crate::transform::apply_all(
-            rec,
-            std::slice::from_ref(t),
-        )?]),
+        CompiledStage::Map(t) => {
+            let one = std::slice::from_ref(t);
+            for rec in &mut records {
+                *rec = crate::transform::apply_all(rec.take(), one)?;
+            }
+            Ok(records)
+        }
         #[cfg(feature = "transform-filter")]
         CompiledStage::Filter(f) => {
-            if f.evaluate(&rec)? {
-                Ok(vec![rec])
-            } else {
-                Ok(vec![])
+            let mut kept = 0;
+            for at in 0..records.len() {
+                if f.evaluate(&records[at])? {
+                    records.swap(kept, at);
+                    kept += 1;
+                }
             }
+            records.truncate(kept);
+            Ok(records)
         }
         #[cfg(feature = "transform-explode")]
-        CompiledStage::Explode(e) => e.apply(rec),
+        CompiledStage::Explode(e) => fan_out(records, |rec| e.apply(rec)),
         #[cfg(feature = "transform-cdc-unwrap")]
-        CompiledStage::CdcUnwrap(c) => c.apply(rec),
-        CompiledStage::Custom(f) => Ok(f(rec)),
-        CompiledStage::PageFn(_) => Err(FaucetError::Transform(
-            "PageFn is a page-level stage and cannot run in a per-record context; \
-             use apply_stages_to_page"
-                .to_owned(),
-        )),
+        CompiledStage::CdcUnwrap(c) => fan_out(records, |rec| c.apply(rec)),
+        CompiledStage::Custom(f) => fan_out(records, |rec| Ok(f(rec))),
+        CompiledStage::PageFn(_) => {
+            if records.is_empty() {
+                return Ok(records);
+            }
+            Err(FaucetError::Transform(
+                "PageFn is a page-level stage and cannot run in a per-record context; \
+                 use apply_stages_to_page"
+                    .to_owned(),
+            ))
+        }
     }
+}
+
+fn fan_out(
+    records: Vec<Value>,
+    mut each: impl FnMut(Value) -> Result<Vec<Value>, FaucetError>,
+) -> Result<Vec<Value>, FaucetError> {
+    let mut next = Vec::with_capacity(records.len());
+    for rec in records {
+        next.extend(each(rec)?);
+    }
+    Ok(next)
 }
 
 #[cfg(test)]
@@ -1276,6 +1297,251 @@ mod tests {
     use super::*;
     use crate::transform::KeyCaseMode;
     use serde_json::json;
+
+    #[cfg(all(
+        feature = "transform-filter",
+        feature = "transform-explode",
+        feature = "transform-flatten"
+    ))]
+    fn apply_stages_reference(
+        rec: Value,
+        stages: &[CompiledStage],
+    ) -> Result<Vec<Value>, FaucetError> {
+        let mut acc = vec![rec];
+        for stage in stages {
+            let mut next: Vec<Value> = Vec::with_capacity(acc.len());
+            for r in acc {
+                next.extend(apply_one_stage(r, stage)?);
+            }
+            acc = next;
+        }
+        Ok(acc)
+    }
+
+    #[cfg(all(
+        feature = "transform-filter",
+        feature = "transform-explode",
+        feature = "transform-flatten"
+    ))]
+    fn apply_stages_to_page_reference(
+        mut records: Vec<Value>,
+        stages: &[CompiledStage],
+    ) -> Result<Vec<Value>, FaucetError> {
+        for stage in stages {
+            match stage {
+                CompiledStage::PageFn(f) => {
+                    records = f(records)?;
+                }
+                per_record => {
+                    let mut next = Vec::with_capacity(records.len());
+                    for r in records {
+                        next.extend(apply_one_stage(r, per_record)?);
+                    }
+                    records = next;
+                }
+            }
+        }
+        Ok(records)
+    }
+
+    #[cfg(all(
+        feature = "transform-filter",
+        feature = "transform-explode",
+        feature = "transform-flatten"
+    ))]
+    fn apply_one_stage(rec: Value, stage: &CompiledStage) -> Result<Vec<Value>, FaucetError> {
+        match stage {
+            CompiledStage::Map(t) => Ok(vec![crate::transform::apply_all(
+                rec,
+                std::slice::from_ref(t),
+            )?]),
+            #[cfg(feature = "transform-filter")]
+            CompiledStage::Filter(f) => {
+                if f.evaluate(&rec)? {
+                    Ok(vec![rec])
+                } else {
+                    Ok(vec![])
+                }
+            }
+            #[cfg(feature = "transform-explode")]
+            CompiledStage::Explode(e) => e.apply(rec),
+            #[cfg(feature = "transform-cdc-unwrap")]
+            CompiledStage::CdcUnwrap(c) => c.apply(rec),
+            CompiledStage::Custom(f) => Ok(f(rec)),
+            CompiledStage::PageFn(_) => Err(FaucetError::Transform(
+                "PageFn is a page-level stage and cannot run in a per-record context; \
+                 use apply_stages_to_page"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    type CountingStage = (Arc<std::sync::Mutex<Vec<Value>>>, TransformStage);
+
+    fn recording_custom() -> CountingStage {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let stage = TransformStage::Custom(Arc::new(move |rec: Value| {
+            log.lock().unwrap().push(rec.clone());
+            match rec.get("n").and_then(Value::as_i64) {
+                Some(n) if n % 3 == 0 => vec![],
+                Some(n) if n % 3 == 1 => vec![rec.clone(), json!({"n": n, "copy": true})],
+                _ => vec![rec],
+            }
+        }));
+        (seen, stage)
+    }
+
+    #[cfg(all(
+        feature = "transform-filter",
+        feature = "transform-explode",
+        feature = "transform-flatten"
+    ))]
+    #[test]
+    fn page_runner_matches_the_per_record_vec_implementation() {
+        let page = || -> Vec<Value> {
+            (0..40)
+                .map(|n| match n % 8 {
+                    0 => json!({"n": n, "items": [1, 2, 3], "keep": true}),
+                    1 => json!({"n": n, "items": [], "keep": true}),
+                    2 => json!({"n": n, "keep": false, "a": {"b": 1}}),
+                    3 => json!({"n": n, "a": {"b": 1}, "a.b": 2, "keep": true}),
+                    4 => json!(n),
+                    5 => json!({"n": n, "items": "scalar", "keep": true}),
+                    6 => json!({"n": n, "keep": true, "FooBar": 1, "foo_bar": 2}),
+                    _ => json!({"n": n, "keep": true}),
+                })
+                .collect()
+        };
+        let keep = || {
+            TransformStage::Filter(FilterSpec {
+                path: "keep".into(),
+                op: FilterOp::Eq,
+                value: Some(json!(true)),
+            })
+        };
+        let flatten = || {
+            TransformStage::Map(RecordTransform::Flatten {
+                separator: ".".into(),
+            })
+        };
+        let snake = || {
+            TransformStage::Map(RecordTransform::KeysCase {
+                mode: KeyCaseMode::Snake,
+                on_collision: Default::default(),
+                suffix_keys: Vec::new(),
+            })
+        };
+        let explode =
+            || TransformStage::Explode(serde_json::from_value(json!({"path": "items"})).unwrap());
+        let page_fn = || {
+            TransformStage::PageFn(Arc::new(|mut records: Vec<Value>| {
+                records.reverse();
+                Ok(records)
+            }))
+        };
+        let chains: Vec<Vec<TransformStage>> = vec![
+            vec![],
+            vec![keep()],
+            vec![snake()],
+            vec![flatten()],
+            vec![keep(), flatten()],
+            vec![flatten(), keep()],
+            vec![snake(), flatten()],
+            vec![explode()],
+            vec![keep(), explode(), snake()],
+            vec![recording_custom().1, keep()],
+            vec![
+                keep(),
+                recording_custom().1,
+                explode(),
+                recording_custom().1,
+            ],
+            vec![page_fn(), keep(), page_fn(), explode()],
+            vec![explode(), flatten(), snake(), keep()],
+        ];
+        let show = |r: Result<Vec<Value>, FaucetError>| match r {
+            Ok(v) => format!("ok {}", Value::Array(v)),
+            Err(e) => format!("err {e}"),
+        };
+        for (i, chain) in chains.iter().enumerate() {
+            let compiled = compile(chain);
+            assert_eq!(
+                show(apply_stages_to_page(page(), &compiled)),
+                show(apply_stages_to_page_reference(page(), &compiled)),
+                "chain {i}"
+            );
+            for rec in page() {
+                if compiled
+                    .iter()
+                    .any(|s| matches!(s, CompiledStage::PageFn(_)))
+                {
+                    continue;
+                }
+                assert_eq!(
+                    show(apply_stages(rec.clone(), &compiled)),
+                    show(apply_stages_reference(rec, &compiled)),
+                    "chain {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_custom_stage_sees_every_record_in_page_order_before_the_next_stage_runs() {
+        let (first_seen, first) = recording_custom();
+        let (second_seen, second) = recording_custom();
+        let compiled = compile(&[first, second]);
+        let page: Vec<Value> = (0..7).map(|n| json!({"n": n})).collect();
+        let out = apply_stages_to_page(page.clone(), &compiled).unwrap();
+        assert_eq!(*first_seen.lock().unwrap(), page);
+        let after_first = vec![
+            json!({"n": 1}),
+            json!({"n": 1, "copy": true}),
+            json!({"n": 2}),
+            json!({"n": 4}),
+            json!({"n": 4, "copy": true}),
+            json!({"n": 5}),
+        ];
+        assert_eq!(*second_seen.lock().unwrap(), after_first);
+        assert_eq!(out.len(), 10);
+    }
+
+    #[cfg(all(feature = "transform-filter", feature = "transform-flatten"))]
+    #[test]
+    fn the_error_is_the_earliest_stage_then_the_earliest_record() {
+        let filter = TransformStage::Filter(FilterSpec {
+            path: "keep".into(),
+            op: FilterOp::Exists,
+            value: None,
+        });
+        let flatten = TransformStage::Map(RecordTransform::Flatten {
+            separator: ".".into(),
+        });
+        let snake = TransformStage::Map(RecordTransform::KeysCase {
+            mode: KeyCaseMode::Snake,
+            on_collision: Default::default(),
+            suffix_keys: Vec::new(),
+        });
+        let compiled = compile(&[filter, flatten, snake]);
+        let page = vec![
+            json!({"keep": 1, "FooBar": 1, "foo_bar": 2}),
+            json!({"keep": 1, "x": {"y": 1}, "x.y": 2}),
+            json!({"keep": 1, "p": {"q": 1}, "p.q": 2}),
+        ];
+        let err = apply_stages_to_page(page, &compiled).unwrap_err();
+        assert!(err.to_string().contains("x.y"), "{err}");
+    }
+
+    #[test]
+    fn a_page_fn_in_a_per_record_run_fails_only_when_a_record_reaches_it() {
+        let drop_all = TransformStage::Custom(Arc::new(|_| Vec::new()));
+        let page_fn = || TransformStage::PageFn(Arc::new(Ok));
+        let err = apply_stages(json!({}), &compile(&[page_fn()])).unwrap_err();
+        assert!(err.to_string().contains("page-level stage"), "{err}");
+        let out = apply_stages(json!({}), &compile(&[drop_all, page_fn()])).unwrap();
+        assert!(out.is_empty());
+    }
 
     fn compile(stages: &[TransformStage]) -> Vec<CompiledStage> {
         stages
@@ -1294,6 +1560,61 @@ mod tests {
         })]);
         let out = apply_stages(json!({"FooBar": 1}), &compiled).unwrap();
         assert_eq!(out, vec![json!({"foo_bar": 1})]);
+    }
+
+    #[cfg(all(
+        feature = "transform-filter",
+        feature = "transform-explode",
+        feature = "transform-flatten",
+        feature = "transform-set",
+        feature = "transform-rename-field"
+    ))]
+    #[test]
+    #[ignore = "timing"]
+    fn bench_stages_200k() {
+        let compiled = compile(&[
+            TransformStage::Map(RecordTransform::Set {
+                values: [("a".to_string(), json!(1))].into_iter().collect(),
+            }),
+            TransformStage::Map(RecordTransform::RenameField {
+                fields: [("c0".to_string(), "d0".to_string())].into_iter().collect(),
+            }),
+            TransformStage::Filter(FilterSpec {
+                path: "c1".into(),
+                op: FilterOp::Exists,
+                value: None,
+            }),
+            TransformStage::Map(RecordTransform::Set {
+                values: [("b".to_string(), json!(2))].into_iter().collect(),
+            }),
+            TransformStage::Map(RecordTransform::Set {
+                values: [("c".to_string(), json!(3))].into_iter().collect(),
+            }),
+        ]);
+        let mut total = std::time::Duration::ZERO;
+        let mut before = std::time::Duration::ZERO;
+        for chunk in 0..200 {
+            let page: Vec<Value> = (0..1000)
+                .map(|i| {
+                    let mut m = serde_json::Map::new();
+                    for c in 0..20 {
+                        m.insert(format!("c{c}"), json!(chunk * 1000 + i + c));
+                    }
+                    Value::Object(m)
+                })
+                .collect();
+            let copy = page.clone();
+            let start = std::time::Instant::now();
+            let out = apply_stages_to_page(page, &compiled).unwrap();
+            total += start.elapsed();
+            assert_eq!(out.len(), 1000);
+            let start = std::time::Instant::now();
+            let out = apply_stages_to_page_reference(copy, &compiled).unwrap();
+            before += start.elapsed();
+            assert_eq!(out.len(), 1000);
+        }
+        eprintln!("5 stages: 200k x 20 keys in {total:?}");
+        eprintln!("5 stages before: 200k x 20 keys in {before:?}");
     }
 
     #[test]

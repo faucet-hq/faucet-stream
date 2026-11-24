@@ -460,6 +460,10 @@ ratatui = "0.30"
 # feature). Draws to stderr so piped stdout stays clean.
 indicatif = "0.18"
 
+# Global allocator of the `faucet` binary (CLI-only `mimalloc` feature). Records
+# are trees of small allocations, so the allocator is a large share of CPU.
+mimalloc = { version = "0.1.52", default-features = false }
+
 # The profile 'dist' builds the release archives with.
 [profile.dist]
 inherits = "release"

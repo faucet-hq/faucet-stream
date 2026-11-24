@@ -925,19 +925,26 @@ impl Clone for CompiledTransform {
                 separator: separator.clone(),
             },
             #[cfg(feature = "transform-rename-keys")]
-            Self::RenameKeys { re, replacement } => Self::RenameKeys {
+            Self::RenameKeys {
+                re,
+                replacement,
+                memo,
+            } => Self::RenameKeys {
                 re: re.clone(),
                 replacement: replacement.clone(),
+                memo: memo.clone(),
             },
             #[cfg(feature = "transform-keys-case")]
             Self::KeysCase {
                 mode,
                 on_collision,
                 assignments,
+                memo,
             } => Self::KeysCase {
                 mode: *mode,
                 on_collision: *on_collision,
                 assignments: assignments.clone(),
+                memo: memo.clone(),
             },
             #[cfg(feature = "transform-select")]
             Self::Select { fields } => Self::Select {
@@ -1109,6 +1116,8 @@ pub enum CompiledTransform {
     RenameKeys {
         re: Regex,
         replacement: String,
+        /// Output names already worked out for keys seen before.
+        memo: KeyMemo,
     },
     #[cfg(feature = "transform-keys-case")]
     KeysCase {
@@ -1117,6 +1126,8 @@ pub enum CompiledTransform {
         /// The source keys written under a suffixed name
         /// (`suffix_keys`).
         assignments: KeyCaseAssignments,
+        /// Output names already worked out for keys seen before.
+        memo: KeyMemo,
     },
     #[cfg(feature = "transform-select")]
     Select {
@@ -1227,6 +1238,7 @@ pub fn compile(t: &RecordTransform) -> Result<CompiledTransform, FaucetError> {
             Ok(CompiledTransform::RenameKeys {
                 re,
                 replacement: replacement.clone(),
+                memo: KeyMemo::default(),
             })
         }
         #[cfg(feature = "transform-keys-case")]
@@ -1238,6 +1250,7 @@ pub fn compile(t: &RecordTransform) -> Result<CompiledTransform, FaucetError> {
             mode: *mode,
             on_collision: *on_collision,
             assignments: KeyCaseAssignments::compile(*mode, *on_collision, suffix_keys)?,
+            memo: KeyMemo::default(),
         }),
         #[cfg(feature = "transform-select")]
         RecordTransform::Select { fields } => Ok(CompiledTransform::Select {
@@ -1471,13 +1484,27 @@ fn apply_one(value: Value, t: &CompiledTransform) -> Result<Value, FaucetError> 
         #[cfg(feature = "transform-flatten")]
         CompiledTransform::Flatten { separator } => flatten(value, separator),
         #[cfg(feature = "transform-rename-keys")]
-        CompiledTransform::RenameKeys { re, replacement } => rename_keys(value, re, replacement),
+        CompiledTransform::RenameKeys {
+            re,
+            replacement,
+            memo,
+        } => memo.run(KeyRule::Rename { re, replacement }, |keys| {
+            rename_keys(value, keys)
+        }),
         #[cfg(feature = "transform-keys-case")]
         CompiledTransform::KeysCase {
             mode,
             on_collision,
             assignments,
-        } => keys_case(value, *mode, *on_collision, assignments),
+            memo,
+        } => memo.run(
+            KeyRule::Case {
+                mode: *mode,
+                on_collision: *on_collision,
+                assignments,
+            },
+            |keys| keys_case(value, *mode, *on_collision, assignments, keys),
+        ),
         #[cfg(feature = "transform-select")]
         CompiledTransform::Select { fields } => Ok(select_fields(value, fields)),
         #[cfg(feature = "transform-drop")]
@@ -1605,20 +1632,283 @@ fn flatten_into(
     Ok(())
 }
 
+// ── Key memo ──────────────────────────────────────────────────────────────────
+
+#[cfg(any(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+const KEY_MEMO_MAX_ENTRIES: usize = 4096;
+#[cfg(any(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+const KEY_MEMO_MAX_KEY_BYTES: usize = 256;
+
+/// A bounded memo of the output name a compiled `keys_case` / `rename_keys`
+/// gives each source key. Column names repeat across records, so the name is
+/// worked out once per distinct key. It holds at most 4096 keys of at most
+/// 256 bytes; any other key is worked out each time. A clone starts empty.
+#[cfg(any(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+#[derive(Default)]
+pub struct KeyMemo {
+    state: std::sync::RwLock<KeyMemoState>,
+}
+
+#[cfg(any(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+impl Clone for KeyMemo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+#[cfg(any(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+impl fmt::Debug for KeyMemo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyMemo").finish_non_exhaustive()
+    }
+}
+
+#[cfg(any(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+#[derive(Default)]
+struct KeyMemoState {
+    rule: Option<OwnedKeyRule>,
+    /// Known keys in first-seen order, each with its output name (`None` =
+    /// the key keeps its name).
+    names: Vec<(Box<str>, Option<Box<str>>)>,
+    index: std::collections::HashMap<Box<str>, usize>,
+}
+
+#[cfg(any(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+enum OwnedKeyRule {
+    #[cfg(feature = "transform-rename-keys")]
+    Rename {
+        pattern: String,
+        replacement: String,
+    },
+    #[cfg(feature = "transform-keys-case")]
+    Case {
+        mode: KeyCaseMode,
+        on_collision: KeyCollision,
+        assignments: KeyCaseAssignments,
+    },
+}
+
+/// The pure function of a key a [`KeyMemo`] caches.
+#[cfg(any(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+#[derive(Clone, Copy)]
+enum KeyRule<'a> {
+    #[cfg(feature = "transform-rename-keys")]
+    Rename { re: &'a Regex, replacement: &'a str },
+    #[cfg(feature = "transform-keys-case")]
+    Case {
+        mode: KeyCaseMode,
+        on_collision: KeyCollision,
+        assignments: &'a KeyCaseAssignments,
+    },
+}
+
+#[cfg(any(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+impl KeyRule<'_> {
+    fn output(&self, key: &str) -> String {
+        match self {
+            #[cfg(feature = "transform-rename-keys")]
+            Self::Rename { re, replacement } => re.replace_all(key, *replacement).into_owned(),
+            #[cfg(feature = "transform-keys-case")]
+            Self::Case {
+                mode,
+                on_collision,
+                assignments,
+            } => case_output_key(key, *mode, *on_collision, assignments),
+        }
+    }
+
+    fn is(&self, owned: &OwnedKeyRule) -> bool {
+        match (self, owned) {
+            #[cfg(feature = "transform-rename-keys")]
+            (
+                Self::Rename { re, replacement },
+                OwnedKeyRule::Rename {
+                    pattern,
+                    replacement: stored,
+                },
+            ) => re.as_str() == pattern && replacement == stored,
+            #[cfg(feature = "transform-keys-case")]
+            (
+                Self::Case {
+                    mode,
+                    on_collision,
+                    assignments,
+                },
+                OwnedKeyRule::Case {
+                    mode: stored_mode,
+                    on_collision: stored_collision,
+                    assignments: stored,
+                },
+            ) => {
+                mode == stored_mode
+                    && on_collision == stored_collision
+                    && std::sync::Arc::ptr_eq(&assignments.0, &stored.0)
+            }
+            #[cfg(all(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+            _ => false,
+        }
+    }
+
+    fn to_owned(self) -> OwnedKeyRule {
+        match self {
+            #[cfg(feature = "transform-rename-keys")]
+            Self::Rename { re, replacement } => OwnedKeyRule::Rename {
+                pattern: re.as_str().to_owned(),
+                replacement: replacement.to_owned(),
+            },
+            #[cfg(feature = "transform-keys-case")]
+            Self::Case {
+                mode,
+                on_collision,
+                assignments,
+            } => OwnedKeyRule::Case {
+                mode,
+                on_collision,
+                assignments: assignments.clone(),
+            },
+        }
+    }
+}
+
+#[cfg(any(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+impl KeyMemo {
+    /// Run `f` over one record with the names memoised for `rule`, then keep
+    /// the names it had to work out.
+    fn run<R>(&self, rule: KeyRule<'_>, f: impl FnOnce(&mut KeySession<'_>) -> R) -> R {
+        let known = self
+            .state
+            .read()
+            .ok()
+            .filter(|state| state.rule.as_ref().is_some_and(|owned| rule.is(owned)));
+        let room = match &known {
+            Some(state) => KEY_MEMO_MAX_ENTRIES.saturating_sub(state.names.len()),
+            None => KEY_MEMO_MAX_ENTRIES,
+        };
+        let mut session = KeySession {
+            rule,
+            known,
+            next: 0,
+            room,
+            learned: Vec::new(),
+        };
+        let out = f(&mut session);
+        let KeySession { known, learned, .. } = session;
+        drop(known);
+        if !learned.is_empty()
+            && let Ok(mut state) = self.state.write()
+        {
+            if !state.rule.as_ref().is_some_and(|owned| rule.is(owned)) {
+                state.names.clear();
+                state.index.clear();
+                state.rule = Some(rule.to_owned());
+            }
+            for (key, name) in learned {
+                if state.names.len() >= KEY_MEMO_MAX_ENTRIES {
+                    break;
+                }
+                if !state.index.contains_key(&key) {
+                    let at = state.names.len();
+                    state.index.insert(key.clone(), at);
+                    state.names.push((key, name));
+                }
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.state.read().map(|s| s.names.len()).unwrap_or(0)
+    }
+}
+
+/// One record's view of a [`KeyMemo`].
+#[cfg(any(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+struct KeySession<'a> {
+    rule: KeyRule<'a>,
+    known: Option<std::sync::RwLockReadGuard<'a, KeyMemoState>>,
+    /// Where the next key is expected in `names`: records repeat their keys
+    /// in the same order, so most lookups are one comparison.
+    next: usize,
+    room: usize,
+    learned: Vec<(Box<str>, Option<Box<str>>)>,
+}
+
+#[cfg(any(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+impl KeySession<'_> {
+    fn known(&mut self, key: &str) -> Option<&Option<Box<str>>> {
+        let state = self.known.as_ref()?;
+        let at = match state.names.get(self.next) {
+            Some((expected, _)) if **expected == *key => self.next,
+            _ => *state.index.get(key)?,
+        };
+        self.next = at + 1;
+        state.names.get(at).map(|(_, name)| name)
+    }
+
+    /// The output name of `key`; `None` when it keeps its name.
+    fn resolve(&mut self, key: &str) -> Option<String> {
+        if let Some(name) = self.known(key) {
+            return name.as_deref().map(str::to_owned);
+        }
+        let name = Some(self.rule.output(key)).filter(|name| name != key);
+        let fits = key.len() <= KEY_MEMO_MAX_KEY_BYTES
+            && name
+                .as_ref()
+                .is_none_or(|n| n.len() <= KEY_MEMO_MAX_KEY_BYTES);
+        if fits && self.learned.len() < self.room {
+            self.learned
+                .push((key.into(), name.as_deref().map(Into::into)));
+        }
+        name
+    }
+}
+
+/// Send every value of `map` through `each` in place for as long as its keys
+/// keep their names. Returns the position and output name of the first key
+/// that does not, or `None` when the whole object is done.
+#[cfg(any(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+fn rekey_in_place(
+    map: &mut Map<String, Value>,
+    keys: &mut KeySession<'_>,
+    mut each: impl FnMut(Value, &mut KeySession<'_>) -> Result<Value, FaucetError>,
+) -> Result<Option<(usize, String)>, FaucetError> {
+    for (at, (k, v)) in map.iter_mut().enumerate() {
+        if let Some(name) = keys.resolve(k) {
+            return Ok(Some((at, name)));
+        }
+        *v = each(v.take(), keys)?;
+    }
+    Ok(None)
+}
+
 // ── Rename keys ───────────────────────────────────────────────────────────────
 
 /// Recursively rename every key matching `re`. Two keys in one object that
 /// rename to the same name fail the record rather than one silently
 /// overwriting the other (CORE-31).
 #[cfg(feature = "transform-rename-keys")]
-fn rename_keys(value: Value, re: &Regex, replacement: &str) -> Result<Value, FaucetError> {
+fn rename_keys(value: Value, keys: &mut KeySession<'_>) -> Result<Value, FaucetError> {
     match value {
-        Value::Object(map) => {
+        Value::Object(mut map) => {
+            let Some((split, first)) = rekey_in_place(&mut map, keys, rename_keys)? else {
+                return Ok(Value::Object(map));
+            };
+            let mut first = Some(first);
             let mut new_map = Map::with_capacity(map.len());
-            for (k, v) in map {
-                let new_k = re.replace_all(&k, replacement).into_owned();
-                let new_v = rename_keys(v, re, replacement)?;
+            for (at, (k, v)) in map.into_iter().enumerate() {
+                if at < split {
+                    new_map.insert(k, v);
+                    continue;
+                }
+                let renamed = first.take().or_else(|| keys.resolve(&k));
+                let new_v = rename_keys(v, keys)?;
+                let (new_k, from) = match renamed {
+                    Some(name) => (name, Some(k)),
+                    None => (k, None),
+                };
                 if new_map.contains_key(&new_k) {
+                    let k = from.as_deref().unwrap_or(&new_k);
                     return Err(FaucetError::Transform(format!(
                         "rename_keys produced a duplicate key '{new_k}' (from '{k}'); two \
                          distinct keys rename to the same name"
@@ -1630,7 +1920,7 @@ fn rename_keys(value: Value, re: &Regex, replacement: &str) -> Result<Value, Fau
         }
         Value::Array(arr) => Ok(Value::Array(
             arr.into_iter()
-                .map(|v| rename_keys(v, re, replacement))
+                .map(|v| rename_keys(v, keys))
                 .collect::<Result<_, _>>()?,
         )),
         other => Ok(other),
@@ -1701,6 +1991,22 @@ fn suffixed_key_name(recased: &str, source: &str) -> String {
     format!("{recased}_{:08x}", (h ^ (h >> 32)) as u32)
 }
 
+/// The name `keys_case` writes source key `key` under.
+#[cfg(feature = "transform-keys-case")]
+fn case_output_key(
+    key: &str,
+    mode: KeyCaseMode,
+    on_collision: KeyCollision,
+    assignments: &KeyCaseAssignments,
+) -> String {
+    let r = recase_key(key, mode);
+    if on_collision == KeyCollision::Suffix && r != key && assignments.suffixes(key) {
+        suffixed_key_name(&r, key)
+    } else {
+        r
+    }
+}
+
 /// Recursively re-case every key in the record according to `mode`.
 ///
 /// Under [`KeyCollision::Suffix`] a source key listed in `suffix_keys` is
@@ -1714,36 +2020,67 @@ fn keys_case(
     mode: KeyCaseMode,
     on_collision: KeyCollision,
     assignments: &KeyCaseAssignments,
+    keys: &mut KeySession<'_>,
 ) -> Result<Value, FaucetError> {
     match value {
-        Value::Object(map) => {
+        Value::Object(mut map) => {
+            let Some((split, first)) = rekey_in_place(&mut map, keys, |v, keys| {
+                keys_case(v, mode, on_collision, assignments, keys)
+            })?
+            else {
+                return Ok(Value::Object(map));
+            };
+            let mut first = Some(first);
+            let suffix = on_collision == KeyCollision::Suffix;
             let mut new_map = Map::with_capacity(map.len());
-            let mut sources: std::collections::HashMap<String, String> =
-                std::collections::HashMap::with_capacity(map.len());
-            for (k, v) in map {
-                let r = recase_key(&k, mode);
-                let final_key =
-                    if on_collision == KeyCollision::Suffix && r != k && assignments.suffixes(&k) {
-                        suffixed_key_name(&r, &k)
-                    } else {
-                        r
-                    };
-                if let Some(other) = sources.get(&final_key) {
+            let mut sources: Vec<String> = Vec::new();
+            for (at, (k, v)) in map.into_iter().enumerate() {
+                if at < split {
+                    if suffix {
+                        sources.push(k.clone());
+                    }
+                    new_map.insert(k, v);
+                    continue;
+                }
+                let renamed = first.take().or_else(|| keys.resolve(&k));
+                let final_key = renamed.as_deref().unwrap_or(&k);
+                if new_map.contains_key(final_key) {
                     return Err(FaucetError::Transform(match on_collision {
                         KeyCollision::Error => format!(
                             "keys_case produced a duplicate key '{final_key}'; two distinct \
                              keys re-case to the same name under mode {mode:?} (set \
                              on_collision: suffix and list all but one of them in suffix_keys)"
                         ),
-                        KeyCollision::Suffix => format!(
-                            "keys_case produced a duplicate key '{final_key}' from source keys \
-                             '{other}' and '{k}'; list all but one of the keys that re-case to \
-                             it in suffix_keys"
-                        ),
+                        KeyCollision::Suffix => {
+                            let other = sources
+                                .iter()
+                                .find(|s| {
+                                    case_output_key(s, mode, on_collision, assignments) == final_key
+                                })
+                                .map_or("", String::as_str);
+                            format!(
+                                "keys_case produced a duplicate key '{final_key}' from source \
+                                 keys '{other}' and '{k}'; list all but one of the keys that \
+                                 re-case to it in suffix_keys"
+                            )
+                        }
                     }));
                 }
-                let new_v = keys_case(v, mode, on_collision, assignments)?;
-                sources.insert(final_key.clone(), k);
+                let new_v = keys_case(v, mode, on_collision, assignments, keys)?;
+                let final_key = match renamed {
+                    Some(name) => {
+                        if suffix {
+                            sources.push(k);
+                        }
+                        name
+                    }
+                    None => {
+                        if suffix {
+                            sources.push(k.clone());
+                        }
+                        k
+                    }
+                };
                 new_map.insert(final_key, new_v);
             }
             Ok(Value::Object(new_map))
@@ -1751,7 +2088,7 @@ fn keys_case(
         Value::Array(arr) => {
             let mut out = Vec::with_capacity(arr.len());
             for v in arr {
-                out.push(keys_case(v, mode, on_collision, assignments)?);
+                out.push(keys_case(v, mode, on_collision, assignments, keys)?);
             }
             Ok(Value::Array(out))
         }
@@ -2587,6 +2924,88 @@ fn scalar_to_string(v: &Value) -> String {
     }
 }
 
+#[cfg(all(test, feature = "transform-rename-keys"))]
+fn rename_keys_reference(
+    value: Value,
+    re: &Regex,
+    replacement: &str,
+) -> Result<Value, FaucetError> {
+    match value {
+        Value::Object(map) => {
+            let mut new_map = Map::with_capacity(map.len());
+            for (k, v) in map {
+                let new_k = re.replace_all(&k, replacement).into_owned();
+                let new_v = rename_keys_reference(v, re, replacement)?;
+                if new_map.contains_key(&new_k) {
+                    return Err(FaucetError::Transform(format!(
+                        "rename_keys produced a duplicate key '{new_k}' (from '{k}'); two \
+                         distinct keys rename to the same name"
+                    )));
+                }
+                new_map.insert(new_k, new_v);
+            }
+            Ok(Value::Object(new_map))
+        }
+        Value::Array(arr) => Ok(Value::Array(
+            arr.into_iter()
+                .map(|v| rename_keys_reference(v, re, replacement))
+                .collect::<Result<_, _>>()?,
+        )),
+        other => Ok(other),
+    }
+}
+
+#[cfg(all(test, feature = "transform-keys-case"))]
+fn keys_case_reference(
+    value: Value,
+    mode: KeyCaseMode,
+    on_collision: KeyCollision,
+    assignments: &KeyCaseAssignments,
+) -> Result<Value, FaucetError> {
+    match value {
+        Value::Object(map) => {
+            let mut new_map = Map::with_capacity(map.len());
+            let mut sources: std::collections::HashMap<String, String> =
+                std::collections::HashMap::with_capacity(map.len());
+            for (k, v) in map {
+                let r = recase_key(&k, mode);
+                let final_key =
+                    if on_collision == KeyCollision::Suffix && r != k && assignments.suffixes(&k) {
+                        suffixed_key_name(&r, &k)
+                    } else {
+                        r
+                    };
+                if let Some(other) = sources.get(&final_key) {
+                    return Err(FaucetError::Transform(match on_collision {
+                        KeyCollision::Error => format!(
+                            "keys_case produced a duplicate key '{final_key}'; two distinct \
+                             keys re-case to the same name under mode {mode:?} (set \
+                             on_collision: suffix and list all but one of them in suffix_keys)"
+                        ),
+                        KeyCollision::Suffix => format!(
+                            "keys_case produced a duplicate key '{final_key}' from source keys \
+                             '{other}' and '{k}'; list all but one of the keys that re-case to \
+                             it in suffix_keys"
+                        ),
+                    }));
+                }
+                let new_v = keys_case_reference(v, mode, on_collision, assignments)?;
+                sources.insert(final_key.clone(), k);
+                new_map.insert(final_key, new_v);
+            }
+            Ok(Value::Object(new_map))
+        }
+        Value::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr {
+                out.push(keys_case_reference(v, mode, on_collision, assignments)?);
+            }
+            Ok(Value::Array(out))
+        }
+        other => Ok(other),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2604,6 +3023,368 @@ mod tests {
 
     fn compiled(transforms: &[RecordTransform]) -> Vec<CompiledTransform> {
         transforms.iter().map(|t| compile(t).unwrap()).collect()
+    }
+
+    #[cfg(all(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+    fn bench_records(n: usize) -> Vec<Value> {
+        (0..n)
+            .map(|i| {
+                let mut m = Map::new();
+                for c in 0..20 {
+                    m.insert(format!("someColumnName{c}"), json!(i + c));
+                }
+                Value::Object(m)
+            })
+            .collect()
+    }
+
+    #[cfg(all(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+    #[test]
+    #[ignore = "timing"]
+    fn bench_key_transforms_200k() {
+        type Run<'a> = Box<dyn Fn(Value) -> Value + 'a>;
+        let timed = |name: &str, now: Run<'_>, before: Run<'_>| {
+            let mut totals = [std::time::Duration::ZERO; 2];
+            for _ in 0..20 {
+                for (slot, run) in [&now, &before].into_iter().enumerate() {
+                    let records = bench_records(10_000);
+                    let start = std::time::Instant::now();
+                    for r in records {
+                        std::hint::black_box(run(r));
+                    }
+                    totals[slot] += start.elapsed();
+                }
+            }
+            eprintln!(
+                "{name}: 200k x 20 keys in {:?} (before: {:?})",
+                totals[0], totals[1]
+            );
+        };
+        let case = compiled(&[RecordTransform::KeysCase {
+            mode: KeyCaseMode::Snake,
+            on_collision: KeyCollision::Error,
+            suffix_keys: Vec::new(),
+        }]);
+        let none = KeyCaseAssignments::default();
+        timed(
+            "keys_case, every key re-cased",
+            Box::new(|r| super::apply_all(r, &case).unwrap()),
+            Box::new(|r| {
+                keys_case_reference(r, KeyCaseMode::Snake, KeyCollision::Error, &none).unwrap()
+            }),
+        );
+        let camel = compiled(&[RecordTransform::KeysCase {
+            mode: KeyCaseMode::Camel,
+            on_collision: KeyCollision::Error,
+            suffix_keys: Vec::new(),
+        }]);
+        timed(
+            "keys_case, keys already in the target case",
+            Box::new(|r| super::apply_all(r, &camel).unwrap()),
+            Box::new(|r| {
+                keys_case_reference(r, KeyCaseMode::Camel, KeyCollision::Error, &none).unwrap()
+            }),
+        );
+        for (name, pattern) in [
+            ("rename_keys, every key renamed", "^some"),
+            ("rename_keys, no key matches", "^zzz"),
+        ] {
+            let rename = compiled(&[RecordTransform::RenameKeys {
+                pattern: pattern.into(),
+                replacement: "a_".into(),
+            }]);
+            let re = Regex::new(pattern).unwrap();
+            timed(
+                name,
+                Box::new(|r| super::apply_all(r, &rename).unwrap()),
+                Box::new(|r| rename_keys_reference(r, &re, "a_").unwrap()),
+            );
+        }
+    }
+
+    // ── Key memo ──────────────────────────────────────────────────────────────
+
+    #[cfg(all(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+    fn key_corpus() -> Vec<Value> {
+        let mut wide = Map::new();
+        for i in 0..40 {
+            wide.insert(format!("wideColumn{i}"), json!(i));
+        }
+        vec![
+            json!({"firstName": "a", "last_name": "b", "Age": 3}),
+            json!({"firstName": "a", "last_name": "b", "Age": 3}),
+            json!({"already_snake": 1, "also_snake": {"deep_key": [1, {"x_y": 2}]}}),
+            json!({"already_snake": 1, "also_snake": {"deepKey": [1, {"xY": 2}]}}),
+            json!({"a": {"userId": 1}, "b": [{"userId": 2}, {"userId": 3, "extraKey": 4}]}),
+            json!({"AccountId": 1, "account_id": 2}),
+            json!({"account_id": 1, "AccountId": 2}),
+            json!({"Account_Id": 1, "AccountId": 2, "account_id": 3}),
+            json!({"plain": 1, "AccountId": 2, "Account_Id": 3}),
+            json!({"outer": {"AccountId": 1, "account_id": 2}, "AccountId": 3, "account_id": 4}),
+            json!({"!!!": 1, "": 2, "ÄpfelKuchen": 3, "x": null}),
+            json!({"a1": 1, "a_1": 2}),
+            json!({"k": "v".repeat(10), "k".repeat(300): 1, "K".repeat(300): 2}),
+            json!([{"firstName": 1}, {"firstName": 2}, 3, "s"]),
+            json!("scalar"),
+            json!({}),
+            Value::Object(wide),
+        ]
+    }
+
+    #[cfg(all(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+    fn render(r: Result<Value, FaucetError>) -> String {
+        match r {
+            Ok(v) => format!("ok {v}"),
+            Err(e) => format!("err {e}"),
+        }
+    }
+
+    #[cfg(all(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+    #[test]
+    fn keys_case_matches_the_unmemoised_implementation() {
+        let modes = [
+            KeyCaseMode::Snake,
+            KeyCaseMode::Camel,
+            KeyCaseMode::Pascal,
+            KeyCaseMode::Kebab,
+            KeyCaseMode::ScreamingSnake,
+            KeyCaseMode::Dot,
+        ];
+        let policies: [(KeyCollision, &[&str]); 3] = [
+            (KeyCollision::Error, &[]),
+            (KeyCollision::Suffix, &[]),
+            (
+                KeyCollision::Suffix,
+                &["AccountId", "Account_Id", "firstName"],
+            ),
+        ];
+        for mode in modes {
+            for (on_collision, suffix_keys) in policies {
+                let spec = RecordTransform::KeysCase {
+                    mode,
+                    on_collision,
+                    suffix_keys: suffix_keys.iter().map(|k| k.to_string()).collect(),
+                };
+                let Ok(t) = compile(&spec) else { continue };
+                let CompiledTransform::KeysCase { assignments, .. } = &t else {
+                    unreachable!()
+                };
+                for pass in 0..3 {
+                    for record in key_corpus() {
+                        let want =
+                            keys_case_reference(record.clone(), mode, on_collision, assignments);
+                        let got = super::apply_all(record, std::slice::from_ref(&t));
+                        assert_eq!(render(got), render(want), "{mode:?} pass {pass}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+    #[test]
+    fn rename_keys_matches_the_unmemoised_implementation() {
+        for (pattern, replacement) in [
+            ("^first", "1st"),
+            ("(?i)account_?id", "acct"),
+            ("[A-Z]", "_$0"),
+            ("zzz", "unused"),
+            ("^(.*)$", "p_$1"),
+            (".*", "same"),
+        ] {
+            let t = compile(&RecordTransform::RenameKeys {
+                pattern: pattern.into(),
+                replacement: replacement.into(),
+            })
+            .unwrap();
+            let re = Regex::new(pattern).unwrap();
+            for pass in 0..3 {
+                for record in key_corpus() {
+                    let want = rename_keys_reference(record.clone(), &re, replacement);
+                    let got = super::apply_all(record, std::slice::from_ref(&t));
+                    assert_eq!(render(got), render(want), "{pattern} pass {pass}");
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "transform-keys-case")]
+    fn snake() -> CompiledTransform {
+        compile(&RecordTransform::KeysCase {
+            mode: KeyCaseMode::Snake,
+            on_collision: KeyCollision::Error,
+            suffix_keys: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    #[cfg(feature = "transform-keys-case")]
+    fn memo_len(t: &CompiledTransform) -> usize {
+        match t {
+            CompiledTransform::KeysCase { memo, .. } => memo.len(),
+            #[cfg(feature = "transform-rename-keys")]
+            CompiledTransform::RenameKeys { memo, .. } => memo.len(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(feature = "transform-keys-case")]
+    #[test]
+    fn key_memo_learns_each_key_once_and_keeps_serving_it() {
+        let t = snake();
+        assert_eq!(memo_len(&t), 0);
+        for _ in 0..3 {
+            let out = super::apply_all(
+                json!({"firstName": 1, "kept": {"lastName": 2}}),
+                std::slice::from_ref(&t),
+            )
+            .unwrap();
+            assert_eq!(out, json!({"first_name": 1, "kept": {"last_name": 2}}));
+            assert_eq!(memo_len(&t), 3);
+        }
+        let out = super::apply_all(json!({"kept": 1, "newKey": 2}), std::slice::from_ref(&t));
+        assert_eq!(out.unwrap(), json!({"kept": 1, "new_key": 2}));
+        assert_eq!(memo_len(&t), 4);
+    }
+
+    #[cfg(feature = "transform-keys-case")]
+    #[test]
+    fn key_memo_is_capped_and_results_stay_right_past_the_cap() {
+        let t = snake();
+        for batch in 0..6 {
+            let mut m = Map::new();
+            for i in 0..1000 {
+                m.insert(format!("someKey{batch}x{i}"), json!(i));
+            }
+            let out = super::apply_all(Value::Object(m), std::slice::from_ref(&t)).unwrap();
+            let out = out.as_object().unwrap();
+            assert_eq!(out.len(), 1000);
+            for i in 0..1000 {
+                assert_eq!(out[&format!("some_key{batch}x{i}")], json!(i));
+            }
+            assert_eq!(memo_len(&t), (1000 * (batch + 1)).min(KEY_MEMO_MAX_ENTRIES));
+        }
+        let out = super::apply_all(
+            json!({"someKey0x1": 1, "brandNew": 2}),
+            std::slice::from_ref(&t),
+        );
+        assert_eq!(out.unwrap(), json!({"some_key0x1": 1, "brand_new": 2}));
+        assert_eq!(memo_len(&t), KEY_MEMO_MAX_ENTRIES);
+    }
+
+    #[cfg(feature = "transform-keys-case")]
+    #[test]
+    fn key_memo_skips_oversized_keys() {
+        let t = snake();
+        let long = format!("longKey{}", "x".repeat(KEY_MEMO_MAX_KEY_BYTES));
+        let mut m = Map::new();
+        m.insert(long.clone(), json!(1));
+        m.insert("shortKey".into(), json!(2));
+        for _ in 0..2 {
+            let out = super::apply_all(Value::Object(m.clone()), std::slice::from_ref(&t));
+            let out = out.unwrap();
+            assert_eq!(out["short_key"], json!(2));
+            assert_eq!(out[&format!("long_key{}", "x".repeat(256))], json!(1));
+            assert_eq!(memo_len(&t), 1);
+        }
+    }
+
+    #[cfg(feature = "transform-keys-case")]
+    #[test]
+    fn a_cloned_transform_starts_with_an_empty_memo() {
+        let t = snake();
+        super::apply_all(json!({"firstName": 1}), std::slice::from_ref(&t)).unwrap();
+        assert_eq!(memo_len(&t), 1);
+        let copy = t.clone();
+        assert_eq!(memo_len(&copy), 0);
+        let out = super::apply_all(json!({"firstName": 1}), std::slice::from_ref(&copy));
+        assert_eq!(out.unwrap(), json!({"first_name": 1}));
+        assert_eq!(format!("{:?}", KeyMemo::default()), "KeyMemo { .. }");
+    }
+
+    #[cfg(feature = "transform-keys-case")]
+    #[test]
+    fn key_memo_filled_under_another_rule_is_not_used() {
+        let mut t = snake();
+        super::apply_all(json!({"firstName": 1, "kept": 2}), std::slice::from_ref(&t)).unwrap();
+        assert_eq!(memo_len(&t), 2);
+        if let CompiledTransform::KeysCase { mode, .. } = &mut t {
+            *mode = KeyCaseMode::ScreamingSnake;
+        }
+        for _ in 0..2 {
+            let out = super::apply_all(json!({"firstName": 1}), std::slice::from_ref(&t));
+            assert_eq!(out.unwrap(), json!({"FIRST_NAME": 1}));
+            assert_eq!(memo_len(&t), 1);
+        }
+    }
+
+    #[cfg(feature = "transform-rename-keys")]
+    #[test]
+    fn rename_memo_filled_under_another_pattern_is_not_used() {
+        let mut t = compile(&RecordTransform::RenameKeys {
+            pattern: "^a".into(),
+            replacement: "b".into(),
+        })
+        .unwrap();
+        let out = super::apply_all(json!({"ax": 1, "c": 2}), std::slice::from_ref(&t));
+        assert_eq!(out.unwrap(), json!({"bx": 1, "c": 2}));
+        if let CompiledTransform::RenameKeys { replacement, .. } = &mut t {
+            *replacement = "z".into();
+        }
+        let out = super::apply_all(json!({"ax": 1, "c": 2}), std::slice::from_ref(&t));
+        assert_eq!(out.unwrap(), json!({"zx": 1, "c": 2}));
+        if let CompiledTransform::RenameKeys { re, .. } = &mut t {
+            *re = Regex::new("^c").unwrap();
+        }
+        let out = super::apply_all(json!({"ax": 1, "c": 2}), std::slice::from_ref(&t));
+        assert_eq!(out.unwrap(), json!({"ax": 1, "z": 2}));
+    }
+
+    #[cfg(feature = "transform-keys-case")]
+    #[test]
+    fn key_memo_gives_the_same_names_from_many_threads() {
+        let t = std::sync::Arc::new(snake());
+        let workers: Vec<_> = (0..8)
+            .map(|w| {
+                let t = std::sync::Arc::clone(&t);
+                std::thread::spawn(move || {
+                    for i in 0..500 {
+                        let mut m = Map::new();
+                        m.insert("sharedKey".into(), json!(i));
+                        m.insert(format!("workerKey{}", (w + i) % 50), json!(w));
+                        m.insert("snake_already".into(), json!({"innerKey": i}));
+                        let out =
+                            super::apply_all(Value::Object(m), std::slice::from_ref(&*t)).unwrap();
+                        assert_eq!(out["shared_key"], json!(i));
+                        assert_eq!(out[&format!("worker_key{}", (w + i) % 50)], json!(w));
+                        assert_eq!(out["snake_already"], json!({"inner_key": i}));
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert_eq!(memo_len(&t), 53);
+    }
+
+    #[cfg(feature = "transform-keys-case")]
+    #[test]
+    fn compiled_key_transforms_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<CompiledTransform>();
+        assert_send_sync::<KeyMemo>();
+    }
+
+    #[cfg(feature = "transform-keys-case")]
+    #[test]
+    fn a_nested_error_is_reported_before_a_later_collision() {
+        let t = snake();
+        let record = json!({"a": {"xY": 1, "x_y": 2}, "bC": 1, "b_c": 2});
+        for _ in 0..2 {
+            let err = super::apply_all(record.clone(), std::slice::from_ref(&t)).unwrap_err();
+            assert!(err.to_string().contains("'x_y'"), "{err}");
+        }
     }
 
     // ── Custom (always available) ─────────────────────────────────────────────
