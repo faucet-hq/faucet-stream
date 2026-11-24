@@ -17,8 +17,10 @@ use faucet_core::{CallSlot, FaucetError, Sink};
 use futures::stream::{FuturesUnordered, StreamExt};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Header, OwnedHeaders};
-use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
+use rdkafka::producer::future_producer::OwnedDeliveryResult;
+use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord, Producer};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +31,29 @@ pub struct KafkaSink {
     inner: DriverSink<KafkaDriver>,
 }
 
+/// The config's JSONPaths, parsed once.
+struct Paths {
+    topic: Option<extract::CompiledPath>,
+    key: Option<extract::CompiledPath>,
+    partition: Option<extract::CompiledPath>,
+    headers: Option<extract::CompiledPath>,
+}
+
+impl Paths {
+    fn new(config: &KafkaSinkConfig) -> Self {
+        let compile = |path: &Option<String>| path.as_deref().map(extract::CompiledPath::new);
+        Self {
+            topic: match &config.topic {
+                KafkaSinkTopic::Fixed { .. } => None,
+                KafkaSinkTopic::FromPath { path, .. } => Some(extract::CompiledPath::new(path)),
+            },
+            key: compile(&config.key_path),
+            partition: compile(&config.partition_path),
+            headers: compile(&config.headers_path),
+        }
+    }
+}
+
 /// The producer primitives the sink runs on.
 pub(crate) struct KafkaDriver {
     config: KafkaSinkConfig,
@@ -37,6 +62,7 @@ pub(crate) struct KafkaDriver {
     /// the first `write_batch_idempotent` call (needs the scope-derived
     /// `transactional.id`, unknown at `new()`).
     txn: tokio::sync::OnceCell<Arc<FutureProducer>>,
+    paths: Paths,
     #[cfg(feature = "schema-registry")]
     sr_client: Option<SchemaRegistryClient>,
     /// The registry the key format names (it may differ from the value's),
@@ -65,6 +91,7 @@ impl KafkaSink {
 
         Ok(Self {
             inner: DriverSink::new(KafkaDriver {
+                paths: Paths::new(&config),
                 config,
                 producer: Arc::new(producer),
                 txn: tokio::sync::OnceCell::new(),
@@ -83,15 +110,19 @@ impl Sink for KafkaSink {
 }
 
 impl KafkaDriver {
-    fn resolve_topic(&self, record: &Value) -> Result<String, FaucetError> {
-        match &self.config.topic {
-            KafkaSinkTopic::Fixed { name } => Ok(name.clone()),
-            KafkaSinkTopic::FromPath { path, .. } => {
-                let topic = extract::string_at(record, path)?.ok_or_else(|| {
+    fn resolve_topic<'a>(&'a self, record: &Value) -> Result<Cow<'a, str>, FaucetError> {
+        match (&self.config.topic, &self.paths.topic) {
+            (KafkaSinkTopic::Fixed { name }, _) => Ok(Cow::Borrowed(name)),
+            (KafkaSinkTopic::FromPath { path, .. }, compiled) => {
+                let found = match compiled {
+                    Some(compiled) => compiled.string(record)?,
+                    None => extract::string_at(record, path)?,
+                };
+                let topic = found.ok_or_else(|| {
                     FaucetError::Sink(format!("topic.path '{path}' did not resolve for record"))
                 })?;
                 self.config.check_record_topic(&topic)?;
-                Ok(topic)
+                Ok(Cow::Owned(topic))
             }
         }
     }
@@ -122,10 +153,10 @@ impl KafkaDriver {
         )
         .await?;
 
-        let key_bytes = match (&self.config.key_path, &self.config.key_format) {
+        let key_bytes = match (&self.paths.key, &self.config.key_format) {
             (Some(path), Some(fmt)) => {
                 // Extract the JSON sub-value at key_path and encode per key_format.
-                let sub = extract::value_at(record, path)?;
+                let sub = path.value(record)?;
                 match self.handle_key_extract(sub).await? {
                     Some(v) => Some(
                         encode::encode(
@@ -143,12 +174,13 @@ impl KafkaDriver {
             }
             (Some(path), None) => {
                 // Extract a string at key_path and use it directly as the key bytes.
-                match extract::string_at(record, path)? {
+                match path.string(record)? {
                     Some(s) => Some(s.into_bytes()),
                     None => match self.config.on_key_error {
                         OnKeyError::Fail => {
                             return Err(FaucetError::Sink(format!(
-                                "key_path '{path}' did not resolve and on_key_error=fail"
+                                "key_path '{}' did not resolve and on_key_error=fail",
+                                path.path()
                             )));
                         }
                         OnKeyError::Skip | OnKeyError::RoundRobin => None,
@@ -313,20 +345,9 @@ impl SinkDriver for KafkaDriver {
         let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
         let mut produced = 0usize;
         let mut skipped = 0usize;
-
-        // Effective in-flight cap: when `batch_size > 0`, take the smaller of
-        // `max_in_flight` and `batch_size` so the FuturesUnordered window
-        // never exceeds the streaming-pipeline page size. The `batch_size = 0`
-        // sentinel keeps the historical behaviour — bounded only by
-        // `max_in_flight`.
-        let in_flight_cap = if self.config.batch_size > 0 {
-            self.config.max_in_flight.min(self.config.batch_size)
-        } else {
-            self.config.max_in_flight
-        };
+        let in_flight_cap = self.config.in_flight_window();
 
         for record in records {
-            // Drain one if we're at capacity.
             if in_flight.len() >= in_flight_cap
                 && let Some(res) = in_flight.next().await
             {
@@ -349,8 +370,8 @@ impl SinkDriver for KafkaDriver {
                 continue;
             }
 
-            let partition = match &self.config.partition_path {
-                Some(p) => extract::partition_at(record, p)?,
+            let partition = match &self.paths.partition {
+                Some(p) => p.partition(record)?,
                 None => None,
             };
 
@@ -358,35 +379,26 @@ impl SinkDriver for KafkaDriver {
             // headers; one that resolves to a non-object fails the batch, which
             // matches `partition_path`'s strictness — a header map the operator
             // asked for and did not get is not something to paper over.
-            let headers = match &self.config.headers_path {
-                Some(p) => extract::headers_at(record, p)?,
+            let headers = match &self.paths.headers {
+                Some(p) => p.headers(record)?,
                 None => None,
             };
 
-            let producer = self.producer.clone();
-            let topic_owned = topic.clone();
-            let message_timeout = self.config.message_timeout;
-            let retries = self.config.queue_full_max_retries;
-            let backoff = self.config.queue_full_backoff;
-            let calls = calls.clone();
-
-            in_flight.push(async move {
-                send_with_queue_full_retry(
-                    &calls,
-                    &producer,
-                    &topic_owned,
-                    value_bytes,
-                    RecordRouting {
-                        key: key_bytes,
-                        partition,
-                        headers,
-                    },
-                    message_timeout,
-                    retries,
-                    backoff,
-                )
-                .await
-            });
+            let delivery = enqueue_with_queue_full_retry(
+                &calls,
+                &self.producer,
+                &topic,
+                &value_bytes,
+                &RecordRouting {
+                    key: key_bytes,
+                    partition,
+                    headers,
+                },
+                self.config.queue_full_max_retries,
+                self.config.queue_full_backoff,
+            )
+            .await?;
+            in_flight.push(confirm_delivery(calls.clone(), delivery));
         }
 
         while let Some(res) = in_flight.next().await {
@@ -571,8 +583,8 @@ impl CommitTokenDriver for KafkaDriver {
                 continue;
             }
 
-            let partition = match &self.config.partition_path {
-                Some(p) => match extract::partition_at(record, p) {
+            let partition = match &self.paths.partition {
+                Some(p) => match p.partition(record) {
                     Ok(v) => v,
                     Err(e) => {
                         let _ = crate::idempotent::abort_txn(
@@ -586,8 +598,8 @@ impl CommitTokenDriver for KafkaDriver {
                 None => None,
             };
 
-            let headers = match &self.config.headers_path {
-                Some(p) => match extract::headers_at(record, p) {
+            let headers = match &self.paths.headers {
+                Some(p) => match p.headers(record) {
                     Ok(v) => v,
                     Err(e) => {
                         let _ = crate::idempotent::abort_txn(
@@ -605,8 +617,8 @@ impl CommitTokenDriver for KafkaDriver {
                 &calls,
                 &producer,
                 &topic,
-                value_bytes,
-                RecordRouting {
+                &value_bytes,
+                &RecordRouting {
                     key: key_bytes,
                     partition,
                     headers,
@@ -632,8 +644,8 @@ impl CommitTokenDriver for KafkaDriver {
             &calls,
             &producer,
             &eo.commit_token_topic,
-            token.as_bytes().to_vec(),
-            RecordRouting {
+            token.as_bytes(),
+            &RecordRouting {
                 key: Some(token_key.into_bytes()),
                 ..RecordRouting::default()
             },
@@ -684,9 +696,6 @@ impl CommitTokenDriver for KafkaDriver {
     }
 }
 
-/// Send a single record, retrying on `QueueFull` up to `max_retries` times
-/// with `backoff` delay between attempts.
-///
 /// Where one record goes and what travels with it: the key, an explicit
 /// partition, and the message headers, each resolved per record from its own
 /// JSONPath.
@@ -723,77 +732,81 @@ pub(crate) fn owned_headers(map: &serde_json::Map<String, Value>) -> OwnedHeader
     out
 }
 
-/// Uses `send_result()` (non-blocking enqueue) so we can apply our own retry
-/// schedule rather than the librdkafka built-in queue timeout.
-/// `_message_timeout` is kept in the signature for callers that track it but
-/// is not needed with `send_result()`.
-#[allow(clippy::too_many_arguments)]
-async fn send_with_queue_full_retry(
+/// Hand one record to the producer's queue without waiting for its delivery.
+/// `Ok(None)` means the queue is full; any other refusal is the send error.
+pub(crate) fn try_enqueue(
+    producer: &FutureProducer,
+    topic: &str,
+    value_bytes: &[u8],
+    routing: &RecordRouting,
+) -> Result<Option<DeliveryFuture>, FaucetError> {
+    let mut record: FutureRecord<'_, [u8], [u8]> = FutureRecord::to(topic).payload(value_bytes);
+    if let Some(k) = routing.key.as_deref() {
+        record = record.key(k);
+    }
+    if let Some(p) = routing.partition {
+        record = record.partition(p);
+    }
+    if let Some(h) = routing.headers.as_ref() {
+        record = record.headers(owned_headers(h));
+    }
+    match producer.send_result(record) {
+        Ok(delivery) => Ok(Some(delivery)),
+        Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), _record)) => Ok(None),
+        Err((e, _record)) => Err(FaucetError::Sink(format!("kafka send: {e}"))),
+    }
+}
+
+/// Enqueue one record, retrying a full queue up to `max_retries` times with
+/// `backoff` between attempts. Records are enqueued in page order.
+async fn enqueue_with_queue_full_retry(
     calls: &faucet_core::CallContext,
     producer: &FutureProducer,
     topic: &str,
-    value_bytes: Vec<u8>,
-    routing: RecordRouting,
-    _message_timeout: Duration,
+    value_bytes: &[u8],
+    routing: &RecordRouting,
     max_retries: u32,
     backoff: Duration,
-) -> Result<(), FaucetError> {
+) -> Result<DeliveryFuture, FaucetError> {
     let mut attempts: u32 = 0;
     loop {
-        // Build a fresh FutureRecord each iteration because send_result()
-        // returns the record back on QueueFull so we can reconstruct it.
-        let mut record: FutureRecord<'_, [u8], [u8]> =
-            FutureRecord::to(topic).payload(value_bytes.as_slice());
-        if let Some(k) = routing.key.as_deref() {
-            record = record.key(k);
+        if let Some(delivery) = try_enqueue(producer, topic, value_bytes, routing)? {
+            return Ok(delivery);
         }
-        if let Some(p) = routing.partition {
-            record = record.partition(p);
+        if attempts >= max_retries {
+            return Err(FaucetError::Sink(format!(
+                "kafka send: QueueFull after {max_retries} retries"
+            )));
         }
-        if let Some(h) = routing.headers.as_ref() {
-            record = record.headers(owned_headers(h));
-        }
+        tracing::warn!(attempts, "kafka send: QueueFull, backing off");
+        calls.wait(backoff).await?;
+        attempts += 1;
+    }
+}
 
-        match producer.send_result(record) {
-            Ok(delivery_future) => {
-                // Record enqueued — await the delivery confirmation.
-                let delivered = calls
-                    .call_once("produce", async { Ok(delivery_future.await) })
-                    .await?;
-                match delivered {
-                    Ok(Ok(_delivery)) => return Ok(()),
-                    Ok(Err((
-                        KafkaError::MessageProduction(RDKafkaErrorCode::MessageSizeTooLarge),
-                        _,
-                    ))) => {
-                        return Err(FaucetError::Sink(
-                            "kafka send: record exceeds broker max.message.bytes".into(),
-                        ));
-                    }
-                    Ok(Err((e, _msg))) => {
-                        return Err(FaucetError::Sink(format!("kafka send: {e}")));
-                    }
-                    Err(_canceled) => {
-                        return Err(FaucetError::Sink(
-                            "kafka send: delivery future canceled (producer dropped)".into(),
-                        ));
-                    }
-                }
-            }
-            Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), _record)) => {
-                if attempts >= max_retries {
-                    return Err(FaucetError::Sink(format!(
-                        "kafka send: QueueFull after {max_retries} retries"
-                    )));
-                }
-                tracing::warn!(attempts, "kafka send: QueueFull, backing off");
-                calls.wait(backoff).await?;
-                attempts += 1;
-            }
-            Err((e, _record)) => {
-                return Err(FaucetError::Sink(format!("kafka send: {e}")));
-            }
-        }
+/// Wait for one enqueued record's delivery report.
+async fn confirm_delivery(
+    calls: faucet_core::CallContext,
+    delivery: DeliveryFuture,
+) -> Result<(), FaucetError> {
+    let delivered = calls
+        .call_once("produce", async { Ok(delivery.await) })
+        .await?;
+    delivery_outcome(delivered)
+}
+
+fn delivery_outcome(
+    delivered: Result<OwnedDeliveryResult, futures::channel::oneshot::Canceled>,
+) -> Result<(), FaucetError> {
+    match delivered {
+        Ok(Ok(_delivery)) => Ok(()),
+        Ok(Err((KafkaError::MessageProduction(RDKafkaErrorCode::MessageSizeTooLarge), _))) => Err(
+            FaucetError::Sink("kafka send: record exceeds broker max.message.bytes".into()),
+        ),
+        Ok(Err((e, _msg))) => Err(FaucetError::Sink(format!("kafka send: {e}"))),
+        Err(_canceled) => Err(FaucetError::Sink(
+            "kafka send: delivery future canceled (producer dropped)".into(),
+        )),
     }
 }
 
