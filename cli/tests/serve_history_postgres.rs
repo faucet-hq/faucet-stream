@@ -894,7 +894,7 @@ async fn postgres_run_log_batches_match_line_by_line_inserts() {
         ts: "2026-01-01T00:00:00.000Z".into(),
         level: "INFO".into(),
         line: text.into(),
-        attrs: if seq % 5 == 0 {
+        attrs: if seq.is_multiple_of(5) {
             [("row".to_string(), format!("r{seq}"))].into()
         } else {
             Default::default()

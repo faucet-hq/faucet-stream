@@ -177,9 +177,9 @@ mod shard_tests {
         crate::serve::history::RunLogLine {
             seq,
             ts: format!("2026-01-01T00:00:{:02}.000Z", seq % 60),
-            level: if seq % 7 == 0 { "WARN" } else { "INFO" }.into(),
+            level: if seq.is_multiple_of(7) { "WARN" } else { "INFO" }.into(),
             line: text.into(),
-            attrs: if seq % 5 == 0 {
+            attrs: if seq.is_multiple_of(5) {
                 [("row".to_string(), format!("r{seq}"))].into()
             } else {
                 Default::default()
@@ -292,7 +292,7 @@ mod shard_tests {
             "INSERT INTO faucet_serve_run_logs (run_id, seq, ts, level, line, attrs) VALUES \
              (?,?,?,?,?,?),(?,?,?,?,?,?) ON CONFLICT (run_id, seq) DO NOTHING"
         );
-        assert!(crate::serve::history::sql::RUN_LOG_INSERT_ROWS * 6 < 32_766);
+        const { assert!(crate::serve::history::sql::RUN_LOG_INSERT_ROWS * 6 < 32_766) };
     }
 
     /// The periodic deletes as they were written with `IN` / `NOT IN`.
