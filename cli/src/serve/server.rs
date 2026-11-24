@@ -661,7 +661,7 @@ pub(crate) fn clock_offset_ms(
 /// and the state format every member reads (#736).
 pub(crate) async fn refresh_membership(state: &ServerState, member_ttl: Duration) {
     heartbeat_member(state).await;
-    refresh_member_view(state, member_ttl).await;
+    refresh_member_view(state, member_ttl, None).await;
 }
 
 /// Write this member's heartbeat row.
@@ -686,10 +686,25 @@ pub(crate) async fn heartbeat_member(state: &ServerState) {
     }
 }
 
-/// Re-read the live members, the state format they share and the pools.
-async fn refresh_member_view(state: &ServerState, member_ttl: Duration) {
+/// Re-read the live members, the state format they share and the pools,
+/// with the reads bounded by `read_bound`.
+async fn refresh_member_view(
+    state: &ServerState,
+    member_ttl: Duration,
+    read_bound: Option<Duration>,
+) {
     let cluster = state.cluster();
-    match state.history().live_instances(member_ttl).await {
+    let members = match read_bound {
+        Some(bound) => {
+            crate::serve::history::fallback::with_call_bound(
+                bound,
+                state.history().live_instances(member_ttl),
+            )
+            .await
+        }
+        None => state.history().live_instances(member_ttl).await,
+    };
+    match members {
         Ok(members) => {
             cluster.set_members(members.len());
             cluster.set_state_format(crate::serve::history::cluster_state_format(&members));
@@ -698,7 +713,7 @@ async fn refresh_member_view(state: &ServerState, member_ttl: Duration) {
         }
         Err(e) => tracing::warn!(error = %e, "cluster: live_instances failed"),
     }
-    crate::serve::pools::upkeep(state).await;
+    crate::serve::pools::upkeep(state, read_bound).await;
 }
 
 /// How long ago this instance last renewed its leases, and whether it has
@@ -1026,84 +1041,37 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
 
 /// Everything a lease tick does besides renewing and heartbeating: see
 /// [`lease_upkeep`], then the member view, failover reclaim and the sweeps.
-/// History calls after the upkeep are bounded one by one.
+/// Each history call is bounded except the terminal writes whose results
+/// fire completion side effects (the sharded-parent sweep, failing runs of an
+/// unserved pool): a write cut client-side may still commit, and its records
+/// would then be lost.
 async fn lease_upkeep_pass(state: ServerState, member_ttl: Duration) {
+    use crate::serve::history::fallback::with_call_bound;
     let cluster = state.cluster().clone();
     lease_upkeep(&state).await;
     let bound = crate::serve::history::sql::lease_call_bound(state.lease_ttl());
-    crate::serve::history::fallback::with_call_bound(bound, async {
-        let state = &state;
-        if cluster.enabled() {
-            refresh_member_view(state, member_ttl).await;
-            // Failover reclaim (re-run orphans).
-            match state
-                .history()
-                .reclaim_orphans(cluster.max_attempts())
-                .await
-            {
-                Ok(r) if r.requeued > 0 || r.failed > 0 => {
-                    crate::serve::metrics::record_runs_reclaimed(r.requeued, r.failed);
-                    tracing::warn!(
-                        requeued = r.requeued,
-                        failed = r.failed,
-                        "cluster: reclaimed orphaned runs from an expired-lease instance"
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "cluster: reclaim_orphans failed"),
+    let state = &state;
+    if cluster.enabled() {
+        refresh_member_view(state, member_ttl, Some(bound)).await;
+        with_call_bound(bound, cluster_reclaim(state, &cluster)).await;
+        // Mode B (#230 / F11): finalize any `sharded` parent whose
+        // shards are all terminal but which no shard task finalized
+        // inline (e.g. the coordinator crashed after the last shard
+        // completed on another instance). Status-fenced + metric
+        // recorded inside the backend, so a parent already finalized by
+        // `maybe_finalize_parent` is not re-finalized or double-counted.
+        match crate::serve::runner::sweep_sharded_parents(state).await {
+            Ok(n) if n > 0 => tracing::info!(
+                finalized = n,
+                "cluster: finalized completed sharded parent run(s) via sweep"
+            ),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "cluster: finalize_completed_sharded_parents failed")
             }
-            // Mode B (#230): rebalance shards whose owner's lease expired
-            // (requeue → another worker, or poison past max_attempts).
-            match state.history().reclaim_shards(cluster.max_attempts()).await {
-                Ok(r) if r.requeued > 0 || r.failed > 0 => {
-                    crate::serve::metrics::record_shards_reclaimed(r.requeued, r.failed);
-                    tracing::warn!(
-                        requeued = r.requeued,
-                        failed = r.failed,
-                        "cluster: reclaimed orphaned shards from an expired-lease instance"
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "cluster: reclaim_shards failed"),
-            }
-            // Mode B (#230 / F11): finalize any `sharded` parent whose
-            // shards are all terminal but which no shard task finalized
-            // inline (e.g. the coordinator crashed after the last shard
-            // completed on another instance). Status-fenced + metric
-            // recorded inside the backend, so a parent already finalized by
-            // `maybe_finalize_parent` is not re-finalized or double-counted.
-            // Sealed secret params outlive no terminal run (#956).
-            match state.history().run_secrets_purge_terminal().await {
-                Ok(n) if n > 0 => tracing::debug!(
-                    purged = n,
-                    "cluster: deleted the sealed secret params of finished runs"
-                ),
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(error = %e, "cluster: purging sealed secret params failed")
-                }
-            }
-            // A cancel recorded for a sharded run stops its pending
-            // shards wherever it was requested.
-            match state.history().cancel_flagged_shards().await {
-                Ok(n) if n > 0 => tracing::info!(
-                    cancelled = n,
-                    "cluster: cancelled the pending shards of cancelled runs"
-                ),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "cluster: cancelling flagged shards failed"),
-            }
-            match crate::serve::runner::sweep_sharded_parents(state).await {
-                Ok(n) if n > 0 => tracing::info!(
-                    finalized = n,
-                    "cluster: finalized completed sharded parent run(s) via sweep"
-                ),
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(error = %e, "cluster: finalize_completed_sharded_parents failed")
-                }
-            }
-        } else {
+        }
+    } else {
+        with_call_bound(bound, async {
             // Single-instance: mark orphans failed. This instance's own
             // runs are live or held for a retry, never orphans, unless
             // their terminal record was dropped (#1050).
@@ -1116,10 +1084,68 @@ async fn lease_upkeep_pass(state: ServerState, member_ttl: Duration) {
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "orphan recovery failed"),
             }
+        })
+        .await;
+    }
+    with_call_bound(bound, clear_settled_forgotten(state)).await;
+}
+
+/// Failover reclaim of runs and shards, the sealed-param purge and the
+/// cancel of flagged shards: their results are counts, so a cut call loses
+/// nothing a later pass needs.
+async fn cluster_reclaim(state: &ServerState, cluster: &crate::serve::cluster::ClusterHandle) {
+    // Failover reclaim (re-run orphans).
+    match state
+        .history()
+        .reclaim_orphans(cluster.max_attempts())
+        .await
+    {
+        Ok(r) if r.requeued > 0 || r.failed > 0 => {
+            crate::serve::metrics::record_runs_reclaimed(r.requeued, r.failed);
+            tracing::warn!(
+                requeued = r.requeued,
+                failed = r.failed,
+                "cluster: reclaimed orphaned runs from an expired-lease instance"
+            );
         }
-        clear_settled_forgotten(state).await;
-    })
-    .await;
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "cluster: reclaim_orphans failed"),
+    }
+    // Mode B (#230): rebalance shards whose owner's lease expired
+    // (requeue → another worker, or poison past max_attempts).
+    match state.history().reclaim_shards(cluster.max_attempts()).await {
+        Ok(r) if r.requeued > 0 || r.failed > 0 => {
+            crate::serve::metrics::record_shards_reclaimed(r.requeued, r.failed);
+            tracing::warn!(
+                requeued = r.requeued,
+                failed = r.failed,
+                "cluster: reclaimed orphaned shards from an expired-lease instance"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "cluster: reclaim_shards failed"),
+    }
+    // Sealed secret params outlive no terminal run (#956).
+    match state.history().run_secrets_purge_terminal().await {
+        Ok(n) if n > 0 => tracing::debug!(
+            purged = n,
+            "cluster: deleted the sealed secret params of finished runs"
+        ),
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "cluster: purging sealed secret params failed")
+        }
+    }
+    // A cancel recorded for a sharded run stops its pending
+    // shards wherever it was requested.
+    match state.history().cancel_flagged_shards().await {
+        Ok(n) if n > 0 => tracing::info!(
+            cancelled = n,
+            "cluster: cancelled the pending shards of cancelled runs"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "cluster: cancelling flagged shards failed"),
+    }
 }
 
 /// Drop from the forgotten set every run whose record is now terminal, or
@@ -1972,6 +1998,12 @@ mod tests {
         secrets_deleted: AtomicUsize,
         heartbeats: AtomicUsize,
         fail_batch_check: AtomicBool,
+        write_takes: std::sync::Mutex<Duration>,
+        sweep_records: std::sync::Mutex<Vec<RunRecord>>,
+        stranded: std::sync::Mutex<Vec<RunRecord>>,
+        members: std::sync::Mutex<Vec<crate::serve::history::InstanceRecord>>,
+        pending: std::sync::Mutex<Vec<(String, usize)>>,
+        terminal_writes: AtomicUsize,
     }
 
     async fn stall_if(flag: &AtomicBool) {
@@ -2086,14 +2118,52 @@ mod tests {
         fn degraded(&self) -> bool {
             false
         }
+        async fn live_instances(
+            &self,
+            _: Duration,
+        ) -> Result<Vec<crate::serve::history::InstanceRecord>, HistoryError> {
+            Ok(self.members.lock().unwrap().clone())
+        }
+        async fn pending_by_pool(&self) -> Result<Vec<(String, usize)>, HistoryError> {
+            Ok(self.pending.lock().unwrap().clone())
+        }
+        async fn stranded_pending(
+            &self,
+            _: &[String],
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<RunRecord>, HistoryError> {
+            Ok(std::mem::take(&mut *self.stranded.lock().unwrap()))
+        }
+        async fn fail_pending(&self, _: &RunRecord) -> Result<bool, HistoryError> {
+            let takes = *self.write_takes.lock().unwrap();
+            tokio::time::sleep(takes).await;
+            self.terminal_writes.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+        async fn finalize_completed_sharded_parents_records(
+            &self,
+        ) -> Result<Vec<RunRecord>, HistoryError> {
+            let done = std::mem::take(&mut *self.sweep_records.lock().unwrap());
+            let takes = *self.write_takes.lock().unwrap();
+            tokio::time::sleep(takes).await;
+            self.terminal_writes.fetch_add(1, Ordering::SeqCst);
+            Ok(done)
+        }
     }
 
     fn state_over(clustered: bool, history: Arc<dyn RunHistory>) -> ServerState {
         let mut config = crate::serve::test_support::test_config();
         config.cluster.enabled = clustered;
         config.lease_ttl = Duration::from_secs(30);
+        state_with(&config, history)
+    }
+
+    fn state_with(
+        config: &crate::serve::config::ServeConfig,
+        history: Arc<dyn RunHistory>,
+    ) -> ServerState {
         ServerState::new(
-            &config,
+            config,
             None,
             CancellationToken::new(),
             history,
@@ -2235,6 +2305,95 @@ mod tests {
         assert!(!mine.is_cancelled() && !broken.is_cancelled());
         assert_eq!(double.batched_checks.load(Ordering::SeqCst), 1);
         assert_eq!(double.single_checks.load(Ordering::SeqCst), 4);
+    }
+
+    fn sharded_state(double: &Arc<Stalling>, pool_wait: Option<Duration>) -> ServerState {
+        let mut config = crate::serve::test_support::test_config();
+        config.cluster.enabled = true;
+        config.cluster.pool_wait_timeout = pool_wait;
+        config.lease_ttl = Duration::from_millis(1500);
+        let history = Arc::new(crate::serve::history::fallback::FallbackHistory::healthy(
+            Box::new(Arc::clone(double)),
+            config.idempotency_retention,
+            "postgres",
+        )) as Arc<dyn RunHistory>;
+        state_with(&config, history)
+    }
+
+    async fn callback_server() -> (wiremock::MockServer, crate::serve::callback::CallbackSpec) {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let spec = serde_json::from_value(serde_json::json!({
+            "url": format!("{}/done", server.uri())
+        }))
+        .unwrap();
+        (server, spec)
+    }
+
+    fn finished(id: &str, status: crate::serve::history::RunStatus) -> RunRecord {
+        let mut rec = RunRecord::queued(
+            id.into(),
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+            chrono::Utc::now(),
+        );
+        rec.status = status;
+        rec.finished_at = Some(chrono::Utc::now());
+        rec
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sweep_slower_than_the_bound_still_fires_its_callback_once() {
+        let double = Arc::new(Stalling::default());
+        let state = sharded_state(&double, None);
+        *double.write_takes.lock().unwrap() = Duration::from_millis(1600);
+        let (server, callback) = callback_server().await;
+        let mut parent = finished("parent", crate::serve::history::RunStatus::Completed);
+        parent.callback = Some(callback);
+        double.sweep_records.lock().unwrap().push(parent);
+        lease_upkeep_pass(state.clone(), Duration::from_secs(3)).await;
+        lease_upkeep_pass(state.clone(), Duration::from_secs(3)).await;
+        assert_eq!(double.terminal_writes.load(Ordering::SeqCst), 2);
+        server.verify().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failing_an_unserved_pools_run_slower_than_the_bound_fires_its_callback_once() {
+        let double = Arc::new(Stalling::default());
+        let state = sharded_state(&double, Some(Duration::from_millis(1)));
+        *double.members.lock().unwrap() = vec![crate::serve::history::InstanceRecord {
+            instance_id: "peer".into(),
+            started_at: chrono::Utc::now(),
+            last_heartbeat: chrono::Utc::now(),
+            listen: None,
+            max_concurrent: 1,
+            in_flight: 0,
+            state_format: faucet_core::state_version::STATE_FORMAT,
+            pools: Some(vec!["default".into()]),
+            capabilities: None,
+            clock_offset_ms: None,
+        }];
+        *double.pending.lock().unwrap() = vec![("gpu".into(), 1)];
+        let (server, callback) = callback_server().await;
+        let mut rec = finished("stranded", crate::serve::history::RunStatus::Pending);
+        rec.pool = "gpu".into();
+        rec.callback = Some(callback);
+        lease_upkeep_pass(state.clone(), Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        double.stranded.lock().unwrap().push(rec);
+        *double.write_takes.lock().unwrap() = Duration::from_millis(1600);
+        lease_upkeep_pass(state.clone(), Duration::from_secs(3)).await;
+        lease_upkeep_pass(state.clone(), Duration::from_secs(3)).await;
+        let fails = double.terminal_writes.load(Ordering::SeqCst);
+        assert_eq!(fails, 4, "one failed pending run and three sweeps");
+        server.verify().await;
     }
 
     #[tokio::test(start_paused = true)]

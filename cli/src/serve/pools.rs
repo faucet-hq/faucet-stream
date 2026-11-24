@@ -235,10 +235,14 @@ pub fn wait_timeout_error(pool: &str, waited_secs: u64) -> String {
 
 /// One lease-loop step for pools (#957): report pending runs per pool and,
 /// with `--pool-wait-timeout-secs`, fail the runs of a pool no live member
-/// has served for that long.
-pub async fn upkeep(state: &crate::serve::state::ServerState) {
+/// has served for that long. `read_bound` bounds the reads; the terminal
+/// writes, whose results fire the completion side effects, are never cut.
+pub async fn upkeep(
+    state: &crate::serve::state::ServerState,
+    read_bound: Option<std::time::Duration>,
+) {
     let cluster = state.cluster();
-    let counts = match state.history().pending_by_pool().await {
+    let counts = match bounded(read_bound, state.history().pending_by_pool()).await {
         Ok(counts) => counts,
         Err(e) => {
             tracing::warn!(error = %e, "cluster: pending_by_pool failed");
@@ -268,7 +272,12 @@ pub async fn upkeep(state: &crate::serve::state::ServerState) {
     if !since.values().any(|t| *t <= before) {
         return;
     }
-    let stranded = match state.history().stranded_pending(&served, before).await {
+    let stranded = match bounded(
+        read_bound,
+        state.history().stranded_pending(&served, before),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "cluster: stranded_pending failed");
@@ -301,6 +310,13 @@ pub async fn upkeep(state: &crate::serve::state::ServerState) {
                 tracing::warn!(run_id = %rec.run_id, error = %e, "cluster: fail_pending failed")
             }
         }
+    }
+}
+
+async fn bounded<F: std::future::Future>(bound: Option<std::time::Duration>, work: F) -> F::Output {
+    match bound {
+        Some(bound) => crate::serve::history::fallback::with_call_bound(bound, work).await,
+        None => work.await,
     }
 }
 
