@@ -916,8 +916,8 @@ async fn cancel_lost_leases(state: &ServerState, bound: Duration) -> usize {
     let lost = match tokio::time::timeout(bound, state.history().leases_lost(&keys)).await {
         Ok(Ok(lost)) => lost,
         Ok(Err(e)) => {
-            tracing::warn!(error = %e, "cluster: lease ownership check failed");
-            return 0;
+            tracing::warn!(error = %e, "cluster: lease ownership check failed; checking each run");
+            leases_lost_one_by_one(state, &keys, bound).await
         }
         Err(_) => {
             crate::serve::metrics::record_lease_renewal_timeout();
@@ -933,6 +933,36 @@ async fn cancel_lost_leases(state: &ServerState, bound: Duration) -> usize {
         state.registry().cancel(key);
     }
     lost.len()
+}
+
+/// The keys a peer holds, asked one at a time within `bound`; a key whose
+/// check fails or is not reached in time counts as still held here.
+async fn leases_lost_one_by_one(
+    state: &ServerState,
+    keys: &[String],
+    bound: Duration,
+) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + bound;
+    let mut lost = Vec::new();
+    for key in keys {
+        let check = async {
+            match key.split_once("::") {
+                Some((run_id, shard_id)) => {
+                    state.history().shard_lease_lost(run_id, shard_id).await
+                }
+                None => state.history().lease_lost(key).await,
+            }
+        };
+        match tokio::time::timeout_at(deadline, check).await {
+            Ok(Ok(true)) => lost.push(key.clone()),
+            Ok(Ok(false)) => {}
+            Ok(Err(e)) => {
+                tracing::debug!(key = %key, error = %e, "cluster: lease ownership check failed")
+            }
+            Err(_) => break,
+        }
+    }
+    lost
 }
 
 /// Aborts the task when dropped.
@@ -1941,6 +1971,7 @@ mod tests {
         finalizes: AtomicUsize,
         secrets_deleted: AtomicUsize,
         heartbeats: AtomicUsize,
+        fail_batch_check: AtomicBool,
     }
 
     async fn stall_if(flag: &AtomicBool) {
@@ -2001,12 +2032,29 @@ mod tests {
         async fn renew_shard_leases(&self) -> Result<usize, HistoryError> {
             Ok(0)
         }
-        async fn lease_lost(&self, _: &str) -> Result<bool, HistoryError> {
+        async fn lease_lost(&self, run_id: &str) -> Result<bool, HistoryError> {
             self.single_checks.fetch_add(1, Ordering::SeqCst);
-            Ok(false)
+            stall_if(&self.stall_reads).await;
+            if run_id.starts_with("broken") {
+                return Err(HistoryError::BackendClassified {
+                    message: "refused".into(),
+                    transience: crate::serve::history::Transience::Permanent,
+                });
+            }
+            Ok(run_id.starts_with("taken"))
+        }
+        async fn shard_lease_lost(&self, run_id: &str, _: &str) -> Result<bool, HistoryError> {
+            self.single_checks.fetch_add(1, Ordering::SeqCst);
+            Ok(run_id.starts_with("taken"))
         }
         async fn leases_lost(&self, keys: &[String]) -> Result<Vec<String>, HistoryError> {
             self.batched_checks.fetch_add(1, Ordering::SeqCst);
+            if self.fail_batch_check.load(Ordering::SeqCst) {
+                return Err(HistoryError::BackendClassified {
+                    message: "refused".into(),
+                    transience: crate::serve::history::Transience::Permanent,
+                });
+            }
             Ok(keys
                 .iter()
                 .filter(|k| k.starts_with("taken"))
@@ -2160,6 +2208,47 @@ mod tests {
         assert!(taken.is_cancelled() && shard.is_cancelled() && !mine.is_cancelled());
         assert_eq!(double.batched_checks.load(Ordering::SeqCst), 1);
         assert_eq!(double.single_checks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_batch_check_falls_back_to_one_check_per_run() {
+        let (state, double) = stalling_state(true);
+        double.fail_batch_check.store(true, Ordering::SeqCst);
+        let (mine, taken, broken, shard) = (
+            CancellationToken::new(),
+            CancellationToken::new(),
+            CancellationToken::new(),
+            CancellationToken::new(),
+        );
+        state.registry().register("mine-1".into(), mine.clone());
+        state.registry().register("taken-1".into(), taken.clone());
+        state.registry().register("broken-1".into(), broken.clone());
+        state
+            .registry()
+            .register_shard("taken-2", "0", shard.clone());
+        let mut health = LeaseHealth::new(std::time::Instant::now());
+        assert_eq!(
+            maintain_leases(&state, &mut health, Duration::from_secs(3600)).await,
+            2
+        );
+        assert!(taken.is_cancelled() && shard.is_cancelled());
+        assert!(!mine.is_cancelled() && !broken.is_cancelled());
+        assert_eq!(double.batched_checks.load(Ordering::SeqCst), 1);
+        assert_eq!(double.single_checks.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_per_run_checks_stop_at_the_bound() {
+        let (state, double) = stalling_state(true);
+        double.fail_batch_check.store(true, Ordering::SeqCst);
+        double.stall_reads.store(true, Ordering::SeqCst);
+        let taken = CancellationToken::new();
+        state.registry().register("taken-1".into(), taken.clone());
+        let started = tokio::time::Instant::now();
+        assert_eq!(cancel_lost_leases(&state, Duration::from_secs(2)).await, 0);
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert!(!taken.is_cancelled());
+        double.stall_reads.store(false, Ordering::SeqCst);
     }
 
     #[tokio::test]
