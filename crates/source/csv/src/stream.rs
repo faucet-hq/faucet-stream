@@ -98,7 +98,10 @@ impl faucet_core::Source for CsvSource {
                     config.path
                 ))
             })?;
-            let reader = tokio::io::BufReader::new(file);
+            let reader = tokio::io::BufReader::with_capacity(
+                faucet_core::file_format::READ_BUFFER_BYTES,
+                file,
+            );
             #[cfg(feature = "compression")]
             let reader = {
                 let codec = config.compression.resolve(&config.path);
