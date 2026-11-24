@@ -706,6 +706,15 @@ impl LeaseHealth {
         }
     }
 
+    /// When the fence falls due if no renewal succeeds first; `None` once
+    /// this outage is fenced.
+    pub fn fence_due(&self, fence_after: Duration) -> Option<std::time::Instant> {
+        if self.fenced {
+            return None;
+        }
+        self.last_renewed.checked_add(fence_after)
+    }
+
     /// Record one heartbeat outcome. Returns `true` exactly once per outage:
     /// when renewal has failed for `fence_after`, which the caller sets short
     /// of the lease TTL so this instance stops before peers may reclaim.
@@ -732,32 +741,92 @@ impl LeaseHealth {
 /// this instance's run (and, clustered, shard) leases, and — clustered — when
 /// renewal has failed for `fence_after`, cancel every local run and shard so a
 /// peer that reclaims them once their leases expire never runs them at the
-/// same time (#789 SERVE-04). Returns how many local runs and shards were
-/// cancelled.
+/// same time (#789 SERVE-04). Then the tick's upkeep: the policy seed, the
+/// feed check and the terminal records still waiting to be written. Returns
+/// how many local runs and shards were cancelled.
 pub async fn maintain_leases(
     state: &ServerState,
     health: &mut LeaseHealth,
     fence_after: Duration,
 ) -> usize {
-    if state.history().recover_degraded().await {
+    let cancelled = renew_and_fence(state, health, fence_after).await;
+    lease_upkeep(state).await;
+    cancelled
+}
+
+/// The renewal half of a lease tick. Every call to the history is cut off
+/// after [`lease_call_bound`](crate::serve::history::sql::lease_call_bound),
+/// and the fence fires `fence_after` into an outage even while a renewal is
+/// still waiting for an answer.
+async fn renew_and_fence(
+    state: &ServerState,
+    health: &mut LeaseHealth,
+    fence_after: Duration,
+) -> usize {
+    use crate::serve::history::fallback::with_call_bound;
+    let bound = crate::serve::history::sql::lease_call_bound(state.lease_ttl());
+    if with_call_bound(bound, state.history().recover_degraded()).await {
         tracing::info!("run-history backend recovered");
     }
-    #[cfg(feature = "policy")]
-    if let Err(e) = retry_policy_seed(state).await {
-        tracing::error!(error = %e, "seeding the policy store from the --policy file failed; new work waits for it");
-    }
-    #[cfg(feature = "feeds")]
-    state.feeds().lease_tick(state).await;
-    // Terminal records whose write failed go first: until they land the rows
-    // read `running`, and their lease is renewed below so no peer re-runs them.
-    crate::serve::runner::retry_pending_finalize(state).await;
-    let mut renewed = true;
     let forgotten = state.forgotten_runs();
     // The fence counts from before the renewal: the lease a renewal writes
     // runs from the database's clock read at its start, not from when the
     // whole tick ends.
     let attempted = std::time::Instant::now();
-    if let Err(e) = state.history().renew_leases_except(&forgotten).await {
+    let give_up = attempted + bound;
+    let renewal = renew_leases(state, &forgotten);
+    tokio::pin!(renewal);
+    let mut cancelled = 0usize;
+    let mut answer = None;
+    if let Some(due) = health
+        .fence_due(fence_after)
+        .filter(|due| *due > attempted && *due < give_up)
+    {
+        match tokio::time::timeout_at(due.into(), &mut renewal).await {
+            Ok(renewed) => answer = Some(renewed),
+            Err(_) => {
+                if health.observe(false, due, fence_after) && state.cluster().enabled() {
+                    cancelled += fence(state, fence_after);
+                }
+            }
+        }
+    }
+    let renewed = match answer {
+        Some(renewed) => renewed,
+        None => match tokio::time::timeout_at(give_up.into(), &mut renewal).await {
+            Ok(renewed) => renewed,
+            Err(_) => {
+                crate::serve::metrics::record_lease_renewal_timeout();
+                tracing::warn!(
+                    waited_ms = bound.as_millis() as u64,
+                    "lease heartbeat: the run history did not answer in time"
+                );
+                false
+            }
+        },
+    };
+    state.cluster().set_history_reachable(renewed);
+    if renewed && state.cluster().enabled() {
+        state.cluster().set_fenced(None);
+        // A renewal only extends the rows this instance still owns. A run a
+        // peer reclaimed (this instance's lease lapsed while it was alive:
+        // clock skew, a stall) is no longer among them, and must stop here
+        // rather than run on beside the peer's execution.
+        let lost = cancel_lost_leases(state, bound).await;
+        if lost > 0 {
+            return cancelled + lost;
+        }
+    }
+    if !health.observe(renewed, attempted, fence_after) || !state.cluster().enabled() {
+        return cancelled;
+    }
+    cancelled + fence(state, fence_after)
+}
+
+/// Renew this instance's run leases and, clustered, its shard leases.
+async fn renew_leases(state: &ServerState, forgotten: &[String]) -> bool {
+    let mut renewed = true;
+    if let Err(e) = state.history().renew_leases_except(forgotten).await {
         tracing::warn!(error = %e, "lease heartbeat (renew_leases) failed");
         renewed = false;
     }
@@ -767,24 +836,14 @@ pub async fn maintain_leases(
         tracing::warn!(error = %e, "cluster: renew_shard_leases failed");
         renewed = false;
     }
-    state.cluster().set_history_reachable(renewed);
-    if renewed && state.cluster().enabled() {
-        state.cluster().set_fenced(None);
-        // A renewal only extends the rows this instance still owns. A run a
-        // peer reclaimed (this instance's lease lapsed while it was alive:
-        // clock skew, a stall) is no longer among them, and must stop here
-        // rather than run on beside the peer's execution.
-        let lost = cancel_lost_leases(state).await;
-        if lost > 0 {
-            return lost;
-        }
-    }
-    if !health.observe(renewed, attempted, fence_after) || !state.cluster().enabled() {
-        return 0;
-    }
-    // The fence fires `fence_after` into the outage, short of the lease TTL;
-    // a cancelled run gets a fraction of the remaining time to flush, so it
-    // has stopped writing before a peer may reclaim it.
+    renewed
+}
+
+/// Cancel every local run and shard: the fence fires `fence_after` into the
+/// outage, short of the lease TTL; a cancelled run gets a fraction of the
+/// remaining time to flush, so it has stopped writing before a peer may
+/// reclaim it.
+fn fence(state: &ServerState, fence_after: Duration) -> usize {
     state.cluster().set_fenced(Some(fence_after / 4));
     let cancelled = state.registry().cancel_all();
     tracing::error!(
@@ -796,39 +855,68 @@ pub async fn maintain_leases(
     cancelled
 }
 
+/// The part of a lease tick that renews nothing: the policy seed, the feed
+/// check, and the terminal records whose write failed (until they land the
+/// rows read `running`; their lease is renewed meanwhile, so no peer re-runs
+/// them). Each history call is bounded, and fails rather than being dropped.
+async fn lease_upkeep(state: &ServerState) {
+    let bound = crate::serve::history::sql::lease_call_bound(state.lease_ttl());
+    crate::serve::history::fallback::with_call_bound(bound, async {
+        #[cfg(feature = "policy")]
+        if let Err(e) = retry_policy_seed(state).await {
+            tracing::error!(error = %e, "seeding the policy store from the --policy file failed; new work waits for it");
+        }
+        #[cfg(feature = "feeds")]
+        state.feeds().lease_tick(state).await;
+        crate::serve::runner::retry_pending_finalize(state).await;
+    })
+    .await;
+}
+
 /// Cancel every local run and shard whose lease a peer now holds (the row is
 /// live but owned by another instance, or requeued). Returns how many.
-async fn cancel_lost_leases(state: &ServerState) -> usize {
-    let mut cancelled = 0usize;
-    for key in state.registry().live_keys() {
-        let lost = match key.split_once("::") {
-            Some((run_id, shard_id)) => state.history().shard_lease_lost(run_id, shard_id).await,
-            None => state.history().lease_lost(&key).await,
-        };
-        match lost {
-            Ok(true) => {
-                tracing::error!(
-                    key = %key,
-                    "cluster: another instance holds this run's lease; cancelling the local execution"
-                );
-                state.registry().cancel(&key);
-                cancelled += 1;
-            }
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(key = %key, error = %e, "cluster: lease ownership check failed")
-            }
-        }
+async fn cancel_lost_leases(state: &ServerState, bound: Duration) -> usize {
+    let keys = state.registry().live_keys();
+    if keys.is_empty() {
+        return 0;
     }
-    cancelled
+    let lost = match tokio::time::timeout(bound, state.history().leases_lost(&keys)).await {
+        Ok(Ok(lost)) => lost,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "cluster: lease ownership check failed");
+            return 0;
+        }
+        Err(_) => {
+            crate::serve::metrics::record_lease_renewal_timeout();
+            tracing::warn!("cluster: lease ownership check did not answer in time");
+            return 0;
+        }
+    };
+    for key in &lost {
+        tracing::error!(
+            key = %key,
+            "cluster: another instance holds this run's lease; cancelling the local execution"
+        );
+        state.registry().cancel(key);
+    }
+    lost.len()
+}
+
+/// Aborts the task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: CancellationToken) {
-    let cluster = state.cluster().clone();
     // Member-liveness window ≈ the real lease TTL (period == lease_ttl/3), so a
     // member must miss ~3 heartbeats before peers treat it as gone.
     let member_ttl = period.saturating_mul(3);
     let mut health = LeaseHealth::new(std::time::Instant::now());
+    let mut upkeep: Option<AbortOnDrop> = None;
     let mut tick = tokio::time::interval(period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tick.tick().await; // consume the immediate first tick
@@ -836,87 +924,122 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = tick.tick() => {
-                maintain_leases(&state, &mut health, member_ttl.saturating_sub(period)).await;
-                if cluster.enabled() {
-                    refresh_membership(&state, member_ttl).await;
-                    // Failover reclaim (re-run orphans).
-                    match state.history().reclaim_orphans(cluster.max_attempts()).await {
-                        Ok(r) if r.requeued > 0 || r.failed > 0 => {
-                            crate::serve::metrics::record_runs_reclaimed(r.requeued, r.failed);
-                            tracing::warn!(
-                                requeued = r.requeued, failed = r.failed,
-                                "cluster: reclaimed orphaned runs from an expired-lease instance"
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(error = %e, "cluster: reclaim_orphans failed"),
-                    }
-                    // Mode B (#230): rebalance shards whose owner's lease expired
-                    // (requeue → another worker, or poison past max_attempts).
-                    match state.history().reclaim_shards(cluster.max_attempts()).await {
-                        Ok(r) if r.requeued > 0 || r.failed > 0 => {
-                            crate::serve::metrics::record_shards_reclaimed(r.requeued, r.failed);
-                            tracing::warn!(
-                                requeued = r.requeued, failed = r.failed,
-                                "cluster: reclaimed orphaned shards from an expired-lease instance"
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(error = %e, "cluster: reclaim_shards failed"),
-                    }
-                    // Mode B (#230 / F11): finalize any `sharded` parent whose
-                    // shards are all terminal but which no shard task finalized
-                    // inline (e.g. the coordinator crashed after the last shard
-                    // completed on another instance). Status-fenced + metric
-                    // recorded inside the backend, so a parent already finalized by
-                    // `maybe_finalize_parent` is not re-finalized or double-counted.
-                    // Sealed secret params outlive no terminal run (#956).
-                    match state.history().run_secrets_purge_terminal().await {
-                        Ok(n) if n > 0 => tracing::debug!(
-                            purged = n,
-                            "cluster: deleted the sealed secret params of finished runs"
-                        ),
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(error = %e, "cluster: purging sealed secret params failed"),
-                    }
-                    // A cancel recorded for a sharded run stops its pending
-                    // shards wherever it was requested.
-                    match state.history().cancel_flagged_shards().await {
-                        Ok(n) if n > 0 => tracing::info!(
-                            cancelled = n,
-                            "cluster: cancelled the pending shards of cancelled runs"
-                        ),
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(error = %e, "cluster: cancelling flagged shards failed"),
-                    }
-                    match crate::serve::runner::sweep_sharded_parents(&state).await {
-                        Ok(n) if n > 0 => tracing::info!(
-                            finalized = n,
-                            "cluster: finalized completed sharded parent run(s) via sweep"
-                        ),
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(error = %e, "cluster: finalize_completed_sharded_parents failed")
-                        }
-                    }
+                renew_and_fence(&state, &mut health, member_ttl.saturating_sub(period)).await;
+                // Upkeep never delays the next renewal: it runs beside the
+                // loop, one pass at a time.
+                if upkeep.as_ref().is_some_and(|pass| !pass.0.is_finished()) {
+                    crate::serve::metrics::record_lease_upkeep_skipped();
+                    tracing::warn!("lease upkeep from an earlier tick is still running; skipping this one");
                 } else {
-                    // Single-instance: mark orphans failed. This instance's own
-                    // runs are live or held for a retry, never orphans, unless
-                    // their terminal record was dropped (#1050).
-                    let forgotten = state.forgotten_runs();
-                    match state.history().recover_orphans_of_peers(&forgotten).await {
-                        Ok(n) if n > 0 => tracing::warn!(
-                            recovered = n,
-                            "recovered orphaned runs from an expired-lease instance"
-                        ),
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(error = %e, "orphan recovery failed"),
-                    }
+                    upkeep = Some(AbortOnDrop(tokio::spawn(lease_upkeep_pass(
+                        state.clone(),
+                        member_ttl,
+                    ))));
                 }
-                clear_settled_forgotten(&state).await;
             }
         }
     }
+    if let Some(mut pass) = upkeep.take() {
+        let _ = (&mut pass.0).await;
+    }
+}
+
+/// Everything a lease tick does besides renewing: see [`lease_upkeep`], then
+/// membership, failover reclaim and the sweeps. History calls are bounded
+/// one by one.
+async fn lease_upkeep_pass(state: ServerState, member_ttl: Duration) {
+    let cluster = state.cluster().clone();
+    lease_upkeep(&state).await;
+    let bound = crate::serve::history::sql::lease_call_bound(state.lease_ttl());
+    crate::serve::history::fallback::with_call_bound(bound, async {
+        let state = &state;
+        if cluster.enabled() {
+            refresh_membership(state, member_ttl).await;
+            // Failover reclaim (re-run orphans).
+            match state
+                .history()
+                .reclaim_orphans(cluster.max_attempts())
+                .await
+            {
+                Ok(r) if r.requeued > 0 || r.failed > 0 => {
+                    crate::serve::metrics::record_runs_reclaimed(r.requeued, r.failed);
+                    tracing::warn!(
+                        requeued = r.requeued,
+                        failed = r.failed,
+                        "cluster: reclaimed orphaned runs from an expired-lease instance"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "cluster: reclaim_orphans failed"),
+            }
+            // Mode B (#230): rebalance shards whose owner's lease expired
+            // (requeue → another worker, or poison past max_attempts).
+            match state.history().reclaim_shards(cluster.max_attempts()).await {
+                Ok(r) if r.requeued > 0 || r.failed > 0 => {
+                    crate::serve::metrics::record_shards_reclaimed(r.requeued, r.failed);
+                    tracing::warn!(
+                        requeued = r.requeued,
+                        failed = r.failed,
+                        "cluster: reclaimed orphaned shards from an expired-lease instance"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "cluster: reclaim_shards failed"),
+            }
+            // Mode B (#230 / F11): finalize any `sharded` parent whose
+            // shards are all terminal but which no shard task finalized
+            // inline (e.g. the coordinator crashed after the last shard
+            // completed on another instance). Status-fenced + metric
+            // recorded inside the backend, so a parent already finalized by
+            // `maybe_finalize_parent` is not re-finalized or double-counted.
+            // Sealed secret params outlive no terminal run (#956).
+            match state.history().run_secrets_purge_terminal().await {
+                Ok(n) if n > 0 => tracing::debug!(
+                    purged = n,
+                    "cluster: deleted the sealed secret params of finished runs"
+                ),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "cluster: purging sealed secret params failed")
+                }
+            }
+            // A cancel recorded for a sharded run stops its pending
+            // shards wherever it was requested.
+            match state.history().cancel_flagged_shards().await {
+                Ok(n) if n > 0 => tracing::info!(
+                    cancelled = n,
+                    "cluster: cancelled the pending shards of cancelled runs"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "cluster: cancelling flagged shards failed"),
+            }
+            match crate::serve::runner::sweep_sharded_parents(state).await {
+                Ok(n) if n > 0 => tracing::info!(
+                    finalized = n,
+                    "cluster: finalized completed sharded parent run(s) via sweep"
+                ),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "cluster: finalize_completed_sharded_parents failed")
+                }
+            }
+        } else {
+            // Single-instance: mark orphans failed. This instance's own
+            // runs are live or held for a retry, never orphans, unless
+            // their terminal record was dropped (#1050).
+            let forgotten = state.forgotten_runs();
+            match state.history().recover_orphans_of_peers(&forgotten).await {
+                Ok(n) if n > 0 => tracing::warn!(
+                    recovered = n,
+                    "recovered orphaned runs from an expired-lease instance"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "orphan recovery failed"),
+            }
+        }
+        clear_settled_forgotten(state).await;
+    })
+    .await;
 }
 
 /// Drop from the forgotten set every run whose record is now terminal, or
@@ -1745,6 +1868,271 @@ async fn wait_for_signal() {
 mod tests {
     use super::*;
     use crate::serve::history::memory::MemoryHistory;
+    use crate::serve::history::{
+        Claim, DeleteOutcome, HistoryError, ListFilter, ListPage, RunHistory, RunRecord,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// A history whose renewals, upkeep and reads can stop answering.
+    #[derive(Default)]
+    struct Stalling {
+        stall_renewal: AtomicBool,
+        stall_upkeep: AtomicBool,
+        stall_reads: AtomicBool,
+        renewal_takes: std::sync::Mutex<Duration>,
+        renewals: AtomicUsize,
+        batched_checks: AtomicUsize,
+        single_checks: AtomicUsize,
+        upkeep_calls: AtomicUsize,
+    }
+
+    async fn stall_if(flag: &AtomicBool) {
+        if flag.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RunHistory for Arc<Stalling> {
+        async fn claim_idempotency(
+            &self,
+            _: &str,
+            _: &str,
+            run_id: &str,
+            _: Duration,
+        ) -> Result<Claim, HistoryError> {
+            let _ = run_id;
+            Ok(Claim::Fresh)
+        }
+        async fn upsert(&self, _: &RunRecord) -> Result<(), HistoryError> {
+            Ok(())
+        }
+        async fn get(&self, _: &str) -> Result<Option<RunRecord>, HistoryError> {
+            stall_if(&self.stall_reads).await;
+            Ok(None)
+        }
+        async fn list(&self, _: &ListFilter) -> Result<ListPage, HistoryError> {
+            Ok(ListPage {
+                runs: Vec::new(),
+                next_cursor: None,
+            })
+        }
+        async fn delete(&self, _: &str) -> Result<DeleteOutcome, HistoryError> {
+            Ok(DeleteOutcome::NotFound)
+        }
+        async fn purge_expired(&self, _: Duration) -> Result<usize, HistoryError> {
+            Ok(0)
+        }
+        async fn recover_orphans(&self) -> Result<usize, HistoryError> {
+            self.upkeep_calls.fetch_add(1, Ordering::SeqCst);
+            stall_if(&self.stall_upkeep).await;
+            Ok(0)
+        }
+        async fn renew_leases(&self) -> Result<usize, HistoryError> {
+            stall_if(&self.stall_renewal).await;
+            let takes = *self.renewal_takes.lock().unwrap();
+            tokio::time::sleep(takes).await;
+            self.renewals.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+        async fn renew_shard_leases(&self) -> Result<usize, HistoryError> {
+            Ok(0)
+        }
+        async fn lease_lost(&self, _: &str) -> Result<bool, HistoryError> {
+            self.single_checks.fetch_add(1, Ordering::SeqCst);
+            Ok(false)
+        }
+        async fn leases_lost(&self, keys: &[String]) -> Result<Vec<String>, HistoryError> {
+            self.batched_checks.fetch_add(1, Ordering::SeqCst);
+            Ok(keys
+                .iter()
+                .filter(|k| k.starts_with("taken"))
+                .cloned()
+                .collect())
+        }
+        fn degraded(&self) -> bool {
+            false
+        }
+    }
+
+    fn stalling_state(clustered: bool) -> (ServerState, Arc<Stalling>) {
+        let mut config = crate::serve::test_support::test_config();
+        config.cluster.enabled = clustered;
+        config.lease_ttl = Duration::from_secs(30);
+        let double = Arc::new(Stalling::default());
+        let history = Arc::new(crate::serve::history::fallback::FallbackHistory::healthy(
+            Box::new(Arc::clone(&double)),
+            config.idempotency_retention,
+            "postgres",
+        )) as Arc<dyn RunHistory>;
+        let state = ServerState::new(
+            &config,
+            None,
+            CancellationToken::new(),
+            history,
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        (state, double)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_renewal_is_given_up_and_the_fence_fires_on_time() {
+        let (state, double) = stalling_state(true);
+        double.stall_renewal.store(true, Ordering::SeqCst);
+        let run = CancellationToken::new();
+        state.registry().register("r1".into(), run.clone());
+        let started = tokio::time::Instant::now();
+        let fenced_after = tokio::spawn({
+            let run = run.clone();
+            async move {
+                run.cancelled().await;
+                started.elapsed()
+            }
+        });
+        let mut health = LeaseHealth::new(std::time::Instant::now());
+        let cancelled = maintain_leases(&state, &mut health, Duration::from_secs(5)).await;
+        let took = started.elapsed();
+        assert_eq!(cancelled, 1);
+        assert!(
+            took >= Duration::from_secs(19) && took <= Duration::from_secs(21),
+            "the attempt ends at two thirds of the 30s lease, took {took:?}"
+        );
+        let fenced_after = fenced_after.await.unwrap();
+        assert!(
+            fenced_after >= Duration::from_secs(4) && fenced_after <= Duration::from_secs(6),
+            "the fence does not wait for the stalled renewal, fired at {fenced_after:?}"
+        );
+        assert!(!state.cluster().history_reachable());
+        assert!(state.cluster().is_fenced());
+        assert_eq!(
+            maintain_leases(&state, &mut health, Duration::from_secs(5)).await,
+            0,
+            "fenced once per outage"
+        );
+
+        double.stall_renewal.store(false, Ordering::SeqCst);
+        maintain_leases(&state, &mut health, Duration::from_secs(5)).await;
+        assert!(state.cluster().history_reachable());
+        assert!(!state.cluster().is_fenced());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_renewal_that_answers_before_the_fence_keeps_the_runs() {
+        let (state, double) = stalling_state(true);
+        *double.renewal_takes.lock().unwrap() = Duration::from_secs(3);
+        let run = CancellationToken::new();
+        state.registry().register("r1".into(), run.clone());
+        let mut health = LeaseHealth::new(std::time::Instant::now());
+        assert_eq!(
+            maintain_leases(&state, &mut health, Duration::from_secs(5)).await,
+            0
+        );
+        assert!(!run.is_cancelled());
+        assert!(state.cluster().history_reachable());
+        assert_eq!(double.renewals.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn lost_leases_are_checked_in_one_call() {
+        let (state, double) = stalling_state(true);
+        let (mine, taken, shard) = (
+            CancellationToken::new(),
+            CancellationToken::new(),
+            CancellationToken::new(),
+        );
+        state.registry().register("mine-1".into(), mine.clone());
+        state.registry().register("taken-1".into(), taken.clone());
+        state
+            .registry()
+            .register_shard("taken-2", "0", shard.clone());
+        let mut health = LeaseHealth::new(std::time::Instant::now());
+        assert_eq!(
+            maintain_leases(&state, &mut health, Duration::from_secs(3600)).await,
+            2
+        );
+        assert!(taken.is_cancelled() && shard.is_cancelled() && !mine.is_cancelled());
+        assert_eq!(double.batched_checks.load(Ordering::SeqCst), 1);
+        assert_eq!(double.single_checks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn no_live_run_means_no_lost_lease_query() {
+        let (state, double) = stalling_state(true);
+        let mut health = LeaseHealth::new(std::time::Instant::now());
+        maintain_leases(&state, &mut health, Duration::from_secs(3600)).await;
+        assert_eq!(double.batched_checks.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bounded_history_call_fails_instead_of_waiting() {
+        use crate::serve::history::fallback::with_call_bound;
+        let (state, double) = stalling_state(false);
+        double.stall_reads.store(true, Ordering::SeqCst);
+        let started = tokio::time::Instant::now();
+        let err = with_call_bound(Duration::from_secs(2), state.history().get("r1"))
+            .await
+            .unwrap_err();
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert!(err.is_transient(), "{err:?}");
+        assert!(!err.is_unreachable(), "a slow call is not an outage");
+        assert!(
+            err.to_string().contains("did not answer within 2000ms"),
+            "{err}"
+        );
+        assert!(!state.history().degraded());
+
+        let history = state.history();
+        let unbounded = tokio::time::timeout(Duration::from_secs(600), history.get("r1"));
+        assert!(unbounded.await.is_err(), "outside the scope nothing is cut");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_upkeep_pass_never_delays_a_renewal() {
+        let (state, double) = stalling_state(false);
+        double.stall_upkeep.store(true, Ordering::SeqCst);
+        let shutdown = CancellationToken::new();
+        let looping = tokio::spawn(lease_loop(
+            state.clone(),
+            Duration::from_secs(1),
+            shutdown.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(10_500)).await;
+        assert_eq!(
+            double.renewals.load(Ordering::SeqCst),
+            10,
+            "one renewal per period while the upkeep call hangs"
+        );
+        assert_eq!(
+            double.upkeep_calls.load(Ordering::SeqCst),
+            1,
+            "one pass at a time: no second pass starts behind a running one"
+        );
+        // The hung call is cut at two thirds of the lease TTL (20s), then the
+        // next tick starts a new pass.
+        tokio::time::sleep(Duration::from_secs(12)).await;
+        assert_eq!(double.upkeep_calls.load(Ordering::SeqCst), 2);
+        double.stall_upkeep.store(false, Ordering::SeqCst);
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(60), looping)
+            .await
+            .expect("the loop ends once its pass has")
+            .unwrap();
+    }
+
+    #[test]
+    fn the_fence_instant_is_known_until_the_outage_is_fenced() {
+        let start = std::time::Instant::now();
+        let mut health = LeaseHealth::new(start);
+        let after = Duration::from_secs(20);
+        assert_eq!(health.fence_due(after), Some(start + after));
+        assert!(health.observe(false, start + after, after));
+        assert_eq!(health.fence_due(after), None);
+        assert!(!health.observe(true, start + after, after));
+        assert_eq!(health.fence_due(after), Some(start + after + after));
+    }
 
     #[test]
     fn the_clock_offset_is_measured_at_the_round_trip_midpoint() {
@@ -1763,7 +2151,7 @@ mod tests {
         let offset = measure_clock_offset(&state).await.unwrap();
         assert!(offset.abs() < 1000, "{offset}");
     }
-    use crate::serve::history::{RunRecord, RunStatus};
+    use crate::serve::history::RunStatus;
     use chrono::Utc;
     use std::collections::BTreeMap;
 

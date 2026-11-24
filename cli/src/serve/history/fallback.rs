@@ -38,6 +38,34 @@ const RETRY_BASE: Duration = Duration::from_millis(50);
 /// saturation alone cannot tell the two apart; silence this long can.
 pub const SATURATION_GRACE: Duration = Duration::from_secs(30);
 
+tokio::task_local! {
+    static CALL_BOUND: Duration;
+}
+
+/// Run `work` with every call it makes to a persistent backend bounded by
+/// `bound`: a call that has not answered by then fails with a transient
+/// error instead of waiting. The caller sees an error, never a dropped
+/// future, so work that queues and retries stays whole. A call cut this way
+/// does not put the wrapper into degraded mode.
+pub async fn with_call_bound<F: std::future::Future>(bound: Duration, work: F) -> F::Output {
+    CALL_BOUND.scope(bound, work).await
+}
+
+fn call_bound() -> Option<Duration> {
+    CALL_BOUND.try_with(|bound| *bound).ok()
+}
+
+fn timed_out(bound: Duration) -> HistoryError {
+    crate::serve::metrics::record_history_call_timeout();
+    HistoryError::BackendClassified {
+        message: format!(
+            "the run-history backend did not answer within {}ms",
+            bound.as_millis()
+        ),
+        transience: super::Transience::Transient,
+    }
+}
+
 /// Opens the persistent backend; retried from the lease tick when it was
 /// unreachable at startup.
 pub type PrimaryConnector = Box<
@@ -184,7 +212,12 @@ impl FallbackHistory {
             },
             (None, None) => return false,
         };
-        if p.probe_write().await.is_err() {
+        let probe = p.probe_write();
+        let answered = match call_bound() {
+            Some(bound) => matches!(tokio::time::timeout(bound, probe).await, Ok(Ok(()))),
+            None => probe.await.is_ok(),
+        };
+        if !answered {
             return false;
         }
         self.note_ok();
@@ -252,21 +285,30 @@ impl FallbackHistory {
 macro_rules! primary {
     ($self:ident, $primary:ident => $pcall:expr) => {{
         let $primary = $self.primary.get().expect("primary checked by the caller");
-        let mut attempt = 1u32;
-        loop {
-            match $pcall.await {
-                Err(e) if e.is_unreachable() && attempt < PRIMARY_ATTEMPTS => {
-                    #[allow(clippy::disallowed_methods)] // history-store reconnect backoff
-                    tokio::time::sleep(RETRY_BASE * 4u32.pow(attempt - 1)).await;
-                    attempt += 1;
-                }
-                other => {
-                    if !matches!(&other, Err(e) if e.is_unreachable()) {
-                        $self.note_ok();
+        let attempts = async {
+            let mut attempt = 1u32;
+            loop {
+                match $pcall.await {
+                    Err(e) if e.is_unreachable() && attempt < PRIMARY_ATTEMPTS => {
+                        #[allow(clippy::disallowed_methods)] // history-store reconnect backoff
+                        tokio::time::sleep(RETRY_BASE * 4u32.pow(attempt - 1)).await;
+                        attempt += 1;
                     }
-                    break other;
+                    other => {
+                        if !matches!(&other, Err(e) if e.is_unreachable()) {
+                            $self.note_ok();
+                        }
+                        break other;
+                    }
                 }
             }
+        };
+        match call_bound() {
+            Some(bound) => match tokio::time::timeout(bound, attempts).await {
+                Ok(answer) => answer,
+                Err(_) => Err(timed_out(bound)),
+            },
+            None => attempts.await,
         }
     }};
 }
@@ -374,6 +416,10 @@ impl RunHistory for FallbackHistory {
 
     async fn lease_lost(&self, run_id: &str) -> Result<bool, HistoryError> {
         strict!(self, p => p.lease_lost(run_id), f => f.lease_lost(run_id))
+    }
+
+    async fn leases_lost(&self, keys: &[String]) -> Result<Vec<String>, HistoryError> {
+        strict!(self, p => p.leases_lost(keys), f => f.leases_lost(keys))
     }
 
     async fn shard_lease_lost(&self, run_id: &str, shard_id: &str) -> Result<bool, HistoryError> {
