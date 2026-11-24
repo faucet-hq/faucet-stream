@@ -87,6 +87,20 @@ pub trait HttpDriver: Send + Sync {
         session: &Self::Session,
         body: &Value,
     ) -> Result<(), FaucetError>;
+
+    /// Send `rows` as one JSON array body (array batching). The default
+    /// copies them into a [`Value::Array`] for [`send`](Self::send); a driver
+    /// that can serialize the slice directly overrides it. The bytes on the
+    /// wire must be the same.
+    async fn send_rows(
+        &self,
+        calls: &CallSlot,
+        session: &Self::Session,
+        rows: &[Value],
+    ) -> Result<(), FaucetError> {
+        self.send(calls, session, &Value::Array(rows.to_vec()))
+            .await
+    }
 }
 
 /// An [`HttpDriver`] as a [`SinkDriver`].
@@ -179,11 +193,7 @@ impl<D: HttpDriver> HttpSinkDriver<D> {
                 }));
                 continue;
             }
-            match self
-                .driver
-                .send(calls, session, &Value::Array(chunk.to_vec()))
-                .await
-            {
+            match self.driver.send_rows(calls, session, chunk).await {
                 Ok(()) => delivered += chunk.len(),
                 Err(e) if policy == RowPolicy::WholePage || delivered == 0 => return Err(e),
                 Err(e) => {

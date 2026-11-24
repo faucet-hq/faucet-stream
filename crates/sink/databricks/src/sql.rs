@@ -386,12 +386,17 @@ fn field_for<'a>(
 pub fn build_matrix(records: &[Value], table: &[TableColumn]) -> Result<Matrix, FaucetError> {
     let mut present = vec![false; table.len()];
     let mut unknown: Vec<String> = Vec::new();
+    let mut column_of: std::collections::HashMap<&str, Option<usize>> =
+        std::collections::HashMap::new();
     for r in records {
         let obj = r.as_object().ok_or_else(|| {
             FaucetError::Sink("databricks sink: records must be JSON objects".into())
         })?;
         for k in obj.keys() {
-            match table.iter().position(|c| c.name.eq_ignore_ascii_case(k)) {
+            let column = *column_of
+                .entry(k.as_str())
+                .or_insert_with(|| table.iter().position(|c| c.name.eq_ignore_ascii_case(k)));
+            match column {
                 Some(i) => present[i] = true,
                 None => {
                     if !unknown.contains(k) {
@@ -1379,6 +1384,30 @@ mod tests {
         );
         assert_eq!(m.row_sizes(), vec![5 + 5 + 4 + 4, 5 + 4 + 9 + 4]);
         assert_eq!(m.estimated_bytes(), 18 + 22);
+    }
+
+    #[test]
+    fn build_matrix_resolves_repeated_and_mixed_case_keys_alike() {
+        let recs: Vec<Value> = (0..50)
+            .map(|i| match i % 3 {
+                0 => json!({"id": i, "name": "a"}),
+                1 => json!({"ID": i, "Name": "b"}),
+                _ => json!({"id": i}),
+            })
+            .collect();
+        let m = build_matrix(&recs, &cols()).unwrap();
+        let names: Vec<&str> = m.columns.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"id") && names.contains(&"name"),
+            "{names:?}"
+        );
+        assert_eq!(m.rows.len(), 50);
+
+        let mut bad = recs.clone();
+        bad.push(json!({"id": 1, "zzz": 1, "Extra": 2}));
+        bad.push(json!({"zzz": 2, "Extra": 3}));
+        let err = build_matrix(&bad, &cols()).unwrap_err().to_string();
+        assert!(err.contains("column(s) Extra, zzz are not in"), "{err}");
     }
 
     #[test]

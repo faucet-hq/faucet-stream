@@ -242,17 +242,35 @@ impl Endpoint {
     }
 
     /// Build an HTTP request with the given pre-resolved auth and body.
+    #[cfg(test)]
     fn build_request_with_auth(
         &self,
         body: &Value,
         auth: &HttpSinkAuth,
     ) -> Result<reqwest::RequestBuilder, FaucetError> {
-        let req = self
+        self.request_with_body(json_body(body)?, auth)
+    }
+
+    /// The request for an already serialized JSON body: as `.json(..)` builds
+    /// it (`Content-Type: application/json` unless the configured headers set
+    /// one), without serializing again for every attempt.
+    fn request_with_body(
+        &self,
+        body: bytes::Bytes,
+        auth: &HttpSinkAuth,
+    ) -> Result<reqwest::RequestBuilder, FaucetError> {
+        let mut req = self
             .client
             .request(self.config.method.clone(), &self.config.url)
-            .headers(self.config.headers.clone())
-            .json(body);
-        self.apply_auth(req, auth)
+            .headers(self.config.headers.clone());
+        if !self
+            .config
+            .headers
+            .contains_key(reqwest::header::CONTENT_TYPE)
+        {
+            req = req.header(reqwest::header::CONTENT_TYPE, "application/json");
+        }
+        self.apply_auth(req.body(body), auth)
     }
 
     /// Send a single request with retry logic, using the pre-resolved `auth`.
@@ -260,12 +278,12 @@ impl Endpoint {
     async fn send_with_retry(
         &self,
         calls: &CallSlot,
-        body: &Value,
+        body: &bytes::Bytes,
         auth: &HttpSinkAuth,
     ) -> Result<(), FaucetError> {
         calls
             .call("send", || async {
-                let req = self.build_request_with_auth(body, auth)?;
+                let req = self.request_with_body(body.clone(), auth)?;
                 let resp = self
                     .client
                     .send(req)
@@ -328,34 +346,24 @@ impl HttpDriver for Endpoint {
         Ok(Session { auth, sent })
     }
 
-    /// [`send_with_retry`](Self::send_with_retry), re-authenticating once when
-    /// the server rejects the shared provider's credential (#789 API-06). The
-    /// provider refreshes once even when concurrent requests all hit the same
-    /// rejection.
     async fn send(
         &self,
         calls: &CallSlot,
         session: &Session,
         body: &Value,
     ) -> Result<(), FaucetError> {
-        match self.send_with_retry(calls, body, &session.auth).await {
-            Err(e) => match (&self.auth_provider, session.sent.as_ref()) {
-                (Some(provider), Some(sent))
-                    if faucet_core::rejects_credential(&e, provider.as_ref()) =>
-                {
-                    let name = provider.provider_name();
-                    tracing::warn!(
-                        provider = name,
-                        "the server rejected the shared credential; re-authenticating and \
-                         retrying once"
-                    );
-                    let fresh = credential_to_auth(provider.invalidate(sent).await?);
-                    self.send_with_retry(calls, body, &fresh).await
-                }
-                _ => Err(e),
-            },
-            ok => ok,
-        }
+        self.send_body(calls, session, json_body(body)?).await
+    }
+
+    /// The page chunk as one JSON array, serialized from the slice (no copy
+    /// of the records).
+    async fn send_rows(
+        &self,
+        calls: &CallSlot,
+        session: &Session,
+        rows: &[Value],
+    ) -> Result<(), FaucetError> {
+        self.send_body(calls, session, json_body(rows)?).await
     }
 
     /// Non-mutating preflight probe (probe name `"network"`).
@@ -413,6 +421,45 @@ impl HttpDriver for Endpoint {
     }
 }
 
+impl Endpoint {
+    /// [`send_with_retry`](Self::send_with_retry), re-authenticating once when
+    /// the server rejects the shared provider's credential (#789 API-06). The
+    /// provider refreshes once even when concurrent requests all hit the same
+    /// rejection.
+    async fn send_body(
+        &self,
+        calls: &CallSlot,
+        session: &Session,
+        body: bytes::Bytes,
+    ) -> Result<(), FaucetError> {
+        match self.send_with_retry(calls, &body, &session.auth).await {
+            Err(e) => match (&self.auth_provider, session.sent.as_ref()) {
+                (Some(provider), Some(sent))
+                    if faucet_core::rejects_credential(&e, provider.as_ref()) =>
+                {
+                    let name = provider.provider_name();
+                    tracing::warn!(
+                        provider = name,
+                        "the server rejected the shared credential; re-authenticating and \
+                         retrying once"
+                    );
+                    let fresh = credential_to_auth(provider.invalidate(sent).await?);
+                    self.send_with_retry(calls, &body, &fresh).await
+                }
+                _ => Err(e),
+            },
+            ok => ok,
+        }
+    }
+}
+
+/// `body` as JSON bytes, exactly what `RequestBuilder::json` would send.
+fn json_body<T: serde::Serialize + ?Sized>(body: &T) -> Result<bytes::Bytes, FaucetError> {
+    serde_json::to_vec(body)
+        .map(bytes::Bytes::from)
+        .map_err(FaucetError::Json)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +471,61 @@ mod tests {
         let config = HttpSinkConfig::new("https://user:secret@api.example.com/ingest");
         let sink = HttpSink::new(config);
         assert_eq!(sink.dataset_uri(), "https://api.example.com/ingest");
+    }
+
+    #[test]
+    fn a_row_slice_and_a_json_body_serialize_to_what_the_json_builder_sent() {
+        let rows = vec![
+            serde_json::json!({"id": 1, "s": "a\"b", "n": [1.5, null]}),
+            serde_json::json!("plain"),
+        ];
+        let array = Value::Array(rows.clone());
+        assert_eq!(
+            json_body(rows.as_slice()).unwrap(),
+            json_body(&array).unwrap()
+        );
+
+        let sink = HttpSink::new(HttpSinkConfig::new("https://api.example.com/ingest"));
+        let endpoint = sink.inner.driver().driver();
+        let ours = endpoint
+            .request_with_body(json_body(rows.as_slice()).unwrap(), &HttpSinkAuth::None)
+            .unwrap()
+            .build()
+            .unwrap();
+        let theirs = endpoint
+            .client
+            .request(endpoint.config.method.clone(), &endpoint.config.url)
+            .headers(endpoint.config.headers.clone())
+            .json(&array)
+            .build()
+            .unwrap();
+        assert_eq!(
+            ours.body().unwrap().as_bytes(),
+            theirs.body().unwrap().as_bytes()
+        );
+        assert_eq!(ours.headers(), theirs.headers());
+        assert_eq!(ours.method(), theirs.method());
+        assert_eq!(ours.url(), theirs.url());
+
+        let mut config = HttpSinkConfig::new("https://api.example.com/ingest");
+        config.headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/vnd.rows+json"),
+        );
+        let sink = HttpSink::new(config);
+        let endpoint = sink.inner.driver().driver();
+        let ours = endpoint
+            .request_with_body(json_body(&array).unwrap(), &HttpSinkAuth::None)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            ours.headers()
+                .get_all(reqwest::header::CONTENT_TYPE)
+                .iter()
+                .collect::<Vec<_>>(),
+            vec!["application/vnd.rows+json"]
+        );
     }
 
     #[test]
