@@ -177,7 +177,12 @@ mod shard_tests {
         crate::serve::history::RunLogLine {
             seq,
             ts: format!("2026-01-01T00:00:{:02}.000Z", seq % 60),
-            level: if seq.is_multiple_of(7) { "WARN" } else { "INFO" }.into(),
+            level: if seq.is_multiple_of(7) {
+                "WARN"
+            } else {
+                "INFO"
+            }
+            .into(),
             line: text.into(),
             attrs: if seq.is_multiple_of(5) {
                 [("row".to_string(), format!("r{seq}"))].into()
