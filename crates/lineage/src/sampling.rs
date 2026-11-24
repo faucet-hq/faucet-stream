@@ -66,6 +66,18 @@ impl SampleState {
             s.push(v);
         }
     }
+    /// [`sample_record`](Self::sample_record), answering whether the sample
+    /// is full afterwards (one lock for both).
+    fn sample_record_then_full(&self, v: Value) -> bool {
+        if self.cap == 0 {
+            return true;
+        }
+        let mut s = self.sample.lock().unwrap();
+        if s.len() < self.cap {
+            s.push(v);
+        }
+        s.len() >= self.cap
+    }
     /// Whether the sample is full — lets the native tap stop parsing early.
     fn sample_full(&self) -> bool {
         self.cap == 0 || self.sample.lock().unwrap().len() >= self.cap
@@ -142,6 +154,23 @@ fn ol_type_of(v: &Value) -> &'static str {
     }
 }
 
+/// Non-empty lines that end inside `chunk`. `open` says whether a line was
+/// left unfinished before the chunk, and is updated for the next one.
+fn count_lines(chunk: &[u8], open: &mut bool) -> u64 {
+    let Some(last) = chunk.iter().rposition(|&b| b == b'\n') else {
+        *open |= !chunk.is_empty();
+        return 0;
+    };
+    let newlines = chunk.iter().filter(|&&b| b == b'\n').count();
+    let doubled = chunk
+        .windows(2)
+        .filter(|pair| pair[0] == b'\n' && pair[1] == b'\n')
+        .count();
+    let leading_empty = usize::from(chunk[0] == b'\n' && !*open);
+    *open = last + 1 < chunk.len();
+    (newlines - doubled - leading_empty) as u64
+}
+
 /// Tap a native NDJSON byte payload (#639): pass every chunk through **unchanged**
 /// (streaming preserved) while counting records by newline and sampling a bounded
 /// prefix into `state`. This lets lineage/catalog sampling coexist with the native
@@ -165,16 +194,15 @@ fn tap_native_payload(
     }
     match payload {
         NativePayload::Bytes(b) => {
-            let mut n = 0u64;
-            for line in b.split(|&x| x == b'\n') {
-                if line.is_empty() {
-                    continue;
-                }
-                n += 1;
-                if !state.sample_full()
-                    && let Ok(v) = serde_json::from_slice::<Value>(line)
-                {
-                    state.sample_record(v);
+            let mut open = false;
+            let n = count_lines(&b, &mut open) + u64::from(open);
+            if !state.sample_full() {
+                for line in b.split(|&x| x == b'\n').filter(|line| !line.is_empty()) {
+                    if let Ok(v) = serde_json::from_slice::<Value>(line)
+                        && state.sample_record_then_full(v)
+                    {
+                        break;
+                    }
                 }
             }
             state.add_count(n);
@@ -186,32 +214,23 @@ fn tap_native_payload(
                 let mut buf: Vec<u8> = Vec::new();
                 let mut sampling = !state.sample_full();
                 // Counts non-empty lines exactly like the `Bytes` arm, including a final line without `\n`.
-                let mut line_len: usize = 0;
+                let mut line_open = false;
                 while let Some(chunk) = inner.next().await {
                     let chunk = chunk?;
-                    let mut lines = 0u64;
-                    for &b in chunk.iter() {
-                        if b == b'\n' {
-                            if line_len > 0 {
-                                lines += 1;
-                            }
-                            line_len = 0;
-                        } else {
-                            line_len += 1;
-                        }
-                    }
-                    state.add_count(lines);
+                    state.add_count(count_lines(&chunk, &mut line_open));
                     if sampling {
                         buf.extend_from_slice(&chunk);
                         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                             let line: Vec<u8> = buf.drain(..=pos).collect();
                             let trimmed = &line[..line.len() - 1];
-                            if !trimmed.is_empty()
+                            let full = if !trimmed.is_empty()
                                 && let Ok(v) = serde_json::from_slice::<Value>(trimmed)
                             {
-                                state.sample_record(v);
-                            }
-                            if state.sample_full() {
+                                state.sample_record_then_full(v)
+                            } else {
+                                state.sample_full()
+                            };
+                            if full {
                                 sampling = false;
                                 buf.clear();
                                 break;
@@ -220,7 +239,7 @@ fn tap_native_payload(
                     }
                     yield chunk;
                 }
-                if line_len > 0 {
+                if line_open {
                     state.add_count(1);
                     if sampling
                         && !buf.is_empty()
@@ -1267,6 +1286,78 @@ mod tests {
         assert_eq!(collected, b"{\"id\":1}\n{\"id\":2}");
         assert_eq!(shared.count(), 2, "trailing line must be counted");
         assert_eq!(shared.samples().len(), 2, "trailing line must be sampled");
+    }
+
+    /// The byte-at-a-time count the tap used before.
+    fn count_lines_bytewise(chunk: &[u8], line_len: &mut usize) -> u64 {
+        let mut lines = 0u64;
+        for &b in chunk {
+            if b == b'\n' {
+                if *line_len > 0 {
+                    lines += 1;
+                }
+                *line_len = 0;
+            } else {
+                *line_len += 1;
+            }
+        }
+        lines
+    }
+
+    #[test]
+    fn block_line_counting_matches_the_bytewise_count_at_every_split() {
+        let inputs: [&[u8]; 9] = [
+            b"",
+            b"\n",
+            b"\n\n\n",
+            b"a",
+            b"a\n",
+            b"\na\n\nb",
+            b"{\"id\":1}\n\n{\"id\":2}\n\n",
+            b"\r\n\r\nxy\n\n\nz\n",
+            b"abc\ndef\n\n\nghi",
+        ];
+        for input in inputs {
+            for first in 0..=input.len() {
+                for second in first..=input.len() {
+                    let parts = [&input[..first], &input[first..second], &input[second..]];
+                    let (mut open, mut len) = (false, 0usize);
+                    let (mut new, mut old) = (0u64, 0u64);
+                    for part in parts {
+                        new += count_lines(part, &mut open);
+                        old += count_lines_bytewise(part, &mut len);
+                        assert_eq!(open, len > 0, "{input:?} at {first}/{second}");
+                    }
+                    assert_eq!(new, old, "{input:?} at {first}/{second}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_bytes_tap_samples_the_first_parseable_lines_up_to_the_cap() {
+        let data = b"{\"id\":1}\nnot json\n\n{\"id\":2}\n{\"id\":3}\n{\"id\":4}".to_vec();
+        let state = Arc::new(SampleState::new(2));
+        let _ = tap_native_payload(
+            faucet_core::NativePayload::Bytes(data),
+            faucet_core::NativeFormat::NdJson,
+            None,
+            Arc::clone(&state),
+        );
+        assert_eq!(state.count(), 5);
+        assert_eq!(
+            state.samples(),
+            vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 2})]
+        );
+        let none = Arc::new(SampleState::new(0));
+        let _ = tap_native_payload(
+            faucet_core::NativePayload::Bytes(b"{\"id\":1}\n".to_vec()),
+            faucet_core::NativeFormat::NdJson,
+            None,
+            Arc::clone(&none),
+        );
+        assert_eq!(none.count(), 1);
+        assert!(none.samples().is_empty());
     }
 
     #[tokio::test]
