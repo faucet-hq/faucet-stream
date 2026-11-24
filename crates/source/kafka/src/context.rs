@@ -28,6 +28,34 @@ use std::time::Duration;
 /// budget used elsewhere in this crate.
 const COMMITTED_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+thread_local! {
+    static KEY_SCRATCH: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// `map.insert((topic.to_string(), partition), value)` without allocating the
+/// topic when the partition is already present.
+pub(crate) fn set_partition_value<V>(
+    map: &mut HashMap<(String, i32), V>,
+    topic: &str,
+    partition: i32,
+    value: V,
+) {
+    KEY_SCRATCH.with_borrow_mut(|scratch| {
+        let mut key = (std::mem::take(scratch), partition);
+        key.0.clear();
+        key.0.push_str(topic);
+        match map.get_mut(&key) {
+            Some(slot) => {
+                *slot = value;
+                *scratch = key.0;
+            }
+            None => {
+                map.insert(key, value);
+            }
+        }
+    });
+}
+
 /// Shared state between [`KafkaSource`](crate::stream::KafkaSource) and the
 /// rdkafka consumer background thread. Cloning a `BookmarkContext` clones the
 /// inner `Arc`s, not the underlying data — both clones see the same bookmark
@@ -87,9 +115,15 @@ impl PartitionEvents {
         self.clock
     }
 
+    #[cfg(test)]
     pub(crate) fn note_delivered(&mut self, tp: (String, i32)) {
         let t = self.tick();
         self.delivered.insert(tp, t);
+    }
+
+    fn note_delivered_from(&mut self, topic: &str, partition: i32) {
+        let t = self.tick();
+        set_partition_value(&mut self.delivered, topic, partition, t);
     }
 
     pub(crate) fn note_revoked(&mut self, tp: (String, i32)) {
@@ -252,10 +286,10 @@ impl BookmarkContext {
     /// Record the next offset after a delivered message.
     pub(crate) fn note_delivered(&self, topic: &str, partition: i32, next_offset: i64) {
         if let Ok(mut map) = self.delivered.lock() {
-            map.insert((topic.to_string(), partition), next_offset);
+            set_partition_value(&mut map, topic, partition, next_offset);
         }
         if let Ok(mut ev) = self.events.lock() {
-            ev.note_delivered((topic.to_string(), partition));
+            ev.note_delivered_from(topic, partition);
         }
     }
 
@@ -808,6 +842,52 @@ fn filter_seeks_by_committed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_partition_value_matches_insert() {
+        let ops: Vec<(&str, i32, i64)> = vec![
+            ("orders", 0, 1),
+            ("orders", 1, 5),
+            ("orders", 0, 2),
+            ("payments", 0, 9),
+            ("orders", 1, 6),
+            ("", 3, 4),
+            ("payments", 0, 10),
+            ("ordérs", 0, 11),
+            ("", 3, 12),
+        ];
+        let mut expected: HashMap<(String, i32), i64> = HashMap::new();
+        let mut actual: HashMap<(String, i32), i64> = HashMap::new();
+        for (topic, partition, value) in ops {
+            expected.insert((topic.to_string(), partition), value);
+            set_partition_value(&mut actual, topic, partition, value);
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn events_note_delivered_from_matches_note_delivered() {
+        let mut by_tuple = PartitionEvents::default();
+        let mut by_str = PartitionEvents::default();
+        for (topic, partition) in [("t", 0), ("t", 1), ("t", 0), ("u", 0)] {
+            by_tuple.note_delivered((topic.to_string(), partition));
+            by_str.note_delivered_from(topic, partition);
+        }
+        by_tuple.note_revoked(("t".into(), 1));
+        by_str.note_revoked(("t".into(), 1));
+        for tp in [
+            ("t".to_string(), 0),
+            ("t".to_string(), 1),
+            ("u".to_string(), 0),
+        ] {
+            assert_eq!(
+                by_tuple.stale_since_revoke(&tp),
+                by_str.stale_since_revoke(&tp)
+            );
+        }
+        assert_eq!(by_tuple.delivered, by_str.delivered);
+        assert_eq!(by_tuple.clock, by_str.clock);
+    }
 
     #[test]
     fn blocking_rebalance_work_runs_on_every_runtime_flavor() {
