@@ -504,17 +504,11 @@ mod shard_tests {
 
     #[test]
     fn lease_bounds_follow_the_lease_ttl() {
-        use crate::serve::history::sql::{
-            lease_call_bound, pool_acquire_timeout, session_keepalive_sql,
-        };
+        use crate::serve::history::sql::{lease_call_bound, session_keepalive_sql};
         let s = Duration::from_secs;
         assert_eq!(lease_call_bound(s(30)), s(20));
         assert_eq!(lease_call_bound(s(90)), s(60));
         assert_eq!(lease_call_bound(Duration::ZERO), s(1));
-        assert_eq!(pool_acquire_timeout(s(30)), s(5));
-        assert_eq!(pool_acquire_timeout(s(6)), s(2));
-        assert_eq!(pool_acquire_timeout(s(600)), s(30));
-        assert!(pool_acquire_timeout(s(30)) * 3 < lease_call_bound(s(30)));
         assert_eq!(
             session_keepalive_sql(s(30)),
             "SET tcp_keepalives_idle = 10; SET tcp_keepalives_interval = 5; SET tcp_keepalives_count = 3"

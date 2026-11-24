@@ -3412,16 +3412,6 @@ pub fn lease_call_bound(lease_ttl: std::time::Duration) -> std::time::Duration {
     (lease_ttl * 2 / 3).max(std::time::Duration::from_secs(1))
 }
 
-/// How long a call waits for a pooled connection: a sixth of the lease TTL,
-/// so the wrapper's three attempts end inside [`lease_call_bound`]; between
-/// two seconds and the driver's default of 30.
-pub fn pool_acquire_timeout(lease_ttl: std::time::Duration) -> std::time::Duration {
-    (lease_ttl / 6).clamp(
-        std::time::Duration::from_secs(2),
-        std::time::Duration::from_secs(30),
-    )
-}
-
 /// Server-side TCP keepalive for one session, sized so the database notices
 /// a vanished server (and frees the row locks its open transaction held)
 /// within about a lease TTL.

@@ -21,7 +21,6 @@ impl PostgresHistory {
         let pool = PgPoolOptions::new()
             .max_connections(super::sql::POOL_MAX_CONNECTIONS)
             .max_lifetime(super::sql::POOL_MAX_LIFETIME)
-            .acquire_timeout(super::sql::pool_acquire_timeout(lease_ttl))
             .after_connect(move |conn, _| {
                 Box::pin(async move {
                     let keepalive = super::sql::session_keepalive_sql(lease_ttl);

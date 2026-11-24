@@ -279,10 +279,10 @@ groups:
         annotations:
           summary: "lease upkeep is slower than the lease tick"
           description: >
-            The work a lease tick does besides renewing (membership, reclaiming
-            a dead member's runs, retrying terminal records) is still running
-            when the next tick comes. Renewals are not delayed; failover and
-            cleanup are. faucet_serve_history_call_timeouts_total counts the
+            The work a lease tick does besides renewing and heartbeating (the
+            member list, reclaiming a dead member's runs, retrying terminal
+            records) is still running when the next tick comes. Renewals and
+            heartbeats are not delayed; failover and cleanup are. faucet_serve_history_call_timeouts_total counts the
             calls that were cut off.
 
       - alert: FaucetServePendingFinalize

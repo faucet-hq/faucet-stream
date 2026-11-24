@@ -660,6 +660,12 @@ pub(crate) fn clock_offset_ms(
 /// Heartbeat this member and refresh the live-member view: the member count
 /// and the state format every member reads (#736).
 pub(crate) async fn refresh_membership(state: &ServerState, member_ttl: Duration) {
+    heartbeat_member(state).await;
+    refresh_member_view(state, member_ttl).await;
+}
+
+/// Write this member's heartbeat row.
+pub(crate) async fn heartbeat_member(state: &ServerState) {
     let cluster = state.cluster();
     let clock_offset_ms = measure_clock_offset(state).await;
     let beat = crate::serve::history::InstanceHeartbeat {
@@ -678,6 +684,11 @@ pub(crate) async fn refresh_membership(state: &ServerState, member_ttl: Duration
     if let Err(e) = state.history().heartbeat_instance(&beat).await {
         tracing::warn!(error = %e, "cluster: heartbeat_instance failed");
     }
+}
+
+/// Re-read the live members, the state format they share and the pools.
+async fn refresh_member_view(state: &ServerState, member_ttl: Duration) {
+    let cluster = state.cluster();
     match state.history().live_instances(member_ttl).await {
         Ok(members) => {
             cluster.set_members(members.len());
@@ -756,8 +767,8 @@ pub async fn maintain_leases(
 
 /// The renewal half of a lease tick. Every call to the history is cut off
 /// after [`lease_call_bound`](crate::serve::history::sql::lease_call_bound),
-/// and the fence fires `fence_after` into an outage even while a renewal is
-/// still waiting for an answer.
+/// and once renewal has failed for `fence_after` the fence fires without
+/// waiting on any history call still in flight.
 async fn renew_and_fence(
     state: &ServerState,
     health: &mut LeaseHealth,
@@ -765,45 +776,35 @@ async fn renew_and_fence(
 ) -> usize {
     use crate::serve::history::fallback::with_call_bound;
     let bound = crate::serve::history::sql::lease_call_bound(state.lease_ttl());
-    if with_call_bound(bound, state.history().recover_degraded()).await {
+    let mut cancelled = 0usize;
+    let recovered = fence_on_time(
+        state,
+        health,
+        fence_after,
+        &mut cancelled,
+        with_call_bound(bound, state.history().recover_degraded()),
+    )
+    .await;
+    if recovered {
         tracing::info!("run-history backend recovered");
     }
     let forgotten = state.forgotten_runs();
     // The fence counts from before the renewal: the lease a renewal writes
     // runs from the database's clock read at its start, not from when the
     // whole tick ends.
-    let attempted = std::time::Instant::now();
-    let give_up = attempted + bound;
-    let renewal = renew_leases(state, &forgotten);
-    tokio::pin!(renewal);
-    let mut cancelled = 0usize;
-    let mut answer = None;
-    if let Some(due) = health
-        .fence_due(fence_after)
-        .filter(|due| *due > attempted && *due < give_up)
-    {
-        match tokio::time::timeout_at(due.into(), &mut renewal).await {
-            Ok(renewed) => answer = Some(renewed),
-            Err(_) => {
-                if health.observe(false, due, fence_after) && state.cluster().enabled() {
-                    cancelled += fence(state, fence_after);
-                }
-            }
+    let attempted = lease_now();
+    let renewal =
+        tokio::time::timeout_at((attempted + bound).into(), renew_leases(state, &forgotten));
+    let renewed = match fence_on_time(state, health, fence_after, &mut cancelled, renewal).await {
+        Ok(renewed) => renewed,
+        Err(_) => {
+            crate::serve::metrics::record_lease_renewal_timeout();
+            tracing::warn!(
+                waited_ms = bound.as_millis() as u64,
+                "lease heartbeat: the run history did not answer in time"
+            );
+            false
         }
-    }
-    let renewed = match answer {
-        Some(renewed) => renewed,
-        None => match tokio::time::timeout_at(give_up.into(), &mut renewal).await {
-            Ok(renewed) => renewed,
-            Err(_) => {
-                crate::serve::metrics::record_lease_renewal_timeout();
-                tracing::warn!(
-                    waited_ms = bound.as_millis() as u64,
-                    "lease heartbeat: the run history did not answer in time"
-                );
-                false
-            }
-        },
     };
     state.cluster().set_history_reachable(renewed);
     if renewed && state.cluster().enabled() {
@@ -817,10 +818,40 @@ async fn renew_and_fence(
             return cancelled + lost;
         }
     }
-    if !health.observe(renewed, attempted, fence_after) || !state.cluster().enabled() {
+    let seen = if renewed { attempted } else { lease_now() };
+    if !health.observe(renewed, seen, fence_after) || !state.cluster().enabled() {
         return cancelled;
     }
     cancelled + fence(state, fence_after)
+}
+
+/// The lease clock: the runtime's, so a paused test clock drives it too.
+fn lease_now() -> std::time::Instant {
+    tokio::time::Instant::now().into_std()
+}
+
+/// Await `work`; if the outage reaches its fence instant first (or already
+/// has), fence then, and keep awaiting `work`.
+async fn fence_on_time<F: std::future::Future>(
+    state: &ServerState,
+    health: &mut LeaseHealth,
+    fence_after: Duration,
+    cancelled: &mut usize,
+    work: F,
+) -> F::Output {
+    tokio::pin!(work);
+    if let Some(due) = health.fence_due(fence_after) {
+        let fire_at = due.max(lease_now());
+        match tokio::time::timeout_at(fire_at.into(), &mut work).await {
+            Ok(out) => return out,
+            Err(_) => {
+                if health.observe(false, fire_at, fence_after) && state.cluster().enabled() {
+                    *cancelled += fence(state, fence_after);
+                }
+            }
+        }
+    }
+    work.await
 }
 
 /// Renew this instance's run leases and, clustered, its shard leases.
@@ -858,7 +889,9 @@ fn fence(state: &ServerState, fence_after: Duration) -> usize {
 /// The part of a lease tick that renews nothing: the policy seed, the feed
 /// check, and the terminal records whose write failed (until they land the
 /// rows read `running`; their lease is renewed meanwhile, so no peer re-runs
-/// them). Each history call is bounded, and fails rather than being dropped.
+/// them). The seed and feed calls are bounded; a terminal write is not cut,
+/// because one cut client-side may still commit and its retry would then
+/// skip the run's completion side effects.
 async fn lease_upkeep(state: &ServerState) {
     let bound = crate::serve::history::sql::lease_call_bound(state.lease_ttl());
     crate::serve::history::fallback::with_call_bound(bound, async {
@@ -868,9 +901,9 @@ async fn lease_upkeep(state: &ServerState) {
         }
         #[cfg(feature = "feeds")]
         state.feeds().lease_tick(state).await;
-        crate::serve::runner::retry_pending_finalize(state).await;
     })
     .await;
+    crate::serve::runner::retry_pending_finalize(state).await;
 }
 
 /// Cancel every local run and shard whose lease a peer now holds (the row is
@@ -915,8 +948,10 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
     // Member-liveness window ≈ the real lease TTL (period == lease_ttl/3), so a
     // member must miss ~3 heartbeats before peers treat it as gone.
     let member_ttl = period.saturating_mul(3);
-    let mut health = LeaseHealth::new(std::time::Instant::now());
+    let bound = crate::serve::history::sql::lease_call_bound(state.lease_ttl());
+    let mut health = LeaseHealth::new(lease_now());
     let mut upkeep: Option<AbortOnDrop> = None;
+    let mut heartbeat: Option<AbortOnDrop> = None;
     let mut tick = tokio::time::interval(period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tick.tick().await; // consume the immediate first tick
@@ -925,6 +960,18 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
             _ = shutdown.cancelled() => break,
             _ = tick.tick() => {
                 renew_and_fence(&state, &mut health, member_ttl.saturating_sub(period)).await;
+                if state.cluster().enabled() {
+                    if heartbeat.as_ref().is_some_and(|beat| !beat.0.is_finished()) {
+                        tracing::warn!("cluster: the previous membership heartbeat is still running; skipping this one");
+                    } else {
+                        let state = state.clone();
+                        heartbeat = Some(AbortOnDrop(tokio::spawn(async move {
+                            if tokio::time::timeout(bound, heartbeat_member(&state)).await.is_err() {
+                                tracing::warn!("cluster: the membership heartbeat did not answer in time");
+                            }
+                        })));
+                    }
+                }
                 // Upkeep never delays the next renewal: it runs beside the
                 // loop, one pass at a time.
                 if upkeep.as_ref().is_some_and(|pass| !pass.0.is_finished()) {
@@ -939,14 +986,17 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
             }
         }
     }
+    if let Some(mut beat) = heartbeat.take() {
+        let _ = (&mut beat.0).await;
+    }
     if let Some(mut pass) = upkeep.take() {
         let _ = (&mut pass.0).await;
     }
 }
 
-/// Everything a lease tick does besides renewing: see [`lease_upkeep`], then
-/// membership, failover reclaim and the sweeps. History calls are bounded
-/// one by one.
+/// Everything a lease tick does besides renewing and heartbeating: see
+/// [`lease_upkeep`], then the member view, failover reclaim and the sweeps.
+/// History calls after the upkeep are bounded one by one.
 async fn lease_upkeep_pass(state: ServerState, member_ttl: Duration) {
     let cluster = state.cluster().clone();
     lease_upkeep(&state).await;
@@ -954,7 +1004,7 @@ async fn lease_upkeep_pass(state: ServerState, member_ttl: Duration) {
     crate::serve::history::fallback::with_call_bound(bound, async {
         let state = &state;
         if cluster.enabled() {
-            refresh_membership(state, member_ttl).await;
+            refresh_member_view(state, member_ttl).await;
             // Failover reclaim (re-run orphans).
             match state
                 .history()
@@ -1877,18 +1927,25 @@ mod tests {
     #[derive(Default)]
     struct Stalling {
         stall_renewal: AtomicBool,
+        fail_renewal: AtomicBool,
+        stall_recover: AtomicBool,
         stall_upkeep: AtomicBool,
         stall_reads: AtomicBool,
+        stall_finalize: AtomicBool,
         renewal_takes: std::sync::Mutex<Duration>,
+        finalize_takes: std::sync::Mutex<Duration>,
         renewals: AtomicUsize,
         batched_checks: AtomicUsize,
         single_checks: AtomicUsize,
         upkeep_calls: AtomicUsize,
+        finalizes: AtomicUsize,
+        secrets_deleted: AtomicUsize,
+        heartbeats: AtomicUsize,
     }
 
     async fn stall_if(flag: &AtomicBool) {
-        if flag.load(Ordering::SeqCst) {
-            std::future::pending::<()>().await;
+        while flag.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -1930,6 +1987,12 @@ mod tests {
         }
         async fn renew_leases(&self) -> Result<usize, HistoryError> {
             stall_if(&self.stall_renewal).await;
+            if self.fail_renewal.load(Ordering::SeqCst) {
+                return Err(HistoryError::BackendClassified {
+                    message: "refused".into(),
+                    transience: crate::serve::history::Transience::Permanent,
+                });
+            }
             let takes = *self.renewal_takes.lock().unwrap();
             tokio::time::sleep(takes).await;
             self.renewals.fetch_add(1, Ordering::SeqCst);
@@ -1950,22 +2013,38 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        async fn finalize_owned(&self, _: &RunRecord) -> Result<bool, HistoryError> {
+            stall_if(&self.stall_finalize).await;
+            let takes = *self.finalize_takes.lock().unwrap();
+            tokio::time::sleep(takes).await;
+            self.finalizes.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+        async fn run_secrets_delete(&self, _: &str) -> Result<(), HistoryError> {
+            self.secrets_deleted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn heartbeat_instance(
+            &self,
+            _: &crate::serve::history::InstanceHeartbeat,
+        ) -> Result<(), HistoryError> {
+            self.heartbeats.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn recover_degraded(&self) -> bool {
+            stall_if(&self.stall_recover).await;
+            false
+        }
         fn degraded(&self) -> bool {
             false
         }
     }
 
-    fn stalling_state(clustered: bool) -> (ServerState, Arc<Stalling>) {
+    fn state_over(clustered: bool, history: Arc<dyn RunHistory>) -> ServerState {
         let mut config = crate::serve::test_support::test_config();
         config.cluster.enabled = clustered;
         config.lease_ttl = Duration::from_secs(30);
-        let double = Arc::new(Stalling::default());
-        let history = Arc::new(crate::serve::history::fallback::FallbackHistory::healthy(
-            Box::new(Arc::clone(&double)),
-            config.idempotency_retention,
-            "postgres",
-        )) as Arc<dyn RunHistory>;
-        let state = ServerState::new(
+        ServerState::new(
             &config,
             None,
             CancellationToken::new(),
@@ -1974,8 +2053,33 @@ mod tests {
             None,
             #[cfg(feature = "triggers")]
             crate::serve::triggers::health::TriggersHandle::empty(),
+        )
+    }
+
+    fn queue_run_finalize(state: &ServerState, id: &str) {
+        let mut rec = RunRecord::queued(
+            id.into(),
+            None,
+            std::collections::BTreeMap::new(),
+            None,
+            chrono::Utc::now(),
         );
-        (state, double)
+        rec.status = crate::serve::history::RunStatus::Completed;
+        state.queue_finalize(crate::serve::runner::PendingFinalize::Run {
+            rec: Box::new(rec),
+            reason: "completed",
+            failures: 0,
+        });
+    }
+
+    fn stalling_state(clustered: bool) -> (ServerState, Arc<Stalling>) {
+        let double = Arc::new(Stalling::default());
+        let history = Arc::new(crate::serve::history::fallback::FallbackHistory::healthy(
+            Box::new(Arc::clone(&double)),
+            crate::serve::test_support::test_config().idempotency_retention,
+            "postgres",
+        )) as Arc<dyn RunHistory>;
+        (state_over(clustered, history), double)
     }
 
     #[tokio::test(start_paused = true)]
@@ -2120,6 +2224,112 @@ mod tests {
             .await
             .expect("the loop ends once its pass has")
             .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stall_after_a_fast_failure_fences_at_the_fence_instant() {
+        let (state, double) = stalling_state(true);
+        let run = CancellationToken::new();
+        state.registry().register("r1".into(), run.clone());
+        let started = tokio::time::Instant::now();
+        let mut health = LeaseHealth::new(lease_now());
+        double.fail_renewal.store(true, Ordering::SeqCst);
+        assert_eq!(
+            maintain_leases(&state, &mut health, Duration::from_secs(5)).await,
+            0
+        );
+        assert!(!run.is_cancelled());
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        double.fail_renewal.store(false, Ordering::SeqCst);
+        double.stall_renewal.store(true, Ordering::SeqCst);
+        let fenced_after = tokio::spawn({
+            let run = run.clone();
+            async move {
+                run.cancelled().await;
+                started.elapsed()
+            }
+        });
+        assert_eq!(
+            maintain_leases(&state, &mut health, Duration::from_secs(5)).await,
+            1
+        );
+        let fenced_after = fenced_after.await.unwrap();
+        assert!(
+            fenced_after <= Duration::from_millis(6_200),
+            "fenced as soon as the tick finds the fence due, not when the renewal gives up: {fenced_after:?}"
+        );
+        assert!(state.cluster().is_fenced());
+        double.stall_renewal.store(false, Ordering::SeqCst);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_recovery_probe_cannot_hold_back_the_fence() {
+        let double = Arc::new(Stalling::default());
+        let state = state_over(true, Arc::new(Arc::clone(&double)) as Arc<dyn RunHistory>);
+        double.stall_recover.store(true, Ordering::SeqCst);
+        let run = CancellationToken::new();
+        state.registry().register("r1".into(), run.clone());
+        let started = tokio::time::Instant::now();
+        let ticking = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let mut health = LeaseHealth::new(lease_now());
+                maintain_leases(&state, &mut health, Duration::from_secs(5)).await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(6), run.cancelled())
+            .await
+            .expect("the fence fires while the recovery probe hangs");
+        assert!(started.elapsed() <= Duration::from_millis(5_200));
+        assert!(!ticking.is_finished());
+        double.stall_recover.store(false, Ordering::SeqCst);
+        assert_eq!(ticking.await.unwrap(), 1);
+        assert_eq!(double.renewals.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_finalize_slower_than_the_bound_still_completes_with_its_side_effects() {
+        let (state, double) = stalling_state(true);
+        *double.finalize_takes.lock().unwrap() = Duration::from_secs(25);
+        queue_run_finalize(&state, "slow");
+        let mut health = LeaseHealth::new(lease_now());
+        let started = tokio::time::Instant::now();
+        maintain_leases(&state, &mut health, Duration::from_secs(3600)).await;
+        assert!(started.elapsed() >= Duration::from_secs(25));
+        assert_eq!(double.finalizes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            double.secrets_deleted.load(Ordering::SeqCst),
+            1,
+            "the completion side effects ran"
+        );
+        assert_eq!(state.pending_finalize_len(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_upkeep_pass_does_not_stop_heartbeats() {
+        let (state, double) = stalling_state(true);
+        double.stall_finalize.store(true, Ordering::SeqCst);
+        queue_run_finalize(&state, "stuck");
+        let shutdown = CancellationToken::new();
+        let looping = tokio::spawn(lease_loop(
+            state.clone(),
+            Duration::from_secs(1),
+            shutdown.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(40_500)).await;
+        assert_eq!(double.finalizes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            double.heartbeats.load(Ordering::SeqCst),
+            40,
+            "one heartbeat per period while the upkeep pass hangs"
+        );
+        double.stall_finalize.store(false, Ordering::SeqCst);
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(60), looping)
+            .await
+            .expect("the loop ends once its pass has")
+            .unwrap();
+        assert_eq!(double.finalizes.load(Ordering::SeqCst), 1);
     }
 
     #[test]
