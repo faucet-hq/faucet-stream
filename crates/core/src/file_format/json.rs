@@ -261,8 +261,12 @@ pub fn encode_raw_text(records: &[Value]) -> Result<Vec<u8>, FaucetError> {
 const PAGE_PRESIZE_CAP: usize = 8 * 1024 * 1024;
 
 fn reserve_like_first(out: &mut Vec<u8>, records: usize) {
-    let rest = out.len().saturating_mul(records.saturating_sub(1));
-    out.reserve(rest.min(PAGE_PRESIZE_CAP));
+    let want = out
+        .len()
+        .saturating_mul(records)
+        .min(PAGE_PRESIZE_CAP)
+        .next_power_of_two();
+    out.reserve(want.saturating_sub(out.len()));
 }
 
 fn as_utf8<'a>(bytes: &'a [u8], what: &str) -> Result<&'a str, FaucetError> {
@@ -418,6 +422,19 @@ mod tests {
         let mut one = vec![0u8; 10];
         reserve_like_first(&mut one, 1);
         assert_eq!(one.len(), 10);
+    }
+
+    #[test]
+    fn a_page_buffer_is_presized_to_one_power_of_two_whatever_the_first_line() {
+        for first in [500usize, 558, 597, 640] {
+            let mut out = vec![b'x'; first];
+            reserve_like_first(&mut out, 5000);
+            assert_eq!(out.capacity(), 4 * 1024 * 1024, "first line {first}");
+            assert_eq!(out.len(), first);
+        }
+        let mut big = vec![0u8; 4096];
+        reserve_like_first(&mut big, 1_000_000);
+        assert_eq!(big.capacity(), PAGE_PRESIZE_CAP);
     }
 
     struct Rng(u64);
