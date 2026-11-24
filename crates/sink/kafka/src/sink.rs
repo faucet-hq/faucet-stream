@@ -69,6 +69,53 @@ pub(crate) struct KafkaDriver {
     /// falling back to the value's (#789 MSG-95).
     #[cfg(feature = "schema-registry")]
     key_sr_client: Option<SchemaRegistryClient>,
+    #[cfg(feature = "schema-registry")]
+    schema_contexts: SchemaContexts,
+}
+
+/// The value and key schema contexts of a topic.
+#[cfg(feature = "schema-registry")]
+type TopicContexts = Arc<(encode::SchemaContext, encode::SchemaContext)>;
+
+/// Topics whose schema contexts are kept; past this they are built per record.
+#[cfg(feature = "schema-registry")]
+const SCHEMA_CONTEXT_TOPICS: usize = 1024;
+
+/// Each topic's schema contexts, built on first use instead of per record.
+#[cfg(feature = "schema-registry")]
+#[derive(Default)]
+struct SchemaContexts(std::sync::Mutex<std::collections::HashMap<String, TopicContexts>>);
+
+#[cfg(feature = "schema-registry")]
+impl SchemaContexts {
+    fn for_topic(&self, topic: &str, config: &KafkaSinkConfig) -> TopicContexts {
+        let mut cache = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cache.get(topic) {
+            return hit.clone();
+        }
+        let built = Arc::new(schema_contexts(topic, config));
+        if cache.len() < SCHEMA_CONTEXT_TOPICS {
+            cache.insert(topic.to_string(), built.clone());
+        }
+        built
+    }
+}
+
+#[cfg(feature = "schema-registry")]
+fn schema_contexts(
+    topic: &str,
+    config: &KafkaSinkConfig,
+) -> (encode::SchemaContext, encode::SchemaContext) {
+    (
+        encode::SchemaContext {
+            subject: format!("{topic}-value"),
+            schema_text: config.value_schema.clone(),
+        },
+        encode::SchemaContext {
+            subject: format!("{topic}-key"),
+            schema_text: config.key_schema.clone(),
+        },
+    )
 }
 
 impl KafkaSink {
@@ -99,6 +146,8 @@ impl KafkaSink {
                 sr_client,
                 #[cfg(feature = "schema-registry")]
                 key_sr_client,
+                #[cfg(feature = "schema-registry")]
+                schema_contexts: SchemaContexts::default(),
             }),
         })
     }
@@ -133,15 +182,9 @@ impl KafkaDriver {
         topic: &str,
     ) -> Result<(Vec<u8>, Option<Vec<u8>>), FaucetError> {
         #[cfg(feature = "schema-registry")]
-        let value_ctx = encode::SchemaContext {
-            subject: format!("{topic}-value"),
-            schema_text: self.config.value_schema.clone(),
-        };
+        let contexts = self.schema_contexts.for_topic(topic, &self.config);
         #[cfg(feature = "schema-registry")]
-        let key_ctx = encode::SchemaContext {
-            subject: format!("{topic}-key"),
-            schema_text: self.config.key_schema.clone(),
-        };
+        let (value_ctx, key_ctx) = (&contexts.0, &contexts.1);
 
         let value_bytes = encode::encode(
             record,
@@ -149,7 +192,7 @@ impl KafkaDriver {
             #[cfg(feature = "schema-registry")]
             self.sr_client.as_ref(),
             #[cfg(feature = "schema-registry")]
-            &value_ctx,
+            value_ctx,
         )
         .await?;
 
@@ -165,7 +208,7 @@ impl KafkaDriver {
                             #[cfg(feature = "schema-registry")]
                             self.key_sr_client.as_ref(),
                             #[cfg(feature = "schema-registry")]
-                            &key_ctx,
+                            key_ctx,
                         )
                         .await?,
                     ),
@@ -831,6 +874,54 @@ mod tests {
     // dataset_uri test is skipped: KafkaSink::new() requires a live Kafka
     // broker (creates a FutureProducer in new()), and no offline constructor
     // exists.
+
+    #[cfg(feature = "schema-registry")]
+    mod schema_contexts {
+        use crate::sink::{SCHEMA_CONTEXT_TOPICS, SchemaContexts, schema_contexts};
+
+        fn config() -> crate::KafkaSinkConfig {
+            serde_json::from_value(serde_json::json!({
+                "brokers": "127.0.0.1:1",
+                "topic": {"type": "from_path", "path": "$.t"},
+                "value_schema": "{\"type\":\"string\"}",
+                "key_schema": "\"long\""
+            }))
+            .unwrap()
+        }
+
+        #[test]
+        fn a_topic_gets_the_contexts_built_per_record_before() {
+            let cfg = config();
+            let cache = SchemaContexts::default();
+            for topic in ["orders", "orders", "events", ""] {
+                let got = cache.for_topic(topic, &cfg);
+                assert_eq!(got.0.subject, format!("{topic}-value"));
+                assert_eq!(got.0.schema_text, cfg.value_schema);
+                assert_eq!(got.1.subject, format!("{topic}-key"));
+                assert_eq!(got.1.schema_text, cfg.key_schema);
+            }
+            let first = cache.for_topic("orders", &cfg);
+            assert!(std::sync::Arc::ptr_eq(
+                &first,
+                &cache.for_topic("orders", &cfg)
+            ));
+        }
+
+        #[test]
+        fn topics_past_the_cap_are_built_and_not_kept() {
+            let cfg = config();
+            let cache = SchemaContexts::default();
+            for i in 0..SCHEMA_CONTEXT_TOPICS {
+                cache.for_topic(&format!("t{i}"), &cfg);
+            }
+            let late = cache.for_topic("late", &cfg);
+            assert_eq!(late.0.subject, "late-value");
+            assert_eq!(cache.0.lock().unwrap().len(), SCHEMA_CONTEXT_TOPICS);
+            let direct = schema_contexts("late", &cfg);
+            assert_eq!(late.1.subject, direct.1.subject);
+            assert_eq!(late.1.schema_text, direct.1.schema_text);
+        }
+    }
 
     #[cfg(feature = "schema-registry")]
     mod sr_client {
