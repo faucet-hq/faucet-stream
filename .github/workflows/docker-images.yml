@@ -80,8 +80,9 @@ jobs:
             sources: ""
             sinks: ""
             oracle: "auto"
-            # Fat LTO runs out of memory linking every feature (#911).
-            cargo_profile: release
+            # Fat LTO runs out of memory linking every feature (#911); thin LTO
+            # (`dist`, what the release archives use) does not.
+            cargo_profile: dist
           # Lean, common analytics/ELT set.
           - profile: core
             sources: "rest,postgres,s3,csv"
