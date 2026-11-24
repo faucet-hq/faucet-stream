@@ -3042,22 +3042,63 @@ mod tests {
     #[test]
     #[ignore = "timing"]
     fn bench_key_transforms_200k() {
+        type Run<'a> = Box<dyn Fn(Value) -> Value + 'a>;
+        let timed = |name: &str, now: Run<'_>, before: Run<'_>| {
+            let mut totals = [std::time::Duration::ZERO; 2];
+            for _ in 0..20 {
+                for (slot, run) in [&now, &before].into_iter().enumerate() {
+                    let records = bench_records(10_000);
+                    let start = std::time::Instant::now();
+                    for r in records {
+                        std::hint::black_box(run(r));
+                    }
+                    totals[slot] += start.elapsed();
+                }
+            }
+            eprintln!(
+                "{name}: 200k x 20 keys in {:?} (before: {:?})",
+                totals[0], totals[1]
+            );
+        };
         let case = compiled(&[RecordTransform::KeysCase {
             mode: KeyCaseMode::Snake,
             on_collision: KeyCollision::Error,
             suffix_keys: Vec::new(),
         }]);
-        let rename = compiled(&[RecordTransform::RenameKeys {
-            pattern: "^some".into(),
-            replacement: "a_".into(),
+        let none = KeyCaseAssignments::default();
+        timed(
+            "keys_case, every key re-cased",
+            Box::new(|r| super::apply_all(r, &case).unwrap()),
+            Box::new(|r| {
+                keys_case_reference(r, KeyCaseMode::Snake, KeyCollision::Error, &none).unwrap()
+            }),
+        );
+        let camel = compiled(&[RecordTransform::KeysCase {
+            mode: KeyCaseMode::Camel,
+            on_collision: KeyCollision::Error,
+            suffix_keys: Vec::new(),
         }]);
-        for (name, t) in [("keys_case", &case), ("rename_keys", &rename)] {
-            let records = bench_records(200_000);
-            let start = std::time::Instant::now();
-            for r in records {
-                std::hint::black_box(super::apply_all(r, t).unwrap());
-            }
-            eprintln!("{name}: 200k x 20 keys in {:?}", start.elapsed());
+        timed(
+            "keys_case, keys already in the target case",
+            Box::new(|r| super::apply_all(r, &camel).unwrap()),
+            Box::new(|r| {
+                keys_case_reference(r, KeyCaseMode::Camel, KeyCollision::Error, &none).unwrap()
+            }),
+        );
+        for (name, pattern) in [
+            ("rename_keys, every key renamed", "^some"),
+            ("rename_keys, no key matches", "^zzz"),
+        ] {
+            let rename = compiled(&[RecordTransform::RenameKeys {
+                pattern: pattern.into(),
+                replacement: "a_".into(),
+            }]);
+            let re = Regex::new(pattern).unwrap();
+            timed(
+                name,
+                Box::new(|r| super::apply_all(r, &rename).unwrap()),
+                Box::new(|r| rename_keys_reference(r, &re, "a_").unwrap()),
+            );
         }
     }
 

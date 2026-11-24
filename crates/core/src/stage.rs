@@ -1564,6 +1564,8 @@ mod tests {
 
     #[cfg(all(
         feature = "transform-filter",
+        feature = "transform-explode",
+        feature = "transform-flatten",
         feature = "transform-set",
         feature = "transform-rename-field"
     ))]
@@ -1590,6 +1592,7 @@ mod tests {
             }),
         ]);
         let mut total = std::time::Duration::ZERO;
+        let mut before = std::time::Duration::ZERO;
         for chunk in 0..200 {
             let page: Vec<Value> = (0..1000)
                 .map(|i| {
@@ -1600,12 +1603,18 @@ mod tests {
                     Value::Object(m)
                 })
                 .collect();
+            let copy = page.clone();
             let start = std::time::Instant::now();
             let out = apply_stages_to_page(page, &compiled).unwrap();
             total += start.elapsed();
             assert_eq!(out.len(), 1000);
+            let start = std::time::Instant::now();
+            let out = apply_stages_to_page_reference(copy, &compiled).unwrap();
+            before += start.elapsed();
+            assert_eq!(out.len(), 1000);
         }
         eprintln!("5 stages: 200k x 20 keys in {total:?}");
+        eprintln!("5 stages before: 200k x 20 keys in {before:?}");
     }
 
     #[test]
