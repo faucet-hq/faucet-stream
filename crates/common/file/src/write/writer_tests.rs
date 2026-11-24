@@ -73,6 +73,9 @@ fn estimate_is_the_json_length_plus_a_newline() {
         assert_eq!(estimate(&v), old(&v), "{v}");
     }
     assert_eq!(estimate(&json!({"a": 1})), 8);
+    let mut count = ByteCount(3);
+    std::io::Write::flush(&mut count).unwrap();
+    assert_eq!(count.0, 3);
 }
 
 #[test]

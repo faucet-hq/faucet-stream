@@ -814,20 +814,21 @@ impl SnowflakeDriver {
 /// plus one more for every `'` or `\` a SQL string literal doubles, so the
 /// bound is right for both the bound and the inlined form.
 fn payload_len(row: &Value) -> usize {
-    struct Count(usize);
-    impl std::io::Write for Count {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len() + buf.iter().filter(|b| matches!(b, b'\'' | b'\\')).count();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+    let mut count = PayloadCount(0);
+    serde_json::to_writer(&mut count, row).map_or(0, |()| count.0)
+}
+
+/// A row's payload bytes; quotes and backslashes count twice.
+struct PayloadCount(usize);
+
+impl std::io::Write for PayloadCount {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len() + buf.iter().filter(|b| matches!(b, b'\'' | b'\\')).count();
+        Ok(buf.len())
     }
-    let mut count = Count(0);
-    match serde_json::to_writer(&mut count, row) {
-        Ok(()) => count.0,
-        Err(_) => 0,
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -1681,6 +1682,9 @@ mod tests {
             r#"{"s":"\u0001'\\"}"#
         );
         assert_eq!(payload_len(&escaped), 17 + 4);
+        let mut count = PayloadCount(5);
+        std::io::Write::flush(&mut count).unwrap();
+        assert_eq!(count.0, 5);
     }
 
     #[test]

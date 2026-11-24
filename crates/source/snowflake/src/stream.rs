@@ -985,6 +985,54 @@ mod tests {
     use super::*;
     use crate::config::SnowflakeAuth;
 
+    #[test]
+    fn a_failed_partition_reads_as_the_sources_error() {
+        let status = |status| FaucetError::HttpStatus {
+            status,
+            url: "https://x/p".into(),
+            body: "nope".into(),
+        };
+        let unavailable = partition_error(status(503), 2, false).to_string();
+        assert!(
+            unavailable.contains(
+                "Snowflake partition fetch returned HTTP 503 Service Unavailable (partition 2): nope"
+            ),
+            "{unavailable}"
+        );
+        assert!(
+            partition_error(status(1000), 2, false)
+                .to_string()
+                .contains("returned HTTP 1000 (partition 2)")
+        );
+        let cancelled = FaucetError::Cancelled {
+            operation: "page call".into(),
+        };
+        assert!(matches!(
+            partition_error(cancelled, 0, true),
+            FaucetError::Cancelled { .. }
+        ));
+        let json = serde_json::from_str::<Value>("{").unwrap_err();
+        let parsed = partition_error(FaucetError::Json(json), 1, true).to_string();
+        assert!(
+            parsed.contains("failed to parse Snowflake partition response (partition 1): "),
+            "{parsed}"
+        );
+        let other = partition_error(FaucetError::Config("c".into()), 1, false);
+        assert!(matches!(other, FaucetError::Config(ref m) if m == "c"));
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_names_the_decode_error() {
+        let json = serde_json::from_str::<Value>("{").unwrap_err();
+        let text = json.to_string();
+        assert_eq!(
+            decode_text(&FaucetError::Json(json)),
+            format!("error decoding response body: {text}")
+        );
+        let other = FaucetError::Config("c".into());
+        assert_eq!(decode_text(&other), other.to_string());
+    }
+
     fn cfg() -> SnowflakeSourceConfig {
         SnowflakeSourceConfig::new(
             "xy12345.us-east-1",

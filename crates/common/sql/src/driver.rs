@@ -384,14 +384,7 @@ pub trait SqlDriver: Send + Sync {
     /// without the split's copy. Default `true` (the page is split to find
     /// out); a driver overrides it together with `split_page`, from the same
     /// rule ([`page_refuses`](crate::page_refuses)).
-    fn refuses_rows(
-        &self,
-        target: &TableTarget,
-        records: &[Value],
-        columns: &[TableColumn],
-        require_match: bool,
-    ) -> bool {
-        let _ = (target, records, columns, require_match);
+    fn refuses_rows(&self, _: &TableTarget, _: &[Value], _: &[TableColumn], _: bool) -> bool {
         true
     }
 
