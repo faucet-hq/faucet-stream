@@ -16,10 +16,28 @@ fn resolve_path<'a>(record: &'a Value, path: &str) -> Option<&'a Value> {
     Some(cur)
 }
 
+/// What a key was read from, rendered only in an error.
+#[derive(Clone, Copy)]
+enum What<'a> {
+    Field(&'a str),
+    Path(&'a str),
+    ExplicitHashKey,
+}
+
+impl std::fmt::Display for What<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            What::Field(name) => write!(f, "field '{name}'"),
+            What::Path(path) => write!(f, "path '{path}'"),
+            What::ExplicitHashKey => f.write_str("explicit hash key"),
+        }
+    }
+}
+
 /// Stringify a scalar for use as a key. Containers and null are per-record
 /// errors — silently serializing an object would spread a hot key across
 /// shards unpredictably and hide config mistakes.
-fn scalar_to_key(v: &Value, what: &str) -> Result<String, FaucetError> {
+fn scalar_to_key(v: &Value, what: What<'_>) -> Result<String, FaucetError> {
     match v {
         Value::String(s) => Ok(s.clone()),
         Value::Number(n) => Ok(n.to_string()),
@@ -34,7 +52,7 @@ fn scalar_to_key(v: &Value, what: &str) -> Result<String, FaucetError> {
 }
 
 /// Validate the final key length (Kinesis limit: 1..=256 chars).
-fn check_key(key: String, what: &str) -> Result<String, FaucetError> {
+fn check_key(key: String, what: What<'_>) -> Result<String, FaucetError> {
     if key.is_empty() {
         return Err(FaucetError::Sink(format!(
             "kinesis: {what} resolved to an empty partition key"
@@ -62,10 +80,7 @@ pub(crate) fn derive_partition_key(
                     "kinesis: record has no top-level field '{name}' for the partition key"
                 ))
             })?;
-            check_key(
-                scalar_to_key(v, &format!("field '{name}'"))?,
-                &format!("field '{name}'"),
-            )
+            check_key(scalar_to_key(v, What::Field(name))?, What::Field(name))
         }
         PartitionKey::Jsonpath { path } => {
             let v = resolve_path(record, path).ok_or_else(|| {
@@ -73,10 +88,7 @@ pub(crate) fn derive_partition_key(
                     "kinesis: path '{path}' matched nothing for the partition key"
                 ))
             })?;
-            check_key(
-                scalar_to_key(v, &format!("path '{path}'"))?,
-                &format!("path '{path}'"),
-            )
+            check_key(scalar_to_key(v, What::Path(path))?, What::Path(path))
         }
         PartitionKey::Hash { path } => {
             let v = resolve_path(record, path).ok_or_else(|| {
@@ -84,7 +96,7 @@ pub(crate) fn derive_partition_key(
                     "kinesis: path '{path}' matched nothing for the hash partition key"
                 ))
             })?;
-            let raw = scalar_to_key(v, &format!("path '{path}'"))?;
+            let raw = scalar_to_key(v, What::Path(path))?;
             use md5::Digest as _;
             let digest = md5::Md5::digest(raw.as_bytes());
             Ok(format!("{digest:x}"))
@@ -110,7 +122,7 @@ pub(crate) fn derive_explicit_hash_key(
             ))
         })?,
     };
-    let key = scalar_to_key(v, "explicit hash key")?;
+    let key = scalar_to_key(v, What::ExplicitHashKey)?;
     // Kinesis requires a decimal integer in [0, 2^128); a 39-digit value can
     // still be 2^128 or more, so parse rather than count digits (#789 MSG-91).
     if key.is_empty() || !key.bytes().all(|b| b.is_ascii_digit()) || key.parse::<u128>().is_err() {
@@ -250,6 +262,52 @@ mod tests {
         );
         assert!(
             derive_partition_key(&with_null, &PartitionKey::Field { name: "obj".into() }).is_err()
+        );
+    }
+
+    #[test]
+    fn key_errors_name_where_the_key_was_read() {
+        let r = json!({"k": null, "obj": {"a": 1}, "long": "x".repeat(257), "empty": ""});
+        let field = |name: &str| PartitionKey::Field { name: name.into() };
+        let path = |path: &str| PartitionKey::Jsonpath { path: path.into() };
+        for (strategy, text) in [
+            (
+                field("k"),
+                "kinesis: field 'k' resolved to null — cannot derive a partition key",
+            ),
+            (
+                field("obj"),
+                "kinesis: field 'obj' resolved to a container — partition keys must be scalars",
+            ),
+            (
+                field("long"),
+                "kinesis: field 'long' resolved to a partition key longer than 256 characters",
+            ),
+            (
+                field("empty"),
+                "kinesis: field 'empty' resolved to an empty partition key",
+            ),
+            (
+                path("obj"),
+                "kinesis: path 'obj' resolved to a container — partition keys must be scalars",
+            ),
+            (
+                path("empty"),
+                "kinesis: path 'empty' resolved to an empty partition key",
+            ),
+            (
+                PartitionKey::Hash { path: "k".into() },
+                "kinesis: path 'k' resolved to null — cannot derive a partition key",
+            ),
+        ] {
+            let err = derive_partition_key(&r, &strategy).unwrap_err();
+            assert_eq!(err.to_string(), format!("Sink error: {text}"));
+        }
+        let err =
+            derive_explicit_hash_key(&r, &ExplicitHashKey::Field { name: "k".into() }).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Sink error: kinesis: explicit hash key resolved to null — cannot derive a partition key"
         );
     }
 
