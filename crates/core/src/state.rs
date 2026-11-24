@@ -1870,7 +1870,7 @@ mod tests {
         assert!(later.contains("failed to create state dir"), "{later}");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "timing loop: cargo test -p faucet-core state::tests::put_timing -- --ignored --nocapture"]
     async fn put_timing() {
         let (old_dir, new_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
@@ -1898,6 +1898,40 @@ mod tests {
                 one_step / n
             );
         }
+        // Eight rows checkpointing at once: behind one lock, then per key.
+        let (old, new) = (std::sync::Arc::new(old), std::sync::Arc::new(new));
+        let one_lock = std::sync::Arc::new(Mutex::new(()));
+        let start = std::time::Instant::now();
+        let mut tasks = tokio::task::JoinSet::new();
+        for row in 0..8u32 {
+            let (old, one_lock) = (old.clone(), one_lock.clone());
+            tasks.spawn(async move {
+                for i in 0..50u32 {
+                    let _held = one_lock.lock().await;
+                    put_stepwise(&old, &format!("row::{row}"), &json!({"lsn": i}))
+                        .await
+                        .unwrap();
+                }
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+        let serial = start.elapsed();
+        let start = std::time::Instant::now();
+        for row in 0..8u32 {
+            let new = new.clone();
+            tasks.spawn(async move {
+                for i in 0..50u32 {
+                    new.put(&format!("row::{row}"), &json!({"lsn": i}))
+                        .await
+                        .unwrap();
+                }
+            });
+        }
+        while tasks.join_next().await.is_some() {}
+        println!(
+            "8 rows x 50 puts: one lock {serial:?}, per-key locks {:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]
