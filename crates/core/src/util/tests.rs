@@ -217,6 +217,128 @@ fn extract_records_owned_matches_the_borrowing_form() {
 }
 
 #[test]
+fn take_records_returns_what_extract_records_does_and_keeps_later_reads_intact() {
+    let body = json!({
+        "data": [{"id": 1, "next": "inner"}, {"id": 2}],
+        "meta": {"next": "c2", "total": 9, "items": [3, 4]},
+        "data_2": {"rows": [7]},
+        "next": null
+    });
+    let paths = [
+        None,
+        Some("$"),
+        Some("$[*]"),
+        Some("$.data"),
+        Some("$.data[*]"),
+        Some("$.meta.items[*]"),
+        Some("$.data_2.rows[*]"),
+        Some("$.missing[*]"),
+        Some("$.data[0]"),
+        Some("$..id"),
+    ];
+    let laters: [&[&str]; 9] = [
+        &[],
+        &["$.meta.next"],
+        &["$.meta.next", "$.meta.total"],
+        &["$.data[0].next"],
+        &["$.data"],
+        &["$..next"],
+        &["$.meta"],
+        &["$"],
+        &["$.links[?(@.rel == 'next')].href", "$.data_2.rows"],
+    ];
+    for path in paths {
+        for later in laters {
+            let mut taken = body.clone();
+            assert_eq!(
+                take_records(&mut taken, path, later).unwrap(),
+                extract_records(&body, path).unwrap(),
+                "{path:?} {later:?}"
+            );
+            for l in later {
+                assert_eq!(
+                    extract_records(&taken, Some(l)).unwrap(),
+                    extract_records(&body, Some(l)).unwrap(),
+                    "{path:?} then {l}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn take_records_moves_only_when_no_later_read_can_see_the_records() {
+    let body = json!({"data": [{"id": 1}], "meta": {"next": "c2"}});
+    let moved = |path: Option<&str>, later: &[&str]| {
+        let mut b = body.clone();
+        take_records(&mut b, path, later).unwrap();
+        b != body
+    };
+    assert!(moved(Some("$.data[*]"), &[]));
+    assert!(moved(Some("$.data[*]"), &["$.meta.next"]));
+    assert!(moved(Some("$.data"), &["$.meta.next"]));
+    assert!(moved(None, &[]));
+    assert!(!moved(None, &["$.meta.next"]));
+    assert!(!moved(Some("$.data[*]"), &["$.data[0].id"]));
+    assert!(!moved(Some("$.data[*]"), &["$..next"]));
+    assert!(!moved(Some("$.data[*]"), &["$"]));
+    assert!(!moved(Some("$.data[*]"), &["meta.next"]));
+    assert!(!moved(Some("$.data[*]"), &["$.length($.data)"]));
+    assert!(!moved(Some("$.meta.next"), &["$.meta"]));
+    assert!(!moved(Some("$.data[*].id"), &[]));
+    assert!(!moved(Some("$[*]"), &["$.meta.next"]));
+
+    let mut b = body.clone();
+    assert_eq!(
+        take_records(&mut b, Some("$.data[*]"), &["$.meta.next"]).unwrap(),
+        vec![json!({"id": 1})]
+    );
+    assert_eq!(b, json!({"data": [], "meta": {"next": "c2"}}));
+    assert!(take_records(&mut b, Some("$["), &[]).is_err());
+    for bad in ["$.data-x[*]", "$.2data[*]"] {
+        let mut b = json!({"data-x": [1], "2data": [1]});
+        assert_eq!(
+            take_records(&mut b, Some(bad), &[]).map_err(|e| e.to_string()),
+            extract_records(&b, Some(bad)).map_err(|e| e.to_string()),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn records_fingerprint_hashes_the_same_bytes_as_the_string_form() {
+    use std::hash::{Hash, Hasher};
+    let reference = |records: &[Value]| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for r in records {
+            r.to_string().hash(&mut h);
+        }
+        h.finish()
+    };
+    let pages: [Vec<Value>; 5] = [
+        vec![],
+        vec![json!(null)],
+        vec![json!({"id": 1, "s": "a\"b\n\u{e9}", "f": 1.5e300, "n": [1, [2, {"k": true}]]})],
+        vec![json!("ab"), json!("c")],
+        vec![json!("a"), json!("bc")],
+    ];
+    for page in &pages {
+        assert_eq!(records_fingerprint(page), reference(page), "{page:?}");
+    }
+    assert_ne!(
+        records_fingerprint(&pages[3]),
+        records_fingerprint(&pages[4])
+    );
+
+    let mut a = std::collections::hash_map::DefaultHasher::new();
+    let mut b = std::collections::hash_map::DefaultHasher::new();
+    let v = json!({"k": [1, "two", null]});
+    hash_value(&v, &mut a);
+    v.to_string().hash(&mut b);
+    assert_eq!(a.finish(), b.finish());
+}
+
+#[test]
 fn extract_with_path() {
     let body = json!({"data": [{"id": 1}, {"id": 2}]});
     let records = extract_records(&body, Some("$.data[*]")).unwrap();
