@@ -627,7 +627,7 @@ fn key_from_filename(stem: &str) -> Option<String> {
 /// filesystem's atomic rename guarantee.
 pub struct FileStateStore {
     root: PathBuf,
-    write_locks: Vec<std::sync::Arc<Mutex<()>>>,
+    write_locks: std::panic::AssertUnwindSafe<Vec<std::sync::Arc<Mutex<()>>>>,
     synced_sidecars: std::sync::Arc<std::sync::Mutex<HashMap<PathBuf, FileIdentity>>>,
     migrated: tokio::sync::OnceCell<()>,
     /// Optional at-rest encryption (#207). When set, `put` seals the JSON
@@ -642,9 +642,11 @@ impl FileStateStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            write_locks: (0..WRITE_LOCK_SLOTS)
-                .map(|_| std::sync::Arc::new(Mutex::new(())))
-                .collect(),
+            write_locks: std::panic::AssertUnwindSafe(
+                (0..WRITE_LOCK_SLOTS)
+                    .map(|_| std::sync::Arc::new(Mutex::new(())))
+                    .collect(),
+            ),
             synced_sidecars: Default::default(),
             migrated: tokio::sync::OnceCell::new(),
             #[cfg(feature = "encryption")]
@@ -1252,6 +1254,12 @@ impl FileStateStore {
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_state_store_keeps_its_auto_traits() {
+        fn assert_auto<T: Send + Sync + Unpin + std::panic::UnwindSafe>() {}
+        assert_auto::<FileStateStore>();
+    }
     use serde_json::json;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -1868,70 +1876,6 @@ mod tests {
         std::fs::write(&root, b"x").unwrap();
         let later = s.put("k", &json!(3)).await.unwrap_err().to_string();
         assert!(later.contains("failed to create state dir"), "{later}");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "timing loop: cargo test -p faucet-core state::tests::put_timing -- --ignored --nocapture"]
-    async fn put_timing() {
-        let (old_dir, new_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
-        let (old, new) = (
-            FileStateStore::new(old_dir.path()),
-            FileStateStore::new(new_dir.path()),
-        );
-        let long = format!("p::{}", "q".repeat(200));
-        for key in ["plain", long.as_str()] {
-            let n = 300u32;
-            let start = std::time::Instant::now();
-            for i in 0..n {
-                put_stepwise(&old, key, &json!({"lsn": i})).await.unwrap();
-            }
-            let stepwise = start.elapsed();
-            let start = std::time::Instant::now();
-            for i in 0..n {
-                new.put(key, &json!({"lsn": i})).await.unwrap();
-            }
-            let one_step = start.elapsed();
-            println!(
-                "key len {}: stepwise {:?}/put, one step {:?}/put",
-                key.len(),
-                stepwise / n,
-                one_step / n
-            );
-        }
-        // Eight rows checkpointing at once: behind one lock, then per key.
-        let (old, new) = (std::sync::Arc::new(old), std::sync::Arc::new(new));
-        let one_lock = std::sync::Arc::new(Mutex::new(()));
-        let start = std::time::Instant::now();
-        let mut tasks = tokio::task::JoinSet::new();
-        for row in 0..8u32 {
-            let (old, one_lock) = (old.clone(), one_lock.clone());
-            tasks.spawn(async move {
-                for i in 0..50u32 {
-                    let _held = one_lock.lock().await;
-                    put_stepwise(&old, &format!("row::{row}"), &json!({"lsn": i}))
-                        .await
-                        .unwrap();
-                }
-            });
-        }
-        while tasks.join_next().await.is_some() {}
-        let serial = start.elapsed();
-        let start = std::time::Instant::now();
-        for row in 0..8u32 {
-            let new = new.clone();
-            tasks.spawn(async move {
-                for i in 0..50u32 {
-                    new.put(&format!("row::{row}"), &json!({"lsn": i}))
-                        .await
-                        .unwrap();
-                }
-            });
-        }
-        while tasks.join_next().await.is_some() {}
-        println!(
-            "8 rows x 50 puts: one lock {serial:?}, per-key locks {:?}",
-            start.elapsed()
-        );
     }
 
     #[tokio::test]
