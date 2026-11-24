@@ -95,6 +95,21 @@ pub fn record_pending_finalize_refused() {
     metrics::counter!("faucet_serve_pending_finalize_refused_total").increment(1);
 }
 
+/// A lease renewal or lost-lease check the history did not answer in time.
+pub fn record_lease_renewal_timeout() {
+    metrics::counter!("faucet_serve_lease_renewal_timeouts_total").increment(1);
+}
+
+/// A lease tick that found the previous tick's upkeep still running.
+pub fn record_lease_upkeep_skipped() {
+    metrics::counter!("faucet_serve_lease_upkeep_skipped_total").increment(1);
+}
+
+/// A bounded history call (lease upkeep) that did not answer in time.
+pub fn record_history_call_timeout() {
+    metrics::counter!("faucet_serve_history_call_timeouts_total").increment(1);
+}
+
 /// A claimed run whose config could not be re-loaded yet (#1051).
 pub fn record_run_reload_retry() {
     metrics::counter!("faucet_serve_run_reload_retries_total").increment(1);

@@ -8,5 +8,8 @@ faucet_notifications_pending: a gauge of batches waiting in the background queue
 faucet_serve_clock_offset_seconds: a per-replica diagnostic for timestamps and timeouts (leases use the database clock); alerted on by FaucetServeClockSkew and shown per member on /readyz
 faucet_serve_runs_lost_ownership_total: a rare failover event (a replica found its claimed run owned by a peer before starting it); counted for investigation, nothing to trend
 faucet_serve_shard_coordinations_total: one increment per sharded run split; the outcome label is for investigating a lost or cancelled split, not for trending
+faucet_serve_lease_renewal_timeouts_total: a rare event (a lease renewal or lost-lease check the history did not answer in time); alerted on by FaucetServeLeaseRenewalTimeouts, and faucet_serve_history_unreachable is charted
+faucet_serve_lease_upkeep_skipped_total: a rare event (a lease tick found the previous tick's upkeep still running); alerted on by FaucetServeLeaseUpkeepBehind
+faucet_serve_history_call_timeouts_total: a bounded history call of the lease upkeep that was cut off; read with the two lease alerts, nothing to trend
 faucet_feed_store_moved: a per-feed 0/1 gauge for a misconfiguration (its events are in another feed store); alerted on by FaucetFeedStoreMoved and shown as the feed's status and on /readyz
 faucet_feed_maintenance_behind: a per-feed 0/1 gauge (retention ran out of time); alerted on by FaucetFeedMaintenanceBehind, read with faucet_feed_trimmed_events_total

@@ -258,6 +258,33 @@ groups:
             tick starts until it recovers. Runs in flight finish and their
             terminal records wait for the backend. /readyz is reporting 503.
 
+      - alert: FaucetServeLeaseRenewalTimeouts
+        expr: sum(increase(faucet_serve_lease_renewal_timeouts_total[10m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "the run history is not answering lease renewals in time"
+          description: >
+            {{ $value }} lease renewals or lost-lease checks got no answer
+            within two thirds of the lease TTL. An instance that cannot renew
+            for that long cancels its runs so a peer can take them. Check the
+            history database's load, locks and connectivity.
+
+      - alert: FaucetServeLeaseUpkeepBehind
+        expr: sum(increase(faucet_serve_lease_upkeep_skipped_total[10m])) > 2
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "lease upkeep is slower than the lease tick"
+          description: >
+            The work a lease tick does besides renewing (membership, reclaiming
+            a dead member's runs, retrying terminal records) is still running
+            when the next tick comes. Renewals are not delayed; failover and
+            cleanup are. faucet_serve_history_call_timeouts_total counts the
+            calls that were cut off.
+
       - alert: FaucetServePendingFinalize
         expr: max(faucet_serve_pending_finalize) > 0
         for: 15m

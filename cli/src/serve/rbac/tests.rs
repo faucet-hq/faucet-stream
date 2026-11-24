@@ -674,3 +674,72 @@ fn a_schedule_change_under_run_approval_must_be_approvable() {
         "{err}"
     );
 }
+
+/// The scan the keyed lookup replaced: every principal compared.
+fn authenticate_by_scan(principals: &[PrincipalSpec], token: &str) -> Option<String> {
+    let mut matched = None;
+    for p in principals {
+        if crate::serve::auth::constant_time_eq(token.as_bytes(), p.token.as_bytes()) {
+            matched = Some(p.name.clone());
+        }
+    }
+    matched
+}
+
+#[test]
+fn the_keyed_lookup_answers_like_the_full_scan() {
+    let principals: Vec<PrincipalSpec> = (0..300)
+        .map(|i| PrincipalSpec {
+            name: format!("p{i}"),
+            token: format!("token-{i:04}-secret"),
+            role: Role::Viewer,
+            tenant: None,
+        })
+        .collect();
+    let cfg = RbacConfig::new(principals.clone()).unwrap();
+    let mut probes: Vec<String> = principals.iter().map(|p| p.token.clone()).collect();
+    probes.extend(
+        [
+            "",
+            "token-0000-secre",
+            "token-0000-secret ",
+            "TOKEN-0000-SECRET",
+            "token-0300-secret",
+            "nothing like a token",
+        ]
+        .map(String::from),
+    );
+    for probe in &probes {
+        assert_eq!(
+            cfg.authenticate(probe).map(|c| c.principal),
+            authenticate_by_scan(&principals, probe),
+            "{probe:?}"
+        );
+    }
+    assert_eq!(
+        cfg.authenticate("token-0299-secret").unwrap().principal,
+        "p299"
+    );
+}
+
+#[test]
+fn the_token_index_is_keyed_per_config_and_prints_no_key() {
+    let p = || PrincipalSpec {
+        name: "a".into(),
+        token: "same-token-value".into(),
+        role: Role::Admin,
+        tenant: None,
+    };
+    let (one, two) = (
+        RbacConfig::new(vec![p()]).unwrap(),
+        RbacConfig::new(vec![p()]).unwrap(),
+    );
+    assert_ne!(
+        one.tokens.digest("same-token-value"),
+        two.tokens.digest("same-token-value"),
+        "each config draws its own key"
+    );
+    let shown = format!("{one:?}");
+    assert!(!shown.contains("same-token-value"), "{shown}");
+    assert!(shown.contains("TokenIndex { principals: 1 }"), "{shown}");
+}

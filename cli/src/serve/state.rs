@@ -117,6 +117,7 @@ struct Inner {
     /// Runs whose terminal record was dropped (#1050): their lease is no
     /// longer renewed, so orphan recovery clears them.
     forgotten_runs: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    lease_ttl: std::time::Duration,
 }
 
 impl ServerState {
@@ -193,6 +194,7 @@ impl ServerState {
                 failed_auth: Default::default(),
                 pending_finalize: std::sync::Mutex::new(Vec::new()),
                 forgotten_runs: Default::default(),
+                lease_ttl: config.lease_ttl,
             }),
         }
     }
@@ -569,6 +571,11 @@ impl ServerState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
+    }
+
+    /// The configured run-lease TTL.
+    pub(crate) fn lease_ttl(&self) -> std::time::Duration {
+        self.inner.lease_ttl
     }
 
     /// Stop renewing a run's lease: its terminal record was dropped (#1050).

@@ -1030,6 +1030,24 @@ pub trait RunHistory: Send + Sync {
         Ok(false)
     }
 
+    /// Which of `keys` (a run id, or `<run id>::<shard id>`) a peer now
+    /// holds, as [`lease_lost`](Self::lease_lost) /
+    /// [`shard_lease_lost`](Self::shard_lease_lost) would answer one by one.
+    /// A SQL store answers in one statement.
+    async fn leases_lost(&self, keys: &[String]) -> Result<Vec<String>, HistoryError> {
+        let mut lost = Vec::new();
+        for key in keys {
+            let held = match key.split_once("::") {
+                Some((run_id, shard_id)) => self.shard_lease_lost(run_id, shard_id).await?,
+                None => self.lease_lost(key).await?,
+            };
+            if held {
+                lost.push(key.clone());
+            }
+        }
+        Ok(lost)
+    }
+
     /// [`upsert`](Self::upsert) for a record other instances must see (a
     /// cluster's `pending` run): a degraded store refuses it rather than
     /// keeping it in memory, where no instance would ever claim it.

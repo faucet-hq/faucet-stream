@@ -46,6 +46,8 @@ Alert rules (`observability/prometheus/alerts.yml`):
 | `FaucetScheduleRunLateness` | tick lateness p95 > 60 s for 15 m | warning |
 | `FaucetConsecutiveScheduleFailures` | ≥3 consecutive failed scheduled runs | critical |
 | `FaucetServeHistoryDegraded` | serve's history backend degraded 5 m | critical |
+| `FaucetServeLeaseRenewalTimeouts` | a lease renewal or lost-lease check got no answer from the history in time | warning |
+| `FaucetServeLeaseUpkeepBehind` | the lease tick's upkeep is still running when the next tick comes | warning |
 | `FaucetServePendingFinalize` | finished runs' terminal records have waited for the history for 15 m | warning |
 | `FaucetServePolicyMergeBroken` | a tenant's policy no longer merges with the server's; its runs are refused | critical |
 | `FaucetServeScheduleStepTimeouts` | a schedule's tick was cut off after the step timeout | warning |

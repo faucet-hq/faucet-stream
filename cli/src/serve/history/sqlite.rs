@@ -173,6 +173,355 @@ mod shard_tests {
         });
     }
 
+    fn log_line(seq: u64, text: &str) -> crate::serve::history::RunLogLine {
+        crate::serve::history::RunLogLine {
+            seq,
+            ts: format!("2026-01-01T00:00:{:02}.000Z", seq % 60),
+            level: if seq.is_multiple_of(7) {
+                "WARN"
+            } else {
+                "INFO"
+            }
+            .into(),
+            line: text.into(),
+            attrs: if seq.is_multiple_of(5) {
+                [("row".to_string(), format!("r{seq}"))].into()
+            } else {
+                Default::default()
+            },
+        }
+    }
+
+    async fn stored_logs(
+        h: &SqliteHistory,
+        run_id: &str,
+    ) -> Vec<(String, String, String, String, Option<String>)> {
+        sqlx::query_as(
+            "SELECT seq, ts, level, line, attrs FROM faucet_serve_run_logs \
+             WHERE run_id = ? ORDER BY seq",
+        )
+        .bind(run_id)
+        .fetch_all(&h.pool)
+        .await
+        .unwrap()
+    }
+
+    /// A batch lands the rows the line-by-line insert lands, with the same
+    /// keys: with no key taken, with keys taken by another writer, with a
+    /// key twice in one batch, and with the truncation marker.
+    #[tokio::test]
+    async fn a_batch_of_run_logs_stores_what_line_by_line_inserts_store() {
+        use crate::serve::history::RUN_LOG_TRUNCATED_SEQ;
+        let dir = tempfile::tempdir().unwrap();
+        let h = backend(&url_in(dir.path()), "a", Duration::from_secs(30)).await;
+        let many: Vec<_> = (1..=1203u64)
+            .map(|i| log_line(i, &format!("line {i}")))
+            .collect();
+        let mut with_marker = many.clone();
+        with_marker.push(log_line(RUN_LOG_TRUNCATED_SEQ, "truncated"));
+        let taken = vec![log_line(10, "theirs 10"), log_line(11, "theirs 11")];
+        let clash = vec![
+            log_line(10, "mine 10"),
+            log_line(12, "mine 12"),
+            log_line(12, "mine 12 again"),
+            log_line(40, "mine 40"),
+            log_line(RUN_LOG_TRUNCATED_SEQ, "truncated"),
+            log_line(RUN_LOG_TRUNCATED_SEQ, "truncated twice"),
+        ];
+        let cases: Vec<(&str, Vec<_>, Vec<_>)> = vec![
+            ("plain", Vec::new(), many),
+            ("marker", Vec::new(), with_marker),
+            ("clash", taken, clash),
+        ];
+        for (name, before, lines) in cases {
+            let (batched, single) = (format!("{name}-batched"), format!("{name}-single"));
+            for run in [&batched, &single] {
+                for l in &before {
+                    h.record_run_logs(run, std::slice::from_ref(l))
+                        .await
+                        .unwrap();
+                }
+            }
+            h.record_run_logs(&batched, &lines).await.unwrap();
+            for l in &lines {
+                h.record_run_logs(&single, std::slice::from_ref(l))
+                    .await
+                    .unwrap();
+            }
+            let stored = stored_logs(&h, &batched).await;
+            assert_eq!(stored, stored_logs(&h, &single).await, "{name}");
+            let marks = |run: &str| {
+                let run = run.to_string();
+                let pool = h.pool.clone();
+                async move {
+                    sqlx::query_as::<_, (String,)>(
+                        "SELECT total_seq FROM faucet_serve_log_ship WHERE run_id = ?",
+                    )
+                    .bind(run)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap()
+                }
+            };
+            assert_eq!(marks(&batched).await, marks(&single).await, "{name}");
+            if name == "clash" {
+                let texts: Vec<&str> = stored.iter().map(|r| r.3.as_str()).collect();
+                assert_eq!(
+                    texts,
+                    vec![
+                        "theirs 10",
+                        "theirs 11",
+                        "mine 10",
+                        "mine 12",
+                        "mine 12 again",
+                        "mine 40",
+                        "truncated"
+                    ]
+                );
+            } else {
+                assert_eq!(stored.len(), lines.len(), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_run_log_batch_statement_has_six_binds_a_row() {
+        use crate::serve::history::sql::{Dialect, Stmts};
+        assert_eq!(
+            Stmts::new(Dialect::Postgres).insert_run_logs_query(2),
+            "INSERT INTO faucet_serve_run_logs (run_id, seq, ts, level, line, attrs) VALUES \
+             ($1,$2,$3,$4,$5,$6),($7,$8,$9,$10,$11,$12) ON CONFLICT (run_id, seq) DO NOTHING"
+        );
+        assert_eq!(
+            Stmts::new(Dialect::Sqlite).insert_run_logs_query(2),
+            "INSERT INTO faucet_serve_run_logs (run_id, seq, ts, level, line, attrs) VALUES \
+             (?,?,?,?,?,?),(?,?,?,?,?,?) ON CONFLICT (run_id, seq) DO NOTHING"
+        );
+        const { assert!(crate::serve::history::sql::RUN_LOG_INSERT_ROWS * 6 < 32_766) };
+    }
+
+    /// The periodic deletes as they were written with `IN` / `NOT IN`.
+    const OLD_PURGES: [(&str, &str); 7] = [
+        (
+            "prune_instance_caps",
+            "DELETE FROM faucet_serve_instance_caps WHERE instance_id NOT IN \
+             (SELECT instance_id FROM faucet_serve_instances)",
+        ),
+        (
+            "purge_orphan_shards",
+            "DELETE FROM faucet_serve_shards WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)",
+        ),
+        (
+            "purge_audit_tenants",
+            "DELETE FROM faucet_serve_audit_tenants WHERE id NOT IN (SELECT id FROM faucet_serve_audit)",
+        ),
+        (
+            "purge_orphan_budgets",
+            "DELETE FROM faucet_serve_run_budgets WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)",
+        ),
+        (
+            "run_secrets_purge",
+            "DELETE FROM faucet_serve_run_secrets WHERE run_id IN \
+             (SELECT run_id FROM faucet_serve_runs WHERE status IN ('completed','failed','cancelled')) \
+             OR (stored_at < ? AND run_id NOT IN (SELECT run_id FROM faucet_serve_runs))",
+        ),
+        (
+            "purge_orphan_tenant_runs",
+            "DELETE FROM faucet_tenant_runs WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)",
+        ),
+        (
+            "purge_orphan_run_labels",
+            "DELETE FROM faucet_serve_run_labels WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)",
+        ),
+    ];
+
+    /// Every rewritten delete removes exactly the rows its `NOT IN` form
+    /// removed, a row with a NULL key included (it stays).
+    #[tokio::test]
+    async fn the_exists_deletes_remove_what_the_not_in_deletes_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = backend(&url_in(dir.path()), "a", Duration::from_secs(30)).await;
+        seed_run(&h, "live").await;
+        seed_run(&h, "done").await;
+        let mut done = h.get("done").await.unwrap().unwrap();
+        done.status = RunStatus::Completed;
+        done.finished_at = Some(chrono::Utc::now());
+        h.upsert(&done).await.unwrap();
+        let seed = [
+            "INSERT INTO faucet_serve_instances (instance_id, started_at, last_heartbeat) VALUES ('i1','t','t')",
+            "INSERT INTO faucet_serve_instance_caps (instance_id, state_format) VALUES ('i1','1'),('gone','1'),(NULL,'1')",
+            "INSERT INTO faucet_serve_shards (run_id, shard_id, descriptor, status, attempt) VALUES \
+             ('live','0','{}','pending','0'),('gone','0','{}','pending','0'),('done','1','{}','pending','0')",
+            "INSERT INTO faucet_serve_audit (id, ts, principal, role, action, result) VALUES ('a1','t','p','admin','x','ok')",
+            "INSERT INTO faucet_serve_audit_tenants (id, tenant) VALUES ('a1','t1'),('a-gone','t1'),(NULL,'t1')",
+            "INSERT INTO faucet_serve_run_budgets (run_id, records, bytes, last_records, last_bytes, updated_at) VALUES \
+             ('live',0,0,0,0,'t'),('gone',0,0,0,0,'t'),(NULL,0,0,0,0,'t')",
+            "INSERT INTO faucet_serve_run_secrets (run_id, stored_at, sealed) VALUES \
+             ('live','2020','s'),('done','2999','s'),('old-gone','2020','s'),('new-gone','2999','s'),(NULL,'2020','s')",
+            "INSERT INTO faucet_tenant_runs (run_id, tenant) VALUES ('live','t1'),('gone','t1'),(NULL,'t1')",
+            "INSERT INTO faucet_serve_run_labels (run_id, key, value) VALUES ('live','k','v'),('gone','k','v'),('done','k','v')",
+        ];
+        for stmt in seed {
+            sqlx::query(stmt)
+                .execute(&h.pool)
+                .await
+                .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+        }
+        let new_of = |name: &str| -> String {
+            let s = &h.stmts;
+            match name {
+                "prune_instance_caps" => &s.prune_instance_caps,
+                "purge_orphan_shards" => &s.purge_orphan_shards,
+                "purge_audit_tenants" => &s.purge_audit_tenants,
+                "purge_orphan_budgets" => &s.purge_orphan_budgets,
+                "run_secrets_purge" => &s.run_secrets_purge,
+                "purge_orphan_tenant_runs" => &s.purge_orphan_tenant_runs,
+                _ => &s.purge_orphan_run_labels,
+            }
+            .clone()
+        };
+        for (name, old) in OLD_PURGES {
+            let table = old.split_whitespace().nth(2).unwrap();
+            let mut left = Vec::new();
+            for stmt in [old.to_string(), new_of(name)] {
+                assert!(
+                    !stmt.contains(" IN (SELECT") || stmt == old,
+                    "{name}: {stmt}"
+                );
+                let mut tx = h.pool.begin().await.unwrap();
+                let mut q = sqlx::query(&stmt);
+                if stmt.contains('?') {
+                    q = q.bind("2500");
+                }
+                let deleted = q.execute(&mut *tx).await.unwrap().rows_affected();
+                let rows: Vec<sqlx::sqlite::SqliteRow> =
+                    sqlx::query(&format!("SELECT * FROM {table} ORDER BY 1, 2"))
+                        .fetch_all(&mut *tx)
+                        .await
+                        .unwrap();
+                let keys: Vec<Option<String>> = rows
+                    .iter()
+                    .map(|r| sqlx::Row::try_get::<Option<String>, _>(r, 0).unwrap())
+                    .collect();
+                tx.rollback().await.unwrap();
+                left.push((deleted, keys));
+            }
+            assert_eq!(left[0], left[1], "{name}");
+            assert!(left[0].0 >= 1, "{name}: the seed has an orphan to delete");
+        }
+    }
+
+    /// One statement answers what the per-run and per-shard checks answer.
+    #[tokio::test]
+    async fn the_batched_lost_lease_check_agrees_with_the_single_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = url_in(dir.path());
+        let a = backend(&url, "a", Duration::from_secs(30)).await;
+        let b = backend(&url, "b", Duration::from_secs(30)).await;
+        for id in ["mine", "theirs", "finished", "sharded"] {
+            seed_run(&a, id).await;
+        }
+        let own = |h: &SqliteHistory,
+                   id: &'static str,
+                   status: &'static str,
+                   owner: Option<&'static str>| {
+            let pool = h.pool.clone();
+            async move {
+                sqlx::query("UPDATE faucet_serve_runs SET status = ?, owner = ? WHERE run_id = ?")
+                    .bind(status)
+                    .bind(owner)
+                    .bind(id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        };
+        own(&a, "mine", "running", Some("a")).await;
+        own(&a, "theirs", "running", Some("b")).await;
+        own(&a, "finished", "completed", Some("b")).await;
+        own(&a, "sharded", "pending", None).await;
+        a.insert_shards("sharded", &[shard("0", 1), shard("1", 1), shard("2", 1)])
+            .await
+            .unwrap();
+        for (shard_id, status, owner) in [
+            ("0", "running", "a"),
+            ("1", "running", "b"),
+            ("2", "completed", "b"),
+        ] {
+            sqlx::query(
+                "UPDATE faucet_serve_shards SET status = ?, owner = ? WHERE run_id = 'sharded' AND shard_id = ?",
+            )
+            .bind(status)
+            .bind(owner)
+            .bind(shard_id)
+            .execute(&a.pool)
+            .await
+            .unwrap();
+        }
+        let keys: Vec<String> = [
+            "mine",
+            "theirs",
+            "finished",
+            "sharded",
+            "missing",
+            "sharded::0",
+            "sharded::1",
+            "sharded::2",
+            "sharded::9",
+            "missing::0",
+        ]
+        .map(String::from)
+        .to_vec();
+        for h in [&a, &b] {
+            let mut expected = Vec::new();
+            for key in &keys {
+                let lost = match key.split_once("::") {
+                    Some((run, shard)) => h.shard_lease_lost(run, shard).await.unwrap(),
+                    None => h.lease_lost(key).await.unwrap(),
+                };
+                if lost {
+                    expected.push(key.clone());
+                }
+            }
+            let mut batched = h.leases_lost(&keys).await.unwrap();
+            batched.sort();
+            expected.sort();
+            assert_eq!(batched, expected, "instance {}", h.instance_id);
+            assert!(!expected.is_empty());
+        }
+        assert!(a.leases_lost(&[]).await.unwrap().is_empty());
+        let only_shards = a.leases_lost(&["sharded::1".to_string()]).await.unwrap();
+        assert_eq!(only_shards, vec!["sharded::1".to_string()]);
+        let many: Vec<String> = (0..950)
+            .map(|i| format!("r{i}"))
+            .chain(["theirs".to_string()])
+            .collect();
+        assert_eq!(
+            a.leases_lost(&many).await.unwrap(),
+            vec!["theirs".to_string()]
+        );
+    }
+
+    #[test]
+    fn lease_bounds_follow_the_lease_ttl() {
+        use crate::serve::history::sql::{
+            lease_call_bound, pool_acquire_timeout, session_keepalive_sql,
+        };
+        let s = Duration::from_secs;
+        assert_eq!(lease_call_bound(s(30)), s(20));
+        assert_eq!(lease_call_bound(s(90)), s(60));
+        assert_eq!(lease_call_bound(Duration::ZERO), s(1));
+        assert_eq!(pool_acquire_timeout(s(30)), s(5));
+        assert_eq!(pool_acquire_timeout(s(6)), s(2));
+        assert_eq!(pool_acquire_timeout(s(600)), s(30));
+        assert!(pool_acquire_timeout(s(30)) * 3 < lease_call_bound(s(30)));
+        assert_eq!(
+            session_keepalive_sql(s(30)),
+            "SET tcp_keepalives_idle = 10; SET tcp_keepalives_interval = 5; SET tcp_keepalives_count = 3"
+        );
+        assert!(session_keepalive_sql(Duration::ZERO).contains("tcp_keepalives_idle = 1;"));
+    }
+
     #[tokio::test]
     async fn run_secrets_are_kept_apart_and_purged_once_terminal() {
         let dir = tempfile::tempdir().unwrap();

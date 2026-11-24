@@ -798,3 +798,303 @@ async fn postgres_db_clock_fenced_start_and_atomic_split() {
         Some(2)
     );
 }
+
+fn unique(prefix: &str) -> String {
+    format!("{prefix}-{}", Utc::now().timestamp_nanos_opt().unwrap_or(0))
+}
+
+/// Issue #1100 C4: the lease statements run in a transaction with its own
+/// statement timeout, the lost-lease check is one statement, and a renewal
+/// blocked behind another session's row lock fails instead of waiting.
+#[tokio::test]
+async fn postgres_lease_statements_are_bounded_and_batched() {
+    let Some((_pg, url)) = postgres().await else {
+        return;
+    };
+    let ttl = Duration::from_millis(1500);
+    let (a_id, b_id) = (unique("lease-a"), unique("lease-b"));
+    let a = PostgresHistory::connect(&url, Duration::from_secs(3600), ttl, a_id.clone())
+        .await
+        .expect("connect a");
+    let b = PostgresHistory::connect(&url, Duration::from_secs(3600), ttl, b_id)
+        .await
+        .expect("connect b");
+    let (mine, other) = (unique("run-mine"), unique("run-other"));
+    a.upsert(&rec(&mine, RunStatus::Running)).await.unwrap();
+    a.upsert(&rec(&other, RunStatus::Running)).await.unwrap();
+
+    assert_eq!(a.renew_leases().await.unwrap(), 2);
+    assert_eq!(
+        a.renew_leases_except(std::slice::from_ref(&other))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(a.renew_shard_leases().await.unwrap(), 0);
+
+    let keys = vec![
+        mine.clone(),
+        other.clone(),
+        unique("run-missing"),
+        format!("{mine}::0"),
+    ];
+    assert!(a.leases_lost(&keys).await.unwrap().is_empty());
+    let mut lost = b.leases_lost(&keys).await.unwrap();
+    lost.sort();
+    let mut expected = vec![mine.clone(), other.clone()];
+    expected.sort();
+    assert_eq!(lost, expected);
+    for key in [&mine, &other] {
+        assert!(b.lease_lost(key).await.unwrap());
+        assert!(!a.lease_lost(key).await.unwrap());
+    }
+
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("UPDATE faucet_serve_runs SET name = name WHERE run_id = $1")
+        .bind(&mine)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let blocked = a.renew_leases().await;
+    let waited = started.elapsed();
+    assert!(blocked.is_err(), "a renewal behind a row lock is cut off");
+    assert!(
+        waited >= Duration::from_millis(900) && waited < Duration::from_secs(10),
+        "cut at the statement timeout (1s for a 1.5s lease), waited {waited:?}"
+    );
+    blocker.rollback().await.unwrap();
+    assert_eq!(a.renew_leases().await.unwrap(), 2, "and works again after");
+    let timeout: String = sqlx::query_scalar("SHOW statement_timeout")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(timeout, "0", "no session keeps the lease timeout");
+}
+
+/// Issue #1100 C3: a batch of log lines stores what line-by-line inserts
+/// store, on Postgres too, including when keys are already taken.
+#[tokio::test]
+async fn postgres_run_log_batches_match_line_by_line_inserts() {
+    use faucet_cli::serve::history::{RUN_LOG_TRUNCATED_SEQ, RunLogLine};
+    let Some((_pg, url)) = postgres().await else {
+        return;
+    };
+    let h = PostgresHistory::connect(
+        &url,
+        Duration::from_secs(3600),
+        Duration::from_secs(30),
+        unique("logs"),
+    )
+    .await
+    .expect("connect");
+    let line = |seq: u64, text: &str| RunLogLine {
+        seq,
+        ts: "2026-01-01T00:00:00.000Z".into(),
+        level: "INFO".into(),
+        line: text.into(),
+        attrs: if seq.is_multiple_of(5) {
+            [("row".to_string(), format!("r{seq}"))].into()
+        } else {
+            Default::default()
+        },
+    };
+    let mut many: Vec<RunLogLine> = (1..=1203u64).map(|i| line(i, &format!("l{i}"))).collect();
+    many.push(line(RUN_LOG_TRUNCATED_SEQ, "truncated"));
+    let clash = vec![
+        line(10, "mine 10"),
+        line(12, "mine 12"),
+        line(12, "mine 12 again"),
+        line(40, "mine 40"),
+    ];
+    for (name, before, lines) in [
+        ("plain", Vec::new(), many),
+        (
+            "clash",
+            vec![line(10, "theirs 10"), line(11, "theirs 11")],
+            clash,
+        ),
+    ] {
+        let (batched, single) = (unique(&format!("{name}-b")), unique(&format!("{name}-s")));
+        for run in [&batched, &single] {
+            for l in &before {
+                h.record_run_logs(run, std::slice::from_ref(l))
+                    .await
+                    .unwrap();
+            }
+        }
+        h.record_run_logs(&batched, &lines).await.unwrap();
+        for l in &lines {
+            h.record_run_logs(&single, std::slice::from_ref(l))
+                .await
+                .unwrap();
+        }
+        let stored = |run: String| {
+            let h = &h;
+            async move {
+                let page = h.list_run_logs(&run, None, 5000).await.unwrap();
+                let rows: Vec<(u64, String, std::collections::BTreeMap<String, String>)> = page
+                    .lines
+                    .iter()
+                    .map(|l| (l.seq, l.line.clone(), l.attrs.clone()))
+                    .collect();
+                (rows, page.truncated)
+            }
+        };
+        let (b_rows, b_trunc) = stored(batched).await;
+        let (s_rows, s_trunc) = stored(single).await;
+        assert_eq!(b_rows, s_rows, "{name}");
+        assert_eq!(b_trunc, s_trunc, "{name}");
+        if name == "clash" {
+            let texts: Vec<&str> = b_rows.iter().map(|r| r.1.as_str()).collect();
+            assert_eq!(
+                texts,
+                vec![
+                    "theirs 10",
+                    "theirs 11",
+                    "mine 10",
+                    "mine 12",
+                    "mine 12 again",
+                    "mine 40"
+                ]
+            );
+        } else {
+            assert_eq!(b_rows.len(), 1203);
+            assert!(b_trunc);
+        }
+    }
+}
+
+/// Issue #1100 C5: each rewritten delete parses on Postgres and removes
+/// exactly the rows its `NOT IN` form removed.
+#[tokio::test]
+async fn postgres_exists_deletes_match_the_not_in_deletes() {
+    use faucet_cli::serve::history::sql::{Dialect, Stmts};
+    let Some((_pg, url)) = postgres().await else {
+        return;
+    };
+    let h = PostgresHistory::connect(
+        &url,
+        Duration::from_secs(3600),
+        Duration::from_secs(30),
+        unique("purge"),
+    )
+    .await
+    .expect("connect");
+    let tag = unique("c5");
+    let (live, done, gone) = (
+        format!("{tag}-live"),
+        format!("{tag}-done"),
+        format!("{tag}-gone"),
+    );
+    h.upsert(&rec(&live, RunStatus::Running)).await.unwrap();
+    h.upsert(&rec(&done, RunStatus::Completed)).await.unwrap();
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let s = Stmts::new(Dialect::Postgres);
+    let cases: [(&str, &str, &String); 7] = [
+        (
+            "faucet_serve_instance_caps",
+            "DELETE FROM faucet_serve_instance_caps WHERE instance_id NOT IN \
+             (SELECT instance_id FROM faucet_serve_instances)",
+            &s.prune_instance_caps,
+        ),
+        (
+            "faucet_serve_shards",
+            "DELETE FROM faucet_serve_shards WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)",
+            &s.purge_orphan_shards,
+        ),
+        (
+            "faucet_serve_audit_tenants",
+            "DELETE FROM faucet_serve_audit_tenants WHERE id NOT IN (SELECT id FROM faucet_serve_audit)",
+            &s.purge_audit_tenants,
+        ),
+        (
+            "faucet_serve_run_budgets",
+            "DELETE FROM faucet_serve_run_budgets WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)",
+            &s.purge_orphan_budgets,
+        ),
+        (
+            "faucet_serve_run_secrets",
+            "DELETE FROM faucet_serve_run_secrets WHERE run_id IN \
+             (SELECT run_id FROM faucet_serve_runs WHERE status IN ('completed','failed','cancelled')) \
+             OR (stored_at < $1 AND run_id NOT IN (SELECT run_id FROM faucet_serve_runs))",
+            &s.run_secrets_purge,
+        ),
+        (
+            "faucet_tenant_runs",
+            "DELETE FROM faucet_tenant_runs WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)",
+            &s.purge_orphan_tenant_runs,
+        ),
+        (
+            "faucet_serve_run_labels",
+            "DELETE FROM faucet_serve_run_labels WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)",
+            &s.purge_orphan_run_labels,
+        ),
+    ];
+    let seed = [
+        format!(
+            "INSERT INTO faucet_serve_instance_caps (instance_id, state_format) VALUES ('{gone}','1')"
+        ),
+        format!(
+            "INSERT INTO faucet_serve_shards (run_id, shard_id, descriptor, status, attempt) VALUES \
+             ('{live}','0','{{}}','pending','0'),('{gone}','0','{{}}','pending','0')"
+        ),
+        format!("INSERT INTO faucet_serve_audit_tenants (id, tenant) VALUES ('{gone}','t1')"),
+        format!(
+            "INSERT INTO faucet_serve_run_budgets (run_id, records, bytes, last_records, last_bytes, updated_at) \
+             VALUES ('{live}',0,0,0,0,'t'),('{gone}',0,0,0,0,'t')"
+        ),
+        format!(
+            "INSERT INTO faucet_serve_run_secrets (run_id, stored_at, sealed) VALUES \
+             ('{live}','2020','s'),('{done}','2999','s'),('{gone}','2020','s'),('{gone}-new','2999','s')"
+        ),
+        format!(
+            "INSERT INTO faucet_tenant_runs (run_id, tenant) VALUES ('{live}','t1'),('{gone}','t1')"
+        ),
+        format!(
+            "INSERT INTO faucet_serve_run_labels (run_id, key, value) VALUES ('{live}','k','v'),('{gone}','k','v')"
+        ),
+    ];
+    for (table, old, new) in cases {
+        let mut left = Vec::new();
+        for stmt in [old, new.as_str()] {
+            let mut tx = pool.begin().await.unwrap();
+            for insert in &seed {
+                if insert.contains(&format!("INTO {table} ")) {
+                    sqlx::query(insert).execute(&mut *tx).await.unwrap();
+                }
+            }
+            let mut q = sqlx::query(stmt);
+            if stmt.contains("$1") {
+                q = q.bind("2500");
+            }
+            let deleted = q
+                .execute(&mut *tx)
+                .await
+                .unwrap_or_else(|e| panic!("{stmt}: {e}"))
+                .rows_affected();
+            let key = match table {
+                "faucet_serve_instance_caps" => "instance_id",
+                "faucet_serve_audit_tenants" => "id",
+                _ => "run_id",
+            };
+            let survivors: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT {key} FROM {table} WHERE {key} LIKE $1 ORDER BY 1"
+            ))
+            .bind(format!("{tag}%"))
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+            tx.rollback().await.unwrap();
+            left.push((deleted >= 1, survivors));
+        }
+        assert_eq!(left[0], left[1], "{table}");
+        assert!(left[0].0, "{table}: the seed has an orphan to delete");
+        assert!(
+            !left[0].1.iter().any(|k| k.starts_with(&gone)) || table == "faucet_serve_run_secrets",
+            "{table}: {:?}",
+            left[0].1
+        );
+    }
+}

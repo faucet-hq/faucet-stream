@@ -811,6 +811,10 @@ pub fn usage_limit(filter: &crate::usage::UsageFilter) -> usize {
 /// How many successive keys a run-log line probes before it is dropped.
 pub const SEQ_PROBES: u64 = 16;
 
+/// Lines per multi-row run-log insert (6 binds each, under every engine's
+/// bind limit).
+pub const RUN_LOG_INSERT_ROWS: usize = 500;
+
 /// A `LIMIT` both dialects accept: a 64-bit signed integer (a caller's
 /// `usize::MAX` "no cap" would overflow it).
 pub fn sql_limit(limit: usize) -> i64 {
@@ -1608,6 +1612,71 @@ impl Stmts {
         (format!("{head} GROUP BY status"), binds)
     }
 
+    /// Sets the statement timeout (bind: milliseconds, as text) for the
+    /// transaction a lease statement runs in. `None` where the engine has no
+    /// such setting (SQLite waits on its busy timeout).
+    pub fn lease_statement_timeout(&self) -> Option<&'static str> {
+        match self.dialect {
+            Dialect::Postgres => Some("SELECT set_config('statement_timeout', $1, true)"),
+            Dialect::Sqlite => None,
+        }
+    }
+
+    /// Owner and status of `runs` runs and `shards` shards in one statement
+    /// (binds: run ids…, then a run id and shard id per shard). A run row
+    /// has an empty `shard_id`.
+    pub fn leases_lost_query(&self, runs: usize, shards: usize) -> String {
+        let mut n = 0usize;
+        let mut next = || {
+            n += 1;
+            self.placeholder(n)
+        };
+        let mut parts = Vec::with_capacity(2);
+        if runs > 0 {
+            let ids: Vec<String> = (0..runs).map(|_| next()).collect();
+            parts.push(format!(
+                "SELECT run_id, '' AS shard_id, owner, status FROM faucet_serve_runs \
+                 WHERE run_id IN ({})",
+                ids.join(",")
+            ));
+        }
+        if shards > 0 {
+            let pairs: Vec<String> = (0..shards)
+                .map(|_| {
+                    let run = next();
+                    format!("(run_id={run} AND shard_id={})", next())
+                })
+                .collect();
+            parts.push(format!(
+                "SELECT run_id, shard_id, owner, status FROM faucet_serve_shards WHERE {}",
+                pairs.join(" OR ")
+            ));
+        }
+        parts.join(" UNION ALL ")
+    }
+
+    /// [`insert_run_log`](Self::insert_run_log) for `rows` lines in one
+    /// statement (binds per row: run_id, seq, ts, level, line, attrs).
+    pub fn insert_run_logs_query(&self, rows: usize) -> String {
+        let mut n = 0usize;
+        let tuples: Vec<String> = (0..rows)
+            .map(|_| {
+                let marks: Vec<String> = (0..6)
+                    .map(|_| {
+                        n += 1;
+                        self.placeholder(n)
+                    })
+                    .collect();
+                format!("({})", marks.join(","))
+            })
+            .collect();
+        format!(
+            "INSERT INTO faucet_serve_run_logs (run_id, seq, ts, level, line, attrs) VALUES {} \
+             ON CONFLICT (run_id, seq) DO NOTHING",
+            tuples.join(",")
+        )
+    }
+
     /// `renew_leases` leaving out `skip` ids (binds: lease, owner, ids…).
     pub fn renew_leases_except_query(&self, skip: usize) -> String {
         if skip == 0 {
@@ -1849,7 +1918,10 @@ impl Stmts {
                 WHERE i.last_heartbeat >= $1"
                 .into(),
             prune_instances: "DELETE FROM faucet_serve_instances WHERE last_heartbeat < $1".into(),
-            prune_instance_caps: "DELETE FROM faucet_serve_instance_caps WHERE instance_id NOT IN (SELECT instance_id FROM faucet_serve_instances)".into(),
+            prune_instance_caps: "DELETE FROM faucet_serve_instance_caps \
+                WHERE instance_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM faucet_serve_instances i \
+                    WHERE i.instance_id = faucet_serve_instance_caps.instance_id)"
+                .into(),
             insert_shard: "INSERT INTO faucet_serve_shards \
                 (run_id, shard_id, descriptor, size_estimate, status, attempt) \
                 VALUES ($1,$2,$3,$4,'pending','0') \
@@ -1910,7 +1982,8 @@ impl Stmts {
                 .into(),
             delete_shards_by_run: "DELETE FROM faucet_serve_shards WHERE run_id = $1".into(),
             purge_orphan_shards: "DELETE FROM faucet_serve_shards \
-                WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
+                WHERE run_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM faucet_serve_runs r \
+                    WHERE r.run_id = faucet_serve_shards.run_id)"
                 .into(),
             insert_audit: "INSERT INTO faucet_serve_audit \
                 (id, ts, principal, role, action, run_id, config_fingerprint, source_ip, result, \
@@ -1941,7 +2014,8 @@ impl Stmts {
                 VALUES ($1,$2) ON CONFLICT (id) DO NOTHING"
                 .into(),
             purge_audit_tenants: "DELETE FROM faucet_serve_audit_tenants \
-                WHERE id NOT IN (SELECT id FROM faucet_serve_audit)"
+                WHERE id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM faucet_serve_audit a \
+                    WHERE a.id = faucet_serve_audit_tenants.id)"
                 .into(),
             insert_run_log: "INSERT INTO faucet_serve_run_logs \
                 (run_id, seq, ts, level, line, attrs) VALUES ($1,$2,$3,$4,$5,$6) \
@@ -2167,8 +2241,9 @@ impl Stmts {
             budget_spent: "SELECT records, bytes FROM faucet_serve_run_budgets WHERE run_id=$1"
                 .into(),
             budget_delete: "DELETE FROM faucet_serve_run_budgets WHERE run_id=$1".into(),
-            purge_orphan_budgets: "DELETE FROM faucet_serve_run_budgets WHERE run_id NOT IN \
-                (SELECT run_id FROM faucet_serve_runs)"
+            purge_orphan_budgets: "DELETE FROM faucet_serve_run_budgets \
+                WHERE run_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM faucet_serve_runs r \
+                    WHERE r.run_id = faucet_serve_run_budgets.run_id)"
                 .into(),
             policy_version_insert: "INSERT INTO faucet_policy_versions \
                 (scope, version, created_at, body) VALUES ($1,$2,$3,$4) \
@@ -2181,14 +2256,18 @@ impl Stmts {
                 WHERE scope=$1 AND version=$2"
                 .into(),
             policy_versions_delete: "DELETE FROM faucet_policy_versions WHERE scope=$1".into(),
-            run_secrets_purge: "DELETE FROM faucet_serve_run_secrets WHERE run_id IN \
-                (SELECT run_id FROM faucet_serve_runs \
-                    WHERE status IN ('completed','failed','cancelled')) \
-                OR (stored_at < $1 AND run_id NOT IN (SELECT run_id FROM faucet_serve_runs))"
+            run_secrets_purge: "DELETE FROM faucet_serve_run_secrets WHERE EXISTS \
+                (SELECT 1 FROM faucet_serve_runs r \
+                    WHERE r.run_id = faucet_serve_run_secrets.run_id \
+                    AND r.status IN ('completed','failed','cancelled')) \
+                OR (stored_at < $1 AND run_id IS NOT NULL AND NOT EXISTS \
+                    (SELECT 1 FROM faucet_serve_runs r \
+                        WHERE r.run_id = faucet_serve_run_secrets.run_id))"
                 .into(),
             tenant_run_delete: "DELETE FROM faucet_tenant_runs WHERE run_id=$1".into(),
             purge_orphan_tenant_runs: "DELETE FROM faucet_tenant_runs \
-                WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
+                WHERE run_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM faucet_serve_runs r \
+                    WHERE r.run_id = faucet_tenant_runs.run_id)"
                 .into(),
             run_label_insert: "INSERT INTO faucet_serve_run_labels (run_id, key, value) \
                 VALUES ($1,$2,$3) \
@@ -2201,7 +2280,8 @@ impl Stmts {
                 .into(),
             run_labels_delete: "DELETE FROM faucet_serve_run_labels WHERE run_id=$1".into(),
             purge_orphan_run_labels: "DELETE FROM faucet_serve_run_labels \
-                WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
+                WHERE run_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM faucet_serve_runs r \
+                    WHERE r.run_id = faucet_serve_run_labels.run_id)"
                 .into(),
             state_ref_insert: "INSERT INTO faucet_tenant_state_refs (tenant, state_key, body) \
                 VALUES ($1,$2,$3) ON CONFLICT (tenant, state_key) DO NOTHING"
@@ -2575,7 +2655,10 @@ impl Stmts {
                 WHERE i.last_heartbeat >= ?"
                 .into(),
             prune_instances: "DELETE FROM faucet_serve_instances WHERE last_heartbeat < ?".into(),
-            prune_instance_caps: "DELETE FROM faucet_serve_instance_caps WHERE instance_id NOT IN (SELECT instance_id FROM faucet_serve_instances)".into(),
+            prune_instance_caps: "DELETE FROM faucet_serve_instance_caps \
+                WHERE instance_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM faucet_serve_instances i \
+                    WHERE i.instance_id = faucet_serve_instance_caps.instance_id)"
+                .into(),
             insert_shard: "INSERT INTO faucet_serve_shards \
                 (run_id, shard_id, descriptor, size_estimate, status, attempt) \
                 VALUES (?,?,?,?,'pending','0') \
@@ -2636,7 +2719,8 @@ impl Stmts {
                 .into(),
             delete_shards_by_run: "DELETE FROM faucet_serve_shards WHERE run_id = ?".into(),
             purge_orphan_shards: "DELETE FROM faucet_serve_shards \
-                WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
+                WHERE run_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM faucet_serve_runs r \
+                    WHERE r.run_id = faucet_serve_shards.run_id)"
                 .into(),
             insert_audit: "INSERT INTO faucet_serve_audit \
                 (id, ts, principal, role, action, run_id, config_fingerprint, source_ip, result, \
@@ -2667,7 +2751,8 @@ impl Stmts {
                 VALUES (?,?) ON CONFLICT (id) DO NOTHING"
                 .into(),
             purge_audit_tenants: "DELETE FROM faucet_serve_audit_tenants \
-                WHERE id NOT IN (SELECT id FROM faucet_serve_audit)"
+                WHERE id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM faucet_serve_audit a \
+                    WHERE a.id = faucet_serve_audit_tenants.id)"
                 .into(),
             insert_run_log: "INSERT INTO faucet_serve_run_logs \
                 (run_id, seq, ts, level, line, attrs) VALUES (?,?,?,?,?,?) \
@@ -2891,8 +2976,9 @@ impl Stmts {
             budget_spent: "SELECT records, bytes FROM faucet_serve_run_budgets WHERE run_id=?"
                 .into(),
             budget_delete: "DELETE FROM faucet_serve_run_budgets WHERE run_id=?".into(),
-            purge_orphan_budgets: "DELETE FROM faucet_serve_run_budgets WHERE run_id NOT IN \
-                (SELECT run_id FROM faucet_serve_runs)"
+            purge_orphan_budgets: "DELETE FROM faucet_serve_run_budgets \
+                WHERE run_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM faucet_serve_runs r \
+                    WHERE r.run_id = faucet_serve_run_budgets.run_id)"
                 .into(),
             policy_version_insert: "INSERT INTO faucet_policy_versions \
                 (scope, version, created_at, body) VALUES (?,?,?,?) \
@@ -2905,14 +2991,18 @@ impl Stmts {
                 WHERE scope=? AND version=?"
                 .into(),
             policy_versions_delete: "DELETE FROM faucet_policy_versions WHERE scope=?".into(),
-            run_secrets_purge: "DELETE FROM faucet_serve_run_secrets WHERE run_id IN \
-                (SELECT run_id FROM faucet_serve_runs \
-                    WHERE status IN ('completed','failed','cancelled')) \
-                OR (stored_at < ? AND run_id NOT IN (SELECT run_id FROM faucet_serve_runs))"
+            run_secrets_purge: "DELETE FROM faucet_serve_run_secrets WHERE EXISTS \
+                (SELECT 1 FROM faucet_serve_runs r \
+                    WHERE r.run_id = faucet_serve_run_secrets.run_id \
+                    AND r.status IN ('completed','failed','cancelled')) \
+                OR (stored_at < ? AND run_id IS NOT NULL AND NOT EXISTS \
+                    (SELECT 1 FROM faucet_serve_runs r \
+                        WHERE r.run_id = faucet_serve_run_secrets.run_id))"
                 .into(),
             tenant_run_delete: "DELETE FROM faucet_tenant_runs WHERE run_id=?".into(),
             purge_orphan_tenant_runs: "DELETE FROM faucet_tenant_runs \
-                WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
+                WHERE run_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM faucet_serve_runs r \
+                    WHERE r.run_id = faucet_tenant_runs.run_id)"
                 .into(),
             run_label_insert: "INSERT INTO faucet_serve_run_labels (run_id, key, value) \
                 VALUES (?,?,?) \
@@ -2925,7 +3015,8 @@ impl Stmts {
                 .into(),
             run_labels_delete: "DELETE FROM faucet_serve_run_labels WHERE run_id=?".into(),
             purge_orphan_run_labels: "DELETE FROM faucet_serve_run_labels \
-                WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)"
+                WHERE run_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM faucet_serve_runs r \
+                    WHERE r.run_id = faucet_serve_run_labels.run_id)"
                 .into(),
             state_ref_insert: "INSERT INTO faucet_tenant_state_refs (tenant, state_key, body) \
                 VALUES (?,?,?) ON CONFLICT (tenant, state_key) DO NOTHING"
@@ -3314,6 +3405,47 @@ fn classified(message: String, e: &sqlx::Error) -> HistoryError {
     }
 }
 
+/// The longest one lease statement (a renewal, the lost-lease check) may
+/// take: two thirds of the lease TTL, so a statement that outlives it could
+/// not have kept a lease alive anyway. At least a second.
+pub fn lease_call_bound(lease_ttl: std::time::Duration) -> std::time::Duration {
+    (lease_ttl * 2 / 3).max(std::time::Duration::from_secs(1))
+}
+
+/// How long a call waits for a pooled connection: a sixth of the lease TTL,
+/// so the wrapper's three attempts end inside [`lease_call_bound`]; between
+/// two seconds and the driver's default of 30.
+pub fn pool_acquire_timeout(lease_ttl: std::time::Duration) -> std::time::Duration {
+    (lease_ttl / 6).clamp(
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(30),
+    )
+}
+
+/// Server-side TCP keepalive for one session, sized so the database notices
+/// a vanished server (and frees the row locks its open transaction held)
+/// within about a lease TTL.
+pub fn session_keepalive_sql(lease_ttl: std::time::Duration) -> String {
+    let idle = (lease_ttl.as_secs() / 3).max(1);
+    let interval = (lease_ttl.as_secs() / 6).max(1);
+    format!(
+        "SET tcp_keepalives_idle = {idle}; SET tcp_keepalives_interval = {interval}; \
+         SET tcp_keepalives_count = 3"
+    )
+}
+
+/// Keys per lost-lease statement.
+pub const LEASES_LOST_CHUNK: usize = 400;
+
+/// The database a pool connects to.
+pub trait PoolDb {
+    type Db: sqlx::Database;
+}
+
+impl<DB: sqlx::Database> PoolDb for sqlx::Pool<DB> {
+    type Db = DB;
+}
+
 /// Pure pool-state test behind `RunHistory::pool_saturated`.
 pub fn saturated(size: u32, idle: usize, max: u32) -> bool {
     size >= max && idle == 0
@@ -3666,6 +3798,34 @@ macro_rules! impl_sql_history {
                 Ok(count)
             }
 
+
+            /// A transaction whose statements the engine cuts off after
+            /// [`lease_call_bound`]($crate::serve::history::sql::lease_call_bound);
+            /// `None` where the engine has no statement timeout.
+            async fn lease_tx(
+                &self,
+            ) -> Result<
+                Option<
+                    sqlx::Transaction<
+                        'static,
+                        <$pool as $crate::serve::history::sql::PoolDb>::Db,
+                    >,
+                >,
+                $crate::serve::history::HistoryError,
+            > {
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let Some(set) = self.stmts.lease_statement_timeout() else {
+                    return Ok(None);
+                };
+                let bound = $crate::serve::history::sql::lease_call_bound(self.lease_ttl);
+                let mut tx = self.pool.begin().await.map_err(backend)?;
+                sqlx::query(set)
+                    .bind(bound.as_millis().to_string())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(backend)?;
+                Ok(Some(tx))
+            }
 
             /// Assemble from an already-connected pool (used by `connect`).
             pub fn from_parts(
@@ -4348,7 +4508,71 @@ macro_rules! impl_sql_history {
                 for id in skip {
                     q = q.bind(id);
                 }
-                Ok(q.execute(&self.pool).await.map_err(backend)?.rows_affected() as usize)
+                let mut tx = self.lease_tx().await?;
+                let done = match tx.as_mut() {
+                    Some(tx) => q.execute(&mut **tx).await,
+                    None => q.execute(&self.pool).await,
+                }
+                .map_err(backend)?;
+                if let Some(tx) = tx {
+                    tx.commit().await.map_err(backend)?;
+                }
+                Ok(done.rows_affected() as usize)
+            }
+
+            async fn leases_lost(
+                &self,
+                keys: &[String],
+            ) -> Result<Vec<String>, $crate::serve::history::HistoryError> {
+                use sqlx::Row as _;
+                let backend = $crate::serve::history::sql::classify_backend_error;
+                let mut lost = Vec::new();
+                for chunk in keys.chunks($crate::serve::history::sql::LEASES_LOST_CHUNK) {
+                    let (shards, runs): (Vec<&String>, Vec<&String>) =
+                        chunk.iter().partition(|k| k.contains("::"));
+                    let stmt = self.stmts.leases_lost_query(runs.len(), shards.len());
+                    let mut q = sqlx::query(&stmt);
+                    for id in &runs {
+                        q = q.bind(id.as_str());
+                    }
+                    for key in &shards {
+                        let (run_id, shard_id) = key.split_once("::").unwrap_or((key, ""));
+                        q = q.bind(run_id).bind(shard_id);
+                    }
+                    let mut tx = self.lease_tx().await?;
+                    let rows = match tx.as_mut() {
+                        Some(tx) => q.fetch_all(&mut **tx).await,
+                        None => q.fetch_all(&self.pool).await,
+                    }
+                    .map_err(backend)?;
+                    if let Some(tx) = tx {
+                        tx.commit().await.map_err(backend)?;
+                    }
+                    for row in rows {
+                        let run_id: String = row.try_get("run_id").map_err(backend)?;
+                        let shard_id: String = row.try_get("shard_id").map_err(backend)?;
+                        let owner: Option<String> = row.try_get("owner").map_err(backend)?;
+                        let status: String = row.try_get("status").map_err(backend)?;
+                        let live: &[&str] = if shard_id.is_empty() {
+                            &["pending", "queued", "running"]
+                        } else {
+                            &["pending", "running"]
+                        };
+                        if $crate::serve::history::sql::held_by_peer(
+                            owner.as_deref(),
+                            &status,
+                            &self.instance_id,
+                            live,
+                        ) {
+                            lost.push(if shard_id.is_empty() {
+                                run_id
+                            } else {
+                                format!("{run_id}::{shard_id}")
+                            });
+                        }
+                    }
+                }
+                Ok(lost)
             }
 
             async fn probe_write(&self) -> Result<(), $crate::serve::history::HistoryError> {
@@ -4413,14 +4637,19 @@ macro_rules! impl_sql_history {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let new_lease = sql::fmt_ts(self.read_db_now().await? + self.lease_ttl);
-                let renewed = sqlx::query(&self.stmts.renew_leases)
+                let q = sqlx::query(&self.stmts.renew_leases)
                     .bind(&new_lease)
-                    .bind(&self.instance_id)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(backend)?
-                    .rows_affected() as usize;
-                Ok(renewed)
+                    .bind(&self.instance_id);
+                let mut tx = self.lease_tx().await?;
+                let done = match tx.as_mut() {
+                    Some(tx) => q.execute(&mut **tx).await,
+                    None => q.execute(&self.pool).await,
+                }
+                .map_err(backend)?;
+                if let Some(tx) = tx {
+                    tx.commit().await.map_err(backend)?;
+                }
+                Ok(done.rows_affected() as usize)
             }
 
             async fn claim_pending(
@@ -5141,14 +5370,19 @@ macro_rules! impl_sql_history {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let lease = sql::fmt_ts(self.read_db_now().await? + self.lease_ttl);
-                let n = sqlx::query(&self.stmts.renew_shard_leases)
+                let q = sqlx::query(&self.stmts.renew_shard_leases)
                     .bind(&lease)
-                    .bind(&self.instance_id)
-                    .execute(&self.pool)
-                    .await
-                    .map_err(backend)?
-                    .rows_affected() as usize;
-                Ok(n)
+                    .bind(&self.instance_id);
+                let mut tx = self.lease_tx().await?;
+                let done = match tx.as_mut() {
+                    Some(tx) => q.execute(&mut **tx).await,
+                    None => q.execute(&self.pool).await,
+                }
+                .map_err(backend)?;
+                if let Some(tx) = tx {
+                    tx.commit().await.map_err(backend)?;
+                }
+                Ok(done.rows_affected() as usize)
             }
 
             async fn reclaim_shards(
@@ -5470,7 +5704,7 @@ macro_rules! impl_sql_history {
             ) -> Result<(), $crate::serve::history::HistoryError> {
                 use $crate::serve::history::sql;
                 let backend = $crate::serve::history::sql::classify_backend_error;
-                sqlx::query(&self.stmts.insert_audit)
+                let insert = sqlx::query(&self.stmts.insert_audit)
                     .bind(&entry.id)
                     .bind(sql::fmt_ts(entry.timestamp))
                     .bind(&entry.principal)
@@ -5481,18 +5715,21 @@ macro_rules! impl_sql_history {
                     .bind(entry.source_ip.as_deref())
                     .bind(&entry.result)
                     .bind(entry.target.as_deref())
-                    .bind(entry.detail.as_deref())
-                    .execute(&self.pool)
+                    .bind(entry.detail.as_deref());
+                let Some(tenant) = &entry.tenant else {
+                    insert.execute(&self.pool).await.map_err(backend)?;
+                    return Ok(());
+                };
+                // The entry and its tenant in one commit.
+                let mut tx = self.pool.begin_with($begin_write).await.map_err(backend)?;
+                insert.execute(&mut *tx).await.map_err(backend)?;
+                sqlx::query(&self.stmts.insert_audit_tenant)
+                    .bind(&entry.id)
+                    .bind(tenant)
+                    .execute(&mut *tx)
                     .await
                     .map_err(backend)?;
-                if let Some(tenant) = &entry.tenant {
-                    sqlx::query(&self.stmts.insert_audit_tenant)
-                        .bind(&entry.id)
-                        .bind(tenant)
-                        .execute(&self.pool)
-                        .await
-                        .map_err(backend)?;
-                }
+                tx.commit().await.map_err(backend)?;
                 Ok(())
             }
 
@@ -5568,7 +5805,58 @@ macro_rules! impl_sql_history {
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let mut tx = self.pool.begin().await.map_err(backend)?;
                 let mut max_seq: Option<u64> = None;
-                for l in lines {
+                // Every line at its own key, a statement per chunk. When any
+                // key is taken (another instance logs this run too) the
+                // attempt is undone and the lines go one by one below, each
+                // moving past taken keys in order.
+                let all_landed = lines.len() > 1 && {
+                    use sqlx::Acquire as _;
+                    let attrs: Vec<Option<String>> = lines
+                        .iter()
+                        .map(|l| {
+                            if l.attrs.is_empty() {
+                                None
+                            } else {
+                                serde_json::to_string(&l.attrs).ok()
+                            }
+                        })
+                        .collect();
+                    let seqs: Vec<String> = lines.iter().map(|l| sql::pad_seq(l.seq)).collect();
+                    let mut attempt = tx.begin().await.map_err(backend)?;
+                    let mut landed = true;
+                    let mut at = 0usize;
+                    for chunk in lines.chunks(sql::RUN_LOG_INSERT_ROWS) {
+                        let stmt = self.stmts.insert_run_logs_query(chunk.len());
+                        let mut q = sqlx::query(&stmt);
+                        for (i, l) in chunk.iter().enumerate() {
+                            q = q
+                                .bind(run_id)
+                                .bind(&seqs[at + i])
+                                .bind(&l.ts)
+                                .bind(&l.level)
+                                .bind(&l.line)
+                                .bind(attrs[at + i].as_deref());
+                        }
+                        at += chunk.len();
+                        let written = q.execute(&mut *attempt).await.map_err(backend)?;
+                        if written.rows_affected() != chunk.len() as u64 {
+                            landed = false;
+                            break;
+                        }
+                    }
+                    if landed {
+                        attempt.commit().await.map_err(backend)?;
+                        max_seq = lines
+                            .iter()
+                            .map(|l| l.seq)
+                            .filter(|seq| *seq != $crate::serve::history::RUN_LOG_TRUNCATED_SEQ)
+                            .max();
+                    } else {
+                        attempt.rollback().await.map_err(backend)?;
+                    }
+                    landed
+                };
+                for l in lines.iter().filter(|_| !all_landed) {
                     // A key another instance already wrote for this run moves
                     // to the next free one instead of dropping the line. The
                     // truncation sentinel is written once, as is.

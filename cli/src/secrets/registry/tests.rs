@@ -426,3 +426,85 @@ async fn an_env_directive_is_the_servers_unless_the_caller_supplied_it() {
     assert!(reg.caller.contains_key("caller-overlay-env-value"));
     assert!(!reg.forms.contains_key("caller-overlay-env-value"));
 }
+
+#[test]
+fn the_matcher_is_kept_until_the_set_of_forms_changes() {
+    let mut r = Registry::default();
+    let compiled = |r: &mut Registry| r.compiled = Some(Arc::new(r.compile()));
+    r.insert(forms_of("first-secret-value"));
+    compiled(&mut r);
+    let generation = r.generation;
+
+    r.insert(forms_of("first-secret-value"));
+    assert!(
+        r.compiled.is_some(),
+        "the same secret again changes nothing"
+    );
+    assert_eq!(r.generation, generation);
+    r.insert_caller(forms_of("first-secret-value"));
+    r.protect(Vec::new());
+    r.pin(Vec::new());
+    assert!(r.compiled.is_some());
+    assert_eq!(r.generation, generation);
+
+    r.insert(forms_of("second-secret-value"));
+    assert!(r.compiled.is_none(), "a new form drops the matcher");
+    assert_eq!(r.generation, generation + 1);
+
+    compiled(&mut r);
+    r.insert_caller(forms_of("caller-secret-value"));
+    assert!(r.compiled.is_none());
+    compiled(&mut r);
+    r.insert_caller(forms_of("caller-secret-value"));
+    assert!(r.compiled.is_some());
+
+    r.protect(forms_of("tenant-secret-value"));
+    assert!(r.compiled.is_none());
+    compiled(&mut r);
+    r.protect(forms_of("tenant-secret-value"));
+    assert!(r.compiled.is_some());
+
+    r.pin(forms_of("pinned-secret-value"));
+    assert!(r.compiled.is_none());
+    compiled(&mut r);
+    r.pin(forms_of("pinned-secret-value"));
+    assert!(r.compiled.is_some());
+    r.pin(forms_of("second-secret-value"));
+    assert!(r.compiled.is_none(), "moving a form between sets drops it");
+
+    let mut small = Registry {
+        max_forms: 1,
+        ..Registry::default()
+    };
+    small.insert(vec!["aaaa-1".into()]);
+    small.compiled = Some(Arc::new(small.compile()));
+    small.insert(vec!["bbbb-2".into()]);
+    assert!(small.compiled.is_none(), "an eviction drops the matcher");
+    assert_eq!(small.compile().patterns, vec!["bbbb-2".to_string()]);
+}
+
+#[test]
+#[serial]
+fn a_secret_is_scrubbed_as_soon_as_it_is_registered_under_churn() {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let churn = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut i = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                register_caller(&format!("churn-c6-{}-value", i % 64));
+                unregister(&format!("churn-c6-{}-value", i % 64));
+                i += 1;
+            }
+        })
+    };
+    for i in 0..300 {
+        let secret = format!("fresh-c6-secret-{i}-zz");
+        register_server(&secret);
+        let line = format!("token={secret} done");
+        assert_eq!(redact(&line), "token=*** done", "round {i}");
+        unregister(&secret);
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    churn.join().unwrap();
+}

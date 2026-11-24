@@ -311,9 +311,53 @@ struct AuthConfigFile {
 #[derive(Debug, Clone)]
 pub struct RbacConfig {
     principals: Vec<PrincipalSpec>,
+    tokens: TokenIndex,
     /// The `approvals:` block (#703); default = admins approve, one each, no
     /// self-approval.
     approvals: crate::serve::changes::ApprovalPolicy,
+}
+
+/// Principals by a keyed digest of their token.
+#[derive(Clone)]
+struct TokenIndex {
+    key: [u8; 32],
+    by_digest: std::collections::HashMap<[u8; 32], usize>,
+}
+
+impl TokenIndex {
+    fn of(principals: &[PrincipalSpec]) -> Self {
+        let mut key = [0u8; 32];
+        key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        let mut index = Self {
+            key,
+            by_digest: std::collections::HashMap::with_capacity(principals.len()),
+        };
+        for (at, p) in principals.iter().enumerate() {
+            index.by_digest.insert(index.digest(&p.token), at);
+        }
+        index
+    }
+
+    fn digest(&self, token: &str) -> [u8; 32] {
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(self.key);
+        hasher.update(token.as_bytes());
+        hasher.finalize().into()
+    }
+
+    fn candidate(&self, token: &str) -> Option<usize> {
+        self.by_digest.get(&self.digest(token)).copied()
+    }
+}
+
+impl std::fmt::Debug for TokenIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenIndex")
+            .field("principals", &self.by_digest.len())
+            .finish()
+    }
 }
 
 /// The resolved identity for one request, carried in the request extensions for
@@ -600,21 +644,23 @@ impl RbacConfig {
             }
         }
         Ok(Self {
+            tokens: TokenIndex::of(&principals),
             principals,
             approvals: crate::serve::changes::ApprovalPolicy::default(),
         })
     }
 
-    /// Resolve a bearer token to its principal in constant time. Every principal
-    /// is compared (no early return) so the match position doesn't leak via
-    /// timing; the matched role/name is returned after the full scan.
+    /// Resolve a bearer token to its principal. The token is looked up by a
+    /// digest keyed with a secret drawn at startup, so the work done depends
+    /// on the token's length alone, never on which principal (if any) it
+    /// matches or how much of a real token it shares; the one candidate is
+    /// then confirmed with a constant-time comparison.
     pub fn authenticate(&self, token: &str) -> Option<AuthContext> {
-        let mut matched: Option<&PrincipalSpec> = None;
-        for p in &self.principals {
-            if crate::serve::auth::constant_time_eq(token.as_bytes(), p.token.as_bytes()) {
-                matched = Some(p);
-            }
-        }
+        let matched = self
+            .tokens
+            .candidate(token)
+            .and_then(|at| self.principals.get(at))
+            .filter(|p| crate::serve::auth::constant_time_eq(token.as_bytes(), p.token.as_bytes()));
         matched.map(|p| AuthContext {
             principal: p.name.clone(),
             role: p.role,
