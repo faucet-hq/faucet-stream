@@ -253,7 +253,14 @@ fn classify_cached(
     names: &mut NameLabels,
 ) -> Vec<ColumnFacts> {
     let mut out: BTreeMap<String, (BTreeSet<String>, &'static str)> = BTreeMap::new();
-    walk(policy, "", record, &BTreeSet::new(), &mut out, names);
+    walk(
+        policy,
+        &mut String::new(),
+        record,
+        &BTreeSet::new(),
+        &mut out,
+        names,
+    );
     out.into_iter()
         .map(|(name, (labels, via))| ColumnFacts {
             masked: maskings
@@ -268,7 +275,99 @@ fn classify_cached(
         .collect()
 }
 
+static NO_LABELS: BTreeSet<String> = BTreeSet::new();
+
+fn labels_by_name<'n>(
+    policy: &CompiledPolicy,
+    names: &'n mut NameLabels,
+    path: &str,
+) -> &'n BTreeSet<String> {
+    if path.is_empty() {
+        return &NO_LABELS;
+    }
+    if !names.contains_key(path) {
+        names.insert(path.to_string(), policy.labels_for_name(path));
+    }
+    names.get(path).unwrap_or(&NO_LABELS)
+}
+
+fn container_labels<'a>(
+    policy: &CompiledPolicy,
+    names: &mut NameLabels,
+    path: &str,
+    inherited: &'a BTreeSet<String>,
+) -> std::borrow::Cow<'a, BTreeSet<String>> {
+    let own = labels_by_name(policy, names, path);
+    if own.is_empty() {
+        std::borrow::Cow::Borrowed(inherited)
+    } else {
+        let mut labels = inherited.clone();
+        labels.extend(own.iter().cloned());
+        std::borrow::Cow::Owned(labels)
+    }
+}
+
+/// `path` is the dot-path of `value`, built in one buffer that is extended
+/// for a child and cut back afterwards.
 fn walk(
+    policy: &CompiledPolicy,
+    path: &mut String,
+    value: &Value,
+    inherited: &BTreeSet<String>,
+    out: &mut BTreeMap<String, (BTreeSet<String>, &'static str)>,
+    names: &mut NameLabels,
+) {
+    use std::fmt::Write as _;
+    match value {
+        Value::Object(map) => {
+            let labels = container_labels(policy, names, path, inherited);
+            let parent = path.len();
+            for (k, v) in map {
+                if parent > 0 {
+                    path.push('.');
+                }
+                path.push_str(k);
+                walk(policy, path, v, &labels, out, names);
+                path.truncate(parent);
+            }
+        }
+        Value::Array(items) => {
+            let labels = container_labels(policy, names, path, inherited);
+            let parent = path.len();
+            for (i, v) in items.iter().enumerate() {
+                let _ = write!(path, ".{i}");
+                walk(policy, path, v, &labels, out, names);
+                path.truncate(parent);
+            }
+        }
+        Value::Null => {}
+        scalar => {
+            if path.is_empty() {
+                return;
+            }
+            let by_name = labels_by_name(policy, names, path);
+            let by_value = policy.labels_for_scalar(scalar);
+            let named = !by_name.is_empty() || !inherited.is_empty();
+            if !named && by_value.is_empty() {
+                return;
+            }
+            let via = match (named, by_value.is_empty()) {
+                (_, true) => "name",
+                (false, false) => "value",
+                (true, false) => "name+value",
+            };
+            let entry = out
+                .entry(path.clone())
+                .or_insert_with(|| (BTreeSet::new(), via));
+            entry.0.extend(by_name.iter().cloned());
+            entry.0.extend(inherited.iter().cloned());
+            entry.0.extend(by_value);
+        }
+    }
+}
+
+#[cfg(test)]
+fn walk_reference(
     policy: &CompiledPolicy,
     path: &str,
     value: &Value,
@@ -295,14 +394,14 @@ fn walk(
                 } else {
                     format!("{path}.{k}")
                 };
-                walk(policy, &child, v, &labels, out, names);
+                walk_reference(policy, &child, v, &labels, out, names);
             }
         }
         Value::Array(items) => {
             let mut labels = inherited.clone();
             labels.extend(by_name(path));
             for (i, v) in items.iter().enumerate() {
-                walk(policy, &format!("{path}.{i}"), v, &labels, out, names);
+                walk_reference(policy, &format!("{path}.{i}"), v, &labels, out, names);
             }
         }
         Value::Null => {}
@@ -593,6 +692,59 @@ mod tests {
             ]
         );
         assert!(classify_record(&p, &json!("scalar")).is_empty());
+    }
+
+    #[test]
+    fn classification_matches_the_path_per_field_implementation() {
+        let spec: PolicySpec = serde_json::from_value(json!({
+            "classifications": [
+                {"label": "pii", "value_detector": "email"},
+                {"label": "pii", "fields": ["ssn", "user", "0"]},
+                {"label": "geo", "field_pattern": "(?i)address"},
+                {"label": "odd", "field_pattern": "^\\.0$"},
+                {"label": "card", "value_detector": "credit_card"}
+            ],
+            "rules": [{"name": "r", "when": {"label": "pii"}, "deny": true}]
+        }))
+        .unwrap();
+        let p = CompiledPolicy::compile(&spec).unwrap();
+        let records = [
+            json!({"id": 1, "user": {"contact": "a@b.io", "ssn": "x", "n": null, "deep": [{"k": 1}]}}),
+            json!({"ssn": "a@b.io", "homeAddress": {"line": "1 Road", "mail": "c@d.io"}}),
+            json!({"tags": ["z@y.io", "plain", ["q@r.io"]], "card": 4111111111111111u64}),
+            json!({"": {"a": "e@f.io", "": 1}, "x": {"": "g@h.io"}}),
+            json!(["top@level.io", {"ssn": 1}]),
+            json!([[1, {"address": 2}]]),
+            json!({"a.b": 1, "a": {"b": "i@j.io"}, "ok": true, "f": 1.5}),
+            json!("k@l.io"),
+            json!(null),
+            json!({}),
+        ];
+        let mut names = NameLabels::new();
+        let mut reference_names = NameLabels::new();
+        for record in &records {
+            let mut got = BTreeMap::new();
+            walk(
+                &p,
+                &mut String::new(),
+                record,
+                &BTreeSet::new(),
+                &mut got,
+                &mut names,
+            );
+            let mut want = BTreeMap::new();
+            walk_reference(
+                &p,
+                "",
+                record,
+                &BTreeSet::new(),
+                &mut want,
+                &mut reference_names,
+            );
+            assert_eq!(got, want, "{record}");
+        }
+        assert_eq!(names, reference_names);
+        assert!(names.values().any(|labels| !labels.is_empty()));
     }
 
     fn phones_policy() -> Arc<CompiledPolicy> {
