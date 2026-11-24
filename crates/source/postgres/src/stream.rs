@@ -1,6 +1,7 @@
 //! PostgreSQL source implementation.
 
 use crate::config::{BOOKMARK_TOKEN, PostgresReplication, PostgresSourceConfig};
+use crate::plan::decode_row;
 use async_trait::async_trait;
 use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::replication::cursor::{CursorBookmark, CursorTracker};
@@ -191,7 +192,7 @@ impl PostgresSource {
     /// `query` wrapped by [`text_cast_query`] for the columns the decoder
     /// has no exact mapping for. A query the server cannot describe is
     /// returned unchanged, so its own error surfaces when it runs.
-    async fn typed_query(&self, query: String) -> String {
+    pub(crate) async fn typed_query(&self, query: String) -> String {
         match self.describe(&query).await {
             Ok(Ok(described)) => {
                 let columns: Vec<(String, String)> = described
@@ -302,7 +303,7 @@ impl PostgresSource {
         }
     }
 
-    fn json_context(&self) -> JsonContext<'_> {
+    pub(crate) fn json_context(&self) -> JsonContext<'_> {
         JsonContext {
             mode: self.config.json_big_numbers,
             warned: &self.json_warned,
@@ -579,29 +580,35 @@ fn temporal_infinity(raw: &sqlx::postgres::PgValueRef<'_>) -> Option<Value> {
     if raw.is_null() {
         return None;
     }
-    let name = raw.type_info().name().to_ascii_uppercase();
+    let date = match raw.type_info().name().to_ascii_uppercase().as_str() {
+        "DATE" => true,
+        "TIMESTAMP" | "TIMESTAMPTZ" => false,
+        _ => return None,
+    };
+    infinity_sentinel(raw, date)
+}
+
+/// [`temporal_infinity`] for a cell already known to be a `date` (`date`) or
+/// a timestamp.
+pub(crate) fn infinity_sentinel(raw: &sqlx::postgres::PgValueRef<'_>, date: bool) -> Option<Value> {
     let bytes = raw.as_bytes().ok()?;
-    let positive = match (name.as_str(), raw.format()) {
-        (_, sqlx::postgres::PgValueFormat::Text) => match bytes {
+    let positive = match raw.format() {
+        sqlx::postgres::PgValueFormat::Text => match bytes {
             b"infinity" => true,
             b"-infinity" => false,
             _ => return None,
         },
-        ("DATE", _) => match i32::from_be_bytes(bytes.try_into().ok()?) {
+        _ if date => match i32::from_be_bytes(bytes.try_into().ok()?) {
             i32::MAX => true,
             i32::MIN => false,
             _ => return None,
         },
-        ("TIMESTAMP" | "TIMESTAMPTZ", _) => match i64::from_be_bytes(bytes.try_into().ok()?) {
+        _ => match i64::from_be_bytes(bytes.try_into().ok()?) {
             i64::MAX => true,
             i64::MIN => false,
             _ => return None,
         },
-        _ => return None,
     };
-    if !matches!(name.as_str(), "DATE" | "TIMESTAMP" | "TIMESTAMPTZ") {
-        return None;
-    }
     Some(Value::String(
         if positive { "infinity" } else { "-infinity" }.into(),
     ))
@@ -610,7 +617,7 @@ fn temporal_infinity(raw: &sqlx::postgres::PgValueRef<'_>) -> Option<Value> {
 /// A JSON / JSONB column read exactly: every number is checked on the
 /// column's text, and one a JSON value cannot hold exactly is refused or kept
 /// as an exact string per `json_big_numbers` (#789 SQL-49).
-fn json_text_to_value(
+pub(crate) fn json_text_to_value(
     text: &str,
     column: &str,
     mode: faucet_core::JsonBigNumbers,
@@ -651,14 +658,25 @@ fn pg_json_text<'r>(raw: &sqlx::postgres::PgValueRef<'r>) -> Option<&'r str> {
     if raw.is_null() {
         return None;
     }
-    let name = raw.type_info().name().to_ascii_uppercase();
-    let bytes = raw.as_bytes().ok()?;
-    let bytes = match (name.as_str(), raw.format()) {
-        ("JSON", _) => bytes,
-        // Binary JSONB carries a one-byte format version before the text.
-        ("JSONB", sqlx::postgres::PgValueFormat::Binary) => bytes.get(1..)?,
-        ("JSONB", _) => bytes,
+    let jsonb = match raw.type_info().name().to_ascii_uppercase().as_str() {
+        "JSON" => false,
+        "JSONB" => true,
         _ => return None,
+    };
+    json_cell_text(raw, jsonb)
+}
+
+/// The text of a non-NULL `json` (or, with `jsonb`, `jsonb`) cell.
+pub(crate) fn json_cell_text<'r>(
+    raw: &sqlx::postgres::PgValueRef<'r>,
+    jsonb: bool,
+) -> Option<&'r str> {
+    let bytes = raw.as_bytes().ok()?;
+    // Binary JSONB carries a one-byte format version before the text.
+    let bytes = if jsonb && raw.format() == sqlx::postgres::PgValueFormat::Binary {
+        bytes.get(1..)?
+    } else {
+        bytes
     };
     std::str::from_utf8(bytes).ok()
 }
@@ -667,7 +685,7 @@ fn pg_json_text<'r>(raw: &sqlx::postgres::PgValueRef<'r>) -> Option<&'r str> {
 ///
 /// Tries the native decodes in turn; a non-NULL cell none of them can decode
 /// is an error rather than a silent `null`.
-fn pg_value_to_json(
+pub(crate) fn pg_value_to_json(
     row: &sqlx::postgres::PgRow,
     idx: usize,
     col_name: &str,
@@ -1040,14 +1058,20 @@ fn descriptors_from_catalog(
 /// column names.
 /// How JSON columns are read: the `json_big_numbers` mode and the columns
 /// already warned about.
-struct JsonContext<'a> {
-    mode: faucet_core::JsonBigNumbers,
-    warned: &'a Mutex<std::collections::HashSet<String>>,
-    decimal: std::collections::HashSet<String>,
-    time: std::collections::HashSet<String>,
+pub(crate) struct JsonContext<'a> {
+    pub(crate) mode: faucet_core::JsonBigNumbers,
+    pub(crate) warned: &'a Mutex<std::collections::HashSet<String>>,
+    pub(crate) decimal: std::collections::HashSet<String>,
+    pub(crate) time: std::collections::HashSet<String>,
 }
 
-fn row_to_json(row: &sqlx::postgres::PgRow, json: &JsonContext<'_>) -> Result<Value, FaucetError> {
+/// The cascade over a whole row: the reference [`DecodePlan`] is checked
+/// against.
+#[cfg(test)]
+pub(crate) fn row_to_json(
+    row: &sqlx::postgres::PgRow,
+    json: &JsonContext<'_>,
+) -> Result<Value, FaucetError> {
     let mut map = serde_json::Map::with_capacity(row.columns().len());
     for (idx, col) in row.columns().iter().enumerate() {
         if row.columns()[..idx].iter().any(|c| c.name() == col.name()) {
@@ -1065,7 +1089,7 @@ fn row_to_json(row: &sqlx::postgres::PgRow, json: &JsonContext<'_>) -> Result<Va
 
 /// A `time` value read as server text, with six fraction digits; text chrono
 /// cannot hold (`24:00:00`) is kept as the server spells it.
-fn time_text(text: String) -> Value {
+pub(crate) fn time_text(text: String) -> Value {
     match sqlx::types::chrono::NaiveTime::parse_from_str(&text, "%H:%M:%S%.f") {
         Ok(t) => faucet_core::fidelity::time(&t, TimePrecision::Micros),
         Err(_) => Value::String(text),
@@ -1075,7 +1099,7 @@ fn time_text(text: String) -> Value {
 /// A result with two columns of the same name is refused, as the sqlite and
 /// mssql sources do: a record keeps only one value per field, so the other
 /// column would vanish, and a suffixed name could collide with a real column.
-fn duplicate_column(name: &str) -> FaucetError {
+pub(crate) fn duplicate_column(name: &str) -> FaucetError {
     FaucetError::Source(format!(
         "PostgreSQL query returns two columns named {name:?}; alias them \
          (`SELECT a.{name} AS a_{name}, b.{name} AS b_{name} …`) so neither is lost"
@@ -1103,10 +1127,12 @@ impl faucet_core::Source for PostgresSource {
             )
             .await?;
 
-        let records: Vec<Value> = rows
-            .iter()
-            .map(|r| row_to_json(r, &self.json_context()))
-            .collect::<Result<_, _>>()?;
+        let json = self.json_context();
+        let mut plan = None;
+        let mut records = Vec::with_capacity(rows.len());
+        for row in &rows {
+            records.push(decode_row(&mut plan, row, &json)?);
+        }
         tracing::info!(rows = records.len(), query = %self.config.query, "PostgreSQL source fetch complete");
         Ok(records)
     }
@@ -1147,12 +1173,14 @@ impl faucet_core::Source for PostgresSource {
             let initial_capacity = if batch_size == 0 { 1024 } else { batch_size };
             let mut buffer: Vec<Value> = Vec::with_capacity(initial_capacity);
             let mut total = 0usize;
+            let json = self.json_context();
+            let mut plan = None;
 
             while let Some(row) = steps
                 .call_once("query", bounded_read(self.config.read_timeout_secs, rows.try_next()))
                 .await?
             {
-                let record = row_to_json(&row, &self.json_context())?;
+                let record = decode_row(&mut plan, &row, &json)?;
                 if tracker.as_mut().is_none_or(|t| t.admit(&record)) {
                     buffer.push(record);
                 }
