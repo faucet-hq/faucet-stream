@@ -620,13 +620,15 @@ fn key_from_filename(stem: &str) -> Option<String> {
 /// bookmark is durable across a crash or power loss, not merely sitting in the
 /// page cache.
 ///
-/// The store creates its root directory on first use. All writes are
-/// serialized through a per-store mutex so two concurrent `put`s for the
-/// same key cannot race on the temp filename. Different processes pointing
-/// at the same directory rely on the filesystem's atomic rename guarantee.
+/// The store creates its root directory on first use. Writes of one key are
+/// serialized (a fixed set of locks, picked by key), so two concurrent `put`s
+/// of the same key land in call order; different keys write side by side.
+/// Different processes pointing at the same directory rely on the
+/// filesystem's atomic rename guarantee.
 pub struct FileStateStore {
     root: PathBuf,
-    write_lock: Mutex<()>,
+    write_locks: Vec<std::sync::Arc<Mutex<()>>>,
+    synced_sidecars: std::sync::Arc<std::sync::Mutex<HashMap<PathBuf, FileIdentity>>>,
     migrated: tokio::sync::OnceCell<()>,
     /// Optional at-rest encryption (#207). When set, `put` seals the JSON
     /// bytes before the atomic write and `get` unseals; plaintext files
@@ -640,7 +642,10 @@ impl FileStateStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            write_lock: Mutex::new(()),
+            write_locks: (0..WRITE_LOCK_STRIPES)
+                .map(|_| std::sync::Arc::new(Mutex::new(())))
+                .collect(),
+            synced_sidecars: Default::default(),
             migrated: tokio::sync::OnceCell::new(),
             #[cfg(feature = "encryption")]
             encryption: None,
@@ -679,7 +684,7 @@ impl FileStateStore {
         // reintroduces exactly that torn-bookmark corruption (F50). A random v4
         // UUID minted once per process is unguessable and collision-free across
         // processes regardless of PID; the counter keeps writers within one
-        // process distinct. The per-store `write_lock` only serializes writers
+        // process distinct. The store's write locks only serialize writers
         // within one process. Orphaned `.tmp` files from an interrupted write are
         // harmless: `get` only ever reads the final `.json` path.
         use std::sync::OnceLock;
@@ -831,8 +836,19 @@ impl FileStateStore {
             .then(|| self.root.join(format!("{stem}.key")))
     }
 
-    async fn put_unlocked(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
-        self.ensure_root().await?;
+    fn write_lock(&self, key: &str) -> std::sync::Arc<Mutex<()>> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        let stripe = (hasher.finish() % self.write_locks.len() as u64) as usize;
+        std::sync::Arc::clone(&self.write_locks[stripe])
+    }
+
+    async fn put_locked(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
+        let held = self.write_lock(key).lock_owned().await;
+        if !self.migrated.initialized() {
+            self.ensure_root().await?;
+        }
         let bytes = serde_json::to_vec(value).map_err(|e| {
             FaucetError::State(format!("failed to serialize state for key '{key}': {e}"))
         })?;
@@ -842,60 +858,25 @@ impl FileStateStore {
             None => bytes,
         };
         self.migrate_legacy_names().await?;
-        let final_path = self.entry_path(key);
-        let tmp_path = self.temp_path(key);
-
-        if let Some(sidecar) = self.key_sidecar(key) {
-            write_synced(&sidecar, key.as_bytes()).await?;
-        }
-
-        // Write the temp file and fsync it BEFORE the rename. `fs::write`
-        // alone leaves the bytes in the page cache: a crash after `put`
-        // returns could surface a zero-length or stale file, breaking the
-        // durability guarantee this store documents (#78/#8). `sync_all`
-        // flushes the file's data and metadata to disk. Any failure removes
-        // the temp file so retries do not accumulate orphans (CORE-96).
-        let written: Result<(), FaucetError> = async {
-            let mut file = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
-                FaucetError::State(format!(
-                    "failed to create temp state file {}: {e}",
-                    tmp_path.display()
-                ))
-            })?;
-            file.write_all(&bytes).await.map_err(|e| {
-                FaucetError::State(format!(
-                    "failed to write temp state file {}: {e}",
-                    tmp_path.display()
-                ))
-            })?;
-            file.sync_all().await.map_err(|e| {
-                FaucetError::State(format!(
-                    "failed to fsync temp state file {}: {e}",
-                    tmp_path.display()
-                ))
-            })?;
-            drop(file);
-            tokio::fs::rename(&tmp_path, &final_path)
-                .await
-                .map_err(|e| {
-                    FaucetError::State(format!(
-                        "failed to commit state file {}: {e}",
-                        final_path.display()
-                    ))
-                })
-        }
-        .await;
-        if let Err(e) = written {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(e);
-        }
-
-        // fsync the parent directory so the rename itself is durable — an
-        // atomic rename can still be lost on crash if the directory entry was
-        // never flushed. Directory fsync is a POSIX concept; on platforms that
-        // don't allow opening a directory as a file (e.g. Windows) it is
-        // skipped.
-        sync_dir(&self.root).await?;
+        let write = EntryWrite {
+            root: self.root.clone(),
+            final_path: self.entry_path(key),
+            tmp_path: self.temp_path(key),
+            sidecar: self
+                .key_sidecar(key)
+                .map(|path| (path, key.as_bytes().to_vec())),
+            synced_sidecars: std::sync::Arc::clone(&self.synced_sidecars),
+            bytes,
+        };
+        let final_path = write.final_path.clone();
+        // The lock travels with the write: a caller that stops waiting never
+        // lets a later put of this key overtake it.
+        tokio::task::spawn_blocking(move || {
+            let _held = held;
+            write.run()
+        })
+        .await
+        .map_err(|e| FaucetError::State(format!("state write task failed: {e}")))??;
 
         tracing::debug!(
             key,
@@ -909,6 +890,165 @@ impl FileStateStore {
     pub fn root(&self) -> &Path {
         &self.root
     }
+}
+
+/// Locks a [`FileStateStore`] spreads its keys over.
+const WRITE_LOCK_STRIPES: usize = 64;
+
+/// Sidecars remembered as flushed, per store; past this the memory is
+/// dropped and each is checked (and flushed) again.
+const SYNCED_SIDECARS_MAX: usize = 4096;
+
+/// What identifies one version of a file on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    inode: (u64, u64),
+}
+
+impl FileIdentity {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            inode: {
+                use std::os::unix::fs::MetadataExt;
+                (meta.dev(), meta.ino())
+            },
+        }
+    }
+}
+
+/// One `put`, done in a single blocking step: sidecar when needed, temp
+/// file, fsync, rename, directory fsync.
+struct EntryWrite {
+    root: PathBuf,
+    final_path: PathBuf,
+    tmp_path: PathBuf,
+    sidecar: Option<(PathBuf, Vec<u8>)>,
+    synced_sidecars: std::sync::Arc<std::sync::Mutex<HashMap<PathBuf, FileIdentity>>>,
+    bytes: Vec<u8>,
+}
+
+impl EntryWrite {
+    fn run(&self) -> Result<(), FaucetError> {
+        std::fs::create_dir_all(&self.root).map_err(|e| {
+            FaucetError::State(format!(
+                "failed to create state dir {}: {e}",
+                self.root.display()
+            ))
+        })?;
+        if let Some((path, key)) = &self.sidecar {
+            self.ensure_sidecar(path, key)?;
+        }
+        // The temp file is fsynced BEFORE the rename: a write alone leaves
+        // the bytes in the page cache, and a crash after `put` returns could
+        // surface a zero-length or stale file (#78/#8). Any failure removes
+        // the temp file so retries do not accumulate orphans (CORE-96).
+        if let Err(e) = self.write_entry() {
+            let _ = std::fs::remove_file(&self.tmp_path);
+            return Err(e);
+        }
+        // The rename is durable only once the directory is flushed too.
+        sync_dir_blocking(&self.root)
+    }
+
+    fn write_entry(&self) -> Result<(), FaucetError> {
+        use std::io::Write as _;
+        let tmp = &self.tmp_path;
+        let mut file = std::fs::File::create(tmp).map_err(|e| {
+            FaucetError::State(format!(
+                "failed to create temp state file {}: {e}",
+                tmp.display()
+            ))
+        })?;
+        file.write_all(&self.bytes).map_err(|e| {
+            FaucetError::State(format!(
+                "failed to write temp state file {}: {e}",
+                tmp.display()
+            ))
+        })?;
+        file.sync_all().map_err(|e| {
+            FaucetError::State(format!(
+                "failed to fsync temp state file {}: {e}",
+                tmp.display()
+            ))
+        })?;
+        drop(file);
+        std::fs::rename(tmp, &self.final_path).map_err(|e| {
+            FaucetError::State(format!(
+                "failed to commit state file {}: {e}",
+                self.final_path.display()
+            ))
+        })
+    }
+
+    /// Leave the sidecar holding `key`, flushed. A sidecar that already holds
+    /// it and that this store flushed (same file, unchanged since) is left
+    /// alone; one that holds it but was flushed by someone else is flushed
+    /// once; anything else is rewritten.
+    fn ensure_sidecar(&self, path: &Path, key: &[u8]) -> Result<(), FaucetError> {
+        let err = |what: &str, e: std::io::Error| {
+            FaucetError::State(format!(
+                "failed to {what} state key file {}: {e}",
+                path.display()
+            ))
+        };
+        let current = std::fs::metadata(path).ok().map(|m| FileIdentity::of(&m));
+        let holds_key = current.is_some() && std::fs::read(path).is_ok_and(|held| held == key);
+        if holds_key {
+            let known = self
+                .synced_sidecars
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(path)
+                .cloned();
+            if known.is_some() && known == current {
+                return Ok(());
+            }
+            std::fs::File::open(path)
+                .and_then(|file| file.sync_all())
+                .map_err(|e| err("fsync", e))?;
+        } else {
+            use std::io::Write as _;
+            let mut file = std::fs::File::create(path).map_err(|e| err("write", e))?;
+            file.write_all(key).map_err(|e| err("write", e))?;
+            file.sync_all().map_err(|e| err("fsync", e))?;
+        }
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut synced = self
+                .synced_sidecars
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if synced.len() >= SYNCED_SIDECARS_MAX {
+                synced.clear();
+            }
+            synced.insert(path.to_path_buf(), FileIdentity::of(&meta));
+        }
+        Ok(())
+    }
+}
+
+/// [`sync_dir`] for a blocking context.
+fn sync_dir_blocking(dir: &Path) -> Result<(), FaucetError> {
+    #[cfg(unix)]
+    {
+        let handle = std::fs::File::open(dir).map_err(|e| {
+            FaucetError::State(format!(
+                "failed to open state dir {} for fsync: {e}",
+                dir.display()
+            ))
+        })?;
+        handle.sync_all().map_err(|e| {
+            FaucetError::State(format!("failed to fsync state dir {}: {e}", dir.display()))
+        })?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 /// Write `bytes` to `path` and flush them to disk.
@@ -957,8 +1097,7 @@ impl StateStore for FileStateStore {
 
     async fn put(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
         validate_state_key(key)?;
-        let _guard = self.write_lock.lock().await;
-        self.put_unlocked(key, value).await
+        self.put_locked(key, value).await
     }
 
     async fn delete(&self, key: &str) -> Result<(), FaucetError> {
@@ -1527,6 +1666,238 @@ mod tests {
         let s = FileStateStore::new(dir.path());
         assert_eq!(s.list("p").await.unwrap(), vec![key.clone()]);
         assert_eq!(s.get(&key).await.unwrap(), Some(json!(3)));
+    }
+
+    /// The write as it was before it became one blocking step.
+    async fn put_stepwise(s: &FileStateStore, key: &str, value: &Value) -> Result<(), FaucetError> {
+        s.ensure_root().await?;
+        let bytes = serde_json::to_vec(value).unwrap();
+        s.migrate_legacy_names().await?;
+        let final_path = s.entry_path(key);
+        let tmp_path = s.temp_path(key);
+        if let Some(sidecar) = s.key_sidecar(key) {
+            write_synced(&sidecar, key.as_bytes()).await?;
+        }
+        let mut file = tokio::fs::File::create(&tmp_path).await.unwrap();
+        file.write_all(&bytes).await.unwrap();
+        file.sync_all().await.unwrap();
+        drop(file);
+        tokio::fs::rename(&tmp_path, &final_path).await.unwrap();
+        sync_dir(&s.root).await
+    }
+
+    fn files_of(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(e.path()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn put_leaves_the_same_files_as_the_stepwise_write() {
+        let long = format!("p::{}", "q".repeat(200));
+        let cases = [
+            ("plain", json!({"cursor": 7, "ids": [1, 2, 3]})),
+            ("Users:x/Y", json!("2026-01-02T03:04:05Z")),
+            (long.as_str(), json!({"nested": {"a": null, "b": 1.5}})),
+            ("plain", json!({"cursor": 8})),
+            (long.as_str(), json!(9)),
+        ];
+        let (old_dir, new_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (old, new) = (
+            FileStateStore::new(old_dir.path()),
+            FileStateStore::new(new_dir.path()),
+        );
+        for (key, value) in &cases {
+            put_stepwise(&old, key, value).await.unwrap();
+            new.put(key, value).await.unwrap();
+            assert_eq!(files_of(new_dir.path()), files_of(old_dir.path()), "{key}");
+        }
+        assert_eq!(files_of(new_dir.path()).len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_is_written_only_when_it_differs() {
+        let dir = TempDir::new().unwrap();
+        let s = FileStateStore::new(dir.path());
+        let key = format!("p::{}", "q".repeat(200));
+        let sidecar = s.key_sidecar(&key).unwrap();
+        let identity = |p: &std::path::Path| FileIdentity::of(&std::fs::metadata(p).unwrap());
+
+        s.put(&key, &json!(1)).await.unwrap();
+        assert_eq!(std::fs::read(&sidecar).unwrap(), key.as_bytes());
+        let first = identity(&sidecar);
+        assert_eq!(
+            s.synced_sidecars.lock().unwrap().get(&sidecar),
+            Some(&first)
+        );
+
+        s.put(&key, &json!(2)).await.unwrap();
+        assert_eq!(
+            identity(&sidecar),
+            first,
+            "an unchanged sidecar is left alone"
+        );
+        assert_eq!(s.get(&key).await.unwrap(), Some(json!(2)));
+
+        std::fs::write(&sidecar, b"someone else").unwrap();
+        s.put(&key, &json!(3)).await.unwrap();
+        assert_eq!(std::fs::read(&sidecar).unwrap(), key.as_bytes());
+
+        std::fs::remove_file(&sidecar).unwrap();
+        s.put(&key, &json!(4)).await.unwrap();
+        assert_eq!(std::fs::read(&sidecar).unwrap(), key.as_bytes());
+        assert_eq!(s.list("p").await.unwrap(), vec![key.clone()]);
+
+        s.delete(&key).await.unwrap();
+        assert!(!sidecar.exists());
+        s.put(&key, &json!(5)).await.unwrap();
+        assert_eq!(std::fs::read(&sidecar).unwrap(), key.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_another_store_wrote_is_flushed_once_and_remembered() {
+        let dir = TempDir::new().unwrap();
+        let key = format!("p::{}", "q".repeat(200));
+        FileStateStore::new(dir.path())
+            .put(&key, &json!(1))
+            .await
+            .unwrap();
+        let s = FileStateStore::new(dir.path());
+        let sidecar = s.key_sidecar(&key).unwrap();
+        let before = std::fs::metadata(&sidecar).unwrap().modified().unwrap();
+        assert!(s.synced_sidecars.lock().unwrap().is_empty());
+        s.put(&key, &json!(2)).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&sidecar).unwrap().modified().unwrap(),
+            before,
+            "its content was right, so it is not rewritten"
+        );
+        assert_eq!(s.synced_sidecars.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_sidecar_memory_is_bounded() {
+        let dir = TempDir::new().unwrap();
+        let s = FileStateStore::new(dir.path());
+        {
+            let mut synced = s.synced_sidecars.lock().unwrap();
+            for i in 0..SYNCED_SIDECARS_MAX {
+                let meta = std::fs::metadata(dir.path()).unwrap();
+                synced.insert(PathBuf::from(format!("/x/{i}")), FileIdentity::of(&meta));
+            }
+        }
+        let key = format!("p::{}", "q".repeat(200));
+        s.put(&key, &json!(1)).await.unwrap();
+        assert_eq!(s.synced_sidecars.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn puts_of_different_keys_run_side_by_side_and_all_land() {
+        let dir = TempDir::new().unwrap();
+        let s = std::sync::Arc::new(FileStateStore::new(dir.path()));
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..200u32 {
+            let s = std::sync::Arc::clone(&s);
+            tasks.spawn(async move {
+                for round in 0..3u32 {
+                    s.put(&format!("row::{i}"), &json!({"i": i, "round": round}))
+                        .await
+                        .unwrap();
+                }
+            });
+        }
+        while let Some(done) = tasks.join_next().await {
+            done.unwrap();
+        }
+        for i in 0..200u32 {
+            assert_eq!(
+                s.get(&format!("row::{i}")).await.unwrap(),
+                Some(json!({"i": i, "round": 2}))
+            );
+        }
+        assert!(!has_tmp_residue(dir.path()));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 200);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abandoned_put_never_lands_after_a_later_one() {
+        let dir = TempDir::new().unwrap();
+        let s = FileStateStore::new(dir.path());
+        s.put("k", &json!(0)).await.unwrap();
+        for round in 1..=50u32 {
+            let stale = json!({"stale": round});
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_micros(u64::from(round) * 20),
+                async { s.put("k", &stale).await },
+            )
+            .await;
+            s.put("k", &json!({"fresh": round})).await.unwrap();
+            assert_eq!(s.get("k").await.unwrap(), Some(json!({"fresh": round})));
+        }
+        assert!(!has_tmp_residue(dir.path()));
+    }
+
+    #[tokio::test]
+    async fn a_root_that_cannot_be_created_keeps_its_error() {
+        let dir = TempDir::new().unwrap();
+        let blocker = dir.path().join("file");
+        std::fs::write(&blocker, b"x").unwrap();
+        let s = FileStateStore::new(blocker.join("state"));
+        let first = s.put("k", &json!(1)).await.unwrap_err().to_string();
+        assert!(
+            first.starts_with("State error: failed to create state dir"),
+            "{first}"
+        );
+
+        // After the first put the root is created inside the write itself.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("state");
+        let s = FileStateStore::new(&root);
+        s.put("k", &json!(1)).await.unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        s.put("k", &json!(2)).await.unwrap();
+        assert_eq!(s.get("k").await.unwrap(), Some(json!(2)));
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::write(&root, b"x").unwrap();
+        let later = s.put("k", &json!(3)).await.unwrap_err().to_string();
+        assert!(later.contains("failed to create state dir"), "{later}");
+    }
+
+    #[tokio::test]
+    #[ignore = "timing loop: cargo test -p faucet-core state::tests::put_timing -- --ignored --nocapture"]
+    async fn put_timing() {
+        let (old_dir, new_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (old, new) = (
+            FileStateStore::new(old_dir.path()),
+            FileStateStore::new(new_dir.path()),
+        );
+        let long = format!("p::{}", "q".repeat(200));
+        for key in ["plain", long.as_str()] {
+            let n = 300u32;
+            let start = std::time::Instant::now();
+            for i in 0..n {
+                put_stepwise(&old, key, &json!({"lsn": i})).await.unwrap();
+            }
+            let stepwise = start.elapsed();
+            let start = std::time::Instant::now();
+            for i in 0..n {
+                new.put(key, &json!({"lsn": i})).await.unwrap();
+            }
+            let one_step = start.elapsed();
+            println!(
+                "key len {}: stepwise {:?}/put, one step {:?}/put",
+                key.len(),
+                stepwise / n,
+                one_step / n
+            );
+        }
     }
 
     #[tokio::test]
