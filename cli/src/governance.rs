@@ -57,6 +57,140 @@ pub(crate) fn profiling_scope_opt_out(
     }
 }
 
+/// The quality, contract and masking of one row, compiled.
+#[derive(Default)]
+struct RecordPasses {
+    #[cfg(feature = "quality")]
+    quality: Option<Arc<faucet_core::CompiledQuality>>,
+    #[cfg(feature = "contract")]
+    contract: Option<Arc<faucet_core::CompiledContract>>,
+    #[cfg(feature = "masking")]
+    masking: Option<Arc<faucet_core::CompiledMasking>>,
+}
+
+impl RecordPasses {
+    fn compile(node: &ExpandedNode) -> CliResult<Self> {
+        #[allow(unused_mut)]
+        let mut passes = Self::default();
+        #[cfg(feature = "quality")]
+        if let Some(spec) = &node.quality {
+            passes.quality = Some(Arc::new(
+                faucet_core::CompiledQuality::compile(spec)
+                    .map_err(|e| CliError::Config(format!("quality: {e}")))?,
+            ));
+        }
+        #[cfg(feature = "contract")]
+        if let Some(spec) = &node.contract {
+            passes.contract = Some(Arc::new(
+                faucet_core::CompiledContract::compile(spec)
+                    .map_err(|e| CliError::Config(format!("contract: {e}")))?,
+            ));
+        }
+        #[cfg(feature = "masking")]
+        if let Some(spec) = &node.masking {
+            passes.masking = Some(Arc::new(
+                faucet_core::CompiledMasking::compile_for_sink(
+                    spec,
+                    &[node.sink_ref.as_str(), node.sink.kind.as_str()],
+                )
+                .map_err(|e| CliError::Config(format!("masking: {e}")))?,
+            ));
+        }
+        let _ = node;
+        Ok(passes)
+    }
+}
+
+#[cfg(feature = "policy")]
+fn compile_policy(
+    spec: &faucet_core::PolicySpec,
+    node: &ExpandedNode,
+) -> CliResult<Arc<faucet_core::CompiledPolicy>> {
+    faucet_core::CompiledPolicy::compile(&crate::policy::runtime_spec(spec, node))
+        .map(Arc::new)
+        .map_err(|e| CliError::Config(format!("policy: {e}")))
+}
+
+/// What one row's governance compiles to, kept for a run.
+struct CompiledNode {
+    /// Holds the row in place: its address is this entry's key.
+    _node: Arc<ExpandedNode>,
+    passes: tokio::sync::OnceCell<Arc<RecordPasses>>,
+    #[cfg(feature = "policy")]
+    policy: tokio::sync::OnceCell<Arc<faucet_core::CompiledPolicy>>,
+}
+
+/// The compiled governance of a run's rows: every invocation of a row (each
+/// child of a fan-out) shares one compile of its quality, contract, masking
+/// and policy, which depend on the row alone.
+#[derive(Clone, Default)]
+pub(crate) struct CompiledGovernance {
+    rows: Arc<std::collections::HashMap<usize, CompiledNode>>,
+}
+
+impl CompiledGovernance {
+    /// A cache for the rows of one run.
+    pub(crate) fn for_rows<'a>(rows: impl Iterator<Item = &'a Arc<ExpandedNode>>) -> Self {
+        Self {
+            rows: Arc::new(
+                rows.map(|node| {
+                    (
+                        Arc::as_ptr(node) as usize,
+                        CompiledNode {
+                            _node: Arc::clone(node),
+                            passes: Default::default(),
+                            #[cfg(feature = "policy")]
+                            policy: Default::default(),
+                        },
+                    )
+                })
+                .collect(),
+            ),
+        }
+    }
+
+    /// Run `work` with this cache in reach of [`governance_for`].
+    pub(crate) async fn scope<F: std::future::Future>(self, work: F) -> F::Output {
+        COMPILED.scope(self, work).await
+    }
+
+    fn row(&self, node: &ExpandedNode) -> Option<&CompiledNode> {
+        self.rows.get(&(std::ptr::from_ref(node) as usize))
+    }
+}
+
+tokio::task_local! {
+    static COMPILED: CompiledGovernance;
+}
+
+async fn record_passes(node: &ExpandedNode) -> CliResult<Arc<RecordPasses>> {
+    let cache = COMPILED.try_with(Clone::clone).ok();
+    match cache.as_ref().and_then(|c| c.row(node)) {
+        Some(row) => row
+            .passes
+            .get_or_try_init(|| async { RecordPasses::compile(node).map(Arc::new) })
+            .await
+            .cloned(),
+        None => RecordPasses::compile(node).map(Arc::new),
+    }
+}
+
+#[cfg(feature = "policy")]
+async fn compiled_policy(
+    spec: &faucet_core::PolicySpec,
+    node: &ExpandedNode,
+) -> CliResult<Arc<faucet_core::CompiledPolicy>> {
+    let cache = COMPILED.try_with(Clone::clone).ok();
+    match cache.as_ref().and_then(|c| c.row(node)) {
+        Some(row) => row
+            .policy
+            .get_or_try_init(|| async { compile_policy(spec, node) })
+            .await
+            .cloned(),
+        None => compile_policy(spec, node),
+    }
+}
+
 /// Build the governance for one invocation of `node`.
 pub(crate) async fn governance_for(req: GovernanceRequest<'_>) -> CliResult<GovernanceBuild> {
     let GovernanceRequest {
@@ -82,35 +216,25 @@ pub(crate) async fn governance_for(req: GovernanceRequest<'_>) -> CliResult<Gove
             None => g.with_budget(spec.clone()),
         };
     }
+    #[cfg_attr(
+        not(any(feature = "quality", feature = "contract", feature = "masking")),
+        allow(unused_variables)
+    )]
+    let passes = record_passes(node).await?;
     #[cfg(feature = "quality")]
-    if let Some(spec) = &node.quality {
-        g = g.with_quality(Arc::new(
-            faucet_core::CompiledQuality::compile(spec)
-                .map_err(|e| CliError::Config(format!("quality: {e}")))?,
-        ));
+    if let Some(quality) = &passes.quality {
+        g = g.with_quality(Arc::clone(quality));
     }
     #[cfg(feature = "contract")]
-    if let Some(spec) = &node.contract {
-        g = g.with_contract(Arc::new(
-            faucet_core::CompiledContract::compile(spec)
-                .map_err(|e| CliError::Config(format!("contract: {e}")))?,
-        ));
+    if let Some(contract) = &passes.contract {
+        g = g.with_contract(Arc::clone(contract));
     }
     #[cfg(feature = "masking")]
-    let masking = match &node.masking {
-        Some(spec) => {
-            let compiled = Arc::new(
-                faucet_core::CompiledMasking::compile_for_sink(
-                    spec,
-                    &[node.sink_ref.as_str(), node.sink.kind.as_str()],
-                )
-                .map_err(|e| CliError::Config(format!("masking: {e}")))?,
-            );
-            g = g.with_masking(Arc::clone(&compiled));
-            Some(compiled)
-        }
-        None => None,
-    };
+    let masking = passes.masking.clone();
+    #[cfg(feature = "masking")]
+    if let Some(compiled) = &masking {
+        g = g.with_masking(Arc::clone(compiled));
+    }
     if let Some(sd) = &node.schema {
         g = g.with_schema_drift(faucet_core::SchemaDriftPolicy::compile(sd));
     }
@@ -137,10 +261,7 @@ pub(crate) async fn governance_for(req: GovernanceRequest<'_>) -> CliResult<Gove
                 node.id
             )));
         }
-        let compiled = Arc::new(
-            faucet_core::CompiledPolicy::compile(&crate::policy::runtime_spec(spec, node))
-                .map_err(|e| CliError::Config(format!("policy: {e}")))?,
-        );
+        let compiled = compiled_policy(spec, node).await?;
         classifier = Some(Arc::clone(&compiled));
         let mut p = faucet_core::PolicyGovernance::new(
             compiled,
@@ -534,6 +655,91 @@ mod tests {
         assert_eq!(dlq.facts.as_ref().unwrap().id, DLQ_ID);
         assert!(dlq.masking.is_some(), "the rule naming the DLQ reaches it");
         assert!(g.dlq_config().is_some());
+    }
+
+    /// Every invocation of a row in one run shares one compile of its
+    /// passes; a copy of the row, or a call outside a run, compiles its own.
+    #[cfg(all(feature = "masking", feature = "quality", feature = "contract"))]
+    #[tokio::test]
+    async fn a_rows_passes_are_compiled_once_per_run() {
+        let c = cfg(
+            "  quality:\n    record:\n      - { type: not_null, field: id, on_failure: abort }\n  contract:\n    version: \"1\"\n    fields:\n      - { name: id, type: integer }\n  masking:\n    rules:\n      - { match: { fields: [email] }, action: { type: hash } }\n",
+        );
+        let shared = Arc::new(node(&c));
+        let copy = (*shared).clone();
+        let cache = CompiledGovernance::for_rows(std::iter::once(&shared));
+        let (first, second, of_copy) = cache
+            .clone()
+            .scope(async {
+                (
+                    record_passes(&shared).await.unwrap(),
+                    record_passes(&shared).await.unwrap(),
+                    record_passes(&copy).await.unwrap(),
+                )
+            })
+            .await;
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &of_copy));
+        assert!(first.quality.is_some() && first.contract.is_some() && first.masking.is_some());
+        let outside = record_passes(&shared).await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &outside));
+
+        let opts = ExecuteOptions::for_tests("g");
+        let built = cache
+            .scope(async { build(&shared, &opts).await })
+            .await
+            .unwrap();
+        for p in [Pass::Quality, Pass::Contract, Pass::Masking] {
+            assert!(built.governance.is_active(p), "{p}");
+        }
+    }
+
+    /// A pass that fails to compile fails every invocation with the same
+    /// error; nothing broken is kept.
+    #[cfg(feature = "masking")]
+    #[tokio::test]
+    async fn a_pass_that_does_not_compile_is_reported_each_time() {
+        let c = cfg(
+            "  masking:\n    rules:\n      - { match: { fields: [email] }, action: { type: hash } }\n",
+        );
+        let mut n = node(&c);
+        n.masking.as_mut().unwrap().rules[0].matcher.field_pattern = Some("(".into());
+        let shared = Arc::new(n);
+        let cache = CompiledGovernance::for_rows(std::iter::once(&shared));
+        let alone = record_passes(&shared).await.err().unwrap().to_string();
+        let (first, second) = cache
+            .scope(async {
+                (
+                    record_passes(&shared).await.err().unwrap().to_string(),
+                    record_passes(&shared).await.err().unwrap().to_string(),
+                )
+            })
+            .await;
+        assert!(alone.contains("masking: "), "{alone}");
+        assert_eq!(first, alone);
+        assert_eq!(second, alone);
+    }
+
+    #[cfg(feature = "policy")]
+    #[tokio::test]
+    async fn a_rows_policy_is_compiled_once_per_run() {
+        let c = cfg(
+            "policy:\n  classifications:\n    - { label: pii, fields: [email] }\n  rules:\n    - { name: pii-eu, when: { label: pii }, require: { residency: [eu] } }\n",
+        );
+        let shared = Arc::new(node(&c));
+        let spec = shared.policy.clone().unwrap();
+        let cache = CompiledGovernance::for_rows(std::iter::once(&shared));
+        let (first, second) = cache
+            .scope(async {
+                (
+                    compiled_policy(&spec, &shared).await.unwrap(),
+                    compiled_policy(&spec, &shared).await.unwrap(),
+                )
+            })
+            .await;
+        assert!(Arc::ptr_eq(&first, &second));
+        let outside = compiled_policy(&spec, &shared).await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &outside));
     }
 
     /// A pass that does not apply is opted out by name, never left out.
