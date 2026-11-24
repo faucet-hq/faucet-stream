@@ -19,7 +19,7 @@ gcp-bigquery-client = "0.28.0"
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing.workspace = true
 async-trait.workspace = true
 futures.workspace = true
@@ -31,6 +31,7 @@ reqwest = { workspace = true }
 # Gzip the NDJSON media part of the load-job upload (BigQuery auto-detects gzip
 # for NEWLINE_DELIMITED_JSON), shrinking the wire payload several-fold.
 flate2 = { workspace = true }
+bytes = { workspace = true }
 
 # Arrow columnar load-job path (#380, `arrow` feature): buffer RecordBatches to
 # Parquet, stage on GCS, then `jobs.insert` a PARQUET load job.
@@ -38,7 +39,6 @@ faucet-common-gcs = { workspace = true, optional = true }
 google-cloud-storage = { workspace = true, optional = true }
 arrow = { workspace = true, optional = true }
 parquet = { workspace = true, optional = true }
-bytes = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
 [features]
@@ -51,7 +51,6 @@ arrow = [
     "dep:google-cloud-storage",
     "dep:arrow",
     "dep:parquet",
-    "dep:bytes",
     "dep:uuid",
 ]
 
