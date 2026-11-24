@@ -1298,6 +1298,11 @@ mod tests {
     use crate::transform::KeyCaseMode;
     use serde_json::json;
 
+    #[cfg(all(
+        feature = "transform-filter",
+        feature = "transform-explode",
+        feature = "transform-flatten"
+    ))]
     fn apply_stages_reference(
         rec: Value,
         stages: &[CompiledStage],
@@ -1313,6 +1318,11 @@ mod tests {
         Ok(acc)
     }
 
+    #[cfg(all(
+        feature = "transform-filter",
+        feature = "transform-explode",
+        feature = "transform-flatten"
+    ))]
     fn apply_stages_to_page_reference(
         mut records: Vec<Value>,
         stages: &[CompiledStage],
@@ -1334,6 +1344,11 @@ mod tests {
         Ok(records)
     }
 
+    #[cfg(all(
+        feature = "transform-filter",
+        feature = "transform-explode",
+        feature = "transform-flatten"
+    ))]
     fn apply_one_stage(rec: Value, stage: &CompiledStage) -> Result<Vec<Value>, FaucetError> {
         match stage {
             CompiledStage::Map(t) => Ok(vec![crate::transform::apply_all(
