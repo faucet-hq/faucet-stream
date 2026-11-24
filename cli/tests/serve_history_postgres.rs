@@ -1019,7 +1019,7 @@ async fn postgres_exists_deletes_match_the_not_in_deletes() {
             "DELETE FROM faucet_serve_run_secrets WHERE run_id IN \
              (SELECT run_id FROM faucet_serve_runs WHERE status IN ('completed','failed','cancelled')) \
              OR (stored_at < $1 AND run_id NOT IN (SELECT run_id FROM faucet_serve_runs))",
-            &s.run_secrets_purge,
+            &s.sealed_params_purge,
         ),
         (
             "faucet_tenant_runs",

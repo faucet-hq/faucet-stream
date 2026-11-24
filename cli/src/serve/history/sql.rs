@@ -1148,7 +1148,7 @@ pub struct Stmts {
     pub policy_versions_delete: String,
     /// Delete the sealed params of terminal runs and of runs with no record
     /// stored before the param (an orphan threshold).
-    pub run_secrets_purge: String,
+    pub sealed_params_purge: String,
     pub tenant_run_delete: String,
     pub purge_orphan_tenant_runs: String,
     /// Insert one `(run_id, key, value)` label row (#958).
@@ -2256,7 +2256,7 @@ impl Stmts {
                 WHERE scope=$1 AND version=$2"
                 .into(),
             policy_versions_delete: "DELETE FROM faucet_policy_versions WHERE scope=$1".into(),
-            run_secrets_purge: "DELETE FROM faucet_serve_run_secrets WHERE EXISTS \
+            sealed_params_purge: "DELETE FROM faucet_serve_run_secrets WHERE EXISTS \
                 (SELECT 1 FROM faucet_serve_runs r \
                     WHERE r.run_id = faucet_serve_run_secrets.run_id \
                     AND r.status IN ('completed','failed','cancelled')) \
@@ -2991,7 +2991,7 @@ impl Stmts {
                 WHERE scope=? AND version=?"
                 .into(),
             policy_versions_delete: "DELETE FROM faucet_policy_versions WHERE scope=?".into(),
-            run_secrets_purge: "DELETE FROM faucet_serve_run_secrets WHERE EXISTS \
+            sealed_params_purge: "DELETE FROM faucet_serve_run_secrets WHERE EXISTS \
                 (SELECT 1 FROM faucet_serve_runs r \
                     WHERE r.run_id = faucet_serve_run_secrets.run_id \
                     AND r.status IN ('completed','failed','cancelled')) \
@@ -7438,7 +7438,7 @@ macro_rules! impl_sql_history {
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let orphaned_before =
                     chrono::Utc::now() - $crate::serve::history::RUN_SECRETS_ORPHAN_GRACE;
-                Ok(sqlx::query(&self.stmts.run_secrets_purge)
+                Ok(sqlx::query(&self.stmts.sealed_params_purge)
                     .bind($crate::serve::history::sql::fmt_ts(orphaned_before))
                     .execute(&self.pool)
                     .await

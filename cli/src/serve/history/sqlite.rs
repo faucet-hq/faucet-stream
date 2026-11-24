@@ -320,7 +320,7 @@ mod shard_tests {
             "DELETE FROM faucet_serve_run_budgets WHERE run_id NOT IN (SELECT run_id FROM faucet_serve_runs)",
         ),
         (
-            "run_secrets_purge",
+            "sealed_params_purge",
             "DELETE FROM faucet_serve_run_secrets WHERE run_id IN \
              (SELECT run_id FROM faucet_serve_runs WHERE status IN ('completed','failed','cancelled')) \
              OR (stored_at < ? AND run_id NOT IN (SELECT run_id FROM faucet_serve_runs))",
@@ -374,7 +374,7 @@ mod shard_tests {
                 "purge_orphan_shards" => &s.purge_orphan_shards,
                 "purge_audit_tenants" => &s.purge_audit_tenants,
                 "purge_orphan_budgets" => &s.purge_orphan_budgets,
-                "run_secrets_purge" => &s.run_secrets_purge,
+                "sealed_params_purge" => &s.sealed_params_purge,
                 "purge_orphan_tenant_runs" => &s.purge_orphan_tenant_runs,
                 _ => &s.purge_orphan_run_labels,
             }
