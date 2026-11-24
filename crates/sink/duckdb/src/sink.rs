@@ -320,9 +320,10 @@ fn insert_json(
     if records.is_empty() {
         return Ok(0);
     }
-    for stmt in &engine().json_insert_statements(&target(table), column, records)? {
-        execute(conn, stmt)?;
-    }
+    execute_all(
+        conn,
+        &engine().json_insert_statements(&target(table), column, records)?,
+    )?;
     Ok(records.len())
 }
 
@@ -425,16 +426,34 @@ fn insert_rows(
         .collect();
     let (written, statements) =
         engine().insert_statements(&target(table), &columns, records, false)?;
-    for stmt in &statements {
-        execute(conn, stmt)?;
-    }
+    execute_all(conn, &statements)?;
     Ok(written)
 }
 
-/// Bind and run one planned statement.
-fn execute(conn: &Connection, stmt: &Statement<'_>) -> Result<(), FaucetError> {
-    let params: Vec<DuckValue> = stmt
-        .params
+/// Bind and run planned statements in order, preparing each distinct SQL
+/// text once while consecutive statements share it.
+fn execute_all(conn: &Connection, statements: &[Statement<'_>]) -> Result<(), FaucetError> {
+    let mut prepared: Option<(&str, duckdb::Statement<'_>)> = None;
+    for stmt in statements {
+        let params = bind_params(stmt);
+        if prepared.as_ref().is_none_or(|(sql, _)| *sql != stmt.sql) {
+            let statement = conn
+                .prepare(&stmt.sql)
+                .map_err(|e| FaucetError::Sink(format!("DuckDB prepare failed: {e}")))?;
+            prepared = Some((stmt.sql.as_str(), statement));
+        }
+        if let Some((_, statement)) = prepared.as_mut() {
+            statement
+                .execute(duckdb::params_from_iter(params))
+                .map_err(|e| FaucetError::Sink(format!("DuckDB insert failed: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+/// One planned statement's parameters as DuckDB values.
+fn bind_params(stmt: &Statement<'_>) -> Vec<DuckValue> {
+    stmt.params
         .iter()
         .map(|p| match p.value.as_ref() {
             Value::String(v) if p.sql_type.is_some_and(is_naive_timestamp) => {
@@ -442,19 +461,12 @@ fn execute(conn: &Connection, stmt: &Statement<'_>) -> Result<(), FaucetError> {
             }
             // Its shortest text, which DuckDB casts exactly into a DECIMAL or
             // DOUBLE column, where a bound double converts from binary (#885).
-            _ if p.non_integer_text().is_some() => {
-                DuckValue::Text(p.non_integer_text().expect("checked"))
-            }
-            v => json_to_duck(v),
+            v => match p.non_integer_text() {
+                Some(text) => DuckValue::Text(text),
+                None => json_to_duck(v),
+            },
         })
-        .collect();
-    let mut prepared = conn
-        .prepare(&stmt.sql)
-        .map_err(|e| FaucetError::Sink(format!("DuckDB prepare failed: {e}")))?;
-    prepared
-        .execute(duckdb::params_from_iter(params))
-        .map_err(|e| FaucetError::Sink(format!("DuckDB insert failed: {e}")))?;
-    Ok(())
+        .collect()
 }
 
 /// Apply the whole batch inside one `BEGIN`/`COMMIT` transaction, re-chunking
@@ -970,6 +982,46 @@ mod tests {
     use super::*;
     use faucet_core::Sink as _;
     use serde_json::json;
+
+    #[test]
+    fn consecutive_statements_with_one_text_share_a_prepared_statement() {
+        use faucet_common_sql::{Param, StatementKind};
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id BIGINT, v DOUBLE)")
+            .unwrap();
+        let one_sql = "INSERT INTO t (id) VALUES (?)";
+        let one = |id: i64| {
+            Statement::new(
+                StatementKind::Insert,
+                one_sql,
+                vec![Param::owned("id", Some("BIGINT"), json!(id))],
+            )
+        };
+        let two = Statement::new(
+            StatementKind::Insert,
+            "INSERT INTO t (id, v) VALUES (?, ?)",
+            vec![
+                Param::owned("id", Some("BIGINT"), json!(3)),
+                Param::owned("v", Some("DOUBLE"), json!(0.1)),
+            ],
+        );
+        execute_all(&conn, &[one(1), one(2), two, one(4)]).unwrap();
+        let rows: Vec<(i64, Option<f64>)> = conn
+            .prepare("SELECT id, v FROM t ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![(1, None), (2, None), (3, Some(0.1)), (4, None)]);
+        let bad = Statement::bare(StatementKind::Insert, "INSERT INTO missing VALUES (?)");
+        let err = execute_all(&conn, &[one(5), bad]).unwrap_err().to_string();
+        assert!(err.contains("DuckDB prepare failed"), "{err}");
+        let err = execute_all(&conn, &[Statement::bare(StatementKind::Insert, one_sql)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("DuckDB insert failed"), "{err}");
+    }
 
     /// A connection another holder keeps locked stands in for a hung backend
     /// (#880): the write's blocking task waits on the lock while the call ends

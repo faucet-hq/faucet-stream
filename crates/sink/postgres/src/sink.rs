@@ -52,12 +52,24 @@ fn split_columns(
         records,
         columns,
         require_match,
-        |idx, col, v| {
-            pg_bind_text_with(Some(v), &col.sql_type, binary)
-                .err()
-                .map(|e| format!("row {idx}: column {}: {e}", col.name))
-        },
+        |idx, col, v| cell_refusal(idx, col, v, binary),
     )
+}
+
+/// Why `v` cannot be bound into `col`: only a `bytea` string
+/// `binary_encoding` refuses.
+fn cell_refusal(
+    idx: usize,
+    col: &TableColumn,
+    v: &Value,
+    binary: BinaryEncoding,
+) -> Option<String> {
+    if !(v.is_string() && col.sql_type.eq_ignore_ascii_case("bytea")) {
+        return None;
+    }
+    pg_bind_text_with(Some(v), &col.sql_type, binary)
+        .err()
+        .map(|e| format!("row {idx}: column {}: {e}", col.name))
 }
 
 /// Connect options for `url`; under `faucet serve` nothing is taken from the
@@ -986,12 +998,13 @@ impl PostgresDriver {
     async fn copy_batch(
         &self,
         conn: &mut sqlx::PgConnection,
-        table_ref: &str,
+        target: &TableTarget,
         records: &[Value],
     ) -> Result<usize, FaucetError> {
         if records.is_empty() {
             return Ok(0);
         }
+        let table_ref = target.reference.as_str();
         let (statement, payload) = match &self.config.column_mapping {
             PostgresColumnMapping::Jsonb { column } => {
                 let payload = build_jsonb_payload(records);
@@ -1001,7 +1014,17 @@ impl PostgresDriver {
                 )
             }
             PostgresColumnMapping::AutoMap => {
-                let columns = self.discover_columns(&mut *conn, table_ref).await?;
+                let mut exec = PgExec {
+                    conn: &mut *conn,
+                    sink: self,
+                };
+                let columns: Vec<(String, String)> = self
+                    .engine
+                    .page_columns(&mut exec, target)
+                    .await?
+                    .into_iter()
+                    .map(|c| (c.name, c.sql_type))
+                    .collect();
                 let Some(payload) =
                     build_auto_map_payload(records, &columns, self.config.binary_encoding)
                         .map_err(FaucetError::Sink)?
@@ -1047,13 +1070,12 @@ impl PostgresDriver {
         if records.is_empty() {
             return Ok(0);
         }
-        let json_values: Vec<serde_json::Value> = records.to_vec();
         let query = format!(
             "INSERT INTO {table_ref} ({}) SELECT * FROM unnest($1::jsonb[])",
             quote_ident(column)
         );
         sqlx::query(&query)
-            .bind(json_values)
+            .bind(records)
             .execute(&mut *conn)
             .await
             .map_err(|e| FaucetError::Sink(format!("PostgreSQL insert failed: {e}")))?;
@@ -1492,7 +1514,7 @@ impl SqlDriver for PostgresDriver {
         let (raw, _) = conn.parts();
         if path == InsertPath::Page && matches!(self.config.write_method, PostgresWriteMethod::Copy)
         {
-            return self.copy_batch(raw, &target.reference, records).await;
+            return self.copy_batch(raw, target, records).await;
         }
         match &self.config.column_mapping {
             PostgresColumnMapping::Jsonb { column } => {
@@ -1507,6 +1529,24 @@ impl SqlDriver for PostgresDriver {
                 self.engine.insert(&mut exec, target, records, false).await
             }
         }
+    }
+
+    fn refuses_rows(
+        &self,
+        _target: &TableTarget,
+        records: &[Value],
+        columns: &[TableColumn],
+        require_match: bool,
+    ) -> bool {
+        let binary = self.config.binary_encoding;
+        faucet_common_sql::page_refuses(
+            &Postgres,
+            "",
+            records,
+            columns,
+            require_match,
+            |i, c, v| cell_refusal(i, c, v, binary),
+        )
     }
 
     /// A `bytea` value `binary_encoding` refuses fails only its own row.
@@ -2152,5 +2192,55 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("PostgreSQL connection failed"), "{err}");
+    }
+
+    #[test]
+    fn a_cell_is_refused_exactly_when_its_bind_text_fails() {
+        use super::{BinaryEncoding, TableColumn, cell_refusal, pg_bind_text_with};
+        use serde_json::json;
+        let types = [
+            "bytea",
+            "BYTEA",
+            "text",
+            "jsonb",
+            "int8",
+            "timestamp",
+            "numeric",
+        ];
+        let values = [
+            json!("SGVsbG8="),
+            json!("not base64!"),
+            json!("abc"),
+            json!("\\x00ff"),
+            json!(""),
+            json!(1),
+            json!(1.5),
+            json!(true),
+            json!(null),
+            json!([1, 2]),
+            json!({"k": "v"}),
+        ];
+        let mut refused = 0;
+        for binary in [
+            BinaryEncoding::Auto,
+            BinaryEncoding::Text,
+            BinaryEncoding::Base64,
+        ] {
+            for ty in types {
+                let col = TableColumn::new("c", ty);
+                for v in &values {
+                    let expected = pg_bind_text_with(Some(v), ty, binary)
+                        .err()
+                        .map(|e| format!("row 4: column c: {e}"));
+                    refused += usize::from(expected.is_some());
+                    assert_eq!(
+                        cell_refusal(4, &col, v, binary),
+                        expected,
+                        "{ty} {v} {binary:?}"
+                    );
+                }
+            }
+        }
+        assert!(refused > 0);
     }
 }

@@ -88,6 +88,13 @@ pub trait SqlDialect: Send + Sync {
     /// binds through a cast.
     fn placeholder(&self, n: usize, sql_type: Option<&str>) -> String;
 
+    /// Append [`placeholder`](Self::placeholder)`(n, sql_type)` to `out`. A
+    /// dialect overrides it to write the same text without an intermediate
+    /// string; a multi-row statement calls it once per bound value.
+    fn write_placeholder(&self, out: &mut String, n: usize, sql_type: Option<&str>) {
+        out.push_str(&self.placeholder(n, sql_type));
+    }
+
     /// The most parameters one statement may bind.
     fn param_limit(&self) -> usize;
 
@@ -189,17 +196,25 @@ pub trait SqlDialect: Send + Sync {
         rows: usize,
         start: usize,
     ) -> String {
-        (0..rows)
-            .map(|r| {
-                let phs: Vec<String> = (0..width)
-                    .map(|c| {
-                        self.placeholder(start + r * width + c + 1, types.get(c).copied().flatten())
-                    })
-                    .collect();
-                format!("({})", phs.join(", "))
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
+        let mut out = String::with_capacity(rows.saturating_mul(width.saturating_mul(4) + 4));
+        for r in 0..rows {
+            if r > 0 {
+                out.push_str(", ");
+            }
+            out.push('(');
+            for c in 0..width {
+                if c > 0 {
+                    out.push_str(", ");
+                }
+                self.write_placeholder(
+                    &mut out,
+                    start + r * width + c + 1,
+                    types.get(c).copied().flatten(),
+                );
+            }
+            out.push(')');
+        }
+        out
     }
 
     /// Quote and comma-join `columns`.

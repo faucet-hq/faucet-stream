@@ -67,6 +67,7 @@ lifecycle; every default reproduces the generic behaviour:
 | `drop_staging(stale)` / `staging_exists()` | the staging table only | mysql: also the swap's `__faucet_ovw_old` table |
 | `staging_table()` | `SqlLayout::staging_table` | postgres: the name shortened to 63 bytes |
 | `split_page(..)` / `splits_keyed_pages()` | no-matching-column refusals, keyed pages unsplit | postgres, mysql: binary values the encoding refuses fail their row, keyed pages too |
+| `refuses_rows(..)` | `true`: the dead-letter path splits (copies) every page | postgres, mysql, sqlite: answered from the same rule as `split_page` (`page_refuses`), so a page with no refused row is written as offered |
 | `guard(what, fut)` | unbounded | postgres, mysql: `write_timeout_secs` per operation |
 | `table_display(table)` | as configured | postgres: the schema-qualified name |
 | `capabilities(derived)` | unchanged | postgres: scoped overwrite |

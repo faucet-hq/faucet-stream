@@ -7,7 +7,7 @@
 use faucet_core::FaucetError;
 use faucet_core::TimePrecision;
 use serde_json::Value;
-use sqlx::{Column, Row};
+use sqlx::Row;
 
 /// Convert a raw Redshift/Postgres column value to a `serde_json::Value`.
 ///
@@ -222,8 +222,11 @@ pub(crate) fn interval_to_iso(months: i32, days: i32, micros: i64) -> String {
     out
 }
 
-/// Convert a single row into a JSON object keyed by column name.
+/// Convert a single row into a JSON object keyed by column name: the cascade
+/// over a whole row, the reference the decode plan is checked against.
+#[cfg(test)]
 pub(crate) fn row_to_json(row: &sqlx::postgres::PgRow) -> Result<Value, FaucetError> {
+    use sqlx::Column as _;
     let mut map = serde_json::Map::new();
     for col in row.columns() {
         let name = col.name().to_string();

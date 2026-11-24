@@ -19,7 +19,8 @@ use faucet_core::{FaucetError, Source, Stream, StreamPage};
 use serde_json::Value;
 
 use crate::config::{BOOKMARK_TOKEN, RedshiftReplication, RedshiftSourceConfig};
-use crate::convert::{bind_params, row_to_json};
+use crate::convert::bind_params;
+use crate::plan::decode_row;
 
 /// A source that executes a SQL query against Amazon Redshift and returns rows
 /// as JSON objects.
@@ -280,7 +281,11 @@ impl RedshiftSource {
                         sqlx::Row::columns(first).iter().map(sqlx::Column::name),
                     )?;
                 }
-                let rows = fetched.iter().map(row_to_json).collect::<Result<_, _>>()?;
+                let mut plan = None;
+                let rows = fetched
+                    .iter()
+                    .map(|row| decode_row(&mut plan, row))
+                    .collect::<Result<_, _>>()?;
                 Ok((rows, exhausted))
             }
             Cursor::DataApi {
