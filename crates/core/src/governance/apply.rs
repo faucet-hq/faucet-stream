@@ -136,8 +136,7 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
     };
 
     // True page positions of the records currently flowing, kept in lockstep as
-    // quality/contract remove rows. `None` until a pass removes one: every
-    // record is still at its own position.
+    // quality/contract remove rows.
     #[cfg(feature = "quality")]
     let page_len = records.len();
 

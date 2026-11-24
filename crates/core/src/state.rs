@@ -871,8 +871,7 @@ impl FileStateStore {
             bytes,
         };
         let final_path = write.final_path.clone();
-        // The lock travels with the write: a caller that stops waiting never
-        // lets a later put of this key overtake it.
+        // The lock moves into the write, so no later put of this key overtakes it.
         tokio::task::spawn_blocking(move || {
             let _held = held;
             write.run()
@@ -946,10 +945,7 @@ impl EntryWrite {
         if let Some((path, key)) = &self.sidecar {
             self.ensure_sidecar(path, key)?;
         }
-        // The temp file is fsynced BEFORE the rename: a write alone leaves
-        // the bytes in the page cache, and a crash after `put` returns could
-        // surface a zero-length or stale file (#78/#8). Any failure removes
-        // the temp file so retries do not accumulate orphans (CORE-96).
+        // fsync the temp file before the rename (#78/#8); remove it on failure (CORE-96).
         if let Err(e) = self.write_entry() {
             let _ = std::fs::remove_file(&self.tmp_path);
             return Err(e);

@@ -207,9 +207,7 @@ fn compiled() -> Arc<Compiled> {
     {
         return Arc::clone(c);
     }
-    // One builder at a time; registrations go on meanwhile. A matcher is
-    // handed out only if the set it was built from is still the current one,
-    // so every secret registered before this returns is in it.
+    // One builder at a time; a matcher is used only while its set is current.
     static BUILDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _building = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
     for _ in 0..BUILDS_OUTSIDE_THE_LOCK {

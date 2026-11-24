@@ -5795,10 +5795,7 @@ macro_rules! impl_sql_history {
                 let backend = $crate::serve::history::sql::classify_backend_error;
                 let mut tx = self.pool.begin().await.map_err(backend)?;
                 let mut max_seq: Option<u64> = None;
-                // Every line at its own key, a statement per chunk. When any
-                // key is taken (another instance logs this run too) the
-                // attempt is undone and the lines go one by one below, each
-                // moving past taken keys in order.
+                // A statement per chunk; a taken key undoes it for the one-by-one path below.
                 let all_landed = lines.len() > 1 && {
                     use sqlx::Acquire as _;
                     let attrs: Vec<Option<String>> = lines

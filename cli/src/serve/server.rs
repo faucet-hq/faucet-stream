@@ -901,12 +901,8 @@ fn fence(state: &ServerState, fence_after: Duration) -> usize {
     cancelled
 }
 
-/// The part of a lease tick that renews nothing: the policy seed, the feed
-/// check, and the terminal records whose write failed (until they land the
-/// rows read `running`; their lease is renewed meanwhile, so no peer re-runs
-/// them). The seed and feed calls are bounded; a terminal write is not cut,
-/// because one cut client-side may still commit and its retry would then
-/// skip the run's completion side effects.
+/// The part of a lease tick that renews nothing: the policy seed and feed
+/// check (bounded), then the pending terminal writes (never cut).
 async fn lease_upkeep(state: &ServerState) {
     let bound = crate::serve::history::sql::lease_call_bound(state.lease_ttl());
     crate::serve::history::fallback::with_call_bound(bound, async {
@@ -950,8 +946,7 @@ async fn cancel_lost_leases(state: &ServerState, bound: Duration) -> usize {
     lost.len()
 }
 
-/// The keys a peer holds, asked one at a time within `bound`; a key whose
-/// check fails or is not reached in time counts as still held here.
+/// The keys a peer holds, asked one at a time within `bound`.
 async fn leases_lost_one_by_one(
     state: &ServerState,
     keys: &[String],
@@ -1017,8 +1012,7 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
                         })));
                     }
                 }
-                // Upkeep never delays the next renewal: it runs beside the
-                // loop, one pass at a time.
+                // Upkeep runs beside the loop, one pass at a time.
                 if upkeep.as_ref().is_some_and(|pass| !pass.0.is_finished()) {
                     crate::serve::metrics::record_lease_upkeep_skipped();
                     tracing::warn!("lease upkeep from an earlier tick is still running; skipping this one");
@@ -1039,12 +1033,9 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
     }
 }
 
-/// Everything a lease tick does besides renewing and heartbeating: see
-/// [`lease_upkeep`], then the member view, failover reclaim and the sweeps.
-/// Each history call is bounded except the terminal writes whose results
-/// fire completion side effects (the sharded-parent sweep, failing runs of an
-/// unserved pool): a write cut client-side may still commit, and its records
-/// would then be lost.
+/// Everything a lease tick does besides renewing and heartbeating. History
+/// calls are bounded, except the terminal writes whose results fire
+/// completion side effects.
 async fn lease_upkeep_pass(state: ServerState, member_ttl: Duration) {
     use crate::serve::history::fallback::with_call_bound;
     let cluster = state.cluster().clone();
@@ -1090,9 +1081,7 @@ async fn lease_upkeep_pass(state: ServerState, member_ttl: Duration) {
     with_call_bound(bound, clear_settled_forgotten(state)).await;
 }
 
-/// Failover reclaim of runs and shards, the sealed-param purge and the
-/// cancel of flagged shards: their results are counts, so a cut call loses
-/// nothing a later pass needs.
+/// Failover reclaim, the sealed-param purge and the flagged-shard cancel.
 async fn cluster_reclaim(state: &ServerState, cluster: &crate::serve::cluster::ClusterHandle) {
     // Failover reclaim (re-run orphans).
     match state

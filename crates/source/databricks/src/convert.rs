@@ -109,8 +109,7 @@ fn typed_cell(s: &str, type_name: &str) -> Option<Value> {
         "BYTE" | "SHORT" | "INT" | "LONG" => s.parse::<i64>().ok().map(|n| Value::Number(n.into())),
         "FLOAT" | "DOUBLE" => Some(parse_float(s)),
         "ARRAY" | "MAP" | "STRUCT" => faucet_core::fidelity::parse_json(s.as_bytes()).ok(),
-        // DECIMAL stays its exact string, like STRING / DATE / TIMESTAMP /
-        // BINARY / CHAR / INTERVAL / NULL / UDT / …
+        // DECIMAL and every other type stay their exact string.
         _ => None,
     }
 }

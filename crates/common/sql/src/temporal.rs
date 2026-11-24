@@ -19,9 +19,7 @@ pub enum NaiveTemporal {
 /// Which zone-less temporal type `sql_type` is, if any. Zoned types
 /// (`timestamptz`, `timestamp with time zone`, `timetz`) are `None`.
 pub fn naive_temporal(sql_type: &str) -> Option<NaiveTemporal> {
-    // The type name lower-cased, with `(…)` groups dropped and runs of
-    // whitespace collapsed to one space, built without allocating: the
-    // longest name matched below is 27 bytes.
+    // Lower-cased, `(…)` dropped, whitespace collapsed; the longest name is 27 bytes.
     let mut base = [0u8; 32];
     let mut len = 0usize;
     let mut depth = 0usize;
