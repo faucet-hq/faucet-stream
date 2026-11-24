@@ -50,9 +50,10 @@ ARG SINKS=""
 # `full` feature, which enables every feature in its manifest. Keep it exactly
 # `full` — scripts/full-feature-coverage.py fails CI otherwise (#845).
 ARG DEFAULT_FEATURES="full"
-# Cargo profile of the binary: `release`, or `release-lto` (fat LTO, about a
+# Cargo profile of the binary: `dist` (thin LTO, what the release archives
+# use), `release` (no LTO, fastest to link), or `release-lto` (fat LTO, about a
 # quarter smaller; linking a full build that way needs more than 16 GB).
-ARG CARGO_PROFILE="release"
+ARG CARGO_PROFILE="dist"
 # Raw override — when set, wins over everything above.
 ARG FEATURES=""
 
