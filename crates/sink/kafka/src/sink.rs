@@ -857,6 +857,35 @@ fn delivery_outcome(
 mod tests {
     use faucet_core::Sink as _;
 
+    #[test]
+    fn a_failed_delivery_report_names_its_cause() {
+        use rdkafka::error::{KafkaError, RDKafkaErrorCode};
+        use rdkafka::message::{OwnedMessage, Timestamp};
+        let failed = |code| {
+            let msg =
+                OwnedMessage::new(None, None, "t".into(), Timestamp::NotAvailable, 0, 0, None);
+            super::delivery_outcome(Ok(Err((KafkaError::MessageProduction(code), msg))))
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(
+            failed(RDKafkaErrorCode::MessageSizeTooLarge)
+                .contains("kafka send: record exceeds broker max.message.bytes")
+        );
+        let other = failed(RDKafkaErrorCode::UnknownTopic);
+        assert!(
+            other.contains("kafka send: Message production error"),
+            "{other}"
+        );
+        let dropped = super::delivery_outcome(Err(futures::channel::oneshot::Canceled))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            dropped.contains("kafka send: delivery future canceled (producer dropped)"),
+            "{dropped}"
+        );
+    }
+
     /// The sink builds offline (the producer connects lazily) and describes
     /// its config.
     #[tokio::test]
