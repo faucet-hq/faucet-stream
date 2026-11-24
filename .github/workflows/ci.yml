@@ -1088,7 +1088,7 @@ jobs:
       # Hard gate: licenses, banned crates, and dependency sources are
       # deterministic and in our control.
       - name: Licenses / bans / sources
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
         with:
           command: check bans licenses sources
       # Hard gate (#789 SUPPLY-03): RustSec advisories and yanked crates. A
@@ -1096,12 +1096,12 @@ jobs:
       # dated reason; anything else fails the build. advisories.yml re-runs this
       # daily and opens an issue for advisories published between merges.
       - name: Advisories
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
         with:
           command: check advisories
       # The fuzz crate is its own workspace with its own lockfile.
       - name: Advisories (fuzz workspace)
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
         with:
           manifest-path: fuzz/Cargo.toml
           command: check advisories
@@ -1126,7 +1126,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: "1.99.1"
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cargo-vet@0.10.3
       - run: cargo vet --locked
@@ -1308,7 +1308,7 @@ jobs:
           dir="$(ls -d /opt/oracle/instantclient_* | sort -V | tail -1)"
           echo "LD_LIBRARY_PATH=$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           echo "Oracle Instant Client installed at $dir"
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cargo-llvm-cov
       # One cache for every shard (the repo's cache budget has no room for
