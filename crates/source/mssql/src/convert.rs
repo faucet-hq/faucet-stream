@@ -17,9 +17,6 @@ use tiberius::{ColumnData, Row};
 /// Decode every column of `row` into a JSON object keyed by column name.
 pub fn row_to_json(row: &Row) -> Result<Value, FaucetError> {
     let mut map = Map::with_capacity(row.columns().len());
-    // Collect names up front (cells borrows the row immutably for the iterator;
-    // we also call try_get — another shared borrow — for temporal columns).
-    let names: Vec<String> = row.columns().iter().map(|c| c.name().to_string()).collect();
     for (i, (col, data)) in row.cells().enumerate() {
         let money = matches!(
             col.column_type(),
@@ -32,8 +29,8 @@ pub fn row_to_json(row: &Row) -> Result<Value, FaucetError> {
                 None => decode_temporal(row, i, data)?,
             },
         };
-        if map.insert(names[i].clone(), value).is_some() {
-            return Err(duplicate_column(&names[i]));
+        if map.insert(col.name().to_string(), value).is_some() {
+            return Err(duplicate_column(col.name()));
         }
     }
     Ok(Value::Object(map))
