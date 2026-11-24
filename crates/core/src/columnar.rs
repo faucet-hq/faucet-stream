@@ -59,9 +59,7 @@ fn te<E: std::fmt::Display>(ctx: &str, e: E) -> FaucetError {
 /// Returns the inferred schema in an [`Arc`]. An empty slice yields a schema
 /// with no fields.
 pub fn infer_arrow_schema(records: &[Value]) -> Result<SchemaRef, FaucetError> {
-    let iter = records
-        .iter()
-        .map(|v| Ok::<_, arrow::error::ArrowError>(v.clone()));
+    let iter = records.iter().map(Ok::<_, arrow::error::ArrowError>);
     let schema = arrow_json::reader::infer_json_schema_from_iterator(iter)
         .map_err(|e| te("schema inference", e))?;
     refine_wide_integers(&schema, records).map(Arc::new)
@@ -149,6 +147,10 @@ fn refine_wide_integers(schema: &Schema, records: &[Value]) -> Result<Schema, Fa
 
     /// Any wide integer nested inside an array (at any depth).
     fn contains_wide_integer_in_container(values: &[&Value]) -> bool {
+        values.iter().any(|v| holds_wide_in_list(v))
+    }
+
+    fn holds_wide_in_list(v: &Value) -> bool {
         fn walk(v: &Value, in_list: bool) -> bool {
             match v {
                 Value::Array(items) => items.iter().any(|i| walk(i, true)),
@@ -156,13 +158,31 @@ fn refine_wide_integers(schema: &Schema, records: &[Value]) -> Result<Schema, Fa
                 other => in_list && is_wide_integer(other),
             }
         }
-        values.iter().any(|v| walk(v, false))
+        walk(v, false)
+    }
+
+    fn refine_top(field: &Arc<Field>, records: &[Value]) -> Result<Arc<Field>, FaucetError> {
+        let values = || {
+            records
+                .iter()
+                .filter_map(|r| r.get(field.name()))
+                .filter(|v| !v.is_null())
+        };
+        let settled = match field.data_type() {
+            DataType::Struct(_) => false,
+            DataType::Float64 => !values().any(|v| is_wide_integer(v) || holds_wide_in_list(v)),
+            _ => !values().any(holds_wide_in_list),
+        };
+        if settled {
+            return Ok(Arc::clone(field));
+        }
+        refine_field(field, observed(records, field.name())).map(Arc::new)
     }
 
     let fields = schema
         .fields()
         .iter()
-        .map(|f| refine_field(f, observed(records, f.name())).map(Arc::new))
+        .map(|f| refine_top(f, records))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Schema::new(fields).with_metadata(schema.metadata().clone()))
 }
@@ -243,6 +263,55 @@ pub fn values_to_record_batch(
     arrow::compute::concat_batches(&schema, &batches).map_err(|e| te("concat", e))
 }
 
+/// A page converted to Arrow by [`convert_page_or_rows`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ConvertedRows<E> {
+    /// The rows that converted, in page order; `None` when none did.
+    pub batch: Option<RecordBatch>,
+    /// `(page index, error)` of each row that did not convert, ascending.
+    pub failed: Vec<(usize, E)>,
+}
+
+/// Convert a page for a sink that reports per-row outcomes: the whole page
+/// in one call, and row by row only when that fails. Rows that fail alone
+/// are listed; the rest are converted together, and that conversion's error
+/// (a page past an Arrow size limit, say) is returned as is.
+///
+/// `convert` must treat each row independently, as a conversion against a
+/// fixed schema does ([`values_to_record_batch`]).
+pub fn convert_page_or_rows<E>(
+    records: &[Value],
+    convert: impl Fn(&[Value]) -> Result<RecordBatch, E>,
+) -> Result<ConvertedRows<E>, E> {
+    if records.is_empty() {
+        return Ok(ConvertedRows {
+            batch: None,
+            failed: Vec::new(),
+        });
+    }
+    if let Ok(batch) = convert(records) {
+        return Ok(ConvertedRows {
+            batch: Some(batch),
+            failed: Vec::new(),
+        });
+    }
+    let mut good = Vec::with_capacity(records.len());
+    let mut failed = Vec::new();
+    for (i, record) in records.iter().enumerate() {
+        match convert(std::slice::from_ref(record)) {
+            Ok(_) => good.push(record.clone()),
+            Err(e) => failed.push((i, e)),
+        }
+    }
+    let batch = if good.is_empty() {
+        None
+    } else {
+        Some(convert(&good)?)
+    };
+    Ok(ConvertedRows { batch, failed })
+}
+
 fn holds_binary(dt: &DataType) -> bool {
     match dt {
         DataType::Binary
@@ -255,6 +324,33 @@ fn holds_binary(dt: &DataType) -> bool {
         }
         _ => false,
     }
+}
+
+#[derive(Clone, Copy)]
+enum FieldPath<'a> {
+    Root(&'a str),
+    Child(&'a FieldPath<'a>, &'a str),
+    Item(&'a FieldPath<'a>),
+}
+
+impl std::fmt::Display for FieldPath<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Root(name) => f.write_str(name),
+            Self::Child(parent, name) => write!(f, "{parent}.{name}"),
+            Self::Item(parent) => write!(f, "{parent}[]"),
+        }
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(char::from(DIGITS[usize::from(b >> 4)]));
+        out.push(char::from(DIGITS[usize::from(b & 0x0f)]));
+    }
+    out
 }
 
 fn uuid_hex(s: &str) -> Option<String> {
@@ -288,7 +384,7 @@ pub fn binary_values_for_arrow_json(
     schema: &Schema,
 ) -> Result<Option<Vec<Value>>, FaucetError> {
     use base64::Engine as _;
-    fn rewrite(value: &mut Value, dt: &DataType, path: &str) -> Result<(), FaucetError> {
+    fn rewrite(value: &mut Value, dt: &DataType, path: FieldPath<'_>) -> Result<(), FaucetError> {
         match (value, dt) {
             (Value::String(s), DataType::FixedSizeBinary(16)) if uuid_hex(s).is_some() => {
                 *s = uuid_hex(s).unwrap_or_default();
@@ -302,13 +398,13 @@ pub fn binary_values_for_arrow_json(
                             "columnar shim: field '{path}' holds {s:?}, which is not base64"
                         ))
                     })?;
-                *s = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                *s = hex_lower(&bytes);
                 Ok(())
             }
             (Value::Object(map), DataType::Struct(fields)) => {
                 for f in fields {
                     if let Some(v) = map.get_mut(f.name()) {
-                        rewrite(v, f.data_type(), &format!("{path}.{}", f.name()))?;
+                        rewrite(v, f.data_type(), FieldPath::Child(&path, f.name()))?;
                     }
                 }
                 Ok(())
@@ -339,7 +435,7 @@ pub fn binary_values_for_arrow_json(
         let Value::Object(map) = record else { continue };
         for f in &fields {
             if let Some(v) = map.get_mut(f.name()) {
-                rewrite(v, f.data_type(), f.name())?;
+                rewrite(v, f.data_type(), FieldPath::Root(f.name()))?;
             }
         }
     }
@@ -365,7 +461,7 @@ pub fn check_integral(records: &[Value], schema: &Schema) -> Result<(), FaucetEr
         }
     }
 
-    fn walk(value: &Value, dt: &DataType, path: &str) -> Result<(), FaucetError> {
+    fn walk(value: &Value, dt: &DataType, path: FieldPath<'_>) -> Result<(), FaucetError> {
         match (value, dt) {
             (Value::Number(n), dt) if dt.is_integer() => {
                 if n.as_i64().is_none()
@@ -382,7 +478,7 @@ pub fn check_integral(records: &[Value], schema: &Schema) -> Result<(), FaucetEr
             (Value::Object(map), DataType::Struct(fields)) => {
                 for f in fields {
                     if let Some(child) = map.get(f.name()) {
-                        walk(child, f.data_type(), &format!("{path}.{}", f.name()))?;
+                        walk(child, f.data_type(), FieldPath::Child(&path, f.name()))?;
                     }
                 }
                 Ok(())
@@ -392,7 +488,7 @@ pub fn check_integral(records: &[Value], schema: &Schema) -> Result<(), FaucetEr
                 DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _),
             ) => {
                 for item in items {
-                    walk(item, f.data_type(), &format!("{path}[]"))?;
+                    walk(item, f.data_type(), FieldPath::Item(&path))?;
                 }
                 Ok(())
             }
@@ -412,7 +508,7 @@ pub fn check_integral(records: &[Value], schema: &Schema) -> Result<(), FaucetEr
         let Value::Object(map) = record else { continue };
         for f in &fields {
             if let Some(v) = map.get(f.name()) {
-                walk(v, f.data_type(), f.name())?;
+                walk(v, f.data_type(), FieldPath::Root(f.name()))?;
             }
         }
     }
@@ -438,7 +534,7 @@ pub fn values_to_record_batch_inferred(records: &[Value]) -> Result<RecordBatch,
 /// `null`; binary columns are base64; timestamps and times carry their unit's
 /// native precision, and a zoned timestamp its offset.
 pub fn record_batch_to_values(batch: &RecordBatch) -> Result<Vec<Value>, FaucetError> {
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(batch.get_array_memory_size().min(JSON_HOP_PRESIZE_CAP));
     {
         let mut writer = arrow_json::writer::WriterBuilder::new()
             .with_explicit_nulls(true)
@@ -449,6 +545,8 @@ pub fn record_batch_to_values(batch: &RecordBatch) -> Result<Vec<Value>, FaucetE
     }
     serde_json::from_slice(&buf).map_err(|e| te("json parse", e))
 }
+
+const JSON_HOP_PRESIZE_CAP: usize = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 struct ExactEncoderFactory;
@@ -1195,5 +1293,228 @@ mod binary_round_trip_tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("not base64"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod perf_1100_tests {
+    use super::*;
+    use serde_json::json;
+    use std::cell::Cell;
+
+    fn schema(fields: Vec<Field>) -> SchemaRef {
+        Arc::new(Schema::new(fields))
+    }
+
+    #[test]
+    fn inference_reads_records_without_changing_the_schema() {
+        let records = vec![
+            json!({"id": 1, "name": "a", "tags": ["x"], "nested": {"k": 1.5}, "big": 18446744073709551615u64}),
+            json!({"id": 2, "name": null, "tags": [], "nested": {"k": 2}, "big": 7, "extra": true}),
+        ];
+        let cloned = arrow_json::reader::infer_json_schema_from_iterator(
+            records
+                .iter()
+                .map(|v| Ok::<_, arrow::error::ArrowError>(v.clone())),
+        )
+        .unwrap();
+        let expected = refine_wide_integers(&cloned, &records).unwrap();
+        assert_eq!(*infer_arrow_schema(&records).unwrap(), expected);
+        assert_eq!(
+            expected.field_with_name("big").unwrap().data_type(),
+            &DataType::UInt64
+        );
+    }
+
+    #[test]
+    fn wide_integers_are_refined_or_refused_as_before() {
+        let ok = vec![
+            json!({"a": 18446744073709551615u64, "s": {"b": 9223372036854775808u64}, "f": 1.5}),
+        ];
+        let got = infer_arrow_schema(&ok).unwrap();
+        assert_eq!(
+            got.field_with_name("a").unwrap().data_type(),
+            &DataType::UInt64
+        );
+        assert_eq!(
+            got.field_with_name("f").unwrap().data_type(),
+            &DataType::Float64
+        );
+        let DataType::Struct(children) = got.field_with_name("s").unwrap().data_type() else {
+            panic!("s is not a struct");
+        };
+        assert_eq!(children[0].data_type(), &DataType::UInt64);
+
+        let mixed = vec![json!({"a": 18446744073709551615u64}), json!({"a": -1})];
+        let e = infer_arrow_schema(&mixed).unwrap_err().to_string();
+        assert!(
+            e.contains("field \"a\" mixes an integer above i64::MAX"),
+            "{e}"
+        );
+
+        let listed = vec![json!({"l": [18446744073709551615u64]}), json!({"l": [1]})];
+        let e = infer_arrow_schema(&listed).unwrap_err().to_string();
+        assert!(
+            e.contains("field \"l\" contains an integer above i64::MAX inside a list"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn hex_matches_the_formatted_rendering() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        let old: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex_lower(&bytes), old);
+        assert_eq!(hex_lower(&[]), "");
+    }
+
+    #[test]
+    fn error_paths_name_the_nested_field() {
+        let inner = Field::new("n", DataType::Int64, true);
+        let item = Field::new("item", DataType::Struct(vec![inner].into()), true);
+        let s = schema(vec![Field::new(
+            "outer",
+            DataType::Struct(vec![Field::new("list", DataType::List(Arc::new(item)), true)].into()),
+            true,
+        )]);
+        let e = check_integral(&[json!({"outer": {"list": [{"n": 1}, {"n": 2.5}]}})], &s)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("field 'outer.list[].n': 2.5 is not a whole number"),
+            "{e}"
+        );
+        check_integral(&[json!({"outer": {"list": [{"n": 1}, {"n": 2.0}]}})], &s).unwrap();
+
+        let bin = Field::new("item", DataType::Binary, true);
+        let s = schema(vec![Field::new(
+            "outer",
+            DataType::Struct(vec![Field::new("blobs", DataType::List(Arc::new(bin)), true)].into()),
+            true,
+        )]);
+        let e = binary_values_for_arrow_json(&[json!({"outer": {"blobs": ["AQI=", "!"]}})], &s)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("field 'outer.blobs' holds \"!\", which is not base64"),
+            "{e}"
+        );
+        let out = binary_values_for_arrow_json(&[json!({"outer": {"blobs": ["AQL/"]}})], &s)
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, vec![json!({"outer": {"blobs": ["0102ff"]}})]);
+    }
+
+    #[test]
+    fn a_page_that_converts_whole_is_converted_once() {
+        let s = schema(vec![Field::new("n", DataType::Int64, true)]);
+        let records = vec![json!({"n": 1}), json!({"n": 2}), json!({"n": 3})];
+        let calls = Cell::new(0);
+        let got = convert_page_or_rows(&records, |rows| {
+            calls.set(calls.get() + 1);
+            values_to_record_batch(rows, s.clone())
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(got.failed.is_empty());
+        assert_eq!(
+            got.batch.unwrap(),
+            values_to_record_batch(&records, s.clone()).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_failing_page_reports_its_rows_and_keeps_the_rest() {
+        let s = schema(vec![Field::new("n", DataType::Int64, true)]);
+        let records = vec![
+            json!({"n": 1}),
+            json!({"n": 1.5}),
+            json!({"n": 3}),
+            json!({"n": "x"}),
+        ];
+        let got =
+            convert_page_or_rows(&records, |rows| values_to_record_batch(rows, s.clone())).unwrap();
+        let failed: Vec<(usize, String)> = got
+            .failed
+            .iter()
+            .map(|(i, e)| (*i, e.to_string()))
+            .collect();
+        let old: Vec<(usize, String)> = records
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                values_to_record_batch(std::slice::from_ref(r), s.clone())
+                    .err()
+                    .map(|e| (i, e.to_string()))
+            })
+            .collect();
+        assert_eq!(failed, old);
+        assert_eq!(failed.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(
+            got.batch.unwrap(),
+            values_to_record_batch(&[json!({"n": 1}), json!({"n": 3})], s.clone()).unwrap()
+        );
+    }
+
+    #[test]
+    fn no_good_row_means_no_batch_and_a_final_failure_is_returned() {
+        let s = schema(vec![Field::new("n", DataType::Int64, true)]);
+        let none = convert_page_or_rows(&[json!({"n": 0.5})], |rows| {
+            values_to_record_batch(rows, s.clone())
+        })
+        .unwrap();
+        assert!(none.batch.is_none());
+        assert_eq!(none.failed.len(), 1);
+
+        let empty = convert_page_or_rows::<FaucetError>(&[], |_| panic!("not called")).unwrap();
+        assert!(empty.batch.is_none() && empty.failed.is_empty());
+
+        let records = vec![json!({"n": 1}), json!({"n": 2})];
+        let e = convert_page_or_rows(&records, |rows| {
+            if rows.len() > 1 {
+                Err("too large".to_string())
+            } else {
+                values_to_record_batch(rows, s.clone()).map_err(|e| e.to_string())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(e, "too large");
+    }
+
+    #[test]
+    fn the_json_hop_reads_back_the_batch() {
+        let records = vec![json!({"a": 1, "b": "x"}), json!({"a": null, "b": "y"})];
+        let batch = values_to_record_batch_inferred(&records).unwrap();
+        assert_eq!(record_batch_to_values(&batch).unwrap(), records);
+    }
+
+    #[test]
+    #[ignore = "timing loop: cargo test -p faucet-core --release --features arrow -- --ignored schema_inference_timing --nocapture"]
+    fn schema_inference_timing() {
+        let records: Vec<Value> = (0..200_000)
+            .map(|i| {
+                json!({"id": i, "name": format!("user-{i}"), "note": "lorem ipsum dolor sit amet ".repeat(8),
+                       "tags": ["a", "b", "c"], "nested": {"x": 1.5, "y": "z"}, "active": true})
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let old = arrow_json::reader::infer_json_schema_from_iterator(
+            records
+                .iter()
+                .map(|v| Ok::<_, arrow::error::ArrowError>(v.clone())),
+        )
+        .unwrap();
+        let old_time = started.elapsed();
+        let started = std::time::Instant::now();
+        let new = arrow_json::reader::infer_json_schema_from_iterator(
+            records.iter().map(Ok::<_, arrow::error::ArrowError>),
+        )
+        .unwrap();
+        let new_time = started.elapsed();
+        assert_eq!(old, new);
+        println!(
+            "infer over {} records: cloning {old_time:?}, borrowing {new_time:?}",
+            records.len()
+        );
     }
 }

@@ -1769,8 +1769,22 @@ fn claim_wall(body: &str) -> Option<u64> {
         .and_then(|w| w.parse().ok())
 }
 
+struct ByteCount(usize);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn estimate(v: &Value) -> usize {
-    serde_json::to_vec(v).map_or(0, |b| b.len()) + 1
+    let mut count = ByteCount(0);
+    serde_json::to_writer(&mut count, v).map_or(0, |()| count.0) + 1
 }
 
 #[cfg(test)]

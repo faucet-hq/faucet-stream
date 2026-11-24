@@ -62,6 +62,59 @@ fn check_numbers_exact(bytes: &[u8]) -> Result<(), String> {
 /// [`literal_is_faithful`]. A literal of at most 15 significant digits is
 /// always faithful and skipped cheaply.
 pub(crate) fn unfaithful_literals(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
+    if !may_hold_long_literal(bytes) {
+        return Vec::new();
+    }
+    scan_literals(bytes)
+}
+
+const fn numeric_bytes() -> [bool; 256] {
+    let mut t = [false; 256];
+    let set = b"0123456789-+.eE";
+    let mut i = 0;
+    while i < set.len() {
+        t[set[i] as usize] = true;
+        i += 1;
+    }
+    t
+}
+
+const NUMERIC: [bool; 256] = numeric_bytes();
+
+/// Whether `bytes` holds a run of number-literal bytes with more than 15
+/// digits, in or out of a string. `false` means [`scan_literals`] finds
+/// nothing; such a run is at least 16 bytes long, so only every 16th byte is
+/// looked at.
+pub(crate) fn may_hold_long_literal(bytes: &[u8]) -> bool {
+    const STEP: usize = 16;
+    let mut i = STEP - 1;
+    while i < bytes.len() {
+        if !NUMERIC[bytes[i] as usize] {
+            i += STEP;
+            continue;
+        }
+        let mut start = i;
+        while start > 0 && NUMERIC[bytes[start - 1] as usize] {
+            start -= 1;
+        }
+        let mut end = i + 1;
+        while end < bytes.len() && NUMERIC[bytes[end] as usize] {
+            end += 1;
+        }
+        if bytes[start..end]
+            .iter()
+            .filter(|b| b.is_ascii_digit())
+            .count()
+            > 15
+        {
+            return true;
+        }
+        i = end + STEP;
+    }
+    false
+}
+
+fn scan_literals(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
     let mut out = Vec::new();
     let mut i = 0;
     let mut in_string = false;
@@ -169,10 +222,13 @@ pub fn decode_raw_text(bytes: &[u8]) -> Result<Vec<Value>, FaucetError> {
 /// One JSON value per line, newline-terminated.
 pub fn encode_lines(records: &[Value]) -> Result<Vec<u8>, FaucetError> {
     let mut out = Vec::new();
-    for r in records {
+    for (i, r) in records.iter().enumerate() {
         serde_json::to_writer(&mut out, r)
             .map_err(|e| FaucetError::Sink(format!("json_lines: {e}")))?;
         out.push(b'\n');
+        if i == 0 {
+            reserve_like_first(&mut out, records.len());
+        }
     }
     Ok(out)
 }
@@ -189,15 +245,24 @@ pub fn encode_array(records: &[Value]) -> Result<Vec<u8>, FaucetError> {
 /// the silent-data-loss failure this project treats as the worst class of bug.
 pub fn encode_raw_text(records: &[Value]) -> Result<Vec<u8>, FaucetError> {
     let mut out = Vec::new();
-    for r in records {
-        let line = match r.get(RAW_TEXT_FIELD) {
-            Some(Value::String(s)) => s.clone(),
-            _ => super::cell_text(r),
-        };
-        out.extend_from_slice(line.as_bytes());
+    for (i, r) in records.iter().enumerate() {
+        match r.get(RAW_TEXT_FIELD) {
+            Some(Value::String(s)) => out.extend_from_slice(s.as_bytes()),
+            _ => out.extend_from_slice(super::cell_str(r).as_bytes()),
+        }
         out.push(b'\n');
+        if i == 0 {
+            reserve_like_first(&mut out, records.len());
+        }
     }
     Ok(out)
+}
+
+const PAGE_PRESIZE_CAP: usize = 8 * 1024 * 1024;
+
+fn reserve_like_first(out: &mut Vec<u8>, records: usize) {
+    let rest = out.len().saturating_mul(records.saturating_sub(1));
+    out.reserve(rest.min(PAGE_PRESIZE_CAP));
 }
 
 fn as_utf8<'a>(bytes: &'a [u8], what: &str) -> Result<&'a str, FaucetError> {
@@ -306,5 +371,310 @@ mod tests {
     fn non_utf8_is_reported_not_replaced() {
         let err = decode_lines(&[0xff, 0xfe]).expect_err("invalid utf-8");
         assert!(err.to_string().contains("not UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn line_pages_are_presized_without_changing_their_bytes() {
+        let records: Vec<Value> = (0..50)
+            .map(|i| serde_json::json!({"i": i, "text": "t".repeat(i), "o": {"k": [i]}}))
+            .collect();
+        let mut old = Vec::new();
+        for r in &records {
+            serde_json::to_writer(&mut old, r).unwrap();
+            old.push(b'\n');
+        }
+        assert_eq!(encode_lines(&records).unwrap(), old);
+        assert!(encode_lines(&[]).unwrap().is_empty());
+
+        let texts = vec![
+            serde_json::json!({"text": "first"}),
+            serde_json::json!({"other": 1}),
+            serde_json::json!("bare"),
+            serde_json::json!({"text": 5}),
+        ];
+        let old: Vec<u8> = texts
+            .iter()
+            .flat_map(|r| {
+                let line = match r.get(RAW_TEXT_FIELD) {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => super::super::cell_text(r),
+                };
+                format!("{line}\n").into_bytes()
+            })
+            .collect();
+        assert_eq!(encode_raw_text(&texts).unwrap(), old);
+
+        let mut out = vec![0u8; 3 * 1024 * 1024];
+        reserve_like_first(&mut out, 1_000_000);
+        assert!(out.capacity() < 3 * 1024 * 1024 + 2 * PAGE_PRESIZE_CAP);
+        let mut one = vec![0u8; 10];
+        reserve_like_first(&mut one, 1);
+        assert_eq!(one.len(), 10);
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    fn random_number(rng: &mut Rng) -> String {
+        const EDGES: [&str; 12] = [
+            "9007199254740992",
+            "9007199254740993",
+            "9223372036854775807",
+            "9223372036854775808",
+            "-9223372036854775808",
+            "-9223372036854775809",
+            "18446744073709551615",
+            "18446744073709551616",
+            "0.10000000000000001",
+            "1.7976931348623157e308",
+            "123456789012345.6",
+            "1234567890123456e-3",
+        ];
+        if rng.below(4) == 0 {
+            return EDGES[rng.below(EDGES.len())].to_string();
+        }
+        let mut out = String::new();
+        if rng.below(3) == 0 {
+            out.push('-');
+        }
+        let int = 1 + rng.below(22);
+        for i in 0..int {
+            let d = if i == 0 && int > 1 {
+                1 + rng.below(9)
+            } else {
+                rng.below(10)
+            };
+            out.push(char::from(b'0' + d as u8));
+        }
+        if rng.below(3) == 0 {
+            out.push('.');
+            for _ in 0..1 + rng.below(20) {
+                out.push(char::from(b'0' + rng.below(10) as u8));
+            }
+        }
+        if rng.below(4) == 0 {
+            out.push(['e', 'E'][rng.below(2)]);
+            out.push_str(["", "+", "-"][rng.below(3)]);
+            out.push_str(&rng.below(30).to_string());
+        }
+        out
+    }
+
+    fn random_string(rng: &mut Rng) -> String {
+        const PARTS: [&str; 12] = [
+            "abc",
+            "12345678901234567890",
+            "\\\"",
+            "\\\\",
+            "\\u00e9",
+            "é",
+            " ",
+            "2026-11-24T10:00:00.123456Z",
+            "-1.5e10",
+            "{[,:]}",
+            "\\n",
+            "99999999999999999",
+        ];
+        let mut out = String::from("\"");
+        for _ in 0..rng.below(5) {
+            out.push_str(PARTS[rng.below(PARTS.len())]);
+        }
+        out.push('"');
+        out
+    }
+
+    fn random_value(rng: &mut Rng, depth: usize) -> String {
+        const WS: [&str; 5] = ["", " ", "\t", "\r\n", "  "];
+        let ws = WS[rng.below(WS.len())];
+        let pick = if depth > 3 {
+            rng.below(4)
+        } else {
+            rng.below(6)
+        };
+        let body = match pick {
+            0 => random_number(rng),
+            1 => random_string(rng),
+            2 => ["true", "false", "null"][rng.below(3)].to_string(),
+            3 => random_number(rng),
+            4 => {
+                let items: Vec<String> = (0..rng.below(5))
+                    .map(|_| random_value(rng, depth + 1))
+                    .collect();
+                format!("[{}]", items.join(","))
+            }
+            _ => {
+                let items: Vec<String> = (0..rng.below(5))
+                    .map(|_| format!("{}:{}", random_string(rng), random_value(rng, depth + 1)))
+                    .collect();
+                format!("{{{}}}", items.join(","))
+            }
+        };
+        format!("{ws}{body}{ws}")
+    }
+
+    fn random_soup(rng: &mut Rng) -> String {
+        const BITS: [&str; 14] = [
+            "{", "}", "[", "]", ",", ":", "\"", "\\", " ", "x", "-", "e", ".", "tru",
+        ];
+        let mut out = String::new();
+        for _ in 0..rng.below(12) {
+            match rng.below(4) {
+                0 => out.push_str(&random_number(rng)),
+                1 => out.push_str(&random_string(rng)),
+                _ => out.push_str(BITS[rng.below(BITS.len())]),
+            }
+        }
+        out
+    }
+
+    fn corpus() -> Vec<String> {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut out = Vec::new();
+        for _ in 0..20_000 {
+            out.push(random_value(&mut rng, 0));
+        }
+        for _ in 0..20_000 {
+            out.push(random_soup(&mut rng));
+        }
+        for pad in 0..40 {
+            for digits in 13..20 {
+                let n = "9".repeat(digits);
+                let lead = " ".repeat(pad);
+                out.push(format!("{lead}{n}"));
+                out.push(format!("{lead}-{n}"));
+                out.push(format!("{lead}[1,{n}]"));
+                out.push(format!("{lead}{{\"k\":0.{n}}}"));
+                out.push(format!("{lead}\"{n}\""));
+                out.push(format!("{lead}{{{n}:1}}"));
+                out.push(format!("{lead}[{n} x]"));
+            }
+        }
+        out
+    }
+
+    fn reference_from_str(text: &str) -> Result<Value, serde_json::Error> {
+        let value: Value = serde_json::from_str(text)?;
+        let lossy = scan_literals(text.as_bytes());
+        if lossy.is_empty() {
+            return Ok(value);
+        }
+        let mut rewritten = String::with_capacity(text.len() + 2 * lossy.len());
+        let mut last = 0;
+        for r in &lossy {
+            rewritten.push_str(&text[last..r.start]);
+            rewritten.push('"');
+            rewritten.push_str(&text[r.clone()]);
+            rewritten.push('"');
+            last = r.end;
+        }
+        rewritten.push_str(&text[last..]);
+        serde_json::from_str(&rewritten)
+    }
+
+    #[test]
+    fn the_pre_filter_never_clears_an_input_the_full_scan_flags() {
+        let mut flagged = 0;
+        let mut cleared = 0;
+        for text in corpus() {
+            let full = scan_literals(text.as_bytes());
+            assert_eq!(unfaithful_literals(text.as_bytes()), full, "{text}");
+            if !full.is_empty() {
+                flagged += 1;
+                assert!(may_hold_long_literal(text.as_bytes()), "{text}");
+            }
+            if !may_hold_long_literal(text.as_bytes()) {
+                cleared += 1;
+            }
+        }
+        assert!(flagged > 1_000, "{flagged}");
+        assert!(cleared > 1_000, "{cleared}");
+    }
+
+    #[test]
+    fn parsing_matches_the_unfiltered_scan_over_a_generated_corpus() {
+        let (mut ok, mut bad) = (0, 0);
+        for text in corpus() {
+            let new = crate::fidelity::from_str(&text);
+            let old = reference_from_str(&text);
+            match (new, old) {
+                (Ok(a), Ok(b)) => {
+                    ok += 1;
+                    assert_eq!(a, b, "{text}");
+                }
+                (Err(a), Err(b)) => {
+                    bad += 1;
+                    assert_eq!(a.to_string(), b.to_string(), "{text}");
+                }
+                (a, b) => panic!("{text}: {a:?} vs {b:?}"),
+            }
+            let lines = decode_lines(text.as_bytes()).map_err(|e| e.to_string());
+            let array = decode_array(text.as_bytes()).map_err(|e| e.to_string());
+            if scan_literals(text.as_bytes()).is_empty() {
+                if let Err(e) = &lines {
+                    assert!(!e.contains("cannot be represented"), "{text}: {e}");
+                }
+                if let Err(e) = &array {
+                    assert!(!e.contains("cannot be represented"), "{text}: {e}");
+                }
+            } else if serde_json::from_str::<Value>(&text).is_ok() {
+                assert!(array.is_err(), "{text}");
+            }
+        }
+        assert!(ok > 5_000, "{ok}");
+        assert!(bad > 5_000, "{bad}");
+    }
+
+    #[test]
+    fn the_pre_filter_reads_runs_at_every_alignment() {
+        assert!(!may_hold_long_literal(b""));
+        assert!(!may_hold_long_literal(b"123456789012345"));
+        assert!(may_hold_long_literal(b"1234567890123456"));
+        assert!(!may_hold_long_literal(b"1234567-8901.2345e+"));
+        assert!(may_hold_long_literal(b"\"id\":\"1234567890123456\""));
+        let quiet = "2026-11-24T10:00:00.123456Z 550e8400-e29b-41d4-a716-446655440000 ".repeat(8);
+        assert!(!may_hold_long_literal(quiet.as_bytes()));
+    }
+
+    #[test]
+    #[ignore = "timing loop: cargo test -p faucet-core --release -- --ignored long_number_check_timing --nocapture"]
+    fn long_number_check_timing() {
+        let line = format!(
+            "{{\"id\":123456789,\"uuid\":\"550e8400-e29b-41d4-a716-446655440000\",\
+             \"created_at\":\"2026-11-24T10:00:00.123456Z\",\"amount\":1234.56,\"active\":true,\
+             \"tags\":[\"alpha\",\"beta\",\"gamma\"],\"note\":\"{}\",\
+             \"nested\":{{\"a\":1,\"b\":\"two\",\"c\":[1.5,2.5,3.5],\"d\":null}}}}",
+            "lorem ipsum dolor sit amet ".repeat(14)
+        );
+        let lines: Vec<String> = (0..200_000).map(|_| line.clone()).collect();
+        let bytes: usize = lines.iter().map(String::len).sum();
+        let time = |f: &dyn Fn(&str) -> Result<Value, serde_json::Error>| {
+            let started = std::time::Instant::now();
+            let mut n = 0usize;
+            for l in &lines {
+                n += usize::from(f(l).is_ok());
+            }
+            assert_eq!(n, lines.len());
+            started.elapsed()
+        };
+        let parse_only = time(&|l| serde_json::from_str(l));
+        let old = time(&reference_from_str);
+        let new = time(&|l| crate::fidelity::from_str(l));
+        println!(
+            "{} lines, {} bytes/line: parse only {parse_only:?}, old {old:?}, new {new:?}",
+            lines.len(),
+            bytes / lines.len()
+        );
     }
 }

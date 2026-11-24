@@ -62,6 +62,7 @@ pub mod csv;
 #[cfg(feature = "file-format-excel")]
 pub mod excel;
 pub mod json;
+mod lines;
 #[cfg(feature = "file-format-orc")]
 pub mod orc;
 pub mod parquet_io;
@@ -70,6 +71,7 @@ pub mod xml;
 
 pub use budget::DecodeBudget;
 pub use container::{ContainerDecoder, FileInput};
+pub use lines::{JsonLineError, JsonLines, READ_BUFFER_BYTES, json_lines};
 
 /// How the bytes of one object are laid out.
 ///
@@ -584,7 +586,7 @@ pub fn capped_lines<R: tokio::io::AsyncRead + Unpin>(
     max: u64,
 ) -> tokio::io::Lines<tokio::io::BufReader<LineCapped<R>>> {
     use tokio::io::AsyncBufReadExt;
-    tokio::io::BufReader::new(line_capped(reader, max)).lines()
+    tokio::io::BufReader::with_capacity(READ_BUFFER_BYTES, line_capped(reader, max)).lines()
 }
 
 /// A reader whose lines are bounded (see [`line_capped`]).
@@ -830,7 +832,7 @@ pub fn header_union(records: &[Value]) -> Vec<String> {
     for r in records {
         if let Value::Object(map) = r {
             for k in map.keys() {
-                if seen.insert(k.clone()) {
+                if seen.insert(k.as_str()) {
                     out.push(k.clone());
                 }
             }
@@ -858,18 +860,83 @@ pub(crate) fn require_objects(records: &[Value], format: &str) -> Result<(), Fau
 /// `Debug`-printed: a spreadsheet cell cannot hold structure, and the round
 /// trip back through `json_parse` is at least lossless.
 pub fn cell_text(v: &Value) -> String {
+    cell_str(v).into_owned()
+}
+
+/// [`cell_text`] without a copy for a string cell.
+pub fn cell_str(v: &Value) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
     match v {
-        Value::Null => String::new(),
-        Value::String(s) => s.clone(),
-        Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
-        other => crate::util::canonical_json(other),
+        Value::Null => Cow::Borrowed(""),
+        Value::String(s) => Cow::Borrowed(s),
+        Value::Bool(true) => Cow::Borrowed("true"),
+        Value::Bool(false) => Cow::Borrowed("false"),
+        Value::Number(n) => Cow::Owned(n.to_string()),
+        other => Cow::Owned(crate::util::canonical_json(other)),
     }
 }
 
 #[cfg(test)]
 mod capped_read_tests {
     use super::*;
+
+    #[test]
+    fn a_borrowed_cell_spells_what_the_owned_one_did() {
+        use serde_json::json;
+        let old = |v: &Value| match v {
+            Value::Null => String::new(),
+            Value::String(s) => s.clone(),
+            Value::Bool(b) => b.to_string(),
+            Value::Number(n) => n.to_string(),
+            other => crate::util::canonical_json(other),
+        };
+        for v in [
+            json!(null),
+            json!("text, \"quoted\""),
+            json!(""),
+            json!(true),
+            json!(false),
+            json!(-12.5),
+            json!(18446744073709551615u64),
+            json!([1, {"b": 2, "a": 1}]),
+            json!({"z": 1, "a": [null]}),
+        ] {
+            assert_eq!(cell_str(&v), old(&v), "{v}");
+            assert_eq!(cell_text(&v), old(&v), "{v}");
+        }
+    }
+
+    #[test]
+    fn the_header_union_keeps_first_seen_order() {
+        use serde_json::json;
+        let records = vec![
+            json!({"a": 1}),
+            json!("x"),
+            json!({"b": 2, "a": 3}),
+            json!({"c": 4, "b": 5}),
+        ];
+        assert_eq!(header_union(&records), ["a", "b", "c"]);
+        assert!(header_union(&[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn capped_lines_reads_long_and_short_lines_through_the_larger_buffer() {
+        let long = "x".repeat(READ_BUFFER_BYTES + 17);
+        let body = format!("a\n{long}\n\nb");
+        let mut lines = capped_lines(body.as_bytes(), 1 << 30);
+        let mut got = Vec::new();
+        while let Some(l) = lines.next_line().await.unwrap() {
+            got.push(l);
+        }
+        assert_eq!(got, ["a", long.as_str(), "", "b"]);
+        let mut capped = capped_lines(body.as_bytes(), 1024);
+        let e = capped.next_line().await.unwrap_err();
+        assert!(
+            e.get_ref()
+                .is_some_and(|i| i.downcast_ref::<LineTooLong>().is_some()),
+            "{e}"
+        );
+    }
 
     #[tokio::test]
     async fn a_body_past_the_cap_fails_and_one_at_the_cap_reads() {

@@ -241,12 +241,15 @@ fn encode_rows(
         wtr.write_record(&headers)
             .map_err(|e| FaucetError::Sink(format!("csv: writing header: {e}")))?;
     }
+    let mut row = Vec::with_capacity(headers.len());
     for r in records {
-        let row: Vec<String> = headers
-            .iter()
-            .map(|h| r.get(h).map(super::cell_text).unwrap_or_default())
-            .collect();
-        wtr.write_record(&row)
+        row.clear();
+        row.extend(
+            headers
+                .iter()
+                .map(|h| r.get(h).map(super::cell_str).unwrap_or_default()),
+        );
+        wtr.write_record(row.iter().map(|c| c.as_bytes()))
             .map_err(|e| FaucetError::Sink(format!("csv: writing row: {e}")))?;
     }
     wtr.into_inner()
