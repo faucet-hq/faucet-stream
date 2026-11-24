@@ -65,6 +65,26 @@ pub fn row_to_json(row: &[Value], columns: &[ColumnMeta]) -> Value {
     Value::Object(obj)
 }
 
+/// [`row_to_json`] over an owned row: a text cell's string is moved into the
+/// record instead of copied. The result is the same.
+pub fn row_into_json(row: Vec<Value>, columns: &[ColumnMeta]) -> Value {
+    let mut obj = Map::with_capacity(columns.len());
+    let mut cells = row.into_iter();
+    for col in columns {
+        let value = match cells.next() {
+            // SQL REST API ships `null` as a JSON null in the array.
+            None | Some(Value::Null) => Value::Null,
+            Some(Value::String(s)) => match typed_cell(&s, &col.ty, col.scale) {
+                Some(value) => value,
+                None => Value::String(s),
+            },
+            Some(other) => other,
+        };
+        obj.insert(col.name.clone(), value);
+    }
+    Value::Object(obj)
+}
+
 /// Convert a single Snowflake cell to a typed `serde_json::Value`.
 ///
 /// `scale` is the column's reported decimal scale (only meaningful for `fixed`
@@ -85,28 +105,33 @@ fn cell_to_json(cell: Option<&Value>, ty: &str, scale: i64) -> Value {
         Value::String(s) => s.as_str(),
         other => return other.clone(),
     };
+    typed_cell(s, ty, scale).unwrap_or_else(|| Value::String(s.to_owned()))
+}
 
-    let ty = ty.to_ascii_lowercase();
-    match ty.as_str() {
-        "fixed" => parse_number(s, scale),
-        "real" => parse_real(s),
-        "boolean" => parse_bool(s),
+/// The typed value of a string cell, or `None` when the cell stays the string
+/// it is (a text column, or a cell its type cannot read).
+fn typed_cell(s: &str, ty: &str, scale: i64) -> Option<Value> {
+    let ty = if ty.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(ty.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(ty)
+    };
+    match ty.as_ref() {
+        "fixed" => Some(parse_number(s, scale)),
+        "real" => Some(parse_real(s)),
+        "boolean" => Some(parse_bool(s)),
         // A number an f64 cannot hold exactly is kept as a string of its digits.
         "variant" | "object" | "array" => {
             faucet_core::parse_json_exact(s, faucet_core::JsonBigNumbers::String)
                 .map(|(v, _)| v)
-                .unwrap_or_else(|_| Value::String(s.to_owned()))
+                .ok()
         }
         "date" | "time" | "timestamp_ntz" | "timestamp_ltz" | "timestamp_tz" => {
-            temporal_to_iso(s, &ty)
-                .map(Value::String)
-                .unwrap_or_else(|| Value::String(s.to_owned()))
+            temporal_to_iso(s, &ty).map(Value::String)
         }
         // The SQL API renders BINARY as hex; the canonical rendering is base64.
-        "binary" => decode_hex(s)
-            .map(|bytes| faucet_core::fidelity::binary(&bytes))
-            .unwrap_or_else(|| Value::String(s.to_owned())),
-        _ => Value::String(s.to_owned()),
+        "binary" => decode_hex(s).map(|bytes| faucet_core::fidelity::binary(&bytes)),
+        _ => None,
     }
 }
 
@@ -344,6 +369,77 @@ mod tests {
     }
 
     /// A `fixed` column with an explicit (non-zero) decimal scale.
+    #[test]
+    fn row_into_json_matches_row_to_json() {
+        let types = [
+            "fixed",
+            "FIXED",
+            "real",
+            "boolean",
+            "text",
+            "Text",
+            "binary",
+            "date",
+            "time",
+            "timestamp_ntz",
+            "timestamp_ltz",
+            "timestamp_tz",
+            "variant",
+            "object",
+            "array",
+            "geography",
+        ];
+        let cells = [
+            json!("42"),
+            json!("1.50"),
+            json!("true"),
+            json!("abc"),
+            json!("48656c6c6f"),
+            json!("19000"),
+            json!("1700000000.123 1500"),
+            json!("{\"a\":[1,2]}"),
+            json!("not json {"),
+            json!(""),
+            Value::Null,
+            json!(7),
+            json!({"k": 1}),
+        ];
+        for ty in types {
+            for scale in [0, 2] {
+                let cols = vec![
+                    ColumnMeta {
+                        name: "A".into(),
+                        ty: ty.into(),
+                        scale,
+                    },
+                    ColumnMeta {
+                        name: "B".into(),
+                        ty: "text".into(),
+                        scale: 0,
+                    },
+                    ColumnMeta {
+                        name: "C".into(),
+                        ty: ty.into(),
+                        scale,
+                    },
+                ];
+                for cell in &cells {
+                    for row in [
+                        vec![cell.clone(), json!("b"), cell.clone(), json!("extra")],
+                        vec![cell.clone()],
+                        vec![],
+                    ] {
+                        assert_eq!(
+                            row_into_json(row.clone(), &cols),
+                            row_to_json(&row, &cols),
+                            "{ty} scale {scale} {cell}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn col_scaled(name: &str, scale: i64) -> ColumnMeta {
         ColumnMeta {
             name: name.into(),

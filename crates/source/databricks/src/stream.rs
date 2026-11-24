@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use crate::config::{
     BOOKMARK_TOKEN, DatabricksReplication, DatabricksSourceConfig, ResultDisposition, shared_auth,
 };
-use crate::convert::{ColumnInfo, row_to_json};
+use crate::convert::{ColumnInfo, row_into_json};
 
 /// Databricks SQL query source.
 pub struct DatabricksSource {
@@ -603,8 +603,8 @@ impl Source for DatabricksSource {
             while let Some(mut c) = chunk {
                 let data = self.chunk_rows(&mut c).await?;
                 {
-                    for row in &data {
-                        let obj = row_to_json(row, &columns);
+                    for row in data {
+                        let obj = row_into_json(row, &columns);
                         if tracker.as_mut().is_none_or(|t| t.admit(&obj)) {
                             buffer.push(obj);
                         }

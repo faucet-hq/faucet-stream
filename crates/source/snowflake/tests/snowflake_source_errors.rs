@@ -444,3 +444,118 @@ async fn a_result_with_two_columns_of_one_name_is_refused_on_both_paths() {
         "{err}"
     );
 }
+
+// --- Partition GET retries (#1100 H7) ---------------------------------------
+
+async fn mount_two_partition_statement(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "code": "090001",
+            "statementHandle": "h",
+            "resultSetMetaData": metadata(2),
+            "data": [["1"]],
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn partition_requests(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.query().is_some_and(|q| q.contains("partition=1")))
+        .count()
+}
+
+#[tokio::test]
+async fn a_transient_partition_failure_is_retried_and_the_read_completes() {
+    let server = MockServer::start().await;
+    mount_two_partition_statement(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/statements/h"))
+        .and(query_param("partition", "1"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("busy"))
+        .up_to_n_times(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/statements/h"))
+        .and(query_param("partition", "1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"code": "090001", "data": [["2"]]})),
+        )
+        .mount(&server)
+        .await;
+
+    let rows = build_source(cfg(), &server).fetch_all().await.unwrap();
+    assert_eq!(rows, vec![json!({"ID": 1}), json!({"ID": 2})]);
+    assert_eq!(partition_requests(&server).await, 3);
+}
+
+#[tokio::test]
+async fn a_partition_that_keeps_failing_ends_with_the_status_error_after_three_tries() {
+    let server = MockServer::start().await;
+    mount_two_partition_statement(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/statements/h"))
+        .and(query_param("partition", "1"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("busy"))
+        .mount(&server)
+        .await;
+
+    let err = build_source(cfg(), &server).fetch_all().await.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        FaucetError::Source(
+            "Snowflake partition fetch returned HTTP 503 Service Unavailable (partition 1): busy"
+                .into()
+        )
+        .to_string()
+    );
+    assert_eq!(partition_requests(&server).await, 3);
+}
+
+#[tokio::test]
+async fn a_partition_refused_by_the_server_is_not_retried() {
+    let server = MockServer::start().await;
+    mount_two_partition_statement(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/statements/h"))
+        .and(query_param("partition", "1"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("gone"))
+        .mount(&server)
+        .await;
+
+    let err = build_source(cfg(), &server).fetch_all().await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Snowflake partition fetch returned HTTP 404 Not Found (partition 1): gone"),
+        "{err}"
+    );
+    assert_eq!(partition_requests(&server).await, 1);
+}
+
+#[tokio::test]
+async fn a_partition_body_that_is_not_json_names_the_partition() {
+    let server = MockServer::start().await;
+    mount_two_partition_statement(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v2/statements/h"))
+        .and(query_param("partition", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>"))
+        .mount(&server)
+        .await;
+
+    let err = build_source(cfg(), &server).fetch_all().await.unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains(
+            "failed to parse Snowflake partition response (partition 1): error decoding response body"
+        ),
+        "{text}"
+    );
+    assert_eq!(partition_requests(&server).await, 1);
+}

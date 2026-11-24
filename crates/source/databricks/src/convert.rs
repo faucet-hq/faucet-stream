@@ -27,6 +27,7 @@ pub use faucet_common_databricks::ResultColumn as ColumnInfo;
 ///
 /// A row shorter than `columns` treats missing trailing cells as `null`;
 /// extra cells are ignored.
+#[cfg(test)]
 pub fn row_to_json(row: &[Value], columns: &[ColumnInfo]) -> Value {
     let mut obj = Map::with_capacity(columns.len());
     for (i, col) in columns.iter().enumerate() {
@@ -52,7 +53,28 @@ pub fn check_unique_columns(columns: &[ColumnInfo]) -> Result<(), faucet_core::F
     Ok(())
 }
 
+/// Build a JSON object from one owned Databricks row; a cell kept as its
+/// string is moved into the record, not copied. A short row reads missing
+/// cells as `null`; extra cells are ignored.
+pub fn row_into_json(row: Vec<Value>, columns: &[ColumnInfo]) -> Value {
+    let mut obj = Map::with_capacity(columns.len());
+    let mut cells = row.into_iter();
+    for col in columns {
+        let value = match cells.next() {
+            None | Some(Value::Null) => Value::Null,
+            Some(Value::String(s)) => match typed_cell(&s, &col.type_name) {
+                Some(value) => value,
+                None => Value::String(s),
+            },
+            Some(other) => other,
+        };
+        obj.insert(col.name.clone(), value);
+    }
+    Value::Object(obj)
+}
+
 /// Convert a single cell (a JSON string or null) to a typed value.
+#[cfg(test)]
 fn cell_to_json(cell: Option<&Value>, type_name: &str) -> Value {
     let Some(cell) = cell else {
         return Value::Null;
@@ -66,32 +88,30 @@ fn cell_to_json(cell: Option<&Value>, type_name: &str) -> Value {
         Value::String(s) => s.as_str(),
         other => return other.clone(),
     };
-
-    match type_name.to_ascii_uppercase().as_str() {
-        "BOOLEAN" => match s {
-            "true" => Value::Bool(true),
-            "false" => Value::Bool(false),
-            _ => Value::String(s.to_owned()),
-        },
-        "BYTE" | "SHORT" | "INT" | "LONG" => parse_int(s),
-        "FLOAT" | "DOUBLE" => parse_float(s),
-        // DECIMAL is preserved as an exact string (serde_json numbers are f64
-        // here, which would lose precision on large/fractional decimals).
-        "DECIMAL" => Value::String(s.to_owned()),
-        "ARRAY" | "MAP" | "STRUCT" => faucet_core::fidelity::parse_json(s.as_bytes())
-            .unwrap_or_else(|_| Value::String(s.to_owned())),
-        // STRING / DATE / TIMESTAMP / BINARY / CHAR / INTERVAL / NULL / UDT / …
-        _ => Value::String(s.to_owned()),
-    }
+    typed_cell(s, type_name).unwrap_or_else(|| Value::String(s.to_owned()))
 }
 
-/// Parse an integer cell, keeping full precision: an `i64` fits into a JSON
-/// number; anything larger (e.g. a `LONG`/`DECIMAL(38,0)` beyond i64) is kept
-/// as a lossless string rather than coerced through `f64`.
-fn parse_int(s: &str) -> Value {
-    match s.parse::<i64>() {
-        Ok(n) => Value::Number(n.into()),
-        Err(_) => Value::String(s.to_owned()),
+/// The typed value of a string cell, or `None` when the cell stays the string
+/// it is.
+fn typed_cell(s: &str, type_name: &str) -> Option<Value> {
+    let type_name = if type_name.bytes().any(|b| b.is_ascii_lowercase()) {
+        std::borrow::Cow::Owned(type_name.to_ascii_uppercase())
+    } else {
+        std::borrow::Cow::Borrowed(type_name)
+    };
+    match type_name.as_ref() {
+        "BOOLEAN" => match s {
+            "true" => Some(Value::Bool(true)),
+            "false" => Some(Value::Bool(false)),
+            _ => None,
+        },
+        // An integer beyond `i64` stays its exact string, never through `f64`.
+        "BYTE" | "SHORT" | "INT" | "LONG" => s.parse::<i64>().ok().map(|n| Value::Number(n.into())),
+        "FLOAT" | "DOUBLE" => Some(parse_float(s)),
+        "ARRAY" | "MAP" | "STRUCT" => faucet_core::fidelity::parse_json(s.as_bytes()).ok(),
+        // DECIMAL stays its exact string, like STRING / DATE / TIMESTAMP /
+        // BINARY / CHAR / INTERVAL / NULL / UDT / …
+        _ => None,
     }
 }
 
@@ -146,6 +166,66 @@ mod tests {
         dup.push(dup[0].clone());
         let err = check_unique_columns(&dup).unwrap_err().to_string();
         assert!(err.contains("two columns named \"id\""), "{err}");
+    }
+
+    #[test]
+    fn row_into_json_matches_row_to_json() {
+        let types = [
+            "BOOLEAN",
+            "boolean",
+            "BYTE",
+            "SHORT",
+            "INT",
+            "LONG",
+            "Long",
+            "FLOAT",
+            "DOUBLE",
+            "DECIMAL",
+            "ARRAY",
+            "MAP",
+            "STRUCT",
+            "STRING",
+            "DATE",
+            "TIMESTAMP",
+            "BINARY",
+        ];
+        let cells = [
+            json!("true"),
+            json!("maybe"),
+            json!("42"),
+            json!("123456789012345678901234"),
+            json!("1.5"),
+            json!("NaN"),
+            json!("[1,2,3]"),
+            json!("[oops"),
+            json!("{\"a\":1}"),
+            json!(""),
+            Value::Null,
+            json!(7),
+            json!([1]),
+        ];
+        for ty in types {
+            let c: Vec<ColumnInfo> = [("a", ty), ("b", "STRING"), ("c", ty)]
+                .iter()
+                .map(|(n, t)| ColumnInfo {
+                    name: (*n).into(),
+                    type_name: (*t).into(),
+                })
+                .collect();
+            for cell in &cells {
+                for row in [
+                    vec![cell.clone(), json!("b"), cell.clone(), json!("extra")],
+                    vec![cell.clone()],
+                    vec![],
+                ] {
+                    assert_eq!(
+                        row_into_json(row.clone(), &c),
+                        row_to_json(&row, &c),
+                        "{ty} {cell}"
+                    );
+                }
+            }
+        }
     }
 
     fn cols() -> Vec<ColumnInfo> {

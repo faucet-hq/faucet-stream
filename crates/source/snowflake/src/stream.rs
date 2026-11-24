@@ -8,7 +8,7 @@
 //! into pages of [`SnowflakeSourceConfig::batch_size`].
 
 use crate::config::SnowflakeSourceConfig;
-use crate::convert::{ColumnMeta, row_to_json};
+use crate::convert::{ColumnMeta, row_into_json, row_to_json};
 use async_trait::async_trait;
 use faucet_common_snowflake::{
     CancelOnDrop, SnowflakeAuth, authorization_header, cancel_statement, credential_to_auth,
@@ -322,8 +322,7 @@ impl SnowflakeSource {
             )));
         }
 
-        let parsed: StatementResponse = resp
-            .json()
+        let parsed = read_statement(resp)
             .await
             .map_err(|e| FaucetError::Source(format!("failed to parse Snowflake response: {e}")))?;
 
@@ -387,7 +386,7 @@ impl SnowflakeSource {
                 )));
             }
             guard.disarm();
-            let parsed: StatementResponse = resp.json().await.map_err(|e| {
+            let parsed = read_statement(resp).await.map_err(|e| {
                 FaucetError::Source(format!("failed to parse Snowflake poll response: {e}"))
             })?;
             check_code(&parsed)?;
@@ -395,49 +394,107 @@ impl SnowflakeSource {
         }
     }
 
-    /// Fetch one additional partition's worth of rows.
+    /// Fetch one additional partition's worth of rows. The GET is an
+    /// idempotent read, so a transient failure — while sending or while
+    /// reading the body — is retried a few times before the extract fails.
     async fn fetch_partition(
         &self,
         handle: &str,
         partition: usize,
     ) -> Result<Vec<Vec<Value>>, FaucetError> {
+        use std::sync::atomic::{AtomicBool, Ordering};
         let url = self.partition_url(handle, partition);
         let (auth, token_type) = self.auth_headers().await?;
-        let resp = self
+        let reading = AtomicBool::new(false);
+        let body = self
             .calls
+            .get()
+            .with_retry(partition_retry())
             .call("partition", || async {
-                Ok(self
+                reading.store(false, Ordering::Relaxed);
+                let resp = self
                     .client
                     .get(&url)
                     .header("Authorization", &auth)
                     .header("Accept", "application/json")
                     .header("X-Snowflake-Authorization-Token-Type", token_type)
                     .send()
-                    .await)
+                    .await
+                    .map_err(FaucetError::Http)?;
+                let status = resp.status();
+                if !status.is_success() {
+                    return Err(FaucetError::HttpStatus {
+                        status: status.as_u16(),
+                        url: String::new(),
+                        body: resp.text().await.unwrap_or_default(),
+                    });
+                }
+                reading.store(true, Ordering::Relaxed);
+                faucet_core::http::read_body_limited(resp, Some(MAX_RESPONSE_BYTES)).await
             })
-            .await?
-            .map_err(|e| {
+            .await
+            .map_err(|e| partition_error(e, partition, reading.load(Ordering::Relaxed)))?;
+
+        let parsed: StatementResponse =
+            faucet_core::http::decode_json(body).await.map_err(|e| {
                 FaucetError::Source(format!(
-                    "Snowflake partition fetch failed (partition {partition}): {e}"
+                    "failed to parse Snowflake partition response (partition {partition}): \
+                     {}",
+                    decode_text(&e)
                 ))
             })?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(FaucetError::Source(format!(
-                "Snowflake partition fetch returned HTTP {status} (partition {partition}): {text}"
-            )));
-        }
-
-        let parsed: StatementResponse = resp.json().await.map_err(|e| {
-            FaucetError::Source(format!(
-                "failed to parse Snowflake partition response (partition {partition}): {e}"
-            ))
-        })?;
         check_code(&parsed)?;
         Ok(parsed.data.unwrap_or_default())
     }
+}
+
+/// The largest response body the source reads.
+const MAX_RESPONSE_BYTES: u64 = faucet_core::http::DEFAULT_MAX_RESPONSE_BYTES;
+
+/// Retries of one partition GET: three attempts, 500 ms doubling to 5 s.
+fn partition_retry() -> faucet_core::resilience::RetryPolicy {
+    faucet_core::resilience::RetryPolicy {
+        max_attempts: 3,
+        base: Duration::from_millis(500),
+        max: Duration::from_secs(5),
+        ..Default::default()
+    }
+}
+
+/// The source's error for a partition GET that failed for good.
+fn partition_error(e: FaucetError, partition: usize, reading: bool) -> FaucetError {
+    match e {
+        FaucetError::HttpStatus { status, body, .. } => {
+            let status = reqwest::StatusCode::from_u16(status)
+                .map_or_else(|_| status.to_string(), |s| s.to_string());
+            FaucetError::Source(format!(
+                "Snowflake partition fetch returned HTTP {status} (partition {partition}): {body}"
+            ))
+        }
+        e @ (FaucetError::Cancelled { .. } | FaucetError::Timeout { .. }) => e,
+        e if reading => FaucetError::Source(format!(
+            "failed to parse Snowflake partition response (partition {partition}): {e}"
+        )),
+        FaucetError::Http(e) => FaucetError::Source(format!(
+            "Snowflake partition fetch failed (partition {partition}): {e}"
+        )),
+        other => other,
+    }
+}
+
+/// How a body that is not the expected JSON reads in an error.
+fn decode_text(e: &FaucetError) -> String {
+    match e {
+        FaucetError::Json(e) => format!("error decoding response body: {e}"),
+        other => other.to_string(),
+    }
+}
+
+/// Read a response body under the size limit and decode it.
+async fn read_statement(resp: reqwest::Response) -> Result<StatementResponse, String> {
+    faucet_core::http::read_json_limited(resp, Some(MAX_RESPONSE_BYTES))
+        .await
+        .map_err(|e| decode_text(&e))
 }
 
 /// Catalog query behind [`Source::discover`](faucet_core::Source::discover):
@@ -757,8 +814,8 @@ impl faucet_core::Source for SnowflakeSource {
         let mut rows: Vec<Value> = initial
             .data
             .unwrap_or_default()
-            .iter()
-            .map(|r| row_to_json(r, &columns))
+            .into_iter()
+            .map(|r| row_into_json(r, &columns))
             .collect();
 
         let partition_count = initial
@@ -777,7 +834,7 @@ impl faucet_core::Source for SnowflakeSource {
             for i in 1..partition_count {
                 let raw = self.fetch_partition(&handle, i).await?;
                 for r in raw {
-                    rows.push(row_to_json(&r, &columns));
+                    rows.push(row_into_json(r, &columns));
                 }
             }
         }
@@ -848,7 +905,7 @@ impl faucet_core::Source for SnowflakeSource {
 
             // First partition: rows come back in the POST response itself.
             for raw in initial.data.unwrap_or_default() {
-                buffer.push(row_to_json(&raw, &columns));
+                buffer.push(row_into_json(raw, &columns));
                 if buffer.len() >= chunk {
                     let page = std::mem::replace(&mut buffer, Vec::with_capacity(initial_capacity));
                     total += page.len();
@@ -879,8 +936,8 @@ impl faucet_core::Source for SnowflakeSource {
                     .buffered(concurrency);
                 while let Some(raw) = fetches.next().await {
                     let raw = raw?;
-                    for r in &raw {
-                        buffer.push(row_to_json(r, &columns));
+                    for r in raw {
+                        buffer.push(row_into_json(r, &columns));
                         if buffer.len() >= chunk {
                             let page = std::mem::replace(
                                 &mut buffer,
