@@ -45,6 +45,8 @@ struct Registry {
     max_forms: usize,
     max_caller_forms: usize,
     compiled: Option<Arc<Compiled>>,
+    /// Counts changes to the set of forms; a matcher belongs to one value.
+    generation: u64,
 }
 
 impl Default for Registry {
@@ -58,6 +60,7 @@ impl Default for Registry {
             max_forms: MAX_FORMS,
             max_caller_forms: MAX_CALLER_FORMS,
             compiled: None,
+            generation: 0,
         }
     }
 }
@@ -75,51 +78,74 @@ struct Compiled {
 }
 
 impl Registry {
+    /// The set of forms changed: the matcher no longer covers it.
+    fn invalidate(&mut self) {
+        self.compiled = None;
+        self.generation += 1;
+    }
+
     fn insert(&mut self, forms: Vec<String>) {
         self.seq += 1;
+        let mut changed = false;
         for f in forms {
             if !self.pinned.contains(&f) && !self.protected.contains(&f) {
-                self.forms.insert(f, self.seq);
+                changed |= self.forms.insert(f, self.seq).is_none();
             }
         }
-        evict_oldest(&mut self.forms, self.max_forms);
-        self.compiled = None;
+        changed |= evict_oldest(&mut self.forms, self.max_forms);
+        if changed {
+            self.invalidate();
+        }
     }
 
     fn insert_caller(&mut self, forms: Vec<String>) {
         self.seq += 1;
+        let mut changed = false;
         for f in forms {
             if !self.pinned.contains(&f)
                 && !self.protected.contains(&f)
                 && !self.forms.contains_key(&f)
             {
-                self.caller.insert(f, self.seq);
+                changed |= self.caller.insert(f, self.seq).is_none();
             }
         }
-        evict_oldest(&mut self.caller, self.max_caller_forms);
-        self.compiled = None;
+        changed |= evict_oldest(&mut self.caller, self.max_caller_forms);
+        if changed {
+            self.invalidate();
+        }
     }
 
     fn pin(&mut self, forms: Vec<String>) {
+        let mut changed = false;
         for f in forms {
-            self.forms.remove(&f);
-            self.pinned.insert(f);
+            changed |= self.forms.remove(&f).is_some();
+            changed |= self.pinned.insert(f);
         }
-        self.compiled = None;
+        if changed {
+            self.invalidate();
+        }
     }
 
     fn protect(&mut self, forms: Vec<String>) {
+        let mut changed = false;
         for f in forms {
             if !self.pinned.contains(&f) {
-                self.forms.remove(&f);
-                self.caller.remove(&f);
-                self.protected.insert(f);
+                changed |= self.forms.remove(&f).is_some();
+                changed |= self.caller.remove(&f).is_some();
+                changed |= self.protected.insert(f);
             }
         }
-        self.compiled = None;
+        if changed {
+            self.invalidate();
+        }
     }
 
     fn compile(&self) -> Compiled {
+        Compiled::of(self.patterns())
+    }
+
+    /// Every form to scrub, longest first (ties by text).
+    fn patterns(&self) -> Vec<String> {
         let mut patterns: Vec<String> = self
             .forms
             .keys()
@@ -129,6 +155,12 @@ impl Registry {
             .cloned()
             .collect();
         patterns.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        patterns
+    }
+}
+
+impl Compiled {
+    fn of(patterns: Vec<String>) -> Self {
         let matcher = (!patterns.is_empty())
             .then(|| {
                 aho_corasick::AhoCorasick::builder()
@@ -148,15 +180,18 @@ impl Registry {
     }
 }
 
-/// Drop the least recently registered forms of `forms` above `max`.
-fn evict_oldest(forms: &mut HashMap<String, u64>, max: usize) {
-    if forms.len() > max {
+/// Drop the least recently registered forms of `forms` above `max`; whether
+/// any was dropped.
+fn evict_oldest(forms: &mut HashMap<String, u64>, max: usize) -> bool {
+    let over = forms.len() > max;
+    if over {
         let mut by_age: Vec<(u64, String)> = forms.iter().map(|(f, s)| (*s, f.clone())).collect();
         by_age.sort();
         let excess = forms.len() - max;
         let cutoff = by_age[excess - 1].0;
         forms.retain(|_, s| *s > cutoff);
     }
+    over
 }
 
 fn registry() -> &'static RwLock<Registry> {
@@ -172,6 +207,26 @@ fn compiled() -> Arc<Compiled> {
     {
         return Arc::clone(c);
     }
+    // One builder at a time; registrations go on meanwhile. A matcher is
+    // handed out only if the set it was built from is still the current one,
+    // so every secret registered before this returns is in it.
+    static BUILDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _building = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
+    for _ in 0..BUILDS_OUTSIDE_THE_LOCK {
+        let (patterns, generation) = {
+            let reg = registry().read().expect("secret registry lock poisoned");
+            if let Some(c) = &reg.compiled {
+                return Arc::clone(c);
+            }
+            (reg.patterns(), reg.generation)
+        };
+        let built = Arc::new(Compiled::of(patterns));
+        let mut reg = registry().write().expect("secret registry lock poisoned");
+        if reg.generation == generation {
+            reg.compiled = Some(Arc::clone(&built));
+            return built;
+        }
+    }
     let mut reg = registry().write().expect("secret registry lock poisoned");
     if let Some(c) = &reg.compiled {
         return Arc::clone(c);
@@ -180,6 +235,10 @@ fn compiled() -> Arc<Compiled> {
     reg.compiled = Some(Arc::clone(&c));
     c
 }
+
+/// Matcher builds tried without holding the registry before one is done
+/// under its lock (registrations kept changing the set).
+const BUILDS_OUTSIDE_THE_LOCK: usize = 2;
 
 /// The forms a secret takes in output: itself, escaped as JSON and `{:?}`,
 /// and for a multi-line secret each line on its own.
@@ -303,7 +362,7 @@ pub fn unregister(secret: &str) {
         reg.protected.remove(&f);
     }
     if reg.forms.len() + reg.caller.len() + reg.protected.len() != before {
-        reg.compiled = None;
+        reg.invalidate();
     }
 }
 
