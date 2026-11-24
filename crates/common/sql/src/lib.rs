@@ -58,7 +58,7 @@ pub use dialect::{SqlDialect, TableTarget};
 pub use driver::{InsertPath, SqlDriver, SqlEvolution, SqlFuture, SqlLayout, SqlSinkDriver};
 pub use engine::{
     EngineOptions, EvolutionStep, PageScope, SplitPage, SqlExecutor, SqlSinkEngine,
-    check_cleanup_columns, no_match_message, split_page,
+    check_cleanup_columns, no_match_message, page_refuses, split_page,
 };
 pub use mapping::{ColumnIndex, ColumnMatching, MapError, MatchedRow, TableColumn};
 pub use overwrite::{

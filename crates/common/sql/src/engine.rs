@@ -931,15 +931,16 @@ pub fn split_page<D: SqlDialect + ?Sized>(
     let mut writable = Vec::with_capacity(records.len());
     let mut positions = Vec::with_capacity(records.len());
     for (idx, record) in records.iter().enumerate() {
-        let failure = record.as_object().and_then(|obj| {
-            let cells = index.match_record(obj);
-            if require_match && cells.is_empty() {
-                return Some(no_match_message(dialect, idx, obj, columns, table));
-            }
-            cells
-                .iter()
-                .find_map(|(i, v)| validate(idx, &columns[*i], v))
-        });
+        let failure = row_refusal(
+            dialect,
+            table,
+            &index,
+            idx,
+            record,
+            columns,
+            require_match,
+            &validate,
+        );
         match failure {
             Some(msg) => outcomes.push(Err(FaucetError::Sink(msg))),
             None => {
@@ -954,6 +955,55 @@ pub fn split_page<D: SqlDialect + ?Sized>(
         writable,
         positions,
     }
+}
+
+/// Why [`split_page`] fails the record at `idx`, if it does.
+#[allow(clippy::too_many_arguments)]
+fn row_refusal<D: SqlDialect + ?Sized>(
+    dialect: &D,
+    table: &str,
+    index: &ColumnIndex<'_>,
+    idx: usize,
+    record: &Value,
+    columns: &[TableColumn],
+    require_match: bool,
+    validate: &impl Fn(usize, &TableColumn, &Value) -> Option<String>,
+) -> Option<String> {
+    let obj = record.as_object()?;
+    let cells = index.match_record(obj);
+    if require_match && cells.is_empty() {
+        return Some(no_match_message(dialect, idx, obj, columns, table));
+    }
+    cells
+        .iter()
+        .find_map(|(i, v)| validate(idx, &columns[*i], v))
+}
+
+/// Whether [`split_page`] with the same arguments would fail any row,
+/// answered without copying the page: when it is `false` the split's
+/// `writable` is `records` itself and every outcome is `Ok`.
+pub fn page_refuses<D: SqlDialect + ?Sized>(
+    dialect: &D,
+    table: &str,
+    records: &[Value],
+    columns: &[TableColumn],
+    require_match: bool,
+    validate: impl Fn(usize, &TableColumn, &Value) -> Option<String>,
+) -> bool {
+    let index = ColumnIndex::new(columns, dialect.column_matching());
+    records.iter().enumerate().any(|(idx, record)| {
+        row_refusal(
+            dialect,
+            table,
+            &index,
+            idx,
+            record,
+            columns,
+            require_match,
+            &validate,
+        )
+        .is_some()
+    })
 }
 
 /// Refuse a scoped cleanup whose scope or key names a column the destination

@@ -38,6 +38,15 @@ impl SqlDialect for Redshift {
         }
     }
 
+    fn write_placeholder(&self, out: &mut String, n: usize, sql_type: Option<&str>) {
+        use std::fmt::Write as _;
+        // Writing to a `String` cannot fail.
+        let _ = match sql_type {
+            Some(t) => write!(out, "${n}::{t}"),
+            None => write!(out, "${n}"),
+        };
+    }
+
     fn param_limit(&self) -> usize {
         PARAM_LIMIT
     }

@@ -47,6 +47,16 @@ impl SqlDialect for Postgres {
         }
     }
 
+    fn write_placeholder(&self, out: &mut String, n: usize, sql_type: Option<&str>) {
+        use std::fmt::Write as _;
+        // Writing to a `String` cannot fail.
+        let _ = match sql_type {
+            Some(t) if is_plain_type_name(t) => write!(out, "${n}::{t}"),
+            Some(t) => write!(out, "${n}::{}", quote(t)),
+            None => write!(out, "${n}"),
+        };
+    }
+
     fn param_limit(&self) -> usize {
         PARAM_LIMIT
     }

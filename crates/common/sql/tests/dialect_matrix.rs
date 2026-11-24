@@ -1745,3 +1745,133 @@ fn declared_precision_without_scale_is_an_integer<D: SqlDialect>(d: D) {
 fn matrix_declared_precision_without_scale() {
     every_dialect!(declared_precision_without_scale_is_an_integer);
 }
+
+fn values_text_is_the_joined_placeholders<D: SqlDialect>(d: D) {
+    let types: [Option<&str>; 4] = [
+        Some("int4"),
+        None,
+        Some("timestamp with time zone"),
+        Some("x"),
+    ];
+    for (width, rows, start) in [(0, 0, 0), (1, 1, 0), (3, 2, 0), (4, 3, 7), (2, 5, 100)] {
+        for types in [&types[..], &types[..1], &[]] {
+            let expected = (0..rows)
+                .map(|r| {
+                    let row: Vec<String> = (0..width)
+                        .map(|c| {
+                            d.placeholder(
+                                start + r * width + c + 1,
+                                types.get(c).copied().flatten(),
+                            )
+                        })
+                        .collect();
+                    format!("({})", row.join(", "))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            assert_eq!(
+                d.values_sql(width, types, rows, start),
+                expected,
+                "{}: {width}x{rows} from {start}",
+                d.name()
+            );
+        }
+    }
+    for (n, ty) in [
+        (1, None),
+        (12, Some("numeric(10,2)")),
+        (65535, Some("Mixed Case")),
+    ] {
+        let mut out = String::from("x");
+        d.write_placeholder(&mut out, n, ty);
+        assert_eq!(out, format!("x{}", d.placeholder(n, ty)), "{}", d.name());
+    }
+}
+
+#[test]
+fn matrix_values_text() {
+    every_dialect!(values_text_is_the_joined_placeholders);
+}
+
+fn a_page_refuses_exactly_when_its_split_fails_a_row<D: SqlDialect>(d: D) {
+    let columns = vec![
+        TableColumn::new("id", "int"),
+        TableColumn::new("Name", "text"),
+    ];
+    let refuse_seven = |idx: usize, col: &TableColumn, v: &Value| {
+        (*v == json!(7)).then(|| format!("{idx}:{}", col.name))
+    };
+    let pages = [
+        vec![],
+        vec![json!({"id": 1}), json!({"Name": "a", "id": 2})],
+        vec![json!({"id": 1}), json!({"other": true})],
+        vec![json!({"id": 7})],
+        vec![json!("not an object"), json!({"id": 3})],
+        vec![json!({"ID": 1, "name": "x"})],
+    ];
+    for page in &pages {
+        for require_match in [false, true] {
+            let split =
+                faucet_common_sql::split_page(&d, "t", page, &columns, require_match, refuse_seven);
+            let refuses = faucet_common_sql::page_refuses(
+                &d,
+                "t",
+                page,
+                &columns,
+                require_match,
+                refuse_seven,
+            );
+            assert_eq!(
+                refuses,
+                split.outcomes.iter().any(Result::is_err),
+                "{}: {page:?} require_match = {require_match}",
+                d.name()
+            );
+            if !refuses {
+                assert_eq!(&split.writable, page);
+                assert_eq!(split.positions, (0..page.len()).collect::<Vec<_>>());
+            }
+        }
+    }
+}
+
+#[test]
+fn matrix_page_refusals() {
+    every_dialect!(a_page_refuses_exactly_when_its_split_fails_a_row);
+}
+
+#[test]
+fn a_page_maps_like_its_records_one_by_one() {
+    use faucet_common_sql::mapping::{map_records, match_record};
+    let columns = vec![
+        TableColumn::new("id", "int"),
+        TableColumn::new("Name", "text"),
+        TableColumn::new("NAME", "text"),
+        TableColumn::new("UPPER", "text"),
+    ];
+    let page = vec![
+        json!({"id": 1, "Name": "exact"}),
+        json!({"id": 2, "ID": 9, "name": "folded", "upper": "u"}),
+        json!({"Id": 3, "NAME": "x", "Upper": 1, "id": 4}),
+        json!({"id": 5, "UPPER": null, "extra": 1}),
+    ];
+    for matching in [
+        ColumnMatching::Exact,
+        ColumnMatching::CaseInsensitive,
+        ColumnMatching::FoldUnique,
+        ColumnMatching::UpperFold,
+    ] {
+        let rows = map_records(&columns, &page, matching).expect("every record matches");
+        assert_eq!(rows.len(), page.len());
+        for (row, record) in rows.iter().zip(&page) {
+            let obj = record.as_object().expect("object");
+            assert_eq!(
+                row.cells,
+                match_record(&columns, obj, matching),
+                "{matching:?} {record}"
+            );
+        }
+    }
+    assert!(map_records(&columns, &[json!({"none": 1})], ColumnMatching::Exact).is_err());
+    assert!(map_records(&columns, &[json!(1)], ColumnMatching::Exact).is_err());
+}
