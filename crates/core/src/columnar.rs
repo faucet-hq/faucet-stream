@@ -1488,33 +1488,4 @@ mod perf_1100_tests {
         assert_eq!(record_batch_to_values(&batch).unwrap(), records);
     }
 
-    #[test]
-    #[ignore = "timing loop: cargo test -p faucet-core --release --features arrow -- --ignored schema_inference_timing --nocapture"]
-    fn schema_inference_timing() {
-        let records: Vec<Value> = (0..200_000)
-            .map(|i| {
-                json!({"id": i, "name": format!("user-{i}"), "note": "lorem ipsum dolor sit amet ".repeat(8),
-                       "tags": ["a", "b", "c"], "nested": {"x": 1.5, "y": "z"}, "active": true})
-            })
-            .collect();
-        let started = std::time::Instant::now();
-        let old = arrow_json::reader::infer_json_schema_from_iterator(
-            records
-                .iter()
-                .map(|v| Ok::<_, arrow::error::ArrowError>(v.clone())),
-        )
-        .unwrap();
-        let old_time = started.elapsed();
-        let started = std::time::Instant::now();
-        let new = arrow_json::reader::infer_json_schema_from_iterator(
-            records.iter().map(Ok::<_, arrow::error::ArrowError>),
-        )
-        .unwrap();
-        let new_time = started.elapsed();
-        assert_eq!(old, new);
-        println!(
-            "infer over {} records: cloning {old_time:?}, borrowing {new_time:?}",
-            records.len()
-        );
-    }
 }

@@ -647,34 +647,4 @@ mod tests {
         assert!(!may_hold_long_literal(quiet.as_bytes()));
     }
 
-    #[test]
-    #[ignore = "timing loop: cargo test -p faucet-core --release -- --ignored long_number_check_timing --nocapture"]
-    fn long_number_check_timing() {
-        let line = format!(
-            "{{\"id\":123456789,\"uuid\":\"550e8400-e29b-41d4-a716-446655440000\",\
-             \"created_at\":\"2026-11-24T10:00:00.123456Z\",\"amount\":1234.56,\"active\":true,\
-             \"tags\":[\"alpha\",\"beta\",\"gamma\"],\"note\":\"{}\",\
-             \"nested\":{{\"a\":1,\"b\":\"two\",\"c\":[1.5,2.5,3.5],\"d\":null}}}}",
-            "lorem ipsum dolor sit amet ".repeat(14)
-        );
-        let lines: Vec<String> = (0..200_000).map(|_| line.clone()).collect();
-        let bytes: usize = lines.iter().map(String::len).sum();
-        let time = |f: &dyn Fn(&str) -> Result<Value, serde_json::Error>| {
-            let started = std::time::Instant::now();
-            let mut n = 0usize;
-            for l in &lines {
-                n += usize::from(f(l).is_ok());
-            }
-            assert_eq!(n, lines.len());
-            started.elapsed()
-        };
-        let parse_only = time(&|l| serde_json::from_str(l));
-        let old = time(&reference_from_str);
-        let new = time(&|l| crate::fidelity::from_str(l));
-        println!(
-            "{} lines, {} bytes/line: parse only {parse_only:?}, old {old:?}, new {new:?}",
-            lines.len(),
-            bytes / lines.len()
-        );
-    }
 }

@@ -1562,61 +1562,6 @@ mod tests {
         assert_eq!(out, vec![json!({"foo_bar": 1})]);
     }
 
-    #[cfg(all(
-        feature = "transform-filter",
-        feature = "transform-explode",
-        feature = "transform-flatten",
-        feature = "transform-set",
-        feature = "transform-rename-field"
-    ))]
-    #[test]
-    #[ignore = "timing"]
-    fn bench_stages_200k() {
-        let compiled = compile(&[
-            TransformStage::Map(RecordTransform::Set {
-                values: [("a".to_string(), json!(1))].into_iter().collect(),
-            }),
-            TransformStage::Map(RecordTransform::RenameField {
-                fields: [("c0".to_string(), "d0".to_string())].into_iter().collect(),
-            }),
-            TransformStage::Filter(FilterSpec {
-                path: "c1".into(),
-                op: FilterOp::Exists,
-                value: None,
-            }),
-            TransformStage::Map(RecordTransform::Set {
-                values: [("b".to_string(), json!(2))].into_iter().collect(),
-            }),
-            TransformStage::Map(RecordTransform::Set {
-                values: [("c".to_string(), json!(3))].into_iter().collect(),
-            }),
-        ]);
-        let mut total = std::time::Duration::ZERO;
-        let mut before = std::time::Duration::ZERO;
-        for chunk in 0..200 {
-            let page: Vec<Value> = (0..1000)
-                .map(|i| {
-                    let mut m = serde_json::Map::new();
-                    for c in 0..20 {
-                        m.insert(format!("c{c}"), json!(chunk * 1000 + i + c));
-                    }
-                    Value::Object(m)
-                })
-                .collect();
-            let copy = page.clone();
-            let start = std::time::Instant::now();
-            let out = apply_stages_to_page(page, &compiled).unwrap();
-            total += start.elapsed();
-            assert_eq!(out.len(), 1000);
-            let start = std::time::Instant::now();
-            let out = apply_stages_to_page_reference(copy, &compiled).unwrap();
-            before += start.elapsed();
-            assert_eq!(out.len(), 1000);
-        }
-        eprintln!("5 stages: 200k x 20 keys in {total:?}");
-        eprintln!("5 stages before: 200k x 20 keys in {before:?}");
-    }
-
     #[test]
     fn empty_stage_list_is_identity() {
         let out = apply_stages(json!({"a": 1}), &[]).unwrap();
