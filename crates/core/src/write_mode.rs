@@ -530,11 +530,9 @@ mod tests {
                 }
             };
             let canon = canonical(&key_tuple);
-            let is_delete = match spec.write_mode {
-                WriteMode::Delete => true,
-                WriteMode::Upsert => is_delete_marked(rec, spec.delete_marker.as_ref()),
-                WriteMode::Append | WriteMode::Overwrite => false,
-            };
+            let is_delete = spec.write_mode == WriteMode::Delete
+                || (spec.write_mode == WriteMode::Upsert
+                    && is_delete_marked(rec, spec.delete_marker.as_ref()));
             let action = if is_delete {
                 Action::Delete(key_tuple)
             } else {

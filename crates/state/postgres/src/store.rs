@@ -422,6 +422,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn postgres_state_store_keeps_its_auto_traits() {
+        fn assert_auto<T: Send + Sync + Unpin>() {}
+        assert_auto::<PostgresStateStore>();
+    }
+
+    #[test]
     fn a_stores_statements_are_the_per_call_renderings() {
         for table in ["faucet_state", "My\"Table", "schema.tbl"] {
             let sql = Statements::of(table);

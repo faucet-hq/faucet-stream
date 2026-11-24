@@ -497,6 +497,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sampling_wrappers_keep_their_auto_traits() {
+        fn assert_auto<T: Send + Sync + Unpin>() {}
+        assert_auto::<SamplingSink>();
+        assert_auto::<SamplingSource>();
+    }
+
+    #[test]
     fn schema_types_merge_across_the_sample() {
         let state = SampleState::new(10);
         state.observe(&[

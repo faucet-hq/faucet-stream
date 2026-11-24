@@ -1212,6 +1212,21 @@ mod tests {
     use axum::routing::{any, get};
     use std::sync::Mutex;
 
+    #[tokio::test]
+    async fn a_decode_task_that_dies_is_a_source_error() {
+        let join = tokio::task::spawn_blocking(|| {
+            std::panic::panic_any("decoder died");
+        })
+        .await
+        .unwrap_err();
+        let err = decode_task_error(join);
+        assert!(matches!(err, FaucetError::Source(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("decoding a response body failed"),
+            "{err}"
+        );
+    }
+
     type Seen = Arc<Mutex<Vec<(String, Vec<(String, String)>)>>>;
 
     async fn serve(router: Router) -> String {
@@ -2448,13 +2463,11 @@ mod tests {
         let err = read_json_limited::<serde_json::Value>(get_resp("/big").await, Some(1024))
             .await
             .unwrap_err();
-        let FaucetError::Custom(inner) = &err else {
-            panic!("{err:?}")
+        let limit = match &err {
+            FaucetError::Custom(inner) => inner.downcast_ref::<ResponseTooLarge>().map(|t| t.limit),
+            _ => None,
         };
-        assert_eq!(
-            inner.downcast_ref::<ResponseTooLarge>().unwrap().limit,
-            1024
-        );
+        assert_eq!(limit, Some(1024), "{err:?}");
 
         for bad in [
             read_json_limited::<serde_json::Value>(get_resp("/bad").await, None).await,

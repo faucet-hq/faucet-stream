@@ -717,6 +717,15 @@ mod tests {
     use crate::resilience::BackoffKind;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    #[test]
+    fn call_slot_keeps_its_auto_traits() {
+        fn assert_auto<
+            T: Send + Sync + Unpin + std::panic::UnwindSafe + std::panic::RefUnwindSafe,
+        >() {
+        }
+        assert_auto::<CallSlot>();
+    }
+
     fn fast(max_attempts: u32) -> RetryPolicy {
         RetryPolicy {
             max_attempts,

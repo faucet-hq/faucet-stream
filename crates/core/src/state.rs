@@ -1260,6 +1260,74 @@ mod tests {
         fn assert_auto<T: Send + Sync + Unpin + std::panic::UnwindSafe>() {}
         assert_auto::<FileStateStore>();
     }
+
+    fn entry_write(root: &Path, final_path: PathBuf, tmp_path: PathBuf) -> EntryWrite {
+        EntryWrite {
+            root: root.to_path_buf(),
+            final_path,
+            tmp_path,
+            sidecar: None,
+            synced_sidecars: Default::default(),
+            bytes: b"{}".to_vec(),
+        }
+    }
+
+    #[test]
+    fn an_entry_write_names_the_step_that_failed() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let missing = root.join("missing");
+
+        let create = entry_write(root, root.join("k.json"), missing.join("k.tmp"));
+        let err = create.write_entry().unwrap_err().to_string();
+        assert!(err.contains("failed to create temp state file"), "{err}");
+
+        let tmp = root.join("k.tmp");
+        let commit = entry_write(root, missing.join("k.json"), tmp.clone());
+        let err = commit.write_entry().unwrap_err().to_string();
+        assert!(err.contains("failed to commit state file"), "{err}");
+
+        let mut sidecar = entry_write(root, root.join("k.json"), tmp);
+        sidecar.sidecar = Some((missing.join("k.key"), b"k".to_vec()));
+        let err = sidecar.run().unwrap_err().to_string();
+        assert!(err.contains("failed to write state key file"), "{err}");
+
+        let err = sync_dir_blocking(&missing).unwrap_err().to_string();
+        assert!(err.contains("failed to open state dir"), "{err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_entry_write_that_cannot_write_its_bytes_says_so() {
+        let dir = TempDir::new().unwrap();
+        let full = entry_write(dir.path(), dir.path().join("k.json"), "/dev/full".into());
+        let err = full.write_entry().unwrap_err().to_string();
+        assert!(err.contains("failed to write temp state file"), "{err}");
+    }
+
+    #[test]
+    fn the_flushed_sidecar_memory_is_dropped_when_full() {
+        let dir = TempDir::new().unwrap();
+        let mut write = entry_write(
+            dir.path(),
+            dir.path().join("k.json"),
+            dir.path().join("k.tmp"),
+        );
+        let path = dir.path().join("k.key");
+        {
+            let mut synced = write.synced_sidecars.lock().unwrap();
+            let stale = FileIdentity::of(&std::fs::metadata(dir.path()).unwrap());
+            for i in 0..SYNCED_SIDECARS_MAX {
+                synced.insert(dir.path().join(format!("other-{i}")), stale.clone());
+            }
+        }
+        write.sidecar = Some((path.clone(), b"k".to_vec()));
+        write.run().unwrap();
+        let synced = write.synced_sidecars.lock().unwrap();
+        assert_eq!(synced.len(), 1);
+        assert!(synced.contains_key(&path));
+        assert_eq!(std::fs::read(&path).unwrap(), b"k");
+    }
     use serde_json::json;
     use std::sync::Arc;
     use tempfile::TempDir;

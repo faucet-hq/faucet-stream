@@ -3013,6 +3013,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn compiled_transform_keeps_its_auto_traits() {
+        fn assert_auto<T: Send + Sync + Unpin>() {}
+        assert_auto::<CompiledTransform>();
+    }
+
     /// Test-only wrapper that shadows [`super::apply_all`] and unwraps, so the
     /// many existing success-path tests need no changes now that `apply_all`
     /// returns `Result`. Collision tests call `super::apply_all` for the
@@ -3026,6 +3032,49 @@ mod tests {
     }
 
     // ── Key memo ──────────────────────────────────────────────────────────────
+
+    #[cfg(all(feature = "transform-keys-case", feature = "transform-rename-keys"))]
+    #[test]
+    fn a_rename_rule_is_never_a_stored_case_rule() {
+        let re = Regex::new("^a").unwrap();
+        let rename = KeyRule::Rename {
+            re: &re,
+            replacement: "b",
+        };
+        let case = OwnedKeyRule::Case {
+            mode: KeyCaseMode::Snake,
+            on_collision: KeyCollision::Error,
+            assignments: KeyCaseAssignments::default(),
+        };
+        assert!(!rename.is(&case));
+        assert!(rename.is(&rename.to_owned()));
+    }
+
+    #[cfg(feature = "transform-rename-keys")]
+    #[test]
+    fn names_learned_while_another_record_filled_the_memo_are_dropped() {
+        let memo = KeyMemo::default();
+        let re = Regex::new("^a").unwrap();
+        let rule = KeyRule::Rename {
+            re: &re,
+            replacement: "b",
+        };
+        let name = memo.run(rule, |keys| {
+            {
+                let mut state = memo.state.write().unwrap();
+                state.rule = Some(rule.to_owned());
+                for i in 0..KEY_MEMO_MAX_ENTRIES {
+                    let key: Box<str> = format!("k{i}").into();
+                    state.index.insert(key.clone(), i);
+                    state.names.push((key, None));
+                }
+            }
+            keys.resolve("abc")
+        });
+        assert_eq!(name.as_deref(), Some("bbc"));
+        assert_eq!(memo.len(), KEY_MEMO_MAX_ENTRIES);
+        assert!(!memo.state.read().unwrap().index.contains_key("abc"));
+    }
 
     #[cfg(all(feature = "transform-keys-case", feature = "transform-rename-keys"))]
     fn key_corpus() -> Vec<Value> {

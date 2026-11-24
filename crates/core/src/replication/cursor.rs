@@ -468,6 +468,17 @@ fn nearest_operator_right(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn the_row_hash_writer_takes_every_byte_and_flushes_nothing() {
+        use std::io::Write as _;
+        let mut hash = super::Hash2 { a: 1, b: 2 };
+        assert_eq!(hash.write(b"abc").unwrap(), 3);
+        hash.flush().unwrap();
+        let mut fed = super::Hash2 { a: 1, b: 2 };
+        fed.feed(b"abc");
+        assert_eq!((hash.a, hash.b), (fed.a, fed.b));
+    }
+
+    #[test]
     fn strict_comparison_handles_an_empty_token_a_leading_token_and_non_comparisons() {
         let t = "${bookmark}";
         assert!(!strict_comparison("ts > 1", ""));

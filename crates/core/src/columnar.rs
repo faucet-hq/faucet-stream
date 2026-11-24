@@ -1340,10 +1340,11 @@ mod perf_1100_tests {
             got.field_with_name("f").unwrap().data_type(),
             &DataType::Float64
         );
-        let DataType::Struct(children) = got.field_with_name("s").unwrap().data_type() else {
-            panic!("s is not a struct");
+        let child = match got.field_with_name("s").unwrap().data_type() {
+            DataType::Struct(children) => Some(children[0].data_type().clone()),
+            _ => None,
         };
-        assert_eq!(children[0].data_type(), &DataType::UInt64);
+        assert_eq!(child, Some(DataType::UInt64));
 
         let mixed = vec![json!({"a": 18446744073709551615u64}), json!({"a": -1})];
         let e = infer_arrow_schema(&mixed).unwrap_err().to_string();
@@ -1487,5 +1488,4 @@ mod perf_1100_tests {
         let batch = values_to_record_batch_inferred(&records).unwrap();
         assert_eq!(record_batch_to_values(&batch).unwrap(), records);
     }
-
 }

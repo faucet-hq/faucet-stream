@@ -276,6 +276,14 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn the_numeric_byte_table_marks_exactly_the_number_bytes() {
+        let table = numeric_bytes();
+        assert_eq!(table, NUMERIC);
+        let marked: Vec<u8> = (0..=255u8).filter(|b| table[*b as usize]).collect();
+        assert_eq!(marked, b"+-.0123456789Ee".to_vec());
+    }
+
+    #[test]
     fn numbers_that_would_round_are_refused() {
         // Exact: big u64, i64::MIN, short decimals, strings that look like numbers.
         let ok = br#"[{"a": 18446744073709551615, "b": -9223372036854775808, "c": 0.1,
@@ -608,17 +616,16 @@ mod tests {
         for text in corpus() {
             let new = crate::fidelity::from_str(&text);
             let old = reference_from_str(&text);
-            match (new, old) {
-                (Ok(a), Ok(b)) => {
-                    ok += 1;
-                    assert_eq!(a, b, "{text}");
-                }
-                (Err(a), Err(b)) => {
-                    bad += 1;
-                    assert_eq!(a.to_string(), b.to_string(), "{text}");
-                }
-                (a, b) => panic!("{text}: {a:?} vs {b:?}"),
+            if new.is_ok() {
+                ok += 1;
+            } else {
+                bad += 1;
             }
+            assert_eq!(
+                new.map_err(|e| e.to_string()),
+                old.map_err(|e| e.to_string()),
+                "{text}"
+            );
             let lines = decode_lines(text.as_bytes()).map_err(|e| e.to_string());
             let array = decode_array(text.as_bytes()).map_err(|e| e.to_string());
             if scan_literals(text.as_bytes()).is_empty() {
@@ -646,5 +653,4 @@ mod tests {
         let quiet = "2026-11-24T10:00:00.123456Z 550e8400-e29b-41d4-a716-446655440000 ".repeat(8);
         assert!(!may_hold_long_literal(quiet.as_bytes()));
     }
-
 }
