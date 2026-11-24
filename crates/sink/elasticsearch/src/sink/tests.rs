@@ -731,3 +731,57 @@ fn only_indices_an_overwrite_created_are_recognised() {
     assert!(!created_by_overwrite("orders", "orders-faucet-ovw-1A2B"));
     assert!(!created_by_overwrite("other", "orders-faucet-ovw-1a2b"));
 }
+
+/// The `_bulk` lines, written straight into the entry, are the bytes the
+/// two-step form (a `Value` action line and a doc string, then copied) built.
+#[test]
+fn bulk_entries_are_byte_identical_to_the_two_step_form() {
+    let reference = |action: &str, id: Option<&str>, doc: Option<&Value>| {
+        let mut meta = serde_json::Map::new();
+        meta.insert("_index".to_string(), json!("test_idx"));
+        if let Some(id) = id {
+            meta.insert("_id".to_string(), json!(id));
+        }
+        let mut out = serde_json::to_string(&json!({ action: meta })).unwrap();
+        out.push('\n');
+        if let Some(doc) = doc {
+            out.push_str(&serde_json::to_string(doc).unwrap());
+            out.push('\n');
+        }
+        out
+    };
+    let mut config = ElasticsearchSinkConfig::new("http://localhost:9200", "test_idx");
+    config.id_field = Some("id".to_string());
+    let sink = ElasticsearchSink::new(config).unwrap();
+    let op = sink.inner.driver().config.op_type.as_str().to_string();
+    let docs = [
+        json!({"id": "a\"b\\c\n", "name": "Zoë ☃", "n": [1, {"k": null}], "f": 1.5}),
+        json!({"id": 7, "v": true}),
+        json!({"name": "no id"}),
+    ];
+    let ids = [Some("a\"b\\c\n"), Some("7"), None];
+    for (doc, id) in docs.iter().zip(ids) {
+        assert_eq!(
+            sink.append_entry(doc).unwrap(),
+            reference(&op, id, Some(doc))
+        );
+    }
+    let upsert = PlannedAction {
+        id: "k\"1".to_string(),
+        doc: Some(docs[0].clone()),
+        origins: vec![0],
+    };
+    assert_eq!(
+        sink.plan_entry(&upsert).unwrap(),
+        reference("index", Some("k\"1"), Some(&docs[0]))
+    );
+    let delete = PlannedAction {
+        id: "k2".to_string(),
+        doc: None,
+        origins: vec![1],
+    };
+    assert_eq!(
+        sink.plan_entry(&delete).unwrap(),
+        reference("delete", Some("k2"), None)
+    );
+}

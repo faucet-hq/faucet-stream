@@ -284,7 +284,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 async-trait = "0.1.92"
 aho-corasick = "1"
 regex = "1"
-reqwest = { version = "0.13", features = ["json", "form", "query"] }
+reqwest = { version = "0.13", features = ["json", "form", "query", "gzip"] }
 futures-core = "0.3"
 jsonpath-rust = "1.0.1"
 quick-xml = { version = "0.42", features = ["serialize"] }

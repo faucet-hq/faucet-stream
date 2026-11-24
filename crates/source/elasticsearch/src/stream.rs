@@ -102,18 +102,18 @@ impl ElasticsearchSource {
     /// fails the read: the document cannot be emitted, and skipping it would
     /// both lose it silently and make a page of such hits look like the end
     /// of the scroll.
-    fn extract_hits(body: &Value) -> Result<Vec<Value>, FaucetError> {
+    fn extract_hits(body: &mut Value) -> Result<Vec<Value>, FaucetError> {
         check_complete(body)?;
         let Some(hits) = body
-            .get("hits")
-            .and_then(|h| h.get("hits"))
-            .and_then(|h| h.as_array())
+            .get_mut("hits")
+            .and_then(|h| h.get_mut("hits"))
+            .and_then(|h| h.as_array_mut())
         else {
             return Ok(Vec::new());
         };
-        hits.iter()
+        hits.iter_mut()
             .map(|hit| {
-                hit.get("_source").cloned().ok_or_else(|| {
+                hit.get_mut("_source").map(Value::take).ok_or_else(|| {
                     let field = |k: &str| hit.get(k).and_then(Value::as_str).unwrap_or("?");
                     FaucetError::Source(format!(
                         "elasticsearch: hit {}/{} has no `_source` (is `_source` disabled in \
@@ -233,17 +233,17 @@ impl faucet_core::Source for ElasticsearchSource {
                 "{}/{}/_search?scroll={}&size={}",
                 self.config.base_url, index, self.config.scroll_timeout, size
             );
-            let body: Value = self
+            let mut body: Value = self
                 .calls
                 .call("search", || async {
-                    let req = self.client.post(&url).json(&json!({"query": query}));
+                    let req = self.client.post(&url).json(&json!({"query": query, "sort": ["_doc"]}));
                     let resp = self.client.send(Self::apply_auth_value(req, &auth)).await?;
                     let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await?;
                     self.client.json_value(resp).await
                 })
                 .await?;
 
-            let records = Self::extract_hits(&body)?;
+            let records = Self::extract_hits(&mut body)?;
             guard.update(Self::extract_scroll_id(&body));
             let mut pages_fetched: usize = 1;
             let mut total = records.len();
@@ -265,7 +265,7 @@ impl faucet_core::Source for ElasticsearchSource {
                     let auth = self.resolve_auth().await?;
                     guard.set_auth(auth.clone());
                     let scroll_url = format!("{}/_search/scroll", self.config.base_url);
-                    let body: Value = self
+                    let mut body: Value = self
                         .calls
                         .call("scroll", || async {
                             let req = self.client.post(&scroll_url).json(&json!({
@@ -278,7 +278,7 @@ impl faucet_core::Source for ElasticsearchSource {
                         })
                         .await?;
 
-                    let records = Self::extract_hits(&body)?;
+                    let records = Self::extract_hits(&mut body)?;
                     guard.update(Self::extract_scroll_id(&body));
                     pages_fetched += 1;
                     total += records.len();
@@ -732,6 +732,38 @@ fn apply_auth_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_hits_moves_each_source_and_leaves_the_scroll_id() {
+        let mut body = json!({
+            "_scroll_id": "s1",
+            "hits": {"hits": [
+                {"_index": "i", "_id": "1", "_source": {"a": 1}},
+                {"_index": "i", "_id": "2", "_source": null}
+            ]}
+        });
+        assert_eq!(
+            ElasticsearchSource::extract_hits(&mut body).unwrap(),
+            vec![json!({"a": 1}), Value::Null]
+        );
+        assert_eq!(
+            ElasticsearchSource::extract_scroll_id(&body).as_deref(),
+            Some("s1")
+        );
+        assert!(
+            ElasticsearchSource::extract_hits(&mut json!({"took": 1}))
+                .unwrap()
+                .is_empty()
+        );
+        let err = ElasticsearchSource::extract_hits(&mut json!({
+            "hits": {"hits": [{"_index": "i", "_id": "7"}]}
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("hit i/7 has no `_source`"), "{err}");
+        let err = ElasticsearchSource::extract_hits(&mut json!({"timed_out": true})).unwrap_err();
+        assert!(matches!(err, FaucetError::Source(_)), "{err}");
+    }
 
     #[test]
     fn an_incomplete_response_names_its_failures() {

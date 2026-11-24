@@ -781,6 +781,11 @@ impl RestStream {
     }
 
     #[cfg(test)]
+    fn take_page(&self, body: &mut Value) -> Result<Vec<Value>, FaucetError> {
+        self.inner.driver().take_page(body)
+    }
+
+    #[cfg(test)]
     fn async_job_new_bookmark(&self) -> Option<Value> {
         self.inner.driver().async_job_new_bookmark()
     }
@@ -1414,13 +1419,55 @@ impl RestDriver {
     }
 
     fn extract_page(&self, body: &Value) -> Result<Vec<Value>, FaucetError> {
-        let mut records = extract::extract_configured(
+        let records = extract::extract_configured(
             body,
             self.config.records_path.as_deref(),
             self.config.record_ancestors.as_ref(),
             &self.config.records_multi,
             self.config.op_field.as_deref().unwrap_or("_op"),
         )?;
+        self.finish_page(records, body)
+    }
+
+    /// Every JSONPath the page loop evaluates against a response body after
+    /// its records were extracted.
+    fn later_body_paths(&self) -> Vec<&str> {
+        let mut paths = self.config.pagination.body_paths();
+        paths.extend(
+            self.config
+                .replication_bind
+                .as_ref()
+                .and_then(|b| b.advance_from.as_deref()),
+        );
+        paths
+    }
+
+    /// [`extract_page`](Self::extract_page) for the page loop: the records
+    /// are moved out of `body` when nothing the loop reads afterwards can see
+    /// them, and copied otherwise.
+    fn take_page(&self, body: &mut Value) -> Result<Vec<Value>, FaucetError> {
+        let plain = self.config.records_multi.is_empty()
+            && self
+                .config
+                .record_ancestors
+                .as_ref()
+                .is_none_or(|a| a.is_empty());
+        if !plain {
+            return self.extract_page(body);
+        }
+        let records = faucet_core::util::take_records(
+            body,
+            self.config.records_path.as_deref(),
+            &self.later_body_paths(),
+        )?;
+        self.finish_page(records, body)
+    }
+
+    fn finish_page(
+        &self,
+        mut records: Vec<Value>,
+        body: &Value,
+    ) -> Result<Vec<Value>, FaucetError> {
         if records.is_empty()
             && !self.config.allow_missing_records_path
             && self.config.records_multi.is_empty()
@@ -1830,10 +1877,14 @@ impl RestDriver {
                     )
                     .await?;
 
-                    let raw_records = self.extract_page(&body)?;
+                    let mut body = body;
+                    let raw_records = self.take_page(&mut body)?;
                     let raw_count = raw_records.len();
-                    state.current_records_fingerprint =
-                        Some(crate::pagination::records_fingerprint(&raw_records));
+                    state.current_records_fingerprint = self
+                        .config
+                        .pagination
+                        .reads_page_fingerprint()
+                        .then(|| crate::pagination::records_fingerprint(&raw_records));
 
                     // #554: derive this page's keyset cursor (max/min of the
                     // configured field) from every record the page returned, before
@@ -1947,19 +1998,21 @@ impl RestDriver {
                         // a CSV over HTTP — but the *parsed* page is bounded.
                         let chunk = self.file_mode_page_size(csv_page_size);
                         if let Some(size) = chunk.filter(|s| records.len() > *s) {
-                            let total = records.len();
-                            let mut emitted = 0usize;
-                            for part in records.chunks(size) {
-                                emitted += part.len();
-                                let last = emitted == total;
+                            let mut rest = records.into_iter();
+                            loop {
+                                let part: Vec<Value> = rest.by_ref().take(size).collect();
+                                let last = rest.len() == 0;
                                 yield faucet_core::StreamPage {
-                                    records: part.to_vec(),
+                                    records: part,
                                     // Only the final chunk carries the
                                     // bookmark: a mid-file checkpoint would
                                     // claim progress the sink has not been
                                     // handed yet.
                                     bookmark: if last { bookmark.clone() } else { None },
                                 };
+                                if last {
+                                    break;
+                                }
                             }
                         } else {
                             yield faucet_core::StreamPage { records, bookmark };
@@ -5424,6 +5477,151 @@ mod patch_edge_tests {
         ]});
         let recs = s.extract_page(&body).unwrap();
         assert_eq!(recs, vec![json!({ "Id": 1, "Name": "a" })]);
+    }
+
+    fn paged(records_path: Option<&str>, pagination: Value) -> RestStream {
+        let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+        cfg.records_path = records_path.map(str::to_owned);
+        cfg.pagination = serde_json::from_value(pagination).unwrap();
+        RestStream::new(cfg).unwrap()
+    }
+
+    fn page_body() -> Value {
+        json!({
+            "data": [{ "id": 1, "next": "in-record" }, { "id": 2 }],
+            "meta": { "next": "c2", "total": 2, "link": "https://api.example.com/p2" }
+        })
+    }
+
+    #[test]
+    fn take_page_moves_the_records_and_leaves_the_paths_read_later() {
+        let styles = [
+            json!({ "type": "None" }),
+            json!({ "type": "LinkHeader" }),
+            json!({ "type": "Cursor", "next_token_path": "$.meta.next", "param_name": "c" }),
+            json!({ "type": "CursorInBody", "next_token_path": "$.meta.next",
+                    "body_cursor_field": "after" }),
+            json!({ "type": "NextLinkInBody", "next_link_path": "$.meta.link" }),
+            json!({ "type": "PageNumber", "param_name": "p", "start_page": 1,
+                    "page_size": null, "page_size_param": null }),
+            json!({ "type": "Offset", "offset_param": "o", "limit_param": "l", "limit": 2,
+                    "total_path": "$.meta.total" }),
+            json!({ "type": "OffsetInBody", "offset_field": "o", "limit_field": "l",
+                    "limit": 2, "total_path": "$.meta.total" }),
+        ];
+        for style in styles {
+            let s = paged(Some("$.data[*]"), style.clone());
+            let original = page_body();
+            let mut body = original.clone();
+            assert_eq!(
+                s.take_page(&mut body).unwrap(),
+                s.extract_page(&original).unwrap(),
+                "{style}"
+            );
+            assert_eq!(body["data"], json!([]), "{style}: the records were moved");
+            assert_eq!(body["meta"], original["meta"], "{style}");
+        }
+    }
+
+    #[test]
+    fn take_page_copies_when_a_later_path_can_see_the_records() {
+        let inside = [
+            (
+                Some("$.data[*]"),
+                json!({ "type": "Cursor", "next_token_path": "$.data[0].next",
+                        "param_name": "c" }),
+            ),
+            (
+                Some("$.data[*]"),
+                json!({ "type": "Cursor", "next_token_path": "$..next", "param_name": "c" }),
+            ),
+            (
+                Some("$.data[*]"),
+                json!({ "type": "Offset", "offset_param": "o", "limit_param": "l", "limit": 2,
+                        "total_path": null, "rows_path": "$.data" }),
+            ),
+            (
+                Some("$.data[*]"),
+                json!({ "type": "OffsetInBody", "offset_field": "o", "limit_field": "l",
+                        "limit": 2, "rows_path": "$.data" }),
+            ),
+            (
+                None,
+                json!({ "type": "NextLinkInBody", "next_link_path": "$.meta.link" }),
+            ),
+            (Some("$.data[?(@.id > 0)]"), json!({ "type": "None" })),
+        ];
+        for (path, style) in inside {
+            let s = paged(path, style.clone());
+            let original = page_body();
+            let mut body = original.clone();
+            assert_eq!(
+                s.take_page(&mut body).unwrap(),
+                s.extract_page(&original).unwrap(),
+                "{style}"
+            );
+            assert_eq!(body, original, "{style}: the body must stay whole");
+        }
+
+        let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+        cfg.records_multi =
+            serde_json::from_value(json!([{ "path": "$.data[*]", "op": "u" }])).unwrap();
+        let s = RestStream::new(cfg).unwrap();
+        let mut body = page_body();
+        assert_eq!(s.take_page(&mut body).unwrap().len(), 2);
+        assert_eq!(body, page_body(), "records_multi keeps the copying path");
+    }
+
+    #[test]
+    fn take_page_keeps_extract_page_errors_and_post_processing() {
+        let s = paged(Some("$.rows[*]"), json!({ "type": "None" }));
+        let mut body = page_body();
+        let taken = s.take_page(&mut body).unwrap_err().to_string();
+        assert_eq!(taken, s.extract_page(&page_body()).unwrap_err().to_string());
+        assert!(taken.contains("matched nothing"), "{taken}");
+        assert!(
+            taken.contains("in-record"),
+            "the excerpt shows the whole body: {taken}"
+        );
+
+        let s = paged(Some("$.data["), json!({ "type": "None" }));
+        assert_eq!(
+            s.take_page(&mut page_body()).unwrap_err().to_string(),
+            s.extract_page(&page_body()).unwrap_err().to_string()
+        );
+
+        let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+        cfg.drop_key_prefixes = vec!["_".to_string()];
+        cfg.records_path = Some("$.data[*]".into());
+        let s = RestStream::new(cfg).unwrap();
+        let mut body = json!({ "data": [{ "_links": 1, "id": 1 }] });
+        assert_eq!(s.take_page(&mut body).unwrap(), vec![json!({ "id": 1 })]);
+
+        let s = paged(None, json!({ "type": "None" }));
+        let mut body = json!([{ "id": 1 }, { "id": 2 }]);
+        assert_eq!(
+            s.take_page(&mut body).unwrap(),
+            vec![json!({ "id": 1 }), json!({ "id": 2 })]
+        );
+        assert_eq!(body, Value::Null);
+    }
+
+    #[test]
+    fn the_advance_from_path_is_a_later_read() {
+        let mut cfg = RestStreamConfig::new("https://api.example.com", "");
+        cfg.records_path = Some("$.data[*]".into());
+        cfg.replication_bind = Some(
+            serde_json::from_value(json!({
+                "name": "since", "advance_from": "$.data[0].id"
+            }))
+            .unwrap(),
+        );
+        cfg.replication_method = ReplicationMethod::Incremental;
+        cfg.replication_key = Some("id".into());
+        let s = RestStream::new(cfg).unwrap();
+        let mut body = page_body();
+        assert_eq!(s.take_page(&mut body).unwrap().len(), 2);
+        assert_eq!(body, page_body());
     }
 
     #[test]

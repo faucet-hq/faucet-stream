@@ -280,6 +280,7 @@ fn substitute_context_sql(
 /// for UTF-8 because a newline never appears inside a multi-byte sequence, so a
 /// line split across two network chunks is reassembled correctly. Pure and
 /// unit-testable.
+#[cfg(test)]
 fn split_complete_lines(buf: &mut Vec<u8>) -> Vec<Vec<u8>> {
     let mut lines = Vec::new();
     let mut start = 0;
@@ -291,9 +292,47 @@ fn split_complete_lines(buf: &mut Vec<u8>) -> Vec<Vec<u8>> {
     lines
 }
 
-/// Append a streamed chunk to `buf` and take out the complete lines. Only a
-/// chunk holding a newline triggers a scan, and a partial line longer than
-/// `limit` is refused.
+/// Append a streamed chunk to `buf` and return how many leading bytes of
+/// `buf` are complete `\n`-terminated lines (0 when the chunk completed none).
+/// The caller reads them in place with [`lines_in`] and then drains them, so a
+/// line is never copied out of the buffer. A partial line longer than `limit`
+/// is refused.
+fn append_chunk(
+    buf: &mut Vec<u8>,
+    bytes: &[u8],
+    limit: Option<u64>,
+    url: &str,
+) -> Result<usize, FaucetError> {
+    let before = buf.len();
+    buf.extend_from_slice(bytes);
+    let complete = bytes
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |pos| before + pos + 1);
+    if let Some(limit) = limit
+        && (buf.len() - complete) as u64 > limit
+    {
+        return Err(FaucetError::Custom(Box::new(
+            faucet_core::http::ResponseTooLarge {
+                url: faucet_core::redact_uri_credentials(url),
+                limit,
+            },
+        )));
+    }
+    Ok(complete)
+}
+
+/// The lines of `complete`, a run of `\n`-terminated lines, without their
+/// newlines.
+fn lines_in(complete: &[u8]) -> impl Iterator<Item = &[u8]> {
+    complete
+        .split_last()
+        .into_iter()
+        .flat_map(|(_, lines)| lines.split(|&b| b == b'\n'))
+}
+
+/// The copying form [`append_chunk`] replaced, kept as its reference.
+#[cfg(test)]
 fn push_chunk(
     buf: &mut Vec<u8>,
     bytes: &[u8],
@@ -414,9 +453,9 @@ impl Source for ClickHouseSource {
 
             while let Some(chunk_result) = next_chunk(&reads, &mut body).await? {
                 let bytes = chunk_result.map_err(FaucetError::Http)?;
-                let lines = push_chunk(&mut buf, &bytes, limit, &self.base_url)?;
-                for line in lines {
-                    let Some(value) = decoder.push_line(&line)? else { continue };
+                let complete = append_chunk(&mut buf, &bytes, limit, &self.base_url)?;
+                for line in lines_in(&buf[..complete]) {
+                    let Some(value) = decoder.push_line(line)? else { continue };
                     if tracker.as_mut().is_none_or(|t| t.admit(&value)) {
                         page.push(value);
                         if page.len() >= chunk {
@@ -427,6 +466,7 @@ impl Source for ClickHouseSource {
                         }
                     }
                 }
+                buf.drain(..complete);
             }
             // Trailing line without a terminating newline (ClickHouse always
             // newline-terminates, but be robust).
@@ -849,6 +889,36 @@ mod tests {
         buf.extend_from_slice(b"1}\n");
         let lines = split_complete_lines(&mut buf);
         assert_eq!(lines, vec![b"{\"a\":1}".to_vec()]);
+    }
+
+    #[test]
+    fn append_chunk_yields_the_lines_push_chunk_did() {
+        let text = b"{\"a\":1}\n\n{\"b\":\"x\\ny\"}\n\n\n{\"c\":3}\n{\"tail\":";
+        for size in 1..=text.len() {
+            for limit in [None, Some(4), Some(64)] {
+                let (mut old_buf, mut new_buf) = (Vec::new(), Vec::new());
+                for chunk in text.chunks(size) {
+                    let old = push_chunk(&mut old_buf, chunk, limit, "http://h");
+                    let new = append_chunk(&mut new_buf, chunk, limit, "http://h").map(|n| {
+                        let lines: Vec<Vec<u8>> =
+                            lines_in(&new_buf[..n]).map(<[u8]>::to_vec).collect();
+                        new_buf.drain(..n);
+                        lines
+                    });
+                    match (old, new) {
+                        (Ok(old), Ok(new)) => assert_eq!(old, new, "size {size}"),
+                        (Err(old), Err(new)) => {
+                            assert_eq!(old.to_string(), new.to_string());
+                            break;
+                        }
+                        (old, new) => panic!("size {size} {limit:?}: {old:?} vs {new:?}"),
+                    }
+                    assert_eq!(old_buf, new_buf, "size {size}");
+                }
+            }
+        }
+        assert_eq!(lines_in(b"").count(), 0);
+        assert_eq!(lines_in(b"\n").collect::<Vec<_>>(), vec![b"" as &[u8]]);
     }
 
     #[test]

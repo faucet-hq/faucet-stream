@@ -193,6 +193,11 @@ impl GraphqlStream {
     fn extract_records(&self, body: &Value) -> Result<Vec<Value>, FaucetError> {
         self.inner.driver().extract_records(body)
     }
+
+    #[cfg(test)]
+    fn take_records(&self, body: &mut Value) -> Result<Vec<Value>, FaucetError> {
+        self.inner.driver().take_records(body)
+    }
 }
 
 #[async_trait]
@@ -534,7 +539,9 @@ impl GraphqlDriver {
         faucet_core::fidelity::from_str(&text).map_err(FaucetError::Json)
     }
 
-    /// Extract records from a GraphQL response using the configured JSONPath.
+    /// Extract records from a GraphQL response using the configured JSONPath
+    /// (the copying form [`take_records`](Self::take_records) is checked against).
+    #[cfg(test)]
     fn extract_records(&self, body: &Value) -> Result<Vec<Value>, FaucetError> {
         match &self.config.records_path {
             Some(path) => util::extract_records(body, Some(path)),
@@ -549,6 +556,25 @@ impl GraphqlDriver {
                     Some(data) => Ok(vec![data.clone()]),
                 }
             }
+        }
+    }
+
+    /// [`extract_records`](Self::extract_records) for the page loop: the
+    /// records are moved out of `body` when the pagination paths read
+    /// afterwards cannot see them, and copied otherwise.
+    fn take_records(&self, body: &mut Value) -> Result<Vec<Value>, FaucetError> {
+        let later: Vec<&str> = match &self.config.pagination {
+            Some(GraphqlPaginationSpec::Cursor(pag)) => {
+                vec![&pag.has_next_page_path, &pag.cursor_path]
+            }
+            _ => Vec::new(),
+        };
+        match &self.config.records_path {
+            Some(path) => util::take_records(body, Some(path), &later),
+            None => match body.get("data") {
+                Some(Value::Null) | None => Ok(Vec::new()),
+                Some(_) => util::take_records(body, Some("$.data"), &later),
+            },
         }
     }
 
@@ -605,12 +631,15 @@ impl GraphqlDriver {
                     break;
                 }
 
-                let body = self
+                let mut body = self
                     .execute_query(calls, &cursor, offset, &owned_context, start.as_ref())
                     .await?;
-                let mut records = self.extract_records(&body)?;
+                let mut records = self.take_records(&mut body)?;
                 let records_in_page = records.len();
-                let fingerprint = page_fingerprint(&records);
+                let fingerprint = match &self.config.pagination {
+                    Some(GraphqlPaginationSpec::Offset(_)) => page_fingerprint(&records),
+                    _ => 0,
+                };
                 pages_fetched += 1;
                 if let Some(key) = &key {
                     if let Some(start) = &start {
@@ -1072,12 +1101,7 @@ fn extract_cursor(body: &Value, path: &str) -> Option<String> {
 /// an envelope's `extensions` (query cost, request ids) differ on every
 /// response and would never repeat.
 fn page_fingerprint(records: &[Value]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for r in records {
-        r.to_string().hash(&mut hasher);
-    }
-    hasher.finish()
+    util::records_fingerprint(records)
 }
 
 /// Pure offset-pagination advance decision.
@@ -1307,6 +1331,60 @@ mod tests {
         let records = stream.extract_records(&body).unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0]["id"], 1);
+    }
+
+    #[test]
+    fn take_records_matches_extract_records_and_keeps_the_pagination_paths() {
+        let body = json!({"data": {"users": {
+            "nodes": [{"id": 1}, {"id": 2}],
+            "pageInfo": {"hasNextPage": true, "endCursor": "c2"}
+        }}});
+        let base = || {
+            GraphqlStreamConfig::new("https://api.example.com/graphql", "query { users { id } }")
+        };
+        let cases: Vec<(GraphqlStreamConfig, bool)> = vec![
+            (base().records_path("$.data.users.nodes[*]"), true),
+            (
+                base()
+                    .records_path("$.data.users.nodes[*]")
+                    .pagination(pageinfo_pagination()),
+                true,
+            ),
+            (
+                base()
+                    .records_path("$.data.users[*]")
+                    .pagination(pageinfo_pagination()),
+                false,
+            ),
+            (base(), true),
+            (base().pagination(pageinfo_pagination()), false),
+            (base().records_path("$..nodes[*]"), false),
+        ];
+        for (config, moved) in cases {
+            let paged = config.pagination.is_some();
+            let label = format!("{:?} {paged}", config.records_path);
+            let stream = GraphqlStream::new(config);
+            let mut taken = body.clone();
+            assert_eq!(
+                stream.take_records(&mut taken).unwrap(),
+                stream.extract_records(&body).unwrap(),
+                "{label}"
+            );
+            assert_eq!(taken != body, moved, "{label}");
+            if paged {
+                assert_eq!(
+                    decide_next_page(&taken, &pageinfo_pagination(), None),
+                    decide_next_page(&body, &pageinfo_pagination(), None),
+                    "{label}"
+                );
+            }
+        }
+        for empty in [json!({"data": null}), json!({"errors": []})] {
+            let stream = GraphqlStream::new(base());
+            let mut taken = empty.clone();
+            assert!(stream.take_records(&mut taken).unwrap().is_empty());
+            assert_eq!(taken, empty);
+        }
     }
 
     #[test]

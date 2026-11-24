@@ -344,21 +344,20 @@ fn deletes_to_payload(deletes: &[faucet_core::KeyTuple]) -> String {
 /// per line) for a `NEWLINE_DELIMITED_JSON` load job. Each record must be a
 /// JSON object; a non-object surfaces as a `FaucetError::Sink`.
 fn records_to_ndjson(records: &[Value]) -> Result<String, FaucetError> {
-    let mut out = String::new();
+    let mut out = Vec::new();
     for (i, rec) in records.iter().enumerate() {
         if !rec.is_object() {
             return Err(FaucetError::Sink(format!(
                 "BigQuery media load: record {i} is not a JSON object"
             )));
         }
-        serde_json::to_string(rec)
-            .map_err(|e| FaucetError::Sink(format!("BigQuery media load: serialize record: {e}")))
-            .map(|line| {
-                out.push_str(&line);
-                out.push('\n');
-            })?;
+        serde_json::to_writer(&mut out, rec).map_err(|e| {
+            FaucetError::Sink(format!("BigQuery media load: serialize record: {e}"))
+        })?;
+        out.push(b'\n');
     }
-    Ok(out)
+    String::from_utf8(out)
+        .map_err(|e| FaucetError::Sink(format!("BigQuery media load: serialize record: {e}")))
 }
 
 /// Build the BigQuery load-job resource JSON for a `NEWLINE_DELIMITED_JSON`
@@ -792,6 +791,30 @@ fn gzip(data: &[u8]) -> Result<Vec<u8>, FaucetError> {
         .map_err(|e| FaucetError::Sink(format!("gzip NDJSON media: {e}")))
 }
 
+/// Input size from which a gzip step runs on a blocking thread instead of the
+/// async worker.
+const BLOCKING_GZIP_BYTES: usize = 32 * 1024;
+
+/// [`gzip`] that keeps a large input off the async worker.
+async fn gzip_off_worker(data: Vec<u8>) -> Result<Vec<u8>, FaucetError> {
+    if data.len() < BLOCKING_GZIP_BYTES {
+        return gzip(&data);
+    }
+    tokio::task::spawn_blocking(move || gzip(&data))
+        .await
+        .map_err(|e| FaucetError::Sink(format!("gzip NDJSON media: {e}")))?
+}
+
+/// The error of a resumable session whose gzip stream was lost: a write was
+/// dropped (or panicked) while compressing, so the stream cannot continue.
+fn interrupted_session() -> FaucetError {
+    FaucetError::Sink(
+        "resumable upload: an earlier write was interrupted while compressing its page, so \
+         the upload stream is incomplete; this load cannot continue"
+            .to_string(),
+    )
+}
+
 /// Upload one intermediate/final chunk to a resumable session and PUT its bytes.
 /// Chunk size the streaming resumable upload flushes at (8 MiB, a multiple of
 /// the 256 KiB alignment the resumable protocol requires for non-final chunks).
@@ -844,7 +867,7 @@ struct UploadSession {
     finalized: bool,
     /// The compressed tail not yet accepted by the terminating PUT, kept so
     /// a retried finalize re-sends the same final range.
-    tail: Option<Vec<u8>>,
+    tail: Option<bytes::Bytes>,
     /// The load job the terminating PUT started, until it is confirmed: a
     /// finalize re-entered after a failed wait polls this job again rather
     /// than reporting success.
@@ -867,36 +890,57 @@ impl UploadSession {
     /// fully-accumulated 256-KiB-aligned chunk (keeps the buffer bounded).
     async fn feed(&mut self, records: &[Value]) -> Result<(), FaucetError> {
         let ndjson = records_to_ndjson(records)?;
-        self.feed_bytes(ndjson.as_bytes()).await
+        self.feed_owned(ndjson.into_bytes()).await
+    }
+
+    /// Compress `ndjson` into the gzip stream; a large input is compressed on
+    /// a blocking thread. A write dropped while the encoder is there leaves
+    /// the session without one, and every later use fails.
+    async fn compress(&mut self, ndjson: Vec<u8>) -> Result<(), FaucetError> {
+        use std::io::Write;
+        let mut encoder = self.encoder.take().ok_or_else(interrupted_session)?;
+        let written = if ndjson.len() < BLOCKING_GZIP_BYTES {
+            encoder.write_all(&ndjson)
+        } else {
+            let (back, written) = tokio::task::spawn_blocking(move || {
+                let written = encoder.write_all(&ndjson);
+                (encoder, written)
+            })
+            .await
+            .map_err(|_| interrupted_session())?;
+            encoder = back;
+            written
+        };
+        self.encoder = Some(encoder);
+        written.map_err(|e| FaucetError::Sink(format!("resumable gzip write: {e}")))
     }
 
     /// Feed raw NDJSON bytes: compress into the gzip stream, then PUT every
     /// fully-accumulated 256-KiB-aligned chunk. The shared core of [`feed`](Self::feed)
     /// (which serializes `Value` rows first) and the native byte path (#633).
     async fn feed_bytes(&mut self, ndjson: &[u8]) -> Result<(), FaucetError> {
-        use std::io::Write;
-        self.encoder
-            .as_mut()
-            .expect("resumable encoder present before finalize")
-            .write_all(ndjson)
-            .map_err(|e| FaucetError::Sink(format!("resumable gzip write: {e}")))?;
+        self.feed_owned(ndjson.to_vec()).await
+    }
+
+    async fn feed_owned(&mut self, ndjson: Vec<u8>) -> Result<(), FaucetError> {
+        self.compress(ndjson).await?;
         // Alignment is capped at the (possibly test-lowered) threshold so a
         // small threshold still makes forward progress; production keeps the
         // 256-KiB protocol alignment (threshold 8 MiB ≫ 256 KiB).
         let align = RESUMABLE_ALIGN.min(self.chunk_threshold).max(1);
         loop {
-            let avail = self.encoder.as_ref().unwrap().get_ref().len();
+            let buffered = self
+                .encoder
+                .as_mut()
+                .ok_or_else(interrupted_session)?
+                .get_mut();
+            let avail = buffered.len();
             if avail < self.chunk_threshold {
                 break;
             }
             let n = (avail / align) * align;
-            let chunk: Vec<u8> = self
-                .encoder
-                .as_mut()
-                .unwrap()
-                .get_mut()
-                .drain(..n)
-                .collect();
+            let rest = buffered.split_off(n);
+            let chunk = bytes::Bytes::from(std::mem::replace(buffered, rest));
             let resp = self.put_range(self.offset, &chunk, None).await?;
             if resp.status().as_u16() != 308 {
                 let s = resp.status();
@@ -917,14 +961,14 @@ impl UploadSession {
     async fn put_range(
         &self,
         start: u64,
-        data: &[u8],
+        data: &bytes::Bytes,
         total: Option<u64>,
     ) -> Result<reqwest::Response, FaucetError> {
         let end = start + data.len() as u64;
         let mut pos = start;
         let mut stalls = 0;
         loop {
-            let body = data[(pos - start) as usize..].to_vec();
+            let body = data.slice((pos - start) as usize..);
             let size = total.map_or_else(|| "*".to_string(), |t| t.to_string());
             let range = if body.is_empty() {
                 format!("bytes */{size}")
@@ -975,11 +1019,12 @@ impl UploadSession {
 
     /// Finish the gzip stream, returning the final bytes (remaining buffered
     /// output + trailer) to PUT as the terminating chunk.
-    fn finish(&mut self) -> Result<Vec<u8>, FaucetError> {
+    fn finish(&mut self) -> Result<bytes::Bytes, FaucetError> {
         self.encoder
             .take()
-            .expect("resumable encoder present at finalize")
+            .ok_or_else(interrupted_session)?
             .finish()
+            .map(bytes::Bytes::from)
             .map_err(|e| FaucetError::Sink(format!("resumable gzip finish: {e}")))
     }
 }
@@ -1818,7 +1863,7 @@ impl BigQueryDriver {
                 self.config.location.as_deref(),
             ))
             .to_string();
-        let media = gzip(ndjson.as_bytes())?;
+        let media = gzip_off_worker(ndjson.into_bytes()).await?;
         self.load_media(calls, &job_json, &media).await.map(|_| ())
     }
 
@@ -4236,6 +4281,121 @@ mod tests {
     fn records_to_ndjson_rejects_non_object_record() {
         let err = records_to_ndjson(&[json!({"a": 1}), json!(5)]).unwrap_err();
         assert!(matches!(err, FaucetError::Sink(m) if m.contains("record 1")));
+    }
+
+    fn bare_session() -> super::UploadSession {
+        super::UploadSession {
+            session_uri: "http://127.0.0.1:1/upload".to_string(),
+            offset: 0,
+            encoder: Some(flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::default(),
+            )),
+            http: super::resumable_client().unwrap(),
+            calls: faucet_core::CallContext::new(),
+            finalized: false,
+            tail: None,
+            job: None,
+            confirmed: false,
+            poisoned: None,
+            appending: true,
+            chunk_threshold: usize::MAX,
+        }
+    }
+
+    fn gunzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Read;
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(bytes)
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_compresses_small_and_large_pages_into_one_gzip_stream() {
+        let small: Vec<serde_json::Value> = (0..3).map(|i| json!({"id": i})).collect();
+        let large: Vec<serde_json::Value> = (0..4000)
+            .map(|i| json!({"id": i, "text": format!("row {i} {}", "x".repeat(i % 37))}))
+            .collect();
+        let large_ndjson = records_to_ndjson(&large).unwrap();
+        assert!(large_ndjson.len() > super::BLOCKING_GZIP_BYTES);
+
+        let mut session = bare_session();
+        session.feed(&small).await.unwrap();
+        session.feed(&large).await.unwrap();
+        session.feed_bytes(b"{\"raw\":1}\n").await.unwrap();
+        session.feed_bytes(large_ndjson.as_bytes()).await.unwrap();
+        let tail = session.finish().unwrap();
+
+        let mut expected = records_to_ndjson(&small).unwrap();
+        expected.push_str(&large_ndjson);
+        expected.push_str("{\"raw\":1}\n");
+        expected.push_str(&large_ndjson);
+        assert_eq!(gunzip(&tail), expected.as_bytes());
+
+        let mut inline = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut inline, records_to_ndjson(&small).unwrap().as_bytes())
+            .unwrap();
+        std::io::Write::write_all(&mut inline, large_ndjson.as_bytes()).unwrap();
+        std::io::Write::write_all(&mut inline, b"{\"raw\":1}\n").unwrap();
+        std::io::Write::write_all(&mut inline, large_ndjson.as_bytes()).unwrap();
+        assert_eq!(
+            &tail[..],
+            &inline.finish().unwrap()[..],
+            "same bytes as one inline encoder"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_whose_write_was_dropped_mid_compression_fails_every_later_use() {
+        let mut session = bare_session();
+        // What a write dropped while its page was on the blocking thread
+        // leaves behind: no encoder.
+        session.encoder = None;
+        for err in [
+            session.feed(&[json!({"id": 1})]).await.unwrap_err(),
+            session.feed_bytes(b"{}\n").await.unwrap_err(),
+            session.finish().unwrap_err(),
+        ] {
+            assert!(
+                err.to_string().contains("interrupted while compressing"),
+                "{err}"
+            );
+        }
+
+        let big: Vec<u8> = (0..super::BLOCKING_GZIP_BYTES * 256)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let mut session = bare_session();
+        {
+            let write = session.feed_bytes(&big);
+            tokio::pin!(write);
+            let dropped = futures::poll!(write.as_mut());
+            assert!(
+                dropped.is_pending(),
+                "the page is compressed off the worker"
+            );
+        }
+        assert!(session.encoder.is_none());
+        assert!(session.finish().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gzip_off_worker_matches_gzip() {
+        for len in [
+            0,
+            10,
+            super::BLOCKING_GZIP_BYTES - 1,
+            super::BLOCKING_GZIP_BYTES * 3,
+        ] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            assert_eq!(
+                super::gzip_off_worker(data.clone()).await.unwrap(),
+                gzip(&data).unwrap(),
+                "{len}"
+            );
+        }
     }
 
     #[test]

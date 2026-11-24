@@ -650,8 +650,11 @@ impl EsDriver {
         let mut pending: Vec<usize> = (0..entries.len()).collect();
         let mut attempt: u32 = 0;
         while !pending.is_empty() {
-            let body: String = pending.iter().map(|&i| entries[i].as_str()).collect();
-            let resp = match self.send_bulk_body(calls, body, auth).await {
+            let mut body = String::with_capacity(pending.iter().map(|&i| entries[i].len()).sum());
+            for &i in &pending {
+                body.push_str(&entries[i]);
+            }
+            let mut resp = match self.send_bulk_body(calls, body, auth).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     return BulkRun {
@@ -660,23 +663,23 @@ impl EsDriver {
                     };
                 }
             };
-            let items = resp
-                .get("items")
-                .and_then(Value::as_array)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
+            let no_errors = resp.get("errors").and_then(Value::as_bool) == Some(false);
+            let items = match resp.get_mut("items") {
+                Some(Value::Array(items)) => std::mem::take(items),
+                _ => Vec::new(),
+            };
             // `errors: false` with no item list vouches for every item; a list
             // shorter than the request is truncated, and a missing item fails.
-            let all_ok =
-                items.is_empty() && resp.get("errors").and_then(Value::as_bool) == Some(false);
+            let all_ok = items.is_empty() && no_errors;
+            let mut items = items.into_iter();
             let mut retry = Vec::new();
-            for (pos, &i) in pending.iter().enumerate() {
-                match items.get(pos) {
+            for &i in &pending {
+                match items.next() {
                     Some(item) => {
-                        if attempt < ITEM_RETRY_LIMIT && retriable_item(item) {
+                        if attempt < ITEM_RETRY_LIMIT && retriable_item(&item) {
                             retry.push(i);
                         }
-                        results[i] = item.clone();
+                        results[i] = item;
                     }
                     None if all_ok => results[i] = serde_json::json!({}),
                     None => results[i] = Value::Null,
@@ -735,20 +738,25 @@ impl EsDriver {
     /// The `_bulk` entry appending `record` (`op_type` action + document).
     fn append_entry(&self, record: &Value) -> Result<String, FaucetError> {
         let meta = self.action_meta(self.append_id(record)?);
-        let mut entry = String::new();
+        let mut entry = Vec::new();
         Self::push_bulk_line(&mut entry, self.config.op_type.as_str(), meta, Some(record))?;
-        Ok(entry)
+        Self::entry_text(entry)
     }
 
     /// The `_bulk` entry for one planned upsert/delete action.
     fn plan_entry(&self, action: &PlannedAction) -> Result<String, FaucetError> {
-        let mut entry = String::new();
+        let mut entry = Vec::new();
         let meta = self.action_meta(Some(action.id.clone()));
         match &action.doc {
             Some(doc) => Self::push_bulk_line(&mut entry, "index", meta, Some(doc))?,
             None => Self::push_bulk_line(&mut entry, "delete", meta, None)?,
         }
-        Ok(entry)
+        Self::entry_text(entry)
+    }
+
+    fn entry_text(entry: Vec<u8>) -> Result<String, FaucetError> {
+        String::from_utf8(entry)
+            .map_err(|e| FaucetError::Sink(format!("failed to serialize record: {e}")))
     }
 
     /// `entries` in `batch_size` chunks (`0` = one chunk).
@@ -774,20 +782,21 @@ impl EsDriver {
     /// Append an `{ "<action>": {...} }` line followed by an optional doc line
     /// to the NDJSON `body`.
     fn push_bulk_line(
-        body: &mut String,
+        body: &mut Vec<u8>,
         action: &str,
         meta: serde_json::Map<String, Value>,
         doc: Option<&Value>,
     ) -> Result<(), FaucetError> {
-        let action_line = serde_json::to_string(&serde_json::json!({ action: meta }))
-            .map_err(|e| FaucetError::Sink(format!("failed to serialize bulk action: {e}")))?;
-        body.push_str(&action_line);
-        body.push('\n');
+        let action_error = |e| FaucetError::Sink(format!("failed to serialize bulk action: {e}"));
+        body.push(b'{');
+        serde_json::to_writer(&mut *body, action).map_err(action_error)?;
+        body.push(b':');
+        serde_json::to_writer(&mut *body, &meta).map_err(action_error)?;
+        body.extend_from_slice(b"}\n");
         if let Some(doc) = doc {
-            let doc_line = serde_json::to_string(doc)
+            serde_json::to_writer(&mut *body, doc)
                 .map_err(|e| FaucetError::Sink(format!("failed to serialize record: {e}")))?;
-            body.push_str(&doc_line);
-            body.push('\n');
+            body.push(b'\n');
         }
         Ok(())
     }
