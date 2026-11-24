@@ -745,7 +745,7 @@ impl MongoCdcSource {
                         // high-throughput stream would grow it without bound.
                         if report_invalidate || !is_invalidate {
                             check_staging_cap(buffer.len(), max_staged)?;
-                            buffer.push(to_envelope(&event, &bookmark)?);
+                            buffer.push(to_envelope(event, &bookmark)?);
                         }
                         // The persisted bookmark records whether it is an
                         // invalidate token, so resume uses `start_after` not

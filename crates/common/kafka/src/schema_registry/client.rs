@@ -63,12 +63,12 @@ pub struct SchemaRegistryClient {
     cache: Arc<Mutex<LruCache<u32, RegistrySchema>>>,
     /// Caches `register_schema` results so the same `(subject, schema)` does
     /// not POST to the registry on every produced record (#78/#30). Keyed by
-    /// subject + schema type + schema text.
-    register_cache: Arc<Mutex<LruCache<String, u32>>>,
+    /// subject, then schema type + schema text.
+    register_cache: Arc<Mutex<RegisterCache>>,
     /// Parsed/compiled schemas keyed by codec + schema text, so a codec
     /// parses an Avro schema, compiles a `.proto` or builds a JSON Schema
     /// validator once per schema rather than once per message (#789 MSG-65).
-    parsed: Arc<std::sync::Mutex<LruCache<String, Arc<dyn std::any::Any + Send + Sync>>>>,
+    parsed: Arc<std::sync::Mutex<ParsedCache>>,
     /// Backend-call context (#880), shared by clones: the connector forwards
     /// the run's context here, so a registry request ends at the run's
     /// deadline and is metered (`schema`, `register`).
@@ -82,6 +82,48 @@ pub struct SchemaRegistryClient {
 }
 
 type CompiledCache = LruCache<(&'static str, u32), Arc<dyn std::any::Any + Send + Sync>>;
+
+type ParsedSchema = Arc<dyn std::any::Any + Send + Sync>;
+
+/// Schema text → (codec kind, parsed schema).
+type ParsedCache = LruCache<String, Vec<(String, ParsedSchema)>>;
+
+/// Subject → (schema type, schema text, registered id).
+type RegisterCache = LruCache<String, Vec<(String, String, u32)>>;
+
+/// Entries one cache key keeps for its second key part (codec kind, schema
+/// type and text); the oldest is dropped past it.
+const ENTRIES_PER_KEY: usize = 16;
+
+/// Look up `matches` among `key`'s entries without building a composite key.
+fn entry_of<'a, E>(
+    cache: &'a mut LruCache<String, Vec<E>>,
+    key: &str,
+    matches: impl Fn(&E) -> bool,
+) -> Option<&'a E> {
+    cache.get(key)?.iter().find(|e| matches(e))
+}
+
+/// Store `entry` under `key`, replacing one `matches` finds.
+fn put_entry<E>(
+    cache: &mut LruCache<String, Vec<E>>,
+    key: &str,
+    entry: E,
+    matches: impl Fn(&E) -> bool,
+) {
+    match cache.get_mut(key) {
+        Some(entries) => {
+            entries.retain(|e| !matches(e));
+            if entries.len() >= ENTRIES_PER_KEY {
+                entries.remove(0);
+            }
+            entries.push(entry);
+        }
+        None => {
+            cache.put(key.to_string(), vec![entry]);
+        }
+    }
+}
 
 impl SchemaRegistryClient {
     pub fn new(config: &SchemaRegistryConfig) -> Result<Self, FaucetError> {
@@ -126,19 +168,22 @@ impl SchemaRegistryClient {
         T: Send + Sync + 'static,
         F: FnOnce(&str) -> Result<T, FaucetError>,
     {
-        let key = format!("{kind}\u{0}{text}");
-        if let Some(hit) = self
-            .parsed
-            .lock()
-            .ok()
-            .and_then(|mut c| c.get(&key).cloned())
+        if let Some(hit) =
+            self.parsed.lock().ok().and_then(|mut c| {
+                entry_of(&mut c, text, |(k, _)| k == kind).map(|(_, v)| v.clone())
+            })
             && let Ok(t) = hit.downcast::<T>()
         {
             return Ok(t);
         }
         let built = Arc::new(build(text)?);
         if let Ok(mut c) = self.parsed.lock() {
-            c.put(key, built.clone() as Arc<dyn std::any::Any + Send + Sync>);
+            put_entry(
+                &mut c,
+                text,
+                (kind.to_string(), built.clone() as ParsedSchema),
+                |(k, _)| k == kind,
+            );
         }
         Ok(built)
     }
@@ -310,10 +355,10 @@ impl SchemaRegistryClient {
         // The registry's register endpoint is idempotent, but POSTing on every
         // record is a severe throughput ceiling — cache the assigned id keyed
         // by the full (subject, type, schema) tuple (#78/#30).
-        let cache_key = format!("{subject}\u{0}{schema_type}\u{0}{schema_text}");
+        let same = |(t, text, _): &(String, String, u32)| t == schema_type && text == schema_text;
         {
             let mut cache = self.register_cache.lock().await;
-            if let Some(&id) = cache.get(&cache_key) {
+            if let Some(&(_, _, id)) = entry_of(&mut cache, subject, same) {
                 return Ok(id);
             }
         }
@@ -356,7 +401,12 @@ impl SchemaRegistryClient {
                 })
             })
             .await?;
-        self.register_cache.lock().await.put(cache_key, parsed.id);
+        put_entry(
+            &mut *self.register_cache.lock().await,
+            subject,
+            (schema_type.to_string(), schema_text.to_string(), parsed.id),
+            same,
+        );
         Ok(parsed.id)
     }
 }
@@ -367,6 +417,102 @@ mod tests {
     use crate::SchemaRegistryConfig;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn entries_are_found_by_both_key_parts_and_capped_per_key() {
+        let mut cache: LruCache<String, Vec<(String, u32)>> =
+            LruCache::new(NonZeroUsize::new(4).unwrap());
+        put_entry(&mut cache, "s", ("a".into(), 1), |(k, _)| k == "a");
+        put_entry(&mut cache, "s", ("b".into(), 2), |(k, _)| k == "b");
+        put_entry(&mut cache, "s", ("a".into(), 3), |(k, _)| k == "a");
+        assert_eq!(
+            entry_of(&mut cache, "s", |(k, _)| k == "a"),
+            Some(&("a".into(), 3))
+        );
+        assert_eq!(
+            entry_of(&mut cache, "s", |(k, _)| k == "b"),
+            Some(&("b".into(), 2))
+        );
+        assert_eq!(entry_of(&mut cache, "t", |(k, _)| k == "a"), None);
+        assert_eq!(cache.get("s").unwrap().len(), 2);
+        for i in 0..ENTRIES_PER_KEY as u32 + 3 {
+            let k = format!("k{i}");
+            put_entry(&mut cache, "s", (k.clone(), i), |(e, _)| *e == k);
+        }
+        let kept = cache.get("s").unwrap();
+        assert_eq!(kept.len(), ENTRIES_PER_KEY);
+        assert_eq!(kept.last().unwrap().1, ENTRIES_PER_KEY as u32 + 2);
+        assert!(entry_of(&mut cache, "s", |(k, _)| k == "a").is_none());
+    }
+
+    #[test]
+    fn parsed_schemas_are_kept_per_codec_kind() {
+        let client =
+            SchemaRegistryClient::new(&SchemaRegistryConfig::new("http://127.0.0.1:1")).unwrap();
+        let builds = std::sync::atomic::AtomicUsize::new(0);
+        let build = |t: &str| {
+            builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<String, FaucetError>(t.to_uppercase())
+        };
+        let a = client.parsed("avro", "text", build).unwrap();
+        let b = client.parsed("avro", "text", build).unwrap();
+        let c = client.parsed("protobuf", "text", build).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(!Arc::ptr_eq(&a, &c));
+        assert_eq!(*c, "TEXT");
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn register_schema_keeps_one_id_per_type_and_text() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        for (schema, id) in [("\"string\"", 1), ("\"long\"", 2)] {
+            Mock::given(method("POST"))
+                .and(path("/subjects/s-value/versions"))
+                .and(body_partial_json(
+                    serde_json::json!({"schema": schema, "schemaType": "AVRO"}),
+                ))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": id})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/subjects/s-value/versions"))
+            .and(body_partial_json(serde_json::json!({"schemaType": "JSON"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 3})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = SchemaRegistryClient::new(&SchemaRegistryConfig::new(server.uri())).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                client
+                    .register_schema("s-value", "AVRO", "\"string\"")
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                client
+                    .register_schema("s-value", "AVRO", "\"long\"")
+                    .await
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                client
+                    .register_schema("s-value", "JSON", "\"string\"")
+                    .await
+                    .unwrap(),
+                3
+            );
+        }
+        drop(server);
+    }
 
     #[tokio::test]
     async fn get_schema_caches_after_first_fetch() {

@@ -24,14 +24,14 @@ pub fn op_str(op: &OperationType) -> &'static str {
     }
 }
 
-fn doc_to_json(doc: &Document) -> Value {
-    Bson::Document(doc.clone()).into_relaxed_extjson()
+fn doc_to_json(doc: Document) -> Value {
+    Bson::Document(doc).into_relaxed_extjson()
 }
 
 /// Build the CDC envelope for one change event. `bookmark` carries the event's
 /// resume token serialized to JSON.
 pub fn to_envelope(
-    event: &ChangeStreamEvent<Document>,
+    event: ChangeStreamEvent<Document>,
     bookmark: &Bookmark,
 ) -> Result<Value, FaucetError> {
     let mut obj = serde_json::Map::new();
@@ -56,32 +56,23 @@ pub fn to_envelope(
 
     obj.insert(
         "document_key".into(),
-        event
-            .document_key
-            .as_ref()
-            .map(doc_to_json)
-            .unwrap_or(Value::Null),
+        event.document_key.map(doc_to_json).unwrap_or(Value::Null),
     );
     obj.insert(
         "before".into(),
         event
             .full_document_before_change
-            .as_ref()
             .map(doc_to_json)
             .unwrap_or(Value::Null),
     );
     obj.insert(
         "after".into(),
-        event
-            .full_document
-            .as_ref()
-            .map(doc_to_json)
-            .unwrap_or(Value::Null),
+        event.full_document.map(doc_to_json).unwrap_or(Value::Null),
     );
 
-    if let Some(ud) = &event.update_description {
+    if let Some(ud) = event.update_description {
         let mut ud_obj = serde_json::Map::new();
-        ud_obj.insert("updated_fields".into(), doc_to_json(&ud.updated_fields));
+        ud_obj.insert("updated_fields".into(), doc_to_json(ud.updated_fields));
         ud_obj.insert("removed_fields".into(), json!(ud.removed_fields));
         if let Some(truncated) = &ud.truncated_arrays {
             ud_obj.insert(
@@ -114,7 +105,7 @@ mod tests {
             .iter()
             .map(
                 |r| match mongodb::bson::Bson::try_from(r.clone()).unwrap() {
-                    mongodb::bson::Bson::Document(d) => doc_to_json(&d),
+                    mongodb::bson::Bson::Document(d) => doc_to_json(d),
                     other => panic!("not a document: {other:?}"),
                 },
             )
@@ -148,7 +139,7 @@ mod tests {
     #[test]
     fn insert_maps_to_c() {
         let e = event_from_json(fixture("insert"));
-        let env = to_envelope(&e, &bookmark()).unwrap();
+        let env = to_envelope(e, &bookmark()).unwrap();
         assert_eq!(env["op"], "c");
         assert_eq!(env["ts_ms"], json!(1716700000_i64 * 1000));
         assert_eq!(env["namespace"]["db"], "app");
@@ -165,7 +156,7 @@ mod tests {
             "removedFields": ["legacy"]
         });
         let e = event_from_json(v);
-        let env = to_envelope(&e, &bookmark()).unwrap();
+        let env = to_envelope(e, &bookmark()).unwrap();
         assert_eq!(env["op"], "u");
         assert_eq!(env["update_description"]["updated_fields"]["name"], "Bob");
         assert_eq!(env["update_description"]["removed_fields"][0], "legacy");
@@ -174,12 +165,12 @@ mod tests {
     #[test]
     fn replace_and_delete_map() {
         assert_eq!(
-            to_envelope(&event_from_json(fixture("replace")), &bookmark()).unwrap()["op"],
+            to_envelope(event_from_json(fixture("replace")), &bookmark()).unwrap()["op"],
             "r"
         );
         let mut del = fixture("delete");
         del.as_object_mut().unwrap().remove("fullDocument");
-        let env = to_envelope(&event_from_json(del), &bookmark()).unwrap();
+        let env = to_envelope(event_from_json(del), &bookmark()).unwrap();
         assert_eq!(env["op"], "d");
         assert_eq!(env["after"], Value::Null);
     }
@@ -189,7 +180,7 @@ mod tests {
         let mut v = fixture("drop");
         v.as_object_mut().unwrap().remove("documentKey");
         v.as_object_mut().unwrap().remove("fullDocument");
-        let env = to_envelope(&event_from_json(v), &bookmark()).unwrap();
+        let env = to_envelope(event_from_json(v), &bookmark()).unwrap();
         assert_eq!(env["op"], "ddl");
     }
 
@@ -201,7 +192,7 @@ mod tests {
         o.remove("ns");
         o.remove("documentKey");
         o.remove("fullDocument");
-        let env = to_envelope(&event_from_json(v), &bookmark()).unwrap();
+        let env = to_envelope(event_from_json(v), &bookmark()).unwrap();
         assert_eq!(env["op"], "ddl");
         assert_eq!(env["namespace"], Value::Null);
     }
@@ -215,9 +206,37 @@ mod tests {
             "truncatedArrays": [{ "field": "tags", "newSize": 2 }]
         });
         let e = event_from_json(v);
-        let env = to_envelope(&e, &bookmark()).unwrap();
+        let env = to_envelope(e, &bookmark()).unwrap();
         let truncated = &env["update_description"]["truncated_arrays"];
         assert!(truncated.is_array());
         assert_eq!(truncated[0]["field"], "tags");
+    }
+
+    #[test]
+    fn every_document_of_an_event_lands_in_the_envelope() {
+        let mut v = fixture("update");
+        v["fullDocumentBeforeChange"] =
+            json!({ "_id": 42, "name": "Al", "n": { "$numberLong": "7" } });
+        v["updateDescription"] = json!({
+            "updatedFields": { "name": "Alice", "tags": ["a", "b"] },
+            "removedFields": ["legacy"]
+        });
+        let env = to_envelope(event_from_json(v), &bookmark()).unwrap();
+        assert_eq!(
+            env,
+            json!({
+                "op": "u",
+                "ts_ms": 1716700000_i64 * 1000,
+                "namespace": { "db": "app", "coll": "users" },
+                "document_key": { "_id": 42 },
+                "before": { "_id": 42, "name": "Al", "n": 7 },
+                "after": { "_id": 42, "name": "Alice" },
+                "update_description": {
+                    "updated_fields": { "name": "Alice", "tags": ["a", "b"] },
+                    "removed_fields": ["legacy"]
+                },
+                "resume_token": bookmark().resume_token
+            })
+        );
     }
 }

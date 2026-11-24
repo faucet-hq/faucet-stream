@@ -82,6 +82,91 @@ enum PlannedOp {
     Delete(Document),
 }
 
+/// The lowest wire version whose server takes the client-level `bulkWrite`
+/// command (MongoDB 8.0).
+const BULK_WRITE_WIRE_VERSION: i64 = 25;
+
+/// Whether a `hello` reply advertises the client-level `bulkWrite` command.
+fn hello_supports_bulk_write(reply: &Document) -> bool {
+    let version = match reply.get("maxWireVersion") {
+        Some(Bson::Int32(v)) => i64::from(*v),
+        Some(Bson::Int64(v)) => *v,
+        Some(Bson::Double(v)) => *v as i64,
+        _ => 0,
+    };
+    version >= BULK_WRITE_WIRE_VERSION
+}
+
+/// How one failed `bulkWrite` of planned ops ends.
+enum BulkFailure {
+    /// The server does not take the command; nothing was sent.
+    Unsupported(mongodb::error::Error),
+    /// The op at this page-plan position was refused, with the error a
+    /// single-document write would have returned.
+    Op(usize, mongodb::error::Error),
+    /// The command failed as a whole.
+    Command(mongodb::error::Error),
+}
+
+/// Sort a `bulk_write` error: the lowest refused op, a server too old for
+/// the command, or the command's own failure.
+fn classify_bulk_error(error: mongodb::error::Error) -> BulkFailure {
+    use mongodb::error::{ErrorKind, WriteFailure};
+    match *error.kind {
+        ErrorKind::IncompatibleServer { .. } => BulkFailure::Unsupported(error),
+        ErrorKind::BulkWrite(ref bulk) if !bulk.write_errors.is_empty() => {
+            let Some((index, write_error)) = bulk
+                .write_errors
+                .iter()
+                .min_by_key(|(index, _)| **index)
+                .map(|(index, e)| (*index, e.clone()))
+            else {
+                return BulkFailure::Command(error);
+            };
+            BulkFailure::Op(
+                index,
+                ErrorKind::Write(WriteFailure::WriteError(write_error)).into(),
+            )
+        }
+        _ => BulkFailure::Command(error),
+    }
+}
+
+/// The models of one planned page, in plan order.
+fn bulk_models(
+    namespace: &mongodb::Namespace,
+    ops: Vec<PlannedOp>,
+) -> (Vec<mongodb::options::WriteModel>, Vec<bool>) {
+    use mongodb::options::{DeleteOneModel, ReplaceOneModel, WriteModel};
+    let mut upserts = Vec::with_capacity(ops.len());
+    let models = ops
+        .into_iter()
+        .map(|op| match op {
+            PlannedOp::Upsert(filter, replacement) => {
+                upserts.push(true);
+                WriteModel::ReplaceOne(
+                    ReplaceOneModel::builder()
+                        .namespace(namespace.clone())
+                        .filter(filter)
+                        .replacement(replacement)
+                        .upsert(true)
+                        .build(),
+                )
+            }
+            PlannedOp::Delete(filter) => {
+                upserts.push(false);
+                WriteModel::DeleteOne(
+                    DeleteOneModel::builder()
+                        .namespace(namespace.clone())
+                        .filter(filter)
+                        .build(),
+                )
+            }
+        })
+        .collect();
+    (models, upserts)
+}
+
 /// A page fully prepared (planned + converted to BSON) **before** the
 /// exactly-once transaction is opened, so no preparation failure can leave a
 /// dangling transaction.
@@ -558,6 +643,12 @@ pub(crate) struct MongoDriver {
     /// The overwrite run this instance belongs to: staging is then
     /// `<collection>__faucet_ovw_<token>`, apart from any concurrent run's.
     overwrite_run: Option<String>,
+    /// Whether the server takes the client-level `bulkWrite` command
+    /// (MongoDB 8.0+), read once from its `hello` reply.
+    bulk_write: tokio::sync::OnceCell<bool>,
+    /// Set when a server refused `bulkWrite` after `hello` advertised it (a
+    /// failover to an older member): keyed pages go row by row from then on.
+    bulk_refused: std::sync::atomic::AtomicBool,
 }
 
 impl MongoSink {
@@ -614,6 +705,8 @@ impl MongoDriver {
             client,
             eo_collections_ready: tokio::sync::OnceCell::new(),
             overwrite_run: None,
+            bulk_write: tokio::sync::OnceCell::new(),
+            bulk_refused: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -991,31 +1084,117 @@ impl MongoDriver {
         json_map_to_bson_filter(&filter)
     }
 
+    /// Whether keyed pages go through the client-level `bulkWrite` command:
+    /// the server's `hello` reply advertises MongoDB 8.0+ and no member has
+    /// refused the command since. A failed `hello` reads as "no".
+    async fn uses_bulk_write(&self) -> bool {
+        if self.bulk_refused.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        *self
+            .bulk_write
+            .get_or_init(|| async {
+                self.client
+                    .database("admin")
+                    .run_command(bson::doc! { "hello": 1 })
+                    .await
+                    .map(|reply| hello_supports_bulk_write(&reply))
+                    .unwrap_or(false)
+            })
+            .await
+    }
+
+    /// One `bulkWrite` command for a planned page (split by the driver at the
+    /// server's batch limits), inside `session` when given.
+    async fn bulk_apply(
+        &self,
+        ops: Vec<PlannedOp>,
+        ordered: bool,
+        session: Option<&mut mongodb::ClientSession>,
+    ) -> Result<(), (BulkFailure, Vec<bool>)> {
+        let namespace = self
+            .client
+            .database(&self.config.database)
+            .collection::<Document>(&self.config.collection)
+            .namespace();
+        let (models, upserts) = bulk_models(&namespace, ops);
+        let action = self.client.bulk_write(models).ordered(ordered);
+        let result = match session {
+            Some(session) => action.session(session).await,
+            None => action.await,
+        };
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let failure = classify_bulk_error(e);
+                if matches!(failure, BulkFailure::Unsupported(_)) {
+                    self.bulk_refused
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err((failure, upserts))
+            }
+        }
+    }
+
     /// Apply a planned page of upserts and deletes to the collection.
     ///
-    /// Each upsert row is committed with `replace_one(filter, replacement)
-    /// .upsert(true)` and each delete with `delete_one(filter)`. We use the
-    /// per-document `replace_one(upsert)` / `delete_one` primitives (not the
-    /// namespaced `Client::bulk_write`) for compatibility with all supported
-    /// MongoDB server versions; throughput is recovered by issuing the ops
-    /// concurrently via `buffer_unordered`. The planner already deduped keys
-    /// (last-write-wins), so concurrent ops target distinct keys and there is
-    /// no intra-batch ordering hazard.
+    /// On MongoDB 8.0+ the page is one unordered client-level `bulkWrite`
+    /// (`replaceOne` with `upsert` / `deleteOne` per row). Older servers have
+    /// no such command: each upsert row is committed with
+    /// `replace_one(filter, replacement).upsert(true)` and each delete with
+    /// `delete_one(filter)`, issued concurrently via `buffer_unordered`. The
+    /// planner already deduped keys (last-write-wins), so the ops target
+    /// distinct keys and there is no intra-batch ordering hazard.
     ///
     /// Returns the number of upserts + deletes applied.
     async fn apply_plan(&self, plan: &faucet_core::WritePlan) -> Result<usize, FaucetError> {
+        let ops = self.build_plan_ops(plan)?;
+        let applied = ops.len();
+
+        let ops = if applied > 0 && self.uses_bulk_write().await {
+            match self.bulk_apply(ops, false, None).await {
+                Ok(()) => None,
+                Err((BulkFailure::Unsupported(_), _)) => Some(self.build_plan_ops(plan)?),
+                Err((BulkFailure::Op(index, e), upserts)) => {
+                    return Err(FaucetError::Sink(
+                        if upserts.get(index).copied().unwrap_or(true) {
+                            format!("MongoDB replace_one (upsert) failed: {e}")
+                        } else {
+                            format!("MongoDB delete_one failed: {e}")
+                        },
+                    ));
+                }
+                Err((BulkFailure::Command(e), _)) => {
+                    return Err(FaucetError::Sink(format!("MongoDB bulk_write failed: {e}")));
+                }
+            }
+        } else {
+            Some(ops)
+        };
+        if let Some(ops) = ops {
+            self.apply_ops_one_by_one(ops).await?;
+        }
+
+        tracing::info!(
+            applied,
+            upserts = plan.upserts.len(),
+            deletes = plan.deletes.len(),
+            database = %self.config.database,
+            collection = %self.config.collection,
+            "MongoDB upsert/delete write complete"
+        );
+
+        Ok(applied)
+    }
+
+    /// One `replace_one(upsert)` / `delete_one` per planned op, up to
+    /// [`APPLY_CONCURRENCY`] at a time.
+    async fn apply_ops_one_by_one(&self, ops: Vec<PlannedOp>) -> Result<(), FaucetError> {
         let collection = self
             .client
             .database(&self.config.database)
             .collection::<Document>(&self.config.collection);
-
-        // Build a single homogeneous op stream of (filter, replacement?) so
-        // upserts and deletes run through one bounded `buffer_unordered`.
         use PlannedOp as Op;
-        let ops = self.build_plan_ops(plan)?;
-
-        let applied = ops.len();
-
         futures::stream::iter(ops.into_iter().map(|op| {
             let collection = collection.clone();
             async move {
@@ -1041,17 +1220,7 @@ impl MongoDriver {
         .await
         .into_iter()
         .collect::<Result<Vec<()>, FaucetError>>()?;
-
-        tracing::info!(
-            applied,
-            upserts = plan.upserts.len(),
-            deletes = plan.deletes.len(),
-            database = %self.config.database,
-            collection = %self.config.collection,
-            "MongoDB upsert/delete write complete"
-        );
-
-        Ok(applied)
+        Ok(())
     }
 
     /// Convert a planned page ([`faucet_core::WritePlan`]) into pre-converted
@@ -1176,17 +1345,17 @@ impl MongoDriver {
     /// already-started transaction on `session`. On `Err` the caller aborts
     /// the transaction (best-effort) so nothing from the page is committed.
     ///
-    /// A [`mongodb::ClientSession`] must not be used concurrently, so the
-    /// planned upsert/delete ops run **sequentially** here — unlike the
-    /// at-least-once path's `buffer_unordered` fan-out. That is the throughput
-    /// tradeoff of exactly-once on this sink; atomicity requires the single
-    /// session.
+    /// With `use_bulk` (MongoDB 8.0+) the planned upsert/delete ops are one
+    /// ordered `bulkWrite` in the session. Otherwise they run one by one: a
+    /// [`mongodb::ClientSession`] must not be used concurrently, so there is
+    /// no fan-out on this path.
     async fn apply_in_transaction(
         &self,
         session: &mut mongodb::ClientSession,
         prepared: PreparedWrite,
         scope: &str,
         token: &str,
+        use_bulk: bool,
     ) -> Result<usize, FaucetError> {
         let collection = self
             .client
@@ -1214,6 +1383,29 @@ impl MongoDriver {
                                 &e.to_string(),
                             )
                         })?;
+                }
+                n
+            }
+            PreparedWrite::Planned(ops) if use_bulk && !ops.is_empty() => {
+                let n = ops.len();
+                match self.bulk_apply(ops, true, Some(&mut *session)).await {
+                    Ok(()) => {}
+                    Err((BulkFailure::Op(index, e), upserts)) => {
+                        return Err(classify_transaction_error(
+                            if upserts.get(index).copied().unwrap_or(true) {
+                                "MongoDB replace_one (exactly-once upsert) failed"
+                            } else {
+                                "MongoDB delete_one (exactly-once) failed"
+                            },
+                            &e.to_string(),
+                        ));
+                    }
+                    Err((BulkFailure::Command(e) | BulkFailure::Unsupported(e), _)) => {
+                        return Err(classify_transaction_error(
+                            "MongoDB bulk_write (exactly-once) failed",
+                            &e.to_string(),
+                        ));
+                    }
                 }
                 n
             }
@@ -1674,9 +1866,9 @@ impl MongoDriver {
     ///   in a single `insert_many` — `batch_size` re-chunking does NOT apply
     ///   here (chunking would break page↔watermark atomicity). Size pages via
     ///   the source's `batch_size` instead.
-    /// - **Upsert/delete ops run sequentially** with the session (a
-    ///   `ClientSession` cannot be used concurrently), trading the
-    ///   at-least-once path's concurrent fan-out for atomicity.
+    /// - **Upsert/delete ops** are one ordered `bulkWrite` in the session on
+    ///   MongoDB 8.0+, and run one by one below it (a `ClientSession` cannot
+    ///   be used concurrently).
     /// - The commit is retried while the driver reports
     ///   `UnknownTransactionCommitResult` (bounded), per the driver's
     ///   recommended pattern; any other failure aborts the transaction
@@ -1714,6 +1906,8 @@ impl MongoDriver {
                         PreparedWrite::Planned(self.build_plan_ops(&plan)?)
                     };
 
+                let use_bulk =
+                    matches!(prepared, PreparedWrite::Planned(_)) && self.uses_bulk_write().await;
                 let mut session =
                     self.client.start_session().await.map_err(|e| {
                         FaucetError::Sink(format!("MongoDB session start failed: {e}"))
@@ -1728,7 +1922,7 @@ impl MongoDriver {
                     .map_err(txn_err("MongoDB transaction start failed"))?;
 
                 let written = match self
-                    .apply_in_transaction(&mut session, prepared, scope, token)
+                    .apply_in_transaction(&mut session, prepared, scope, token, use_bulk)
                     .await
                 {
                     Ok(written) => written,
@@ -1828,6 +2022,91 @@ mod tests {
         }
         assert!(!retry_commit(&"unknown", true, &mut attempt));
         assert_eq!(attempt, MAX_COMMIT_RETRIES);
+    }
+
+    #[test]
+    fn only_a_hello_reply_from_8_0_or_later_enables_bulk_write() {
+        assert!(hello_supports_bulk_write(
+            &bson::doc! {"maxWireVersion": 25}
+        ));
+        assert!(hello_supports_bulk_write(
+            &bson::doc! {"maxWireVersion": 27_i64}
+        ));
+        assert!(hello_supports_bulk_write(
+            &bson::doc! {"maxWireVersion": 25.0}
+        ));
+        assert!(!hello_supports_bulk_write(
+            &bson::doc! {"maxWireVersion": 24}
+        ));
+        assert!(!hello_supports_bulk_write(
+            &bson::doc! {"maxWireVersion": "25"}
+        ));
+        assert!(!hello_supports_bulk_write(&bson::doc! {"ok": 1}));
+    }
+
+    #[test]
+    fn bulk_models_keep_plan_order_kind_and_namespace() {
+        let namespace = mongodb::Namespace::new("db", "coll");
+        let (models, upserts) = bulk_models(
+            &namespace,
+            vec![
+                PlannedOp::Upsert(bson::doc! {"_id": 1}, bson::doc! {"_id": 1, "v": "a"}),
+                PlannedOp::Delete(bson::doc! {"_id": 2}),
+                PlannedOp::Upsert(bson::doc! {"_id": 3}, bson::doc! {"_id": 3}),
+            ],
+        );
+        assert_eq!(upserts, vec![true, false, true]);
+        assert_eq!(models.len(), 3);
+        match &models[0] {
+            mongodb::options::WriteModel::ReplaceOne(m) => {
+                assert_eq!(m.namespace, namespace);
+                assert_eq!(m.filter, bson::doc! {"_id": 1});
+                assert_eq!(m.replacement, bson::doc! {"_id": 1, "v": "a"});
+                assert_eq!(m.upsert, Some(true));
+            }
+            other => panic!("not a replace: {other:?}"),
+        }
+        match &models[1] {
+            mongodb::options::WriteModel::DeleteOne(m) => {
+                assert_eq!(m.namespace, namespace);
+                assert_eq!(m.filter, bson::doc! {"_id": 2});
+            }
+            other => panic!("not a delete: {other:?}"),
+        }
+    }
+
+    fn write_error(code: i32, message: &str) -> mongodb::error::WriteError {
+        bson::from_document(bson::doc! {"code": code, "errmsg": message}).unwrap()
+    }
+
+    #[test]
+    fn a_bulk_error_names_its_lowest_refused_op_as_a_single_write_error() {
+        use mongodb::error::{BulkWriteError, ErrorKind, WriteFailure};
+        let mut bulk = BulkWriteError::default();
+        bulk.write_errors.insert(7, write_error(11000, "later"));
+        bulk.write_errors.insert(2, write_error(11000, "dup key"));
+        let single: mongodb::error::Error =
+            ErrorKind::Write(WriteFailure::WriteError(write_error(11000, "dup key"))).into();
+        match classify_bulk_error(ErrorKind::BulkWrite(bulk).into()) {
+            BulkFailure::Op(index, e) => {
+                assert_eq!(index, 2);
+                assert_eq!(e.to_string(), single.to_string());
+            }
+            _ => panic!("not an op failure"),
+        }
+    }
+
+    #[test]
+    fn a_bulk_error_without_a_refused_op_is_the_commands_failure() {
+        use mongodb::error::{BulkWriteError, ErrorKind};
+        assert!(matches!(
+            classify_bulk_error(ErrorKind::BulkWrite(BulkWriteError::default()).into()),
+            BulkFailure::Command(_)
+        ));
+        assert!(matches!(
+            classify_bulk_error(mongodb::error::Error::custom("transport")),
+            BulkFailure::Command(_)
+        ));
     }
 
     #[test]

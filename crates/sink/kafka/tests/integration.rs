@@ -221,6 +221,57 @@ async fn batch_size_zero_preserves_legacy_send_path() {
     assert_eq!(payloads.len(), 500);
 }
 
+/// Records reach a partition in page order for a window of one, a window
+/// smaller than the page and the default whole-page window.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_is_delivered_in_order_for_every_window() {
+    let (_c, brokers) = start_kafka().await;
+    let default_window = serde_json::from_value::<KafkaSinkConfig>(json!({
+        "brokers": brokers,
+        "topic": {"type": "fixed", "name": "unused"}
+    }))
+    .unwrap()
+    .max_in_flight;
+    assert_eq!(default_window, DEFAULT_BATCH_SIZE);
+    for (window, total) in [(1usize, 40usize), (64, 1500), (default_window, 2500)] {
+        let topic = format!("order-{window}");
+        let mut cfg = sink_config(
+            &brokers,
+            KafkaSinkTopic::Fixed {
+                name: topic.clone(),
+            },
+        );
+        cfg.max_in_flight = window;
+        let sink = KafkaSink::new(cfg).await.unwrap();
+        let records: Vec<_> = (0..total).map(|i| json!({"id": i})).collect();
+        assert_eq!(sink.write_batch(&records).await.unwrap(), total);
+        sink.flush().await.unwrap();
+        let got: Vec<serde_json::Value> = drain_topic(&brokers, &topic, total)
+            .await
+            .iter()
+            .map(|p| serde_json::from_str(p).unwrap())
+            .collect();
+        assert_eq!(got, records, "window {window}");
+    }
+}
+
+/// A record the broker refuses fails the page with the send error, whatever
+/// the window.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_record_fails_the_page() {
+    let (_c, brokers) = start_kafka().await;
+    let topic = "too-large";
+    let mut cfg = sink_config(&brokers, KafkaSinkTopic::Fixed { name: topic.into() });
+    cfg.max_in_flight = DEFAULT_BATCH_SIZE;
+    cfg.extra_client_config
+        .insert("message.max.bytes".into(), "2000".into());
+    let sink = KafkaSink::new(cfg).await.unwrap();
+    let mut records: Vec<_> = (0..10).map(|i| json!({"id": i})).collect();
+    records.push(json!({"id": 10, "blob": "x".repeat(5000)}));
+    let err = sink.write_batch(&records).await.unwrap_err().to_string();
+    assert!(err.starts_with("Sink error: kafka send: "), "{err}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn every_compression_codec_round_trips() {
     let (_c, brokers) = start_kafka().await;

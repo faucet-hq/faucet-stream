@@ -20,7 +20,11 @@ use faucet_core::driver::{
 use faucet_core::{CallSlot, FaucetError, RowOutcome, Sink};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+#[cfg(test)]
 use jsonpath_rust::JsonPath;
+use jsonpath_rust::parser::model::JpQuery;
+use jsonpath_rust::parser::parse_json_path;
+use jsonpath_rust::query::js_path_process;
 use lapin::options::{BasicPublishOptions, ConfirmSelectOptions};
 use lapin::{BasicProperties, Confirmation};
 use serde_json::Value;
@@ -40,7 +44,7 @@ pub struct RabbitMqSink {
 /// The AMQP I/O primitives the messaging driver runs on.
 pub(crate) struct RabbitMqDriver {
     config: RabbitMqSinkConfig,
-    routing: RoutingKey,
+    routing: Routing,
     state: Mutex<Option<Publisher>>,
 }
 
@@ -57,7 +61,7 @@ impl RabbitMqSink {
         Ok(Self {
             inner: DriverSink::new(MessageSinkDriver::new(RabbitMqDriver {
                 config,
-                routing,
+                routing: Routing::new(routing),
                 state: Mutex::new(None),
             })),
         })
@@ -238,7 +242,89 @@ pub(crate) fn confirmation_outcome(c: Confirmation, exchange: &str) -> RowOutcom
     }
 }
 
-/// Derive one record's routing key. Pure.
+/// A routing rule with its JSONPath parsed once.
+pub(crate) enum Routing {
+    Static(String),
+    Field(String),
+    JsonPath {
+        path: String,
+        query: Result<JpQuery, String>,
+    },
+}
+
+impl Routing {
+    pub(crate) fn new(key: RoutingKey) -> Self {
+        match key {
+            RoutingKey::Static(k) => Self::Static(k),
+            RoutingKey::Field(f) => Self::Field(f),
+            RoutingKey::JsonPath(path) => Self::JsonPath {
+                query: parse_json_path(&path).map_err(|e| e.to_string()),
+                path,
+            },
+        }
+    }
+
+    fn what(&self) -> String {
+        match self {
+            Self::Static(_) => String::new(),
+            Self::Field(f) => format!("routing_key_field '{f}'"),
+            Self::JsonPath { path, .. } => format!("routing_key_jsonpath '{path}'"),
+        }
+    }
+
+    /// Derive one record's routing key. Pure.
+    pub(crate) fn resolve(&self, record: &Value) -> Result<String, FaucetError> {
+        let value = match self {
+            Self::Static(k) => return Ok(k.clone()),
+            Self::Field(f) => record.get(f),
+            Self::JsonPath { path, query } => {
+                let invalid = |e: &dyn std::fmt::Display| {
+                    FaucetError::Config(format!("invalid JSONPath '{path}': {e}"))
+                };
+                let query = query.as_ref().map_err(|e| invalid(e))?;
+                js_path_process(query, record)
+                    .map_err(|e| invalid(&e))?
+                    .into_iter()
+                    .next()
+                    .map(|hit| hit.val())
+            }
+        };
+        let key = match value {
+            None => {
+                return Err(FaucetError::Sink(format!(
+                    "rabbitmq sink: {} matched nothing in the record",
+                    self.what()
+                )));
+            }
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Number(n)) => n.to_string(),
+            Some(Value::Bool(b)) => b.to_string(),
+            Some(Value::Null) => {
+                return Err(FaucetError::Sink(format!(
+                    "rabbitmq sink: {} resolved to null",
+                    self.what()
+                )));
+            }
+            Some(_) => {
+                return Err(FaucetError::Sink(format!(
+                    "rabbitmq sink: {} resolved to a container — routing keys must be scalars",
+                    self.what()
+                )));
+            }
+        };
+        if key.len() > 255 {
+            return Err(FaucetError::Sink(format!(
+                "rabbitmq sink: {} resolved to a routing key longer than 255 bytes",
+                self.what()
+            )));
+        }
+        Ok(key)
+    }
+}
+
+/// Derive one record's routing key, parsing the rule per call. The reference
+/// [`Routing::resolve`] is checked against.
+#[cfg(test)]
 pub(crate) fn resolve_routing_key(
     record: &Value,
     routing: &RoutingKey,
@@ -324,7 +410,7 @@ impl MessageDriver for RabbitMqDriver {
     /// Resolve the routing key and encode the body; a record that cannot be
     /// routed or encoded fails alone.
     fn encode(&self, record: &Value) -> Result<OutboundMessage, FaucetError> {
-        let key = resolve_routing_key(record, &self.routing)?;
+        let key = self.routing.resolve(record)?;
         let body = encode_payload(record, self.config.value_format)?;
         Ok(OutboundMessage::new(key, body))
     }
@@ -544,6 +630,38 @@ mod tests {
         }
         let err = resolve_routing_key(&rec, &RoutingKey::JsonPath("$[".into())).unwrap_err();
         assert!(matches!(err, FaucetError::Config(_)));
+    }
+
+    #[test]
+    fn a_prepared_rule_resolves_like_a_rule_parsed_per_record() {
+        let records = [
+            json!({"kind": "order.created", "n": 5, "ok": true, "meta": {"route": "r1", "list": ["a", "b"]}}),
+            json!({"kind": null, "meta": {"route": {"deep": 1}}}),
+            json!({"kind": "x".repeat(256), "meta": {"route": 1.5}}),
+            json!("not an object"),
+            json!({}),
+        ];
+        let rules = [
+            RoutingKey::Static("q".into()),
+            RoutingKey::Field("kind".into()),
+            RoutingKey::Field("n".into()),
+            RoutingKey::Field("missing".into()),
+            RoutingKey::JsonPath("$.meta.route".into()),
+            RoutingKey::JsonPath("$.meta.list[1]".into()),
+            RoutingKey::JsonPath("$.meta.list[*]".into()),
+            RoutingKey::JsonPath("$..route".into()),
+            RoutingKey::JsonPath("$.kind".into()),
+            RoutingKey::JsonPath("$[".into()),
+            RoutingKey::JsonPath("kind".into()),
+        ];
+        for rule in &rules {
+            let prepared = Routing::new(rule.clone());
+            for record in &records {
+                let expected = resolve_routing_key(record, rule).map_err(|e| format!("{e:?}"));
+                let got = prepared.resolve(record).map_err(|e| format!("{e:?}"));
+                assert_eq!(got, expected, "{rule:?} over {record}");
+            }
+        }
     }
 
     #[test]

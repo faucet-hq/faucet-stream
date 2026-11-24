@@ -11,7 +11,7 @@ Reach for it when you want to land any faucet-stream source — a REST API, a da
 
 ## Feature highlights
 
-- **Concurrent batched sends** — each `write_batch` enqueues its records into a `FuturesUnordered` of `send_result` futures so multiple produce requests are in flight at once, bounded by `min(max_in_flight, batch_size)`.
+- **Windowed batched sends** — each `write_batch` hands its records to the producer in page order and waits for their delivery reports, with at most `min(max_in_flight, batch_size)` records unconfirmed at once. The default window is a whole page (1000), so one produce request can carry a full page.
 - **Idempotent producer by default** — `idempotent: true` sets `enable.idempotence`, so retried produce calls within a session never duplicate. Combined with `acks: all`, that's no-loss, no-duplicate delivery per produce call.
 - **`QueueFull` retry** — when librdkafka's send queue is full, the sink backs off (`queue_full_backoff`) and retries up to `queue_full_max_retries` before surfacing the error.
 - **Multi-topic routing** — send everything to one `fixed` topic, or extract the destination topic from each record with a JSONPath (`from_path`).
@@ -100,7 +100,7 @@ All fields are keys under `sink.config`.
 | `acks` | `"none" \| "leader" \| "all"` | `"all"` | Broker acknowledgment level. Must be `"all"` when `idempotent: true`. |
 | `idempotent` | bool | `true` | Enable the idempotent producer (`enable.idempotence = true`). Requires `acks: all`. |
 | `message_timeout` | int (seconds) | `30` | Per-message delivery timeout. Raise for high-latency brokers. |
-| `max_in_flight` | int | `100` | Max concurrent produce requests. Must be ≥ 1. Set to `1` (with `idempotent: true`) for strict per-partition ordering. |
+| `max_in_flight` | int | `1000` | Max records enqueued but not yet confirmed delivered. Must be ≥ 1. A small value caps how many records one produce request carries (the default was `100` before this release); set `1` (with `idempotent: true`) to send one record at a time. |
 | `queue_full_backoff` | int (seconds) | `0` *(0.1s)* | Pause between retries on `QueueFull`. The default is **100 ms** (sub-second); the config field is whole-seconds, so use `extra_client_config` only if you need finer control elsewhere. |
 | `queue_full_max_retries` | int | `3` | Max `QueueFull` retries before the error surfaces. |
 
@@ -108,7 +108,7 @@ All fields are keys under `sink.config`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `batch_size` | int | `1000` | In-flight `FuturesUnordered` send-window cap per `write_batch`, and the seed for librdkafka's `queue.buffering.max.messages`. **`0` = no cap** (bounded only by `max_in_flight`). See [Streaming & batching](#streaming--batching). |
+| `batch_size` | int | `1000` | Unconfirmed-record window cap per `write_batch`, and the seed for librdkafka's `queue.buffering.max.messages`. **`0` = no cap** (bounded only by `max_in_flight`). See [Streaming & batching](#streaming--batching). |
 | `linger` | int (seconds) | `0` *(5ms)* | Time the producer waits to accumulate a batch before flushing. The default is **5 ms**; for other sub-second values set `linger.ms` via `extra_client_config`. |
 | `compression` | `"none" \| "gzip" \| "snappy" \| "lz4" \| "zstd"` | `"none"` | Producer-side compression codec. See [Compression](#compression). |
 | `extra_client_config` | object (string→string) | `{}` | Raw librdkafka client properties, applied after `auth` and the typed fields. Options faucet derives from a typed field are refused when the value disagrees: `bootstrap.servers` / `metadata.broker.list` (use `brokers`), `acks` / `request.required.acks` (use `acks`), `enable.idempotence` (use `idempotent`); `transactional.id` is always refused (faucet derives it under `delivery: exactly_once`). Restating faucet's value is allowed; other keys (`linger.ms`, `compression.type`, …) override the typed fields. Under `faucet serve`, keys naming a broker (`bootstrap.servers`, `metadata.broker.list`), a URL (`*.url`) or a file (`*.location`, `*.file`, `sasl.kerberos.keytab`) are checked like the typed fields, and keys that load or run a program (`plugin.library.paths`, `ssl.engine.location`, `ssl.providers`, `*.cmd`) are refused for configs the server does not trust. |
@@ -332,10 +332,10 @@ sink:
 
 ## Streaming & batching
 
-The sink is driven from the streaming pipeline via `Sink::write_batch`, once per `StreamPage` the source emits. Within a single call, records are produced through a `FuturesUnordered` of `send_result` futures so multiple sends fly concurrently. `batch_size` bounds how many futures are in flight at any moment:
+The sink is driven from the streaming pipeline via `Sink::write_batch`, once per `StreamPage` the source emits. Within a single call, records are enqueued on the producer in page order and their delivery reports awaited, so librdkafka batches them into few produce requests. `batch_size` bounds how many records are unconfirmed at any moment:
 
 - **Effective in-flight cap = `min(max_in_flight, batch_size)`** when `batch_size > 0`.
-- **Effective in-flight cap = `max_in_flight`** when `batch_size = 0` (the "no batching" sentinel — every record is enqueued immediately).
+- **Effective in-flight cap = `max_in_flight`** when `batch_size = 0` (the "no batching" sentinel).
 
 When `batch_size > 0`, `KafkaSink::new` also sets librdkafka's `queue.buffering.max.messages` to `batch_size` so the broker-side buffer can hold one full send window (avoiding spurious `QueueFull` rejections). `extra_client_config` takes precedence — set a smaller `queue.buffering.max.messages` there to force backpressure. `QueueFull` retry semantics (`queue_full_backoff` / `queue_full_max_retries`) are independent of `batch_size`.
 
@@ -438,7 +438,7 @@ In a full pipeline, wire the sink into `faucet_core::Pipeline` (or `run_stream`)
 
 1. `new()` resolves `KafkaAuth`, applies compression / acks / idempotence / timeout / `extra_client_config`, and builds the `FutureProducer` **once**.
 2. Each `write_batch` resolves the topic, key, partition and headers per record (JSONPath), encoding the value via `value_format`.
-3. Records are enqueued into a `FuturesUnordered` up to the effective in-flight cap; `QueueFull` rejections back off and retry.
+3. Records are enqueued in page order up to the effective in-flight cap; `QueueFull` rejections back off and retry.
 4. `flush()` blocks until all in-flight deliveries are acknowledged (or `message_timeout` elapses) before the pipeline advances the bookmark.
 
 ### How it is built

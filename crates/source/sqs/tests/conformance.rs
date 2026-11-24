@@ -459,3 +459,57 @@ async fn conformance_roundtrips_recorded() {
     let source = SqsSource::new(cfg).await.expect("source");
     faucet_conformance::calls::assert_source_records_roundtrips(&source).await;
 }
+
+/// Messages the queue still holds, visible or in flight.
+async fn held_by_queue(client: &aws_sdk_sqs::Client, queue_url: &str) -> usize {
+    use aws_sdk_sqs::types::QueueAttributeName;
+    let out = client
+        .get_queue_attributes()
+        .queue_url(queue_url)
+        .attribute_names(QueueAttributeName::ApproximateNumberOfMessages)
+        .attribute_names(QueueAttributeName::ApproximateNumberOfMessagesNotVisible)
+        .send()
+        .await
+        .expect("get_queue_attributes");
+    let attributes = out.attributes().expect("attributes");
+    [
+        QueueAttributeName::ApproximateNumberOfMessages,
+        QueueAttributeName::ApproximateNumberOfMessagesNotVisible,
+    ]
+    .iter()
+    .map(|name| {
+        attributes
+            .get(name)
+            .and_then(|v| v.parse::<usize>().ok())
+            .expect("count")
+    })
+    .sum()
+}
+
+/// A page spanning many delete requests is deleted in full, and nothing is
+/// read twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_spanning_many_delete_requests_is_deleted_in_full() {
+    let (_container, endpoint) = start_localstack().await;
+    let client = raw_client(&endpoint).await;
+    let queue_url = create_queue(&client, "delete-fan-out").await;
+    seed(&client, &queue_url, 230).await;
+
+    let mut cfg = SqsSourceConfig::new(&queue_url);
+    cfg.region = Some("us-east-1".into());
+    cfg.endpoint_url = Some(endpoint.clone());
+    cfg.credentials = test_credentials();
+    cfg.wait_time_seconds = 1;
+    cfg.idle_timeout_secs = Some(3);
+    cfg.batch_size = 115;
+
+    let source = SqsSource::new(cfg).await.expect("source");
+    let mut seen: Vec<i64> = drain(&source)
+        .await
+        .iter()
+        .map(|r| r["i"].as_i64().expect("i"))
+        .collect();
+    seen.sort_unstable();
+    assert_eq!(seen, (0..230).collect::<Vec<i64>>());
+    assert_eq!(held_by_queue(&client, &queue_url).await, 0);
+}

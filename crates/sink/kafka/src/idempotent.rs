@@ -11,8 +11,8 @@ use faucet_core::FaucetError;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::consumer::{BaseConsumer, Consumer};
-use rdkafka::error::{KafkaError, RDKafkaErrorCode};
-use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
+use rdkafka::error::RDKafkaErrorCode;
+use rdkafka::producer::{FutureProducer, Producer};
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
 use std::time::Duration;
 
@@ -453,7 +453,7 @@ pub(crate) fn fold_token_for_scope(
 
 /// Enqueue one record into the current transaction, retrying on `QueueFull`.
 ///
-/// Unlike the at-least-once `send_with_queue_full_retry`, this does NOT await
+/// Unlike the at-least-once path, this does NOT await
 /// the delivery future: inside a transaction, delivery only completes at
 /// `commit_transaction`, so awaiting here would deadlock. Errors surface at
 /// commit time.
@@ -466,38 +466,24 @@ pub(crate) async fn enqueue_in_txn(
     calls: &faucet_core::CallContext,
     producer: &FutureProducer,
     topic: &str,
-    value_bytes: Vec<u8>,
-    routing: crate::sink::RecordRouting,
+    value_bytes: &[u8],
+    routing: &crate::sink::RecordRouting,
     backoff: Duration,
     budget: Duration,
 ) -> Result<(), FaucetError> {
     let started = std::time::Instant::now();
     let backoff = backoff.max(Duration::from_millis(1));
     loop {
-        let mut record: FutureRecord<'_, [u8], [u8]> =
-            FutureRecord::to(topic).payload(value_bytes.as_slice());
-        if let Some(k) = routing.key.as_deref() {
-            record = record.key(k);
+        if crate::sink::try_enqueue(producer, topic, value_bytes, routing)?.is_some() {
+            return Ok(());
         }
-        if let Some(p) = routing.partition {
-            record = record.partition(p);
+        if started.elapsed() >= budget {
+            return Err(FaucetError::Sink(format!(
+                "kafka send: producer queue still full after {budget:?}"
+            )));
         }
-        if let Some(h) = routing.headers.as_ref() {
-            record = record.headers(crate::sink::owned_headers(h));
-        }
-        match producer.send_result(record) {
-            Ok(_delivery_future) => return Ok(()),
-            Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), _)) => {
-                if started.elapsed() >= budget {
-                    return Err(FaucetError::Sink(format!(
-                        "kafka send: producer queue still full after {budget:?}"
-                    )));
-                }
-                tracing::debug!("kafka send: QueueFull inside a transaction, waiting for room");
-                calls.wait(backoff).await?;
-            }
-            Err((e, _)) => return Err(FaucetError::Sink(format!("kafka send: {e}"))),
-        }
+        tracing::debug!("kafka send: QueueFull inside a transaction, waiting for room");
+        calls.wait(backoff).await?;
     }
 }
 

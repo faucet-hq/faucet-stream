@@ -732,8 +732,10 @@ impl Source for KafkaSource {
                         Ok(Ok(msg)) => {
                             match self.message_to_value(&msg).await {
                                 Ok(record) => {
-                                    pending_offsets.insert(
-                                        (msg.topic().to_string(), msg.partition()),
+                                    crate::context::set_partition_value(
+                                        &mut pending_offsets,
+                                        msg.topic(),
+                                        msg.partition(),
                                         msg.offset() + 1,
                                     );
                                     self.context.note_delivered(
@@ -874,8 +876,10 @@ impl Source for KafkaSource {
                             Ok(Ok(msg)) => {
                                 match self.message_to_value(&msg).await {
                                     Ok(record) => {
-                                        pending_offsets.insert(
-                                            (msg.topic().to_string(), msg.partition()),
+                                        crate::context::set_partition_value(
+                                            &mut pending_offsets,
+                                            msg.topic(),
+                                            msg.partition(),
                                             msg.offset() + 1,
                                         );
                                         self.context.note_delivered(
