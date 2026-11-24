@@ -13,7 +13,7 @@ Reach for it when you want to land any faucet-stream source — a REST API, a da
 
 - **Batched inserts** — append mode issues `insert_many` per `batch_size`-sized chunk, the documented sweet spot for balancing round-trip overhead against MongoDB's ~48 MB per-request budget.
 - **Unordered by default** — `ordered: false` so a single poison document (duplicate `_id`, validation error) can't drop the rest of the batch.
-- **Write modes** — `append` (default), `upsert` (per-document `replace_one(upsert)`), and `delete` (`delete_one`); the `key` fields become the match filter (MongoDB is schemaless — no key columns).
+- **Write modes** — `append` (default), `upsert` (`replace_one(upsert)` per document) and `delete` (`delete_one`), sent as one `bulkWrite` per page on MongoDB 8.0+; the `key` fields become the match filter (MongoDB is schemaless — no key columns).
 - **CDC mirroring** — a `delete_marker` mixes upserts and deletes in one stream, so a CDC source carrying an op flag (`__op: "u" | "d"`) keeps a collection in lock-step with its origin.
 - **Effectively-once delivery** — with `delivery: exactly_once` each page and its commit-token watermark commit atomically in one **multi-document transaction** (replica set required). See [Effectively-once delivery](#effectively-once-delivery).
 - **Dead-letter queue aware** — overrides `write_batch_partial` so a document the server rejects (append) or a missing/null-key row (upsert/delete) is routed to a DLQ per-row while the good documents still commit.
@@ -160,7 +160,7 @@ Within a single batch, repeated keys are deduped **last-write-wins** before any 
 
 A document missing or null in a key field fails. When a `dlq:` block is configured the good documents are still written and only the missing/null-key documents are routed to the DLQ per-row; without a DLQ the whole batch fails.
 
-Each `replace_one` / `delete_one` is a per-document primitive (not the namespaced `Client::bulk_write`) for compatibility with all supported MongoDB server versions; the sink recovers throughput by issuing the deduped ops concurrently.
+On **MongoDB 8.0 and later** a page's deduped ops go to the server as one client-level `bulkWrite` command (a `replaceOne` with `upsert` or a `deleteOne` per row; the driver splits it at the server's batch limits), so a page costs one round trip instead of one per row. The sink reads the server version once, from its `hello` reply. Older servers have no such command: there each row is its own `replace_one` / `delete_one`, issued concurrently. The documents written are the same either way. A row the server refuses fails the page with the same `MongoDB replace_one (upsert) failed: …` / `MongoDB delete_one failed: …` error (without the raw server reply a single write appends); a failure of the command as a whole reads `MongoDB bulk_write failed: …`.
 
 ## Effectively-once delivery
 
@@ -174,7 +174,7 @@ Each `replace_one` / `delete_one` is a per-document primitive (not the namespace
 Semantics on the effectively-once path (vs. the at-least-once `write_batch`):
 
 - **One page = one transaction.** In append mode the whole page goes in a single `insert_many` — the sink's `batch_size` re-chunking knob does **not** apply on this path (chunking would break page↔watermark atomicity). Size pages with the **source's** `batch_size` instead, keeping each page within MongoDB's per-transaction limits.
-- **Upsert/delete ops run sequentially inside the transaction.** A MongoDB `ClientSession` cannot be used concurrently, so the planned `replace_one(upsert)` / `delete_one` ops are issued one at a time — a throughput tradeoff versus the at-least-once path's concurrent fan-out. Atomicity requires the single session.
+- **Upsert/delete ops inside the transaction.** On MongoDB 8.0 and later the planned ops are one ordered `bulkWrite` command in the session. On older servers they are issued one at a time, because a MongoDB `ClientSession` cannot be used concurrently — a throughput tradeoff versus the at-least-once path's concurrent fan-out.
 - **The transaction writes with `w: majority`**, whatever the client's default, so a committed page and its watermark cannot roll back after a failover.
 - **Commit is retried** while the driver reports `UnknownTransactionCommitResult` (the driver-recommended pattern, bounded); any other failure aborts the transaction (best-effort) and surfaces the original error — nothing from the page is committed.
 - The data and `_faucet_commit_token` collections are pre-created (idempotently) before the first transaction, so the path also works on servers that can't create collections inside a transaction (MongoDB < 4.4).
