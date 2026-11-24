@@ -1,6 +1,7 @@
 //! MySQL source implementation.
 
 use crate::config::{BOOKMARK_TOKEN, MysqlReplication, MysqlSourceConfig};
+use crate::plan::decode_row;
 use async_trait::async_trait;
 use faucet_core::io::{CallContext, CallSlot};
 use faucet_core::replication::cursor::{CursorBookmark, CursorTracker};
@@ -170,7 +171,7 @@ impl MysqlSource {
     /// sqlx then hands its value over as bytes (#789 SQL-13). Found by
     /// describing the query and probing the flagged columns' character sets
     /// over zero rows; empty when the probe cannot run.
-    async fn text_columns(
+    pub(crate) async fn text_columns(
         &self,
         query: &str,
         bind_values: &[Value],
@@ -235,7 +236,7 @@ impl MysqlSource {
             .collect()
     }
 
-    fn json_context(&self) -> JsonContext<'_> {
+    pub(crate) fn json_context(&self) -> JsonContext<'_> {
         JsonContext {
             mode: self.config.json_big_numbers,
             warned: &self.json_warned,
@@ -261,7 +262,7 @@ impl MysqlSource {
 /// A JSON column read exactly: every number is checked on the column's
 /// text, and one a JSON value cannot hold exactly is refused or kept as an
 /// exact string per `json_big_numbers` (#789 SQL-49).
-fn json_text_to_value(
+pub(crate) fn json_text_to_value(
     text: &str,
     column: &str,
     json: &JsonContext<'_>,
@@ -298,9 +299,9 @@ fn json_text_to_value(
 
 /// How JSON columns are read: the `json_big_numbers` mode and the columns
 /// already warned about.
-struct JsonContext<'a> {
-    mode: faucet_core::JsonBigNumbers,
-    warned: &'a Mutex<std::collections::HashSet<String>>,
+pub(crate) struct JsonContext<'a> {
+    pub(crate) mode: faucet_core::JsonBigNumbers,
+    pub(crate) warned: &'a Mutex<std::collections::HashSet<String>>,
 }
 
 /// The text of a `JSON` cell (`None` for other types or NULL).
@@ -316,7 +317,7 @@ fn mysql_json_text(raw: sqlx::mysql::MySqlValueRef<'_>) -> Option<String> {
 ///
 /// Attempts common types in order of likelihood. Falls back to `Value::Null`
 /// for unsupported or null columns.
-fn mysql_value_to_json(
+pub(crate) fn mysql_value_to_json(
     row: &sqlx::mysql::MySqlRow,
     col_name: &str,
     text_columns: &std::collections::HashSet<String>,
@@ -330,7 +331,7 @@ fn mysql_value_to_json(
     mysql_scalar_to_json(row, col_name, text_columns)
 }
 
-fn mysql_scalar_to_json(
+pub(crate) fn mysql_scalar_to_json(
     row: &sqlx::mysql::MySqlRow,
     col_name: &str,
     text_columns: &std::collections::HashSet<String>,
@@ -351,7 +352,7 @@ fn mysql_scalar_to_json(
 
 /// A non-NULL cell as JSON, or an error naming the column when no decoder
 /// accepts it; `null` is only SQL NULL.
-fn mysql_decoded(
+pub(crate) fn mysql_decoded(
     row: &sqlx::mysql::MySqlRow,
     col_name: &str,
     text_columns: &std::collections::HashSet<String>,
@@ -512,7 +513,7 @@ fn mysql_scalar(
 
 /// A `TIME` as `[-]HH:MM:SS[.fff|.ffffff]`, keeping its sign and hours of 24
 /// and more.
-fn time_text(t: &sqlx::mysql::types::MySqlTime) -> String {
+pub(crate) fn time_text(t: &sqlx::mysql::types::MySqlTime) -> String {
     // `MySqlTime::is_negative` is inverted in sqlx 0.8; ask the sign itself.
     let sign = if t.sign().is_negative() { "-" } else { "" };
     let mut out = format!(
@@ -531,7 +532,7 @@ fn time_text(t: &sqlx::mysql::types::MySqlTime) -> String {
 
 /// A byte-valued cell: text (when the column is text with a binary collation
 /// and the bytes are UTF-8) or base64 (#789 SQL-13).
-fn bytes_to_json(bytes: Vec<u8>, is_text: bool) -> Value {
+pub(crate) fn bytes_to_json(bytes: Vec<u8>, is_text: bool) -> Value {
     use base64::Engine as _;
     let bytes = if is_text {
         match String::from_utf8(bytes) {
@@ -796,7 +797,8 @@ fn check_unique_columns(row: &sqlx::mysql::MySqlRow) -> Result<(), FaucetError> 
     faucet_core::util::check_unique_columns("MySQL", row.columns().iter().map(|c| c.name()))
 }
 
-fn row_to_json(
+#[cfg(test)]
+pub(crate) fn row_to_json(
     row: &sqlx::mysql::MySqlRow,
     text_columns: &std::collections::HashSet<String>,
     json: &JsonContext<'_>,
@@ -879,10 +881,12 @@ impl faucet_core::Source for MysqlSource {
         if let Some(first) = rows.first() {
             check_unique_columns(first)?;
         }
-        let records: Vec<Value> = rows
-            .iter()
-            .map(|r| row_to_json(r, &text_columns, &self.json_context()))
-            .collect::<Result<_, _>>()?;
+        let json = self.json_context();
+        let mut plan = None;
+        let mut records = Vec::with_capacity(rows.len());
+        for row in &rows {
+            records.push(decode_row(&mut plan, row, &text_columns, &json)?);
+        }
         tracing::info!(rows = records.len(), query = %self.config.query, "MySQL source fetch complete");
         Ok(records)
     }
@@ -921,6 +925,8 @@ impl faucet_core::Source for MysqlSource {
             let mut buffer: Vec<Value> = Vec::with_capacity(initial_capacity);
             let mut total = 0usize;
             let mut checked = false;
+            let json = self.json_context();
+            let mut plan = None;
 
             while let Some(row) = steps
                 .call_once("query", bounded_read(self.config.read_timeout_secs, rows.try_next()))
@@ -930,7 +936,7 @@ impl faucet_core::Source for MysqlSource {
                     check_unique_columns(&row)?;
                     checked = true;
                 }
-                let record = row_to_json(&row, &text_columns, &self.json_context())?;
+                let record = decode_row(&mut plan, &row, &text_columns, &json)?;
                 if tracker.as_mut().is_none_or(|t| t.admit(&record)) {
                     buffer.push(record);
                 }
