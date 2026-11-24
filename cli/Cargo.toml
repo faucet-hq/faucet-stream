@@ -25,13 +25,17 @@ path = "src/main.rs"
 # `serve` (HTTP control plane; links a web-server dependency tree and opens a
 # network listener). Opt in with `--features schedule` / `--features serve`, or
 # take everything with `--features full`.
-default = ["observability", "source", "sink", "state", "transforms", "compression", "quality", "contract", "masking", "policy", "cli-progress", "hub-remote", "google-sa", "file-format-csv", "file-format-parquet"]
+default = ["observability", "source", "sink", "state", "transforms", "compression", "quality", "contract", "masking", "policy", "cli-progress", "hub-remote", "google-sa", "file-format-csv", "file-format-parquet", "mimalloc"]
 
 # Every feature in this manifest: the default build plus every runtime mode,
 # transform, secrets resolver and catalog option. The container image's
 # complete build is exactly this set; `scripts/full-feature-coverage.py`
 # fails CI when a new feature is left out.
 full = ["default", "hub-remote", "otel", "schedule", "serve", "serve-ui", "serve-history-postgres", "serve-history-sqlite", "catalog", "lineage", "lineage-kafka", "notify", "transform-sql", "transform-wasm", "triggers", "triggers-object-store", "triggers-redis", "triggers-kafka", "templates", "templates-sync", "templates-sync-object-store", "tenants", "feeds", "cli-dev", "cli-interactive", "encryption", "cli-tui", "mcp", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "sink-clickhouse-staging", "sink-mssql-staging", "sink-databricks-staging", "source-oracle", "source-oracle-cdc", "sink-oracle", "source-rest-excel", "source-xml-excel", "file-formats", "secrets", "kafka-schema-registry", "quality-jsonschema", "arrow", "source-iceberg-glue", "source-iceberg-hms", "source-iceberg-sql", "sink-iceberg-glue", "sink-iceberg-hms", "sink-iceberg-sql"]
+
+# mimalloc as the global allocator of the `faucet` binary (`src/main.rs` only;
+# the library target and embedders keep their own allocator). In `default`.
+mimalloc = ["dep:mimalloc"]
 
 # Remote Template Hub catalogs (#677): `--hub github:owner/repo[@ref][/path]`
 # fetches a catalog through the GitHub contents API and caches it locally;
@@ -698,6 +702,7 @@ inquire = { version = "0.9", optional = true, default-features = false, features
 notify-fs = { package = "notify", version = "8", optional = true }
 ratatui = { workspace = true, optional = true }
 indicatif = { workspace = true, optional = true }
+mimalloc = { workspace = true, optional = true }
 futures = { workspace = true }
 glob = { workspace = true }
 url = { workspace = true }
@@ -800,7 +805,7 @@ flate2 = { workspace = true }
 features = [
     "arrow", "catalog", "cli-dev", "cli-interactive", "cli-progress", "cli-tui", "compression",
     "contract", "delta-azure", "delta-gcs", "delta-s3", "feeds", "file-formats", "google-sa",
-    "hub-remote", "mcp", "mtls", "oauth1", "otel", "policy", "quality-jsonschema",
+    "hub-remote", "mcp", "mimalloc", "mtls", "oauth1", "otel", "policy", "quality-jsonschema",
     "rabbitmq-tls", "schedule", "secrets", "serve-history-postgres", "serve-history-sqlite",
     "serve-ui", "sink-azure-blob", "sink-bigquery", "sink-clickhouse-staging", "sink-csv",
     "sink-databricks-staging", "sink-delta", "sink-dynamodb", "sink-elasticsearch",

@@ -75,7 +75,7 @@ ARG FEATURES
 # `triggers-redis` / `triggers-kafka`, which pull heavy (and for Kafka, native)
 # dependency trees — add them explicitly when a lean image needs them. The
 # complete image below includes all three.
-ARG EXTRAS="observability,state,transforms,compression,quality,contract,masking,cli-progress,serve,serve-ui,schedule,catalog,serve-history-postgres,serve-history-sqlite,notify,lineage,templates,mcp,triggers"
+ARG EXTRAS="observability,state,transforms,compression,quality,contract,masking,cli-progress,mimalloc,serve,serve-ui,schedule,catalog,serve-history-postgres,serve-history-sqlite,notify,lineage,templates,mcp,triggers"
 
 # Native build prerequisites: cmake + a C/C++ toolchain (bundled DuckDB, some
 # -sys crates), OpenSSL/SASL/curl headers (librdkafka for the kafka feature).
