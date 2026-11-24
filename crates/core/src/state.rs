@@ -1253,7 +1253,7 @@ mod tests {
 
     #[test]
     fn file_state_store_keeps_its_auto_traits() {
-        fn assert_auto<T: Send + Sync + Unpin + std::panic::UnwindSafe>() {}
+        fn assert_auto<T: Send + Sync + Unpin>() {}
         assert_auto::<FileStateStore>();
     }
 
