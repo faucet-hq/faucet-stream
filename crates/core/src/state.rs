@@ -642,7 +642,7 @@ impl FileStateStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            write_locks: (0..WRITE_LOCK_STRIPES)
+            write_locks: (0..WRITE_LOCK_SLOTS)
                 .map(|_| std::sync::Arc::new(Mutex::new(())))
                 .collect(),
             synced_sidecars: Default::default(),
@@ -840,8 +840,8 @@ impl FileStateStore {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         key.hash(&mut hasher);
-        let stripe = (hasher.finish() % self.write_locks.len() as u64) as usize;
-        std::sync::Arc::clone(&self.write_locks[stripe])
+        let slot = (hasher.finish() % self.write_locks.len() as u64) as usize;
+        std::sync::Arc::clone(&self.write_locks[slot])
     }
 
     async fn put_locked(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
@@ -893,7 +893,7 @@ impl FileStateStore {
 }
 
 /// Locks a [`FileStateStore`] spreads its keys over.
-const WRITE_LOCK_STRIPES: usize = 64;
+const WRITE_LOCK_SLOTS: usize = 64;
 
 /// Sidecars remembered as flushed, per store; past this the memory is
 /// dropped and each is checked (and flushed) again.
