@@ -212,6 +212,18 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         }
     }
 
+    /// `target`'s live columns as [`insert`](Self::insert) reads them: from
+    /// the page cache while a [`page_scope`](Self::page_scope) is open, else
+    /// from the catalog. For a backend path that writes a chunk itself (a
+    /// bulk load) and must not read the catalog once per chunk.
+    pub async fn page_columns<E: SqlExecutor + ?Sized>(
+        &self,
+        exec: &mut E,
+        target: &TableTarget,
+    ) -> Result<Vec<TableColumn>, FaucetError> {
+        self.live_columns(exec, target).await
+    }
+
     /// `target`'s live columns, from the page cache when a scope is open.
     pub(crate) async fn live_columns<E: SqlExecutor + ?Sized>(
         &self,

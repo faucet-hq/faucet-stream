@@ -1875,3 +1875,32 @@ fn a_page_maps_like_its_records_one_by_one() {
     assert!(map_records(&columns, &[json!({"none": 1})], ColumnMatching::Exact).is_err());
     assert!(map_records(&columns, &[json!(1)], ColumnMatching::Exact).is_err());
 }
+
+/// A backend path that writes a chunk itself shares the page's one catalog
+/// read with the engine's own inserts.
+fn page_columns_share_the_page_cache<D: SqlDialect>(d: D) {
+    let engine = SqlSinkEngine::new(d, WriteSpec::default());
+    let t = target(engine.dialect(), "t");
+    let mut rec = Recorder::new(&[("id", "bigint"), ("v", "text")]);
+    {
+        let _page = engine.page_scope();
+        for _ in 0..3 {
+            let columns = futures_lite_block_on(engine.page_columns(&mut rec, &t)).unwrap();
+            assert_eq!(columns, rec.columns);
+        }
+        futures_lite_block_on(engine.insert(&mut rec, &t, &[json!({"id": 1})], false)).unwrap();
+    }
+    assert_eq!(rec.catalog_reads, 1, "{}", engine.dialect().name());
+    futures_lite_block_on(engine.page_columns(&mut rec, &t)).unwrap();
+    assert_eq!(
+        rec.catalog_reads,
+        2,
+        "{}: no cache outside a scope",
+        engine.dialect().name()
+    );
+}
+
+#[test]
+fn matrix_page_columns() {
+    every_dialect!(page_columns_share_the_page_cache);
+}
