@@ -306,6 +306,32 @@ fn take_records_moves_only_when_no_later_read_can_see_the_records() {
 }
 
 #[test]
+fn take_records_copies_when_a_later_filter_reads_back_into_the_records() {
+    let body = json!({
+        "data": [{"id": 1}, {"id": 2}],
+        "meta": [{"id": 1, "next": "c2"}, {"id": 3, "next": "c3"}]
+    });
+    for later in [
+        "$.meta[?(@.id == $.data[0].id)].next",
+        "$.meta[?(@.id > 1)].next",
+        "$.meta.$ref",
+    ] {
+        let mut taken = body.clone();
+        assert_eq!(
+            take_records(&mut taken, Some("$.data[*]"), &[later]).unwrap(),
+            extract_records(&body, Some("$.data[*]")).unwrap(),
+            "{later}"
+        );
+        assert_eq!(taken, body, "{later}: the records stay in the body");
+        assert_eq!(
+            extract_records(&taken, Some(later)).map_err(|e| e.to_string()),
+            extract_records(&body, Some(later)).map_err(|e| e.to_string()),
+            "{later}"
+        );
+    }
+}
+
+#[test]
 fn records_fingerprint_hashes_the_same_bytes_as_the_string_form() {
     use std::hash::{Hash, Hasher};
     let reference = |records: &[Value]| {

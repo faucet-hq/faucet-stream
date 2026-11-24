@@ -156,11 +156,15 @@ fn take_plain(body: &mut Value, segments: &[&str], wildcard: bool) -> Option<Vec
 
 /// Whether JSONPath `other` provably descends through a key the plain path
 /// `segments` does not: its leading `.name` steps differ from `segments`
-/// before either ends.
+/// before either ends, and nothing in it (a filter, another `$`) can read
+/// back into the records.
 fn diverges(segments: &[&str], other: &str) -> bool {
     let Some(mut rest) = other.strip_prefix('$') else {
         return false;
     };
+    if rest.contains(['?', '$']) {
+        return false;
+    }
     for seg in segments {
         let Some(after_dot) = rest.strip_prefix('.') else {
             return false;
