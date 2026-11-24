@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use faucet_common_sftp::{
     ChunkedReader, SftpFile, SftpHandle, SftpLister, SftpSession, authenticate,
 };
-use faucet_core::CallExt as _;
 #[cfg(feature = "arrow")]
+use faucet_core::CallExt as _;
 use faucet_core::file_format::JsonLineError;
 use faucet_core::{FaucetError, Stream, StreamPage};
 use futures::stream::StreamExt;
