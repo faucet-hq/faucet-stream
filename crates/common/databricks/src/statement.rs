@@ -401,6 +401,7 @@ pub struct StatementClient {
     side: ErrorSide,
     calls: CallContext,
     max_response_bytes: Option<u64>,
+    op: Option<&'static str>,
 }
 
 impl std::fmt::Debug for StatementClient {
@@ -435,7 +436,15 @@ impl StatementClient {
             side,
             calls: CallContext::new().without_timeout(),
             max_response_bytes: Some(faucet_core::http::DEFAULT_MAX_RESPONSE_BYTES),
+            op: None,
         }
+    }
+
+    /// Meter every request of this client as `op` instead of `submit` /
+    /// `poll` (a probe that is not the read, such as a `describe`).
+    pub fn with_op(mut self, op: &'static str) -> Self {
+        self.op = Some(op);
+        self
     }
 
     /// Run every request through `calls` (#880): each attempt bounded by its
@@ -655,7 +664,9 @@ impl StatementClient {
     ) -> Result<reqwest::Response, FaucetError> {
         let mut attempt: u32 = 0;
         let mut refreshed = false;
-        let op = if verb == Verb::Get { "poll" } else { "submit" };
+        let op = self
+            .op
+            .unwrap_or(if verb == Verb::Get { "poll" } else { "submit" });
         loop {
             let header = auth.clone();
             let sent = self

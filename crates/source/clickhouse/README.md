@@ -84,6 +84,20 @@ after its last row, so a crash replays at most one page. A bare bookmark stored
 by an earlier release reads as that value with an empty boundary (its rows are
 re-delivered once). Rows whose cursor is `NULL` are never read.
 
+**Single-precision cursors.** When the bookmark is a non-integer number, the
+source first describes the query. If the cursor column is `Float32` (also inside `Nullable` / `LowCardinality`), the bookmark
+is replaced by its exact single-precision value (sent as `reinterpretAsFloat64(toUInt64(<bits>))`, never as decimal text), in the outer filter
+and in every `@bookmark`: the stored `0.7` sits above the column's
+`0.699999988…` when compared as a double, which would skip the rows at the
+bookmark. The value comes from
+[`faucet_core::fidelity::f32_cursor_bound`](https://docs.rs/faucet-core/latest/faucet_core/fidelity/fn.f32_cursor_bound.html):
+it is never above the bookmark, so a wrong describe costs a re-read row, never
+a lost one. A failed describe, or a `column` that names no column or two of
+them, fails the read. Integer, decimal, text and timestamp cursors are not
+described and are compared exactly as before.
+A `BFloat16` cursor is refused with a config error: cast it to `Float32` in
+the query.
+
 `DateTime` / `DateTime64` values are emitted as RFC 3339 in UTC
 (`2024-01-01T04:30:00Z`, the `date_time_output_format=iso` setting), so a
 non-UTC column zone never shifts them. ClickHouse will not compare a

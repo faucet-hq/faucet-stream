@@ -173,6 +173,17 @@ is written, and so is a boundary row updated in place. Above 10,000 rows at one
 value the fingerprints are dropped and the next run re-reads the value whole
 (duplicates, not loss).
 
+**Single-precision cursors compare exactly.** A bookmark taken from a
+single-precision column (`FLOAT` in MySQL and Databricks, `REAL` in SQL Server,
+`Float32` in ClickHouse, `FLOAT32` in Spanner) holds the value's shortest
+decimal, `0.7`. Compared as a double, `0.7` is above the stored
+`0.699999988…`, so the rows at the bookmark would be skipped. When the
+bookmark is a non-integer number, these sources describe the query, and for a
+single-precision cursor they compare with the exact single-precision value
+instead (sent bit-exact, in the outer filter and in the bookmark token). A
+query the server cannot describe fails the read. A ClickHouse `BFloat16`
+cursor is refused: cast it to `Float32`. Other cursors are compared as before.
+
 **Every page is checkpointed.** Each page carries the bookmark after its last
 row, persisted only after the sink has written the page, so a crash replays at
 most one page. Rows with a `NULL` cursor are never read, and a row committed

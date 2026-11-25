@@ -168,6 +168,18 @@ pipeline:
       path: ./.faucet-state
 ```
 
+**Single-precision cursors.** When the bookmark is a non-integer number, the
+source first describes the query. If the cursor column is `real` (`float(1)` to `float(24)`), read with `sp_describe_first_result_set`, or with a `SELECT TOP 0` probe when SQL Server cannot describe the query, the bookmark
+is replaced by its exact single-precision value (bound as a native `float(53)` parameter), in the outer filter
+and in every `@bookmark`: the stored `0.7` sits above the column's
+`0.699999988…` when compared as a double, which would skip the rows at the
+bookmark. The value comes from
+[`faucet_core::fidelity::f32_cursor_bound`](https://docs.rs/faucet-core/latest/faucet_core/fidelity/fn.f32_cursor_bound.html):
+it is never above the bookmark, so a wrong describe costs a re-read row, never
+a lost one. A failed describe, or a `column` that names no column or two of
+them, fails the read. Integer, decimal, text and timestamp cursors are not
+described and are compared exactly as before.
+
 ### Parameterized query with bind values
 
 ```yaml

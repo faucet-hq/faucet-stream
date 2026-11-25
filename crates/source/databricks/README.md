@@ -95,6 +95,21 @@ replays at most one page. A bare bookmark stored by an earlier release reads
 as that value with an empty boundary (its rows are re-delivered once). Rows
 whose cursor is `NULL` are never read.
 
+**Single-precision cursors.** When the bookmark is a non-integer number, the
+source first describes the query. If the cursor column is `FLOAT` (from the manifest of a `SELECT * FROM (<sql>) AS q LIMIT 0` statement, metered as `describe`), the bookmark
+is replaced by its exact single-precision value (its shortest double text, typed `DOUBLE`), in the outer filter
+and in every `${bookmark}`: the stored `0.7` sits above the column's
+`0.699999988…` when compared as a double, which would skip the rows at the
+bookmark. The value comes from
+[`faucet_core::fidelity::f32_cursor_bound`](https://docs.rs/faucet-core/latest/faucet_core/fidelity/fn.f32_cursor_bound.html):
+it is never above the bookmark, so a wrong describe costs a re-read row, never
+a lost one. A failed describe, or a `column` that names no column or two of
+them, fails the read. Integer, decimal, text and timestamp cursors are not
+described and are compared exactly as before.
+This costs one extra warehouse statement per read whose bookmark is a
+non-integer number. That an untyped STRING parameter is compared as a DOUBLE is
+taken from the Databricks documentation (ANSI mode).
+
 ## Arrow columnar (Parquet) mode
 
 Behind the crate-local `arrow` Cargo feature, setting `arrow_native: true`

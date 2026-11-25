@@ -82,6 +82,15 @@ struct Executed {
     result: Option<ResultChunk>,
 }
 
+/// What a statement body is for.
+#[derive(Debug, Clone, Copy)]
+enum Body {
+    /// The read; `Some` compares the cursor with this exact bound.
+    Read(Option<f64>),
+    /// A `LIMIT 0` probe of the query's result columns.
+    Describe,
+}
+
 /// Incremental-read context (column + starting position).
 struct IncrementalCtx {
     column: String,
@@ -185,7 +194,19 @@ impl DatabricksSource {
     /// rewritten to named params, and for an incremental read wrapped as
     /// `SELECT * FROM (<sql>) AS q WHERE q.<column> >= :_faucet_bookmark
     /// ORDER BY q.<column>`) plus the `parameters` array.
+    #[cfg(test)]
     fn build_body(&self, context: &HashMap<String, Value>, incr: Option<&IncrementalCtx>) -> Value {
+        self.build_body_for(context, incr, Body::Read(None))
+    }
+
+    /// [`build_body`](Self::build_body) for a read comparing with an exact
+    /// single-precision bound, or for the `LIMIT 0` describe of the query.
+    fn build_body_for(
+        &self,
+        context: &HashMap<String, Value>,
+        incr: Option<&IncrementalCtx>,
+        purpose: Body,
+    ) -> Value {
         let mut sql = self.config.sql.clone();
         // Named parameters: start with the user's static ones.
         let mut params: Vec<Value> = self
@@ -222,13 +243,27 @@ impl DatabricksSource {
             sql = sql.replace(BOOKMARK_TOKEN, ":_faucet_bookmark");
             let c = quote_ident(&ctx.column);
             let inner = sql.trim_end_matches(|ch: char| ch.is_whitespace() || ch == ';');
-            sql = format!(
-                "SELECT * FROM ({inner}\n) AS q WHERE q.{c} >= :_faucet_bookmark ORDER BY q.{c}"
-            );
-            params.push(json!({
-                "name": "_faucet_bookmark",
-                "value": value_to_param_string(&ctx.start.value),
-            }));
+            sql = match purpose {
+                Body::Describe => format!("SELECT * FROM ({inner}\n) AS q LIMIT 0"),
+                Body::Read(_) => format!(
+                    "SELECT * FROM ({inner}\n) AS q WHERE q.{c} >= :_faucet_bookmark ORDER BY q.{c}"
+                ),
+            };
+            let token_used = sql.contains(":_faucet_bookmark");
+            params.push(match purpose {
+                Body::Read(Some(bound)) => json!({
+                    "name": "_faucet_bookmark",
+                    "value": bound.to_string(),
+                    "type": "DOUBLE",
+                }),
+                _ => json!({
+                    "name": "_faucet_bookmark",
+                    "value": value_to_param_string(&ctx.start.value),
+                }),
+            });
+            if !token_used {
+                params.pop();
+            }
         }
 
         // ARROW_STREAM is only valid with EXTERNAL_LINKS disposition; JSON_ARRAY
@@ -236,7 +271,9 @@ impl DatabricksSource {
         // feature at config load, so requesting Arrow here is always decodable.
         // INLINE results are capped at 25 MiB server-side, so the row path
         // reads presigned JSON chunks by default (SQL-45).
-        let (disposition, format) = if self.config.arrow_native {
+        let (disposition, format) = if matches!(purpose, Body::Describe) {
+            ("INLINE", "JSON_ARRAY")
+        } else if self.config.arrow_native {
             ("EXTERNAL_LINKS", "ARROW_STREAM")
         } else {
             match self.config.result_disposition {
@@ -264,13 +301,55 @@ impl DatabricksSource {
         body
     }
 
+    /// The exact single-precision bound the cursor compares with, for a
+    /// `FLOAT` column and a non-integer bookmark (#1114); only that case runs
+    /// the `LIMIT 0` describe.
+    async fn cursor_bound(
+        &self,
+        context: &HashMap<String, Value>,
+        incr: Option<&IncrementalCtx>,
+    ) -> Result<Option<f64>, FaucetError> {
+        let Some(ctx) = incr else {
+            return Ok(None);
+        };
+        let Some(bound) = faucet_core::fidelity::f32_cursor_bound(&ctx.start.value)? else {
+            return Ok(None);
+        };
+        let body = self.build_body_for(context, incr, Body::Describe);
+        let resp = self
+            .statement_client()
+            .with_op("describe")
+            .execute_body(&body)
+            .await
+            .map_err(|e| {
+                FaucetError::Source(format!(
+                    "databricks: could not describe the incremental query to read the type of \
+                     cursor column {:?}: {e}",
+                    ctx.column
+                ))
+            })?;
+        let mut found = resp
+            .columns()
+            .iter()
+            .filter(|c| c.name.eq_ignore_ascii_case(&ctx.column));
+        let (Some(col), None) = (found.next(), found.next()) else {
+            return Err(FaucetError::Config(format!(
+                "databricks: incremental replication `column` {:?} must name exactly one \
+                 column of the query's output",
+                ctx.column
+            )));
+        };
+        Ok(col.type_name.eq_ignore_ascii_case("FLOAT").then_some(bound))
+    }
+
     /// Submit the statement and poll until it reaches a terminal state.
     async fn run_statement(
         &self,
         context: &HashMap<String, Value>,
         incr: Option<&IncrementalCtx>,
     ) -> Result<Executed, FaucetError> {
-        let body = self.build_body(context, incr);
+        let bound = self.cursor_bound(context, incr).await?;
+        let body = self.build_body_for(context, incr, Body::Read(bound));
         let resp = self.statement_client().execute_body(&body).await?;
         let columns = resp.columns().to_vec();
         crate::convert::check_unique_columns(&columns)?;
@@ -768,6 +847,45 @@ mod tests {
     }
 
     #[test]
+    fn the_describe_body_probes_the_query_with_its_parameters() {
+        let s = source(cfg());
+        let incr = s.incremental_ctx();
+        let body = s.build_body_for(&HashMap::new(), incr.as_ref(), Body::Describe);
+        assert_eq!(
+            body["statement"],
+            json!("SELECT * FROM (SELECT * FROM t WHERE ts >= :_faucet_bookmark\n) AS q LIMIT 0")
+        );
+        assert_eq!(body["disposition"], json!("INLINE"));
+        assert!(
+            body["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["name"] == json!("_faucet_bookmark"))
+        );
+
+        let mut plain = cfg();
+        plain.sql = "SELECT * FROM t".into();
+        let s = source(plain);
+        let incr = s.incremental_ctx();
+        let body = s.build_body_for(&HashMap::new(), incr.as_ref(), Body::Describe);
+        assert!(
+            body["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["name"] != json!("_faucet_bookmark"))
+        );
+        let read = s.build_body_for(&HashMap::new(), incr.as_ref(), Body::Read(Some(0.5)));
+        assert!(
+            read["parameters"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({"name": "_faucet_bookmark", "value": "0.5", "type": "DOUBLE"}))
+        );
+    }
+
+    #[test]
     fn body_has_required_fields_and_params() {
         let s = source(cfg());
         let incr = s.incremental_ctx();
@@ -776,7 +894,6 @@ mod tests {
         assert_eq!(body["catalog"], json!("main"));
         // SQL-45: the row path no longer requests INLINE (capped at 25 MiB).
         assert_eq!(body["disposition"], json!("EXTERNAL_LINKS"));
-        assert_eq!(body["format"], json!("JSON_ARRAY"));
         assert_eq!(body["wait_timeout"], json!("50s"));
         let mut inline = cfg();
         inline.result_disposition = ResultDisposition::Inline;

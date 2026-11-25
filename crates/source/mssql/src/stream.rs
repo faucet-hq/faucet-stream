@@ -128,6 +128,142 @@ impl MssqlSource {
             None => query,
         }
     }
+
+    /// The context [`cursor_wrap`] filters with: `incr`, or for a `real`
+    /// cursor column and a non-integer bookmark one comparing with its
+    /// single-precision bound (#1114), also written to a user `@bookmark`
+    /// (the last of `values`). Only that case describes `inner`.
+    async fn bound_cursor(
+        &self,
+        conn: &mut faucet_common_mssql::MssqlPooledConnection<'_>,
+        inner: &str,
+        values: &mut [Value],
+        incr: Option<&IncrementalCtx>,
+    ) -> Result<Option<IncrementalCtx>, FaucetError> {
+        let Some(ctx) = incr else {
+            return Ok(None);
+        };
+        let mut wrap = ctx.clone();
+        let Some(bound) = faucet_core::fidelity::f32_cursor_bound(&ctx.start.value)? else {
+            return Ok(Some(wrap));
+        };
+        if self
+            .cursor_is_real(conn, inner, values, &ctx.column)
+            .await?
+        {
+            let bound = faucet_core::fidelity::float64(bound);
+            if self.config.query.contains(BOOKMARK_TOKEN)
+                && let Some(token) = values.last_mut()
+            {
+                *token = bound.clone();
+            }
+            wrap.start.value = bound;
+        }
+        Ok(Some(wrap))
+    }
+
+    /// Whether `column` of `inner` is single precision: from
+    /// `sp_describe_first_result_set`, or when SQL Server cannot describe the
+    /// query, from the metadata of `SELECT TOP 0`.
+    async fn cursor_is_real(
+        &self,
+        conn: &mut faucet_common_mssql::MssqlPooledConnection<'_>,
+        inner: &str,
+        values: &[Value],
+        column: &str,
+    ) -> Result<bool, FaucetError> {
+        let decl = money::param_declarations(values);
+        let (described, cut) = self
+            .bounded(
+                &self.calls.get(),
+                "describe",
+                async { Ok(money::describe(conn, inner, &decl).await) },
+                || FaucetError::Source("MSSQL cursor-type probe timed out".into()),
+            )
+            .await;
+        if cut {
+            self.recover(conn).await;
+        }
+        match described? {
+            Ok(columns) => {
+                let typed = columns
+                    .into_iter()
+                    .map(|c| {
+                        let real = c.type_name.as_deref().is_some_and(is_real_type_name);
+                        (c.name.unwrap_or_default(), real)
+                    })
+                    .collect::<Vec<_>>();
+                return single_column(&typed, column);
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "MSSQL cannot describe the incremental query; probing with TOP 0");
+            }
+        }
+        let probe = format!("SELECT TOP 0 * FROM ({inner}) AS q");
+        let (typed, cut) = {
+            let owned: Vec<OwnedParam> = values.iter().map(OwnedParam::from_value).collect();
+            let refs: Vec<&dyn ToSql> = owned.iter().map(OwnedParam::as_tosql).collect();
+            let run = async {
+                let fail = |e: tiberius::error::Error| {
+                    FaucetError::Source(format!(
+                        "mssql: could not read the type of the incremental cursor column \
+                         {column:?}: {e}"
+                    ))
+                };
+                let mut stream = conn.query(&probe, &refs).await.map_err(fail)?;
+                let typed = stream
+                    .columns()
+                    .await
+                    .map_err(fail)?
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|c| {
+                        let real = matches!(
+                            c.column_type(),
+                            tiberius::ColumnType::Float4 | tiberius::ColumnType::Floatn
+                        );
+                        (c.name().to_string(), real)
+                    })
+                    .collect::<Vec<_>>();
+                stream.into_results().await.map_err(fail)?;
+                Ok(typed)
+            };
+            self.bounded(&self.calls.get(), "describe", run, || {
+                FaucetError::Source("MSSQL cursor-type probe timed out".into())
+            })
+            .await
+        };
+        if cut {
+            self.recover(conn).await;
+        }
+        single_column(&typed?, column)
+    }
+}
+
+/// Whether a `sp_describe_first_result_set` type is single precision:
+/// `real`, which `float(1)` to `float(24)` also report.
+fn is_real_type_name(name: &str) -> bool {
+    let t = name.trim().to_ascii_lowercase();
+    t == "real"
+        || t.strip_prefix("float(")
+            .and_then(|r| r.strip_suffix(')'))
+            .and_then(|n| n.trim().parse::<u8>().ok())
+            .is_some_and(|n| n <= 24)
+}
+
+/// The flag of the one column named `column` (case-insensitive); a missing
+/// or repeated name is a config error.
+fn single_column(columns: &[(String, bool)], column: &str) -> Result<bool, FaucetError> {
+    let mut found = columns
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(column));
+    match (found.next(), found.next()) {
+        (Some((_, flag)), None) => Ok(*flag),
+        _ => Err(FaucetError::Config(format!(
+            "mssql: incremental replication `column` {column:?} must name exactly one column \
+             of the query's output"
+        ))),
+    }
 }
 
 /// Infallible bracket quoting for a shard key whose NUL-freeness was already
@@ -440,7 +576,9 @@ impl Source for MssqlSource {
                 out?
             };
             let query = self.shard_wrap(money::resolve(query, planned, &self.money_warned));
-            let (query, values) = cursor_wrap(query, values, incr.as_ref(), true);
+            let mut values = values;
+            let wrap = self.bound_cursor(&mut conn, &query, &mut values, incr.as_ref()).await?;
+            let (query, values) = cursor_wrap(query, values, wrap.as_ref(), true);
             let mut tracker = incr.as_ref().map(IncrementalCtx::tracker);
 
             // Scope the borrowed param slice to the query() call — the
@@ -824,13 +962,15 @@ impl Source for MssqlSource {
         };
 
         let start = self.current_start();
-        let (inner, values, incr) =
+        let (inner, mut values, incr) =
             build_query_and_params(&self.config, &HashMap::new(), start.as_ref());
-        let (inner, values) = cursor_wrap(inner, values, incr.as_ref(), false);
+        let mut conn = self.checkout().await?;
+        let wrap = self
+            .bound_cursor(&mut conn, &inner, &mut values, incr.as_ref())
+            .await?;
+        let (inner, values) = cursor_wrap(inner, values, wrap.as_ref(), false);
         let key = quote_ident_mssql(&shard_cfg.key)?;
         let bounds_sql = pk_bounds_query(&inner, &key, "BIGINT");
-
-        let mut conn = self.checkout().await?;
 
         let rows = {
             let owned: Vec<OwnedParam> = values.iter().map(OwnedParam::from_value).collect();
@@ -976,6 +1116,39 @@ mod tests {
     use super::*;
     use faucet_core::shard::plan_pk_shards;
     use serde_json::json;
+
+    #[test]
+    fn single_precision_type_names() {
+        for t in ["real", " REAL ", "float(24)", "float(1)", "FLOAT( 7 )"] {
+            assert!(is_real_type_name(t), "{t}");
+        }
+        for t in [
+            "float",
+            "float(25)",
+            "float(53)",
+            "decimal(10,2)",
+            "float(x)",
+            "int",
+        ] {
+            assert!(!is_real_type_name(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn the_cursor_column_matches_once_ignoring_case() {
+        let cols = vec![("id".to_string(), false), ("C".to_string(), true)];
+        assert!(single_column(&cols, "c").unwrap());
+        assert!(!single_column(&cols, "ID").unwrap());
+        assert!(matches!(
+            single_column(&cols, "x"),
+            Err(FaucetError::Config(_))
+        ));
+        let twice = vec![("c".to_string(), true), ("C".to_string(), false)];
+        assert!(matches!(
+            single_column(&twice, "c"),
+            Err(FaucetError::Config(_))
+        ));
+    }
 
     fn full_cfg() -> MssqlSourceConfig {
         MssqlSourceConfig::new("mssql://sa:pw@db.example.com:1433/sales", "SELECT * FROM t")

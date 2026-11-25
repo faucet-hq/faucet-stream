@@ -52,12 +52,27 @@ impl IncrementalCtx {
 /// with a `T…Z` string literal. A `String` column holding such text refuses
 /// the parsed value instead, so the read is retried untyped
 /// ([`is_type_mismatch`]).
+#[cfg(test)]
 fn cursor_wrap(query: String, incr: Option<&IncrementalCtx>, typed: bool) -> String {
+    cursor_wrap_with(query, incr, typed, None)
+}
+
+/// [`cursor_wrap`], comparing with `literal` instead of the bookmark when
+/// given (the single-precision bound of [`float_bound_literal`]).
+fn cursor_wrap_with(
+    query: String,
+    incr: Option<&IncrementalCtx>,
+    typed: bool,
+    literal: Option<&str>,
+) -> String {
     let Some(ctx) = incr else {
         return query;
     };
     let c = quote_ident(&ctx.column);
     let inner = query.trim_end_matches(|ch: char| ch.is_whitespace() || ch == ';');
+    if let Some(lit) = literal {
+        return format!("SELECT * FROM ({inner}) AS q WHERE q.{c} >= {lit} ORDER BY q.{c}");
+    }
     let lit = sql_literal(&ctx.start.value);
     let bound = if typed && is_instant(&ctx.start.value) {
         format!("parseDateTime64BestEffort({lit}, 9)")
@@ -95,7 +110,89 @@ fn is_type_mismatch(e: &FaucetError) -> bool {
         if body.contains("Code: 53.") || body.contains("Code: 386."))
 }
 
+/// A ClickHouse expression for `bound` that the server reads bit-exact.
+fn float_bound_literal(bound: f64) -> String {
+    format!("reinterpretAsFloat64(toUInt64({}))", bound.to_bits())
+}
+
+/// `ty` without its `Nullable(…)` / `LowCardinality(…)` wrappers.
+fn base_type(ty: &str) -> &str {
+    let mut t = ty.trim();
+    loop {
+        let inner = ["Nullable(", "LowCardinality("]
+            .iter()
+            .find_map(|w| t.strip_prefix(w).and_then(|r| r.strip_suffix(')')));
+        match inner {
+            Some(i) => t = i.trim(),
+            None => return t,
+        }
+    }
+}
+
+/// Whether the cursor column of a `DESCRIBE` result (`JSONEachRow` lines of
+/// `name` and `type`) is `Float32`; a `BFloat16` cursor is refused, and a
+/// missing or repeated name is a config error.
+fn cursor_is_float32(describe: &str, column: &str) -> Result<bool, FaucetError> {
+    let mut found = Vec::new();
+    for line in describe.lines().filter(|l| !l.trim().is_empty()) {
+        let row: Value = serde_json::from_str(line).map_err(|e| {
+            FaucetError::Source(format!("ClickHouse: unreadable DESCRIBE row: {e}"))
+        })?;
+        if row["name"].as_str() == Some(column) {
+            found.push(row["type"].as_str().unwrap_or_default().to_string());
+        }
+    }
+    let [ty] = found.as_slice() else {
+        return Err(FaucetError::Config(format!(
+            "ClickHouse: incremental replication `column` {column:?} must name exactly one \
+             column of the query's output"
+        )));
+    };
+    match base_type(ty) {
+        "Float32" => Ok(true),
+        "BFloat16" => Err(FaucetError::Config(format!(
+            "ClickHouse: the incremental cursor column {column:?} has type {ty}, which \
+             faucet cannot compare with a bookmark exactly; cast it to Float32 in the query"
+        ))),
+        _ => Ok(false),
+    }
+}
+
 impl ClickHouseSource {
+    /// The literal the cursor compares with instead of the bookmark: for a
+    /// `Float32` column and a non-integer bookmark, its single-precision
+    /// bound (#1114). Only that case describes `query`.
+    async fn cursor_literal(
+        &self,
+        calls: &faucet_core::CallContext,
+        query: &str,
+        incr: Option<&IncrementalCtx>,
+    ) -> Result<Option<String>, FaucetError> {
+        let Some(ctx) = incr else {
+            return Ok(None);
+        };
+        let Some(bound) = faucet_core::fidelity::f32_cursor_bound(&ctx.start.value)? else {
+            return Ok(None);
+        };
+        let inner = query.trim_end_matches(|ch: char| ch.is_whitespace() || ch == ';');
+        let describe = format!("DESCRIBE TABLE ({inner}) FORMAT JSONEachRow");
+        let resp = self
+            .client
+            .call(calls, "describe", self.request(describe))
+            .await?;
+        let resp = check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN)
+            .await
+            .map_err(|e| {
+                FaucetError::Source(format!(
+                    "ClickHouse: could not describe the incremental query to read the type of \
+                     cursor column {:?}: {e}",
+                    ctx.column
+                ))
+            })?;
+        let body = self.client.text(resp).await?;
+        Ok(cursor_is_float32(&body, &ctx.column)?.then(|| float_bound_literal(bound)))
+    }
+
     /// Validate the config and build the reusable HTTP client.
     pub fn new(config: ClickHouseSourceConfig) -> Result<Self, FaucetError> {
         config.validate()?;
@@ -198,6 +295,17 @@ fn build_effective_query(
     context: &HashMap<String, Value>,
     start_bookmark: Option<&CursorBookmark>,
 ) -> (String, Option<IncrementalCtx>) {
+    build_effective_query_with(config, context, start_bookmark, None)
+}
+
+/// [`build_effective_query`], writing `literal` in place of `@bookmark` when
+/// given.
+fn build_effective_query_with(
+    config: &ClickHouseSourceConfig,
+    context: &HashMap<String, Value>,
+    start_bookmark: Option<&CursorBookmark>,
+    literal: Option<&str>,
+) -> (String, Option<IncrementalCtx>) {
     let mut template = config.query.clone();
     let mut literals: HashMap<String, Value> = HashMap::new();
 
@@ -216,7 +324,7 @@ fn build_effective_query(
                 template = template.replace(BOOKMARK_TOKEN, &format!("{{{BOOKMARK_KEY}}}"));
                 literals.insert(
                     BOOKMARK_KEY.to_owned(),
-                    Value::String(sql_literal(&start.value)),
+                    Value::String(literal.map_or_else(|| sql_literal(&start.value), str::to_owned)),
                 );
             }
             Some(IncrementalCtx {
@@ -427,12 +535,19 @@ impl Source for ClickHouseSource {
         let cap = if batch_size == 0 { 1024 } else { batch_size };
         let start = self.current_start();
         let (query, incr) = build_effective_query(&self.config, context, start.as_ref());
-        let typed = cursor_wrap(query.clone(), incr.as_ref(), true);
-        let text = cursor_wrap(query, incr.as_ref(), false);
         let mut tracker = incr.as_ref().map(IncrementalCtx::tracker);
 
         Box::pin(async_stream::try_stream! {
             let calls = self.calls.get();
+            let literal = self.cursor_literal(&calls, &query, incr.as_ref()).await?;
+            let query = match &literal {
+                Some(lit) => {
+                    build_effective_query_with(&self.config, context, start.as_ref(), Some(lit)).0
+                }
+                None => query,
+            };
+            let typed = cursor_wrap_with(query.clone(), incr.as_ref(), true, literal.as_deref());
+            let text = cursor_wrap_with(query, incr.as_ref(), false, literal.as_deref());
             let resp = self.client.call(&calls, "query", self.request(typed.clone())).await?;
             let resp = match check_http_response(resp, DEFAULT_ERROR_BODY_MAX_LEN).await {
                 Err(e) if typed != text && is_type_mismatch(&e) => {
@@ -565,6 +680,47 @@ impl Source for ClickHouseSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_float32_bound_is_sent_by_its_bits() {
+        assert_eq!(
+            float_bound_literal(f64::from(0.7f32)),
+            format!(
+                "reinterpretAsFloat64(toUInt64({}))",
+                f64::from(0.7f32).to_bits()
+            )
+        );
+    }
+
+    #[test]
+    fn describe_rows_name_the_cursor_type() {
+        let rows = |ty: &str| {
+            format!(
+                "{{\"name\":\"id\",\"type\":\"UInt32\"}}\n{{\"name\":\"c\",\"type\":\"{ty}\"}}\n"
+            )
+        };
+        for ty in [
+            "Float32",
+            "Nullable(Float32)",
+            "LowCardinality(Nullable(Float32))",
+        ] {
+            assert!(cursor_is_float32(&rows(ty), "c").unwrap(), "{ty}");
+        }
+        for ty in ["Float64", "Decimal(10, 2)", "String"] {
+            assert!(!cursor_is_float32(&rows(ty), "c").unwrap(), "{ty}");
+        }
+        let err = cursor_is_float32(&rows("Nullable(BFloat16)"), "c").unwrap_err();
+        assert!(matches!(err, FaucetError::Config(_)), "{err}");
+        assert!(err.to_string().contains("BFloat16"), "{err}");
+        assert!(matches!(
+            cursor_is_float32(&rows("Float32"), "C"),
+            Err(FaucetError::Config(_))
+        ));
+        assert!(matches!(
+            cursor_is_float32("not json", "c"),
+            Err(FaucetError::Source(_))
+        ));
+    }
     use serde_json::json;
 
     fn full_cfg() -> ClickHouseSourceConfig {

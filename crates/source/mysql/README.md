@@ -224,6 +224,18 @@ pipeline:
 - every row the server returns past the bookmark is kept — the server compared and ordered it by the column's own type and collation (a text column holding numbers or mixed-offset timestamps included);
 - nothing already written is emitted twice.
 
+**Single-precision cursors.** When the bookmark is a non-integer number, the
+source first describes the query. If the cursor column is `FLOAT`, the bookmark
+is replaced by its exact single-precision value (bound as a native `DOUBLE`; MySQL compares a `FLOAT` as a double, exactly), in the outer filter
+and in every `@bookmark`: the stored `0.7` sits above the column's
+`0.699999988…` when compared as a double, which would skip the rows at the
+bookmark. The value comes from
+[`faucet_core::fidelity::f32_cursor_bound`](https://docs.rs/faucet-core/latest/faucet_core/fidelity/fn.f32_cursor_bound.html):
+it is never above the bookmark, so a wrong describe costs a re-read row, never
+a lost one. A failed describe, or a `column` that names no column or two of
+them, fails the read. Integer, decimal, text and timestamp cursors are not
+described and are compared exactly as before.
+
 The fingerprint covers the whole row, so no key column is needed. When more than 10,000 rows share one cursor value the set is dropped (`"boundary": null`) and the next read re-emits every row at that value — duplicates, never loss (a warning names the column). A bare value written with `faucet state set` reads as that value with an empty boundary.
 
 **A crash replays at most one page.** Every page carries the bookmark after its last row, and the pipeline persists it only after the sink has written and flushed the page. The final page carries a bookmark even when it is empty.
