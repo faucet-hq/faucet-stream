@@ -85,7 +85,7 @@ faucet run pipeline.yaml
 | `batch_size` | int | `1000` | Records per emitted `StreamPage`. **`0` = no batching** (one page per object). See [Streaming & batching](#streaming--batching). Validated at config load: an empty `bucket`, or a `batch_size` above `MAX_BATCH_SIZE` (1,000,000), is rejected with `FaucetError::Config`. |
 | `verify_length` | bool | `true` | Verify each object's byte count against the `size` GCS reports; a short (truncated) or over-long transfer fails with `FaucetError::Source`. Auto-skipped for a transcoded object (non-empty `Content-Encoding`) or when no size is reported. See [Read-integrity verification](#read-integrity-verification). |
 | `verify_checksum` | bool | `false` | Also verify the body against the CRC-32C (preferred) or MD5 checksum GCS reports. Costs a hash over the full body; skipped for transcoded objects. A JSON Lines object is then read whole (up to `max_object_bytes`) and verified before any record is emitted. |
-| `body_resume_attempts` | int | `3` | How many times one object read (or one ranged Parquet read) may resume after its body drops mid-stream. A resume re-requests only the bytes not yet received, pinned to the object generation the read started on, so a replaced object fails the read instead of being spliced. Each resume counts as a `get` round trip and a `faucet_source_retries_total{class="connection"}` retry and logs a warning; past the limit the read fails with the body error. `0` never resumes. |
+| `body_resume_attempts` | int | `3` | How many times in a row one object read (or one ranged Parquet read) may resume after its body drops mid-stream with no new bytes received; a drop that follows new bytes starts the count again. A resume re-requests only the bytes not yet received, pinned to the object generation the read started on, so a replaced object fails the read instead of being spliced. Each resume counts as a `get` round trip and a `faucet_source_retries_total{class="connection"}` retry and logs a warning; past the limit the read fails with the body error. `0` never resumes. |
 
 ### Format & testing
 
@@ -486,7 +486,8 @@ unchanged.
 
 A body that drops mid-stream is resumed by the storage client from the last
 byte received, on the object generation the read started on. That resume is
-bounded by `body_resume_attempts` (default 3, `0` turns it off): each one is a
+bounded by `body_resume_attempts` (default 3 in a row without new bytes, `0`
+turns it off; a drop after new bytes starts the count again): each one is a
 `get` round trip, one `faucet_source_retries_total{class="connection"}` and a
 warning naming the object and the attempt, and past the limit the read fails
 with the body error instead of resuming for as long as the run lasts.

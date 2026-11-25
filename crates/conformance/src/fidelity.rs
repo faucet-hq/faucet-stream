@@ -115,9 +115,7 @@ pub fn corpus() -> Vec<Value> {
             "very_large": 1e300,
             // Distinct from 0.0 by sign bit; many round-trips lose it.
             "negative_zero": -0.0,
-            // Sixteen and seventeen significant digits: the shortest text of
-            // 632/7 and 1/7. A reader that is not correctly rounded lands one
-            // unit in the last place away.
+            // Shortest texts of 632/7 and 1/7; an inexact reader lands one unit away.
             "shortest_16_digits": 90.28571428571429,
             "shortest_17_digits": 0.14285714285714285,
         }),

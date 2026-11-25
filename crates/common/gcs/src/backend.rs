@@ -127,13 +127,13 @@ impl ObjectClient for GcsObjects {
     async fn download(&self, key: &str, to: &Path) -> Result<(), FaucetError> {
         use tokio::io::AsyncWriteExt as _;
         self.roundtrips.record("get");
+        let resume = crate::BodyResume::new(crate::DEFAULT_BODY_RESUME_ATTEMPTS, &self.bucket, key)
+            .with_recorder(self.roundtrips.recorder());
+        let received = resume.progress();
         let mut resp = self
             .storage
             .read_object(self.bucket_path(), key.to_string())
-            .with_read_resume_policy(
-                crate::BodyResume::new(crate::DEFAULT_BODY_RESUME_ATTEMPTS, &self.bucket, key)
-                    .with_recorder(self.roundtrips.recorder()),
-            )
+            .with_read_resume_policy(resume)
             .send()
             .within(&self.calls, "get")
             .await?
@@ -143,6 +143,7 @@ impl ObjectClient for GcsObjects {
             .map_err(|e| err("create local copy", key, e))?;
         while let Some(chunk) = resp.next().within(&self.calls, "get").await? {
             let chunk = chunk.map_err(|e| self.gcs_err("download", key, e))?;
+            received.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
             file.write_all(&chunk)
                 .await
                 .map_err(|e| err("download", key, e))?;

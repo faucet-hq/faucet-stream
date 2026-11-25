@@ -778,8 +778,7 @@ mod tests {
 
     #[test]
     fn a_double_halfway_between_two_literals_accepts_its_own_renderings() {
-        // 1727756845721204.25 is a double: its shortest text rounds the tie
-        // up, its 17-digit rounding goes to even. Both are its renderings.
+        // 1727756845721204.25: shortest text rounds the tie up, 17 digits round to even.
         assert!(faithful("1727756845721204.3"));
         assert!(faithful("1727756845721204.2"));
         assert!(faithful("1727756845721204.25"));

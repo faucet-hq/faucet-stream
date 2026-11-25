@@ -30365,7 +30365,7 @@
                       "default": false
                     },
                     "body_resume_attempts": {
-                      "description": "How many times one object read may resume after its body drops\nmid-stream. A resume re-requests the bytes not yet received, pinned to\nthe object generation the read started on, so a replaced object fails\nthe read instead of being spliced. Each resume counts as a source\nretry and logs a warning; past the limit the read fails with the body\nerror. `0` never resumes. Default 3.",
+                      "description": "How many times in a row one object read may resume after its body\ndrops mid-stream without any new bytes arriving; a drop that follows\nnew bytes starts the count again. A resume re-requests the bytes not\nyet received, pinned to the object generation the read started on, so\na replaced object fails the read instead of being spliced. Each resume\ncounts as a source retry and logs a warning; past the limit the read\nfails with the body error. `0` never resumes. Default 3.",
                       "type": [
                         "integer",
                         "string"

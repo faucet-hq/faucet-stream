@@ -58,7 +58,8 @@ read-resume policy every pipeline `read_object` installs
 (`with_read_resume_policy`). The storage client re-requests a dropped body
 from the last byte received, pinned to the first response's generation, and by
 default does so without limit. This policy keeps the client's rule for which
-errors are resumable, stops after `attempts` resumes (`0` never resumes),
+errors are resumable, stops after `attempts` resumes in a row with no new bytes (`0` never resumes;
+a reader reports bytes through `BodyResume::progress`),
 counts each as a `get` round trip and a retry of class `connection`, and logs a
 warning naming the object and the attempt. `DEFAULT_BODY_RESUME_ATTEMPTS` is 3.
 

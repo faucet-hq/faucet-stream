@@ -218,10 +218,30 @@ fn a_dropped_body_resumes_from_the_last_byte_on_the_same_generation() {
 }
 
 #[test]
+fn a_body_that_drops_often_but_keeps_arriving_is_read_to_the_end() {
+    faucet_conformance::block_on_large_stack(async {
+        let body = jsonl(200);
+        let cuts = body.len() / 100;
+        assert!(
+            cuts > 6,
+            "the body must drop more often than the limit: {cuts}"
+        );
+        let server = CuttingServer::start(body, usize::MAX, 100).await;
+        let source = source(&server, Some(1)).await;
+        let records = tokio::time::timeout(std::time::Duration::from_secs(60), read_all(&source))
+            .await
+            .expect("the read must end")
+            .expect("every drop followed new bytes, so the read completes");
+        assert_eq!(records.len(), 200);
+        assert!(server.media_reads().len() > 6);
+    });
+}
+
+#[test]
 fn a_body_that_keeps_dropping_fails_after_the_configured_resumes() {
     faucet_conformance::block_on_large_stack(async {
         for (configured, resumes) in [(Some(0), 0), (Some(2), 2), (None, 3)] {
-            let server = CuttingServer::start(jsonl(200), usize::MAX, 100).await;
+            let server = CuttingServer::start(jsonl(200), usize::MAX, 0).await;
             let source = source(&server, configured).await;
             let meter = metered(&source);
 

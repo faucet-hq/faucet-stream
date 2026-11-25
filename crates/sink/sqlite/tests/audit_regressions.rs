@@ -375,3 +375,49 @@ async fn an_uncreatable_database_directory_is_a_sink_error() {
         other => panic!("expected FaucetError::Sink, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn a_float_key_in_a_text_key_column_matches_on_upsert_and_delete() {
+    let (_d, url) = fresh_db(&["CREATE TABLE t (k TEXT PRIMARY KEY, v TEXT, n TEXT)"]).await;
+    let key = 1.0f64 / 7.0;
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO t (k, v) VALUES (?, 'old release')")
+        .bind(key)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let sink = SqliteSink::new(config(&url, "t", WriteMode::Upsert, &["k"]))
+        .await
+        .unwrap();
+    sink.write_batch(&[json!({"k": key, "v": "new", "n": 632.0 / 7.0})])
+        .await
+        .unwrap();
+    sink.flush().await.unwrap();
+    let rows = sqlx::query("SELECT v, n FROM t")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the upsert must replace the row an earlier release wrote"
+    );
+    assert_eq!(rows[0].get::<String, _>(0), "new");
+    assert_eq!(rows[0].get::<String, _>(1), "90.28571428571429");
+
+    let sink = SqliteSink::new(config(&url, "t", WriteMode::Delete, &["k"]))
+        .await
+        .unwrap();
+    sink.write_batch(&[json!({"k": key})]).await.unwrap();
+    sink.flush().await.unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM t")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "the delete must match the key the upsert wrote");
+}

@@ -142,12 +142,13 @@ pub struct GcsSourceConfig {
     /// before any of its records is emitted.
     #[serde(default)]
     pub verify_checksum: bool,
-    /// How many times one object read may resume after its body drops
-    /// mid-stream. A resume re-requests the bytes not yet received, pinned to
-    /// the object generation the read started on, so a replaced object fails
-    /// the read instead of being spliced. Each resume counts as a source
-    /// retry and logs a warning; past the limit the read fails with the body
-    /// error. `0` never resumes. Default 3.
+    /// How many times in a row one object read may resume after its body
+    /// drops mid-stream without any new bytes arriving; a drop that follows
+    /// new bytes starts the count again. A resume re-requests the bytes not
+    /// yet received, pinned to the object generation the read started on, so
+    /// a replaced object fails the read instead of being spliced. Each resume
+    /// counts as a source retry and logs a warning; past the limit the read
+    /// fails with the body error. `0` never resumes. Default 3.
     #[serde(default = "default_body_resume_attempts")]
     pub body_resume_attempts: u32,
     /// Largest object, once decompressed, that a format read whole (JSON

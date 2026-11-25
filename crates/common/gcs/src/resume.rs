@@ -1,13 +1,4 @@
-//! [`BodyResume`]: the bounded, counted resume policy every pipeline
-//! `read_object` installs.
-//!
-//! The storage client re-requests a body that drops mid-stream from the last
-//! byte it received, pinned to the generation of the first response. Its
-//! default policy does so without an attempt limit and without telling
-//! anyone, so a body that keeps failing would loop until a run deadline that
-//! may not exist. This policy keeps the client's own rule for which errors
-//! are worth a resume, stops after a fixed number of resumes, counts each one
-//! as a source retry and a `get` round trip, and logs it.
+//! [`BodyResume`]: the bounded, counted resume policy every pipeline `read_object` installs.
 
 use faucet_core::RetryClass;
 use faucet_core::observability::RoundtripRecorder;
@@ -15,22 +6,34 @@ use google_cloud_storage::Error;
 use google_cloud_storage::read_resume_policy::{
     ReadResumePolicy, Recommended, ResumeQuery, ResumeResult,
 };
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Resumes of one object body before the read fails, when a connector does
 /// not configure its own.
 pub const DEFAULT_BODY_RESUME_ATTEMPTS: u32 = 3;
 
-/// A read-resume policy that resumes a dropped body at most `attempts` times.
+/// A read-resume policy that resumes a dropped body at most `attempts` times
+/// in a row without new bytes arriving.
 ///
 /// Install it per request with `with_read_resume_policy`. `attempts: 0` never
-/// resumes: the first body error fails the read.
+/// resumes: the first body error fails the read. A reader that adds the bytes
+/// it receives to [`BodyResume::progress`] gets a fresh allowance after every
+/// drop that followed new bytes; without it the limit covers the whole read.
 #[derive(Debug)]
 pub struct BodyResume {
     attempts: u32,
     bucket: String,
     key: String,
     recorder: Option<Arc<RoundtripRecorder>>,
+    progress: Arc<AtomicU64>,
+    mark: Mutex<Mark>,
+}
+
+#[derive(Debug, Default)]
+struct Mark {
+    bytes: u64,
+    resumes_before: u32,
 }
 
 impl BodyResume {
@@ -41,7 +44,24 @@ impl BodyResume {
             bucket: bucket.into(),
             key: key.into(),
             recorder: None,
+            progress: Arc::new(AtomicU64::new(0)),
+            mark: Mutex::new(Mark::default()),
         }
+    }
+
+    /// The counter of body bytes received; the reader adds each chunk's length.
+    pub fn progress(&self) -> Arc<AtomicU64> {
+        self.progress.clone()
+    }
+
+    fn resumes_without_progress(&self, attempt_count: u32) -> u32 {
+        let received = self.progress.load(Ordering::Relaxed);
+        let mut mark = self.mark.lock().unwrap_or_else(|e| e.into_inner());
+        if received > mark.bytes {
+            mark.bytes = received;
+            mark.resumes_before = attempt_count;
+        }
+        attempt_count.saturating_sub(mark.resumes_before)
     }
 
     /// Count each resume on `recorder` (a retry of class `connection` and a
@@ -56,7 +76,10 @@ impl BodyResume {
 impl ReadResumePolicy for BodyResume {
     fn on_error(&self, status: &ResumeQuery, error: Error) -> ResumeResult {
         match Recommended.on_error(status, error) {
-            ResumeResult::Continue(e) if status.attempt_count > self.attempts => {
+            ResumeResult::Continue(e)
+                if self.attempts == 0
+                    || self.resumes_without_progress(status.attempt_count) > self.attempts =>
+            {
                 ResumeResult::Exhausted(e)
             }
             ResumeResult::Continue(e) => {
@@ -146,5 +169,28 @@ mod tests {
     #[test]
     fn default_is_three() {
         assert_eq!(DEFAULT_BODY_RESUME_ATTEMPTS, 3);
+    }
+
+    #[test]
+    fn a_drop_after_new_bytes_starts_a_fresh_allowance() {
+        let policy = BodyResume::new(1, "b", "k");
+        let progress = policy.progress();
+        for attempt in 1..=6 {
+            progress.fetch_add(10, Ordering::Relaxed);
+            let r = policy.on_error(&ResumeQuery::new(attempt), dropped());
+            assert!(matches!(r, ResumeResult::Continue(_)), "{attempt}: {r:?}");
+        }
+        let r = policy.on_error(&ResumeQuery::new(7), dropped());
+        assert!(matches!(r, ResumeResult::Continue(_)), "{r:?}");
+        let r = policy.on_error(&ResumeQuery::new(8), dropped());
+        assert!(matches!(r, ResumeResult::Exhausted(_)), "{r:?}");
+    }
+
+    #[test]
+    fn zero_never_resumes_even_after_new_bytes() {
+        let policy = BodyResume::new(0, "b", "k");
+        policy.progress().fetch_add(10, Ordering::Relaxed);
+        let r = policy.on_error(&ResumeQuery::new(1), dropped());
+        assert!(matches!(r, ResumeResult::Exhausted(_)), "{r:?}");
     }
 }

@@ -119,13 +119,17 @@ pub(crate) fn has_text_affinity(declared: &str) -> bool {
 /// Bind one statement parameter. A non-integer number bound for a
 /// TEXT-affinity column goes as its shortest decimal text: SQLite renders a
 /// bound REAL into such a column with 15 significant digits, which drops the
-/// last digits of a double. Every other value binds as [`bind_value`] does.
+/// last digits of a double. A `key` column and every other value bind as
+/// [`bind_value`] does, so a key matches the rows deletes, the rollback
+/// journal and earlier releases address.
 pub(crate) fn bind_param<'q>(
     q: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
     p: &faucet_common_sql::Param<'_>,
+    key: &[String],
 ) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
     if let (Value::Number(n), Some(declared)) = (p.value.as_ref(), p.sql_type)
         && has_text_affinity(declared)
+        && !key.iter().any(|k| k.eq_ignore_ascii_case(p.column))
         && let Some(text) = faucet_core::fidelity::non_integer_text(n)
     {
         return q.bind(text);
@@ -366,7 +370,7 @@ impl SqlExecutor for SqliteExec<'_> {
         let mut q = sqlx::query(&stmt.sql);
         for p in &stmt.params {
             // Native SQLite types so affinity and typed reads round-trip (#78/#4).
-            q = bind_param(q, p);
+            q = bind_param(q, p, &self.sink.config.write.key);
         }
         let context = match stmt.kind {
             StatementKind::Insert | StatementKind::InsertJson | StatementKind::Upsert => {
@@ -389,7 +393,7 @@ impl SqlExecutor for SqliteExec<'_> {
     async fn fetch_text(&mut self, stmt: &Statement<'_>) -> Result<Vec<String>, FaucetError> {
         let mut q = sqlx::query(&stmt.sql);
         for p in &stmt.params {
-            q = bind_param(q, p);
+            q = bind_param(q, p, &self.sink.config.write.key);
         }
         let rows = q
             .fetch_all(&mut *self.conn)
