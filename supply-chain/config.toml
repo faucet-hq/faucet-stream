@@ -1229,7 +1229,7 @@ version = "1.2.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.croner]]
-version = "3.0.1"
+version = "5.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.crossbeam-channel]]
@@ -2146,7 +2146,7 @@ criteria = "safe-to-deploy"
 
 [[exemptions.jiff]]
 version = "1.0.3"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 
 [[exemptions.jiff-core]]
 version = "0.1.1"
@@ -2154,7 +2154,7 @@ criteria = "safe-to-deploy"
 
 [[exemptions.jiff-core]]
 version = "1.0.2"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 
 [[exemptions.jiff-static]]
 version = "0.2.38"
@@ -2162,7 +2162,7 @@ criteria = "safe-to-deploy"
 
 [[exemptions.jiff-static]]
 version = "1.0.3"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 
 [[exemptions.jiff-tzdb]]
 version = "0.1.6"
@@ -2170,7 +2170,7 @@ criteria = "safe-to-deploy"
 
 [[exemptions.jiff-tzdb]]
 version = "1.0.0"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 
 [[exemptions.jiff-tzdb-platform]]
 version = "0.1.3"

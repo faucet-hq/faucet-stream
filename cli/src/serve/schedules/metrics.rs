@@ -44,6 +44,10 @@ pub fn describe() {
         "Fan-out ticks refused for one tenant while the others ran"
     );
     describe_counter!(
+        "faucet_serve_schedule_compute_errors_total",
+        "Times a schedule's next tick could not be computed; it stops ticking until that clears"
+    );
+    describe_counter!(
         "faucet_serve_schedule_runner_restarts_total",
         "Times the schedule loop panicked and was restarted"
     );
@@ -60,6 +64,11 @@ pub fn step_timed_out(schedule: &str) {
         .increment(1);
 }
 
+pub fn compute_error(schedule: &str) {
+    counter!("faucet_serve_schedule_compute_errors_total", "schedule" => schedule.to_string())
+        .increment(1);
+}
+
 pub fn runner_restarted() {
     counter!("faucet_serve_schedule_runner_restarts_total").increment(1);
 }
@@ -71,6 +80,8 @@ pub fn preinit(schedule: &str) {
             .increment(0);
     }
     counter!("faucet_serve_schedule_missed_ticks_total", "schedule" => schedule.to_string())
+        .increment(0);
+    counter!("faucet_serve_schedule_compute_errors_total", "schedule" => schedule.to_string())
         .increment(0);
     healthy(schedule, true);
 }
@@ -132,6 +143,7 @@ mod tests {
             last_tick("nightly", 1_700_000_000);
             runner_restarted();
             step_timed_out("nightly");
+            compute_error("nightly");
         });
         let names: Vec<String> = snapshotter
             .snapshot()
@@ -148,6 +160,7 @@ mod tests {
             "faucet_serve_schedule_tenant_failures_total",
             "faucet_serve_schedule_runner_restarts_total",
             "faucet_serve_schedule_step_timeouts_total",
+            "faucet_serve_schedule_compute_errors_total",
         ] {
             assert!(names.iter().any(|n| n == want), "missing {want}: {names:?}");
         }

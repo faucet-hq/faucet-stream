@@ -3355,6 +3355,13 @@ pub struct ValidateArgs {
     #[arg(long)]
     pub json: bool,
 
+    /// Validate a `faucet serve --schedules` file instead of a pipeline config:
+    /// every schedule's cron, time zone, minimum interval and template
+    /// reference shape, offline. Lists every problem; exits non-zero on any.
+    /// Run it with a new release before upgrading a server.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["config", "source", "show_composed"])]
+    pub schedules: Option<PathBuf>,
+
     /// Template Hub (#571): compose this `source-template` (path or hub id)
     /// with `--sink` and validate the result instead of loading a config file.
     #[arg(long, requires = "sink", conflicts_with = "config")]

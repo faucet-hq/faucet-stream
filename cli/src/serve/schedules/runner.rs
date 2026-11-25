@@ -62,6 +62,9 @@ pub struct Entry {
     attempts: u32,
     /// The tick waits out a run-history outage (#1050).
     held: bool,
+    /// The next tick could not be computed (#1111): the entry does not tick
+    /// until a reload computes one again.
+    compute_error: Option<String>,
 }
 
 /// What identifies a definition: a change rebuilds the entry.
@@ -79,19 +82,57 @@ impl Entry {
         schedule: CompiledSchedule,
         now: DateTime<Utc>,
     ) -> Self {
-        let next = schedule.next_after(now);
-        Self {
+        let mut entry = Self {
             fingerprint: fingerprint(&spec, owner.as_deref(), false),
             spec,
             owner,
             source,
             approved: false,
             schedule,
-            next,
+            next: None,
             resumed: false,
             retry_at: None,
             attempts: 0,
             held: false,
+            compute_error: None,
+        };
+        entry.next = entry.next_of(now);
+        entry
+    }
+
+    /// The next occurrence strictly after `after`; a failed search stops the
+    /// entry (logged and counted once per failure, gauge 0) instead of reading
+    /// as the end of the schedule.
+    fn next_of(&mut self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        match self.schedule.try_next_after(after) {
+            Ok(t) => t,
+            Err(e) => {
+                if self.compute_error.is_none() {
+                    tracing::error!(schedule = %self.spec.name, cron = %self.spec.cron, timezone = %self.spec.timezone, error = %e, "cannot compute the schedule's next tick; it stops ticking until this clears");
+                    metrics::compute_error(&self.spec.name);
+                }
+                metrics::healthy(&self.spec.name, false);
+                self.compute_error = Some(e.to_string());
+                None
+            }
+        }
+    }
+
+    /// Why the entry cannot compute its next tick, if it cannot.
+    pub fn compute_error(&self) -> Option<&str> {
+        self.compute_error.as_deref()
+    }
+
+    /// Try again to compute the next tick of an entry stopped by a failed search.
+    fn retry_compute(&mut self, now: DateTime<Utc>) {
+        if self.compute_error.is_none() || self.next.is_some() {
+            return;
+        }
+        if let Ok(next) = self.schedule.try_next_after(now) {
+            tracing::info!(schedule = %self.spec.name, "the schedule's next tick computes again; it ticks again");
+            metrics::healthy(&self.spec.name, true);
+            self.compute_error = None;
+            self.next = next;
         }
     }
 
@@ -108,11 +149,15 @@ impl Entry {
     }
 
     /// The latest occurrence in `(after, now]` and how many there are.
-    fn latest_due(&self, after: DateTime<Utc>, now: DateTime<Utc>) -> (Option<DateTime<Utc>>, u64) {
+    fn latest_due(
+        &mut self,
+        after: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> (Option<DateTime<Utc>>, u64) {
         let (mut latest, mut count) = (None, 0);
         let mut cursor = after;
         while count < MAX_SCAN {
-            match self.schedule.next_after(cursor) {
+            match self.next_of(cursor) {
                 Some(t) if t <= now => {
                     latest = Some(t);
                     count += 1;
@@ -125,17 +170,22 @@ impl Entry {
         (self.latest_before(now).or(latest), count)
     }
 
-    fn latest_before(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    fn latest_before(&mut self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         // Look back in doubling windows for any occurrence, then walk to the last.
-        std::iter::successors(Some(chrono::Duration::minutes(1)), |s| Some(*s * 2))
-            .take_while(|s| *s < chrono::Duration::days(3660))
-            .find_map(|step| self.schedule.next_after(now - step).filter(|t| *t <= now))
-            .map(|mut cursor| {
-                while let Some(n) = self.schedule.next_after(cursor).filter(|n| *n <= now) {
-                    cursor = n;
-                }
-                cursor
-            })
+        let mut step = chrono::Duration::minutes(1);
+        let mut cursor = loop {
+            if step >= chrono::Duration::days(3660) {
+                return None;
+            }
+            if let Some(t) = self.next_of(now - step).filter(|t| *t <= now) {
+                break t;
+            }
+            step = step * 2;
+        };
+        while let Some(n) = self.next_of(cursor).filter(|n| *n <= now) {
+            cursor = n;
+        }
+        Some(cursor)
     }
 
     /// Apply `missed` ticks in `(after, now]` ending at `latest`: run the latest
@@ -153,14 +203,14 @@ impl Entry {
             self.next = Some(latest);
             format!("running the latest ({latest}) once")
         } else {
-            self.next = self.schedule.next_after(now);
+            self.next = self.next_of(now);
             "catch_up is off, skipping them".to_string()
         };
         let never_ran = missed - u64::from(self.spec.catch_up);
         metrics::missed(&self.spec.name, never_ran);
         tracing::warn!(schedule = %self.spec.name, missed, "schedule missed {more}{missed} tick(s) {why}; {skipped}");
         MissedRange {
-            from: self.schedule.next_after(after).unwrap_or(latest),
+            from: self.next_of(after).unwrap_or(latest),
             to: latest,
             count: missed,
             reason: why.to_string(),
@@ -184,7 +234,7 @@ impl Entry {
                 None
             }
             (None, _) => {
-                self.next = self.schedule.next_after(fired);
+                self.next = self.next_of(fired);
                 None
             }
         }
@@ -260,11 +310,15 @@ pub struct Scheduler {
     pub entries: BTreeMap<String, Entry>,
     /// Wanted schedules that do not validate: left out, reported unhealthy,
     /// and forgotten once they are no longer wanted.
-    invalid: std::collections::BTreeSet<String>,
+    /// Name → the definition's fingerprint, so a refusal is logged once per
+    /// definition, not at every reload.
+    invalid: BTreeMap<String, String>,
     /// Schedules whose step runs now: their entry is out of `entries`.
     busy: std::collections::BTreeSet<String>,
     /// The schedule started last, so starts take turns.
     last_started: Option<String>,
+    /// Refusals reported (logged) so far: once per definition (#1111).
+    refusals_reported: u64,
 }
 
 impl Scheduler {
@@ -279,11 +333,13 @@ impl Scheduler {
                 continue;
             }
             let fp = fingerprint(&spec, owner.as_deref(), approved);
-            if self
-                .entries
-                .get(&spec.name)
-                .is_some_and(|e| e.fingerprint == fp)
+            if let Some(e) = self.entries.get_mut(&spec.name)
+                && e.fingerprint == fp
             {
+                e.retry_compute(now);
+                continue;
+            }
+            if self.invalid.get(&spec.name) == Some(&fp) {
                 continue;
             }
             match super::validate::validate(&spec) {
@@ -299,8 +355,9 @@ impl Scheduler {
                     // The API validates before storing; this is a record a newer
                     // or older binary wrote. Report it and leave it out.
                     tracing::error!(schedule = %spec.name, error = %e, "invalid schedule; not ticking it");
+                    self.refusals_reported += 1;
                     metrics::healthy(&spec.name, false);
-                    self.invalid.insert(spec.name.clone());
+                    self.invalid.insert(spec.name.clone(), fp);
                     self.entries.remove(&spec.name);
                 }
             }
@@ -313,7 +370,7 @@ impl Scheduler {
             }
             kept
         });
-        self.invalid.retain(|name| {
+        self.invalid.retain(|name, _| {
             let kept = keep.contains(name);
             if !kept {
                 metrics::forget(name);
@@ -356,6 +413,11 @@ impl Scheduler {
         if let Some(e) = entry {
             self.entries.insert(name.to_string(), e);
         }
+    }
+
+    /// Wanted schedules that do not validate, by name.
+    pub fn invalid_names(&self) -> Vec<String> {
+        self.invalid.keys().cloned().collect()
     }
 
     /// Schedules that tick (not paused).
@@ -599,6 +661,20 @@ async fn step_task(state: ServerState, mut entry: Entry, limit: Duration) -> (St
     (name, out)
 }
 
+/// One WARN at startup naming every schedule this release refuses (#1111):
+/// a stored cron an older parser accepted stops ticking after an upgrade.
+fn warn_invalid_at_start(names: &[String]) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    tracing::warn!(
+        schedules = ?names,
+        "{} schedule(s) do not validate with this release and will not tick; fix or delete them (the release notes list the cron forms it refuses)",
+        names.len()
+    );
+    true
+}
+
 /// Run the loop until `shutdown`.
 #[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 pub async fn run(state: ServerState, shutdown: CancellationToken) {
@@ -613,11 +689,17 @@ pub async fn run_with(state: ServerState, shutdown: CancellationToken, step_limi
     let mut scheduler = Scheduler::default();
     let mut steps: tokio::task::JoinSet<(String, Stepped)> = tokio::task::JoinSet::new();
     let mut reload_at = Utc::now();
+    let mut first_load = true;
     loop {
         let now = Utc::now();
         if now >= reload_at {
             match wanted(&state).await {
-                Ok(w) => scheduler.reconcile(w, now),
+                Ok(w) => {
+                    scheduler.reconcile(w, now);
+                    if std::mem::take(&mut first_load) {
+                        warn_invalid_at_start(&scheduler.invalid_names());
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "could not reload schedules; keeping the current set")
                 }
@@ -761,12 +843,12 @@ mod tests {
 
     #[test]
     fn a_dense_schedule_over_a_long_outage_finds_the_latest_tick() {
-        let e = dense("* * * * * *", at("2026-09-26T00:00:00Z"));
+        let mut e = dense("* * * * * *", at("2026-09-26T00:00:00Z"));
         let now = at("2026-09-28T00:00:00Z");
         let (latest, missed) = e.latest_due(at("2026-09-26T00:00:00Z"), now);
         assert_eq!(latest, Some(at("2026-09-28T00:00:00Z")));
         assert_eq!(missed, MAX_SCAN);
-        let yearly = entry("0 0 29 2 *", at("2026-09-26T00:00:00Z"));
+        let mut yearly = entry("0 0 29 2 *", at("2026-09-26T00:00:00Z"));
         assert!(yearly.latest_before(at("2026-09-26T00:00:00Z")).is_some());
         let mut big = dense("* * * * * *", at("2026-09-26T00:00:00Z"));
         let r = big.settle_missed(at("2026-09-26T00:00:00Z"), now, MAX_SCAN, now, "while down");
@@ -1103,12 +1185,12 @@ mod tests {
         let mut bad = spec("0 * * * *", true);
         bad.cron = "nope".into();
         s.reconcile(vec![(bad.clone(), None, Source::Console, false)], now);
-        assert!(s.invalid.contains("nightly"));
+        assert!(s.invalid.contains_key("nightly"));
         s.reconcile(
             vec![(spec("0 * * * *", true), None, Source::Console, false)],
             now,
         );
-        assert!(!s.invalid.contains("nightly"), "valid again");
+        assert!(!s.invalid.contains_key("nightly"), "valid again");
         s.reconcile(vec![(bad, None, Source::Console, false)], now);
         s.reconcile(Vec::new(), now);
         assert!(s.invalid.is_empty());
@@ -1372,5 +1454,65 @@ mod tests {
             .await
             .expect("the loop returns once shut down")
             .unwrap();
+    }
+
+    #[test]
+    fn a_refused_schedule_is_reported_once_per_definition() {
+        let now = at("2026-09-26T10:00:00Z");
+        let mut s = Scheduler::default();
+        let mut bad = spec("0 * * * *", true);
+        bad.cron = "0 0 * * SUN-SUN".into();
+        for _ in 0..3 {
+            s.reconcile(vec![(bad.clone(), None, Source::Console, false)], now);
+        }
+        assert_eq!(s.refusals_reported, 1);
+        assert_eq!(s.invalid_names(), ["nightly"]);
+        bad.cron = "mon * * * *".into();
+        s.reconcile(vec![(bad.clone(), None, Source::Console, false)], now);
+        assert_eq!(
+            s.refusals_reported, 2,
+            "a changed definition is reported again"
+        );
+        assert!(warn_invalid_at_start(&s.invalid_names()));
+        assert!(!warn_invalid_at_start(&[]));
+    }
+
+    #[test]
+    fn a_failed_search_stops_the_entry_until_a_reload_computes_again() {
+        use ::metrics::with_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let far = at("9999-12-31T00:00:00Z");
+        let now = at("2026-09-26T10:00:00Z");
+        let mut s = Scheduler::default();
+        with_local_recorder(&recorder, || {
+            let e = entry("0 0 * * *", far);
+            assert!(e.compute_error().is_some());
+            assert_eq!(e.next, None);
+            assert_eq!(e.due(far), None, "a failed entry is never due");
+            let mut e = e;
+            // Searching again from the same place fails again: counted once.
+            assert_eq!(e.next_of(far), None);
+            assert_eq!(e.latest_due(far, far), (None, 0));
+            let fp = e.fingerprint.clone();
+            s.entries.insert("nightly".into(), e);
+            // The same definition reloads: the entry searches again from now.
+            let wanted = vec![(spec("0 0 * * *", true), None, Source::File, false)];
+            assert_eq!(fingerprint(&wanted[0].0, None, false), fp);
+            s.reconcile(wanted.clone(), now);
+            let e = &s.entries["nightly"];
+            assert_eq!(e.compute_error(), None, "recovered");
+            assert_eq!(e.next, Some(at("2026-09-27T00:00:00Z")));
+            s.reconcile(wanted, now);
+        });
+        let counted: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, _, _, _)| k.key().name() == "faucet_serve_schedule_compute_errors_total")
+            .map(|(_, _, _, v)| v)
+            .collect();
+        assert_eq!(counted, [DebugValue::Counter(1)]);
     }
 }

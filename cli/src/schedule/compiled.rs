@@ -1,21 +1,43 @@
 //! Validated, compiled form of a [`ScheduleSpec`]: the parsed cron + timezone
-//! plus the numeric knobs. `next_after` is pure (no wall clock) and is the
+//! plus the numeric knobs. `try_next_after` is pure (no wall clock) and is the
 //! single source of truth for "when does the next run fire".
 
 use crate::error::{CliError, CliResult};
 use crate::schedule::spec::{OverlapPolicy, ScheduleOnFailure, ScheduleSpec};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, LocalResult, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use croner::Cron;
 use croner::parser::{CronParser, Seconds};
 use std::time::Duration;
 
+/// Matches skipped in the later pass of one repeated hour before the search gives up.
+const MAX_REPEATED_SKIPS: usize = 100_000;
+
+/// Why the next tick of a schedule could not be computed. Never "the schedule
+/// ended": that is `Ok(None)` from [`CompiledSchedule::try_next_after`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NextTickError {
+    /// The cron library failed to search.
+    #[error("the cron search failed: {0}")]
+    Search(String),
+    /// The cron library returned an instant that is not after the start.
+    #[error("the cron search returned {got}, which is not after {after}")]
+    NotAfter {
+        after: DateTime<Utc>,
+        got: DateTime<Utc>,
+    },
+}
+
 /// A `ScheduleSpec` whose cron + timezone have been parsed and whose invariants
-/// have been checked. Built once at startup; `next_after` is called per tick.
+/// have been checked. Built once at startup; `try_next_after` is called per tick.
 #[derive(Debug)]
 pub struct CompiledSchedule {
     cron: Cron,
     tz: Tz,
+    /// List and range jobs run once in a repeated hour (classic cron); see `try_next_after`.
+    once_in_repeated_hour: bool,
+    /// The last year of an explicit year field, when it has one.
+    last_year: Option<i32>,
     pub overlap_policy: OverlapPolicy,
     pub on_failure: ScheduleOnFailure,
     pub max_runs: Option<u64>,
@@ -25,6 +47,67 @@ pub struct CompiledSchedule {
     pub shutdown_grace: Duration,
 }
 
+/// The parser every runtime uses: optional seconds, and `5/5`-style steps
+/// without a range accepted as croner 3 did.
+fn parser() -> CronParser {
+    CronParser::builder()
+        .seconds(Seconds::Optional)
+        .sloppy_ranges(true)
+        .build()
+}
+
+/// The minute and hour fields of a cron, or `None` for an `@` alias.
+fn minute_and_hour(cron: &str) -> Option<(&str, &str)> {
+    let f: Vec<&str> = cron.split_whitespace().collect();
+    match f.len() {
+        5 => Some((f[0], f[1])),
+        6 | 7 => Some((f[1], f[2])),
+        _ => None,
+    }
+}
+
+/// Whether a match in the later pass of a repeated hour is skipped: the
+/// minute and hour fields hold no `*` and no step.
+fn runs_once_in_repeated_hour(cron: &str) -> bool {
+    let cron = cron.trim();
+    if cron.starts_with('@') {
+        return !cron.eq_ignore_ascii_case("@hourly");
+    }
+    minute_and_hour(cron).is_some_and(|(m, h)| !(m.contains(['*', '/']) || h.contains(['*', '/'])))
+}
+
+/// Refuse a weekday range from Sunday to `SUN` (`SUN-SUN`, `0-SUN`): croner
+/// reads it as every day.
+fn check_sunday_range(cron: &str) -> Result<(), String> {
+    let f: Vec<&str> = cron.split_whitespace().collect();
+    let dow = match f.len() {
+        5 => f[4],
+        6 | 7 => f[5],
+        _ => return Ok(()),
+    };
+    for part in dow.split(',') {
+        let range = part.split('/').next().unwrap_or(part);
+        if let Some((a, b)) = range.split_once('-')
+            && b.eq_ignore_ascii_case("SUN")
+            && (a.eq_ignore_ascii_case("SUN") || a == "0")
+        {
+            return Err(format!(
+                "weekday range `{range}` would run every day; write `SUN`, `0` or `7` for Sunday"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `t`, when it is after `after`; the search must only move forward.
+fn strictly_after(after: DateTime<Utc>, t: DateTime<Utc>) -> Result<DateTime<Utc>, NextTickError> {
+    if t > after {
+        Ok(t)
+    } else {
+        Err(NextTickError::NotAfter { after, got: t })
+    }
+}
+
 impl CompiledSchedule {
     /// Validate + compile. Every problem surfaces here, never mid-run.
     pub fn compile(spec: &ScheduleSpec) -> CliResult<Self> {
@@ -32,13 +115,12 @@ impl CompiledSchedule {
             CliError::Config(format!("schedule: unknown timezone '{}'", spec.timezone))
         })?;
 
-        let cron = CronParser::builder()
-            .seconds(Seconds::Optional)
-            .build()
+        let invalid =
+            |e: String| CliError::Config(format!("schedule: invalid cron '{}': {e}", spec.cron));
+        check_sunday_range(&spec.cron).map_err(invalid)?;
+        let cron = parser()
             .parse(&spec.cron)
-            .map_err(|e| {
-                CliError::Config(format!("schedule: invalid cron '{}': {e}", spec.cron))
-            })?;
+            .map_err(|e| invalid(e.to_string()))?;
 
         if matches!(spec.max_runs, Some(0)) {
             return Err(CliError::Config(
@@ -56,7 +138,13 @@ impl CompiledSchedule {
             ));
         }
 
+        let last_year = (spec.cron.split_whitespace().count() == 7
+            && !cron.pattern.years.from_wildcard)
+            .then(|| cron.pattern.years.values().last().map(|y| i32::from(*y)))
+            .flatten();
         let compiled = Self {
+            once_in_repeated_hour: runs_once_in_repeated_hour(&spec.cron),
+            last_year,
             cron,
             tz,
             overlap_policy: spec.overlap_policy,
@@ -68,15 +156,18 @@ impl CompiledSchedule {
             shutdown_grace: Duration::from_secs(spec.shutdown_grace_secs),
         };
 
-        // Reject a cron that can never fire (e.g. Feb 30): if there is no
-        // occurrence at all, croner returns no next, so guard against a spin.
-        if compiled.next_after(Utc::now()).is_none() {
-            return Err(CliError::Config(format!(
+        // Reject a cron that can never fire (e.g. Feb 30) or whose years have passed.
+        match compiled.try_next_after(Utc::now()) {
+            Ok(Some(_)) => Ok(compiled),
+            Ok(None) => Err(CliError::Config(format!(
                 "schedule: cron '{}' has no upcoming occurrence in timezone '{}'",
                 spec.cron, spec.timezone
-            )));
+            ))),
+            Err(e) => Err(CliError::Config(format!(
+                "schedule: cron '{}' has no upcoming occurrence in timezone '{}': {e}",
+                spec.cron, spec.timezone
+            ))),
         }
-        Ok(compiled)
     }
 
     /// Render a UTC instant in the schedule's timezone, as a fixed-offset clock
@@ -89,19 +180,104 @@ impl CompiledSchedule {
     }
 
     /// The next UTC instant strictly after `after` that matches the cron in the
-    /// configured timezone. `None` when there is no such occurrence.
+    /// configured timezone.
     ///
-    /// Operating on strictly-increasing UTC instants gives the production-cron
-    /// semantics: a DST fall-back repeated hour fires once, a spring-forward
-    /// skipped hour rolls to the next valid time, and occurrences that elapsed
-    /// between two `after` values are simply skipped (no backfill).
+    /// `Ok(None)` means the schedule has ended: only a cron with an explicit
+    /// year field whose last year has been reached ends. Any other failure is
+    /// `Err`, so a caller never mistakes a failed search for the end.
+    ///
+    /// Daylight-saving rule. A *fixed-time* job has one value each in its
+    /// seconds, minutes and hours fields (`30 2 * * *`); anything else is an
+    /// *interval* job (`*/30 * * * *`, `0 * * * *`, `0 1,13 * * *`, `58 1-2 * * *`).
+    /// - Spring-forward gap: a fixed-time job runs once, at the first valid time
+    ///   after the gap, if that time is still on a day the cron allows; an
+    ///   interval job skips the missing times (`0 2,14 * * *` has no 02:00 run).
+    /// - Repeated (fall-back) hour: a fixed-time job runs once, in the first
+    ///   pass. An interval job whose minute or hour field has `*` or a step runs
+    ///   in both passes; one whose minute and hour fields are only numbers, lists
+    ///   and ranges runs once, in the first pass (faucet skips croner's
+    ///   later-pass match, the classic-cron rule; see #1111).
+    pub fn try_next_after(
+        &self,
+        after: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, NextTickError> {
+        let mut cursor = after;
+        for _ in 0..MAX_REPEATED_SKIPS {
+            let found = match self
+                .cron
+                .find_next_occurrence(&cursor.with_timezone(&self.tz), false)
+            {
+                Ok(t) => t.with_timezone(&Utc),
+                Err(e) => {
+                    return match self.last_year {
+                        Some(last) if cursor.with_timezone(&self.tz).year() >= last => Ok(None),
+                        _ => Err(NextTickError::Search(e.to_string())),
+                    };
+                }
+            };
+            let t = strictly_after(cursor, found.with_nanosecond(0).unwrap_or(found))?;
+            if self.once_in_repeated_hour && self.in_later_pass(t) {
+                cursor = t;
+                continue;
+            }
+            return Ok(Some(t));
+        }
+        Err(NextTickError::Search(format!(
+            "more than {MAX_REPEATED_SKIPS} matches in one repeated hour"
+        )))
+    }
+
+    /// Whether `t` is the later of two instants with the same local wall time.
+    fn in_later_pass(&self, t: DateTime<Utc>) -> bool {
+        let wall = t.with_timezone(&self.tz).naive_local();
+        matches!(self.tz.from_local_datetime(&wall), LocalResult::Ambiguous(_, later) if later.with_timezone(&Utc) == t)
+    }
+
+    /// [`Self::try_next_after`] with an error read as "no next tick". Kept for
+    /// API compatibility; faucet itself calls `try_next_after`.
     pub fn next_after(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        let local = after.with_timezone(&self.tz);
-        self.cron
-            .find_next_occurrence(&local, false)
-            .ok()
-            .map(|dt| dt.with_timezone(&Utc))
-            .and_then(|t| chrono::Timelike::with_nanosecond(&t, 0))
+        self.try_next_after(after).ok().flatten()
+    }
+
+    /// The shortest gap between two ticks of the cron on a UTC clock, so the
+    /// answer does not depend on the date or on daylight saving: the smaller of
+    /// the shortest gap between two times of one day and the shortest gap
+    /// between matching days less the span of the day's times. Matching days are
+    /// read over the four years from the first tick after 2024-01-01T00:00Z.
+    pub fn nominal_shortest_gap(&self) -> Option<Duration> {
+        let next = |a: DateTime<Utc>| {
+            self.cron
+                .find_next_occurrence(&a, false)
+                .ok()
+                .map(|t| t.with_nanosecond(0).unwrap_or(t))
+                .filter(|t| *t > a)
+        };
+        let origin =
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).single()? - chrono::Duration::seconds(1);
+        let first = next(origin)?;
+        let day0 = first.date_naive();
+        let mut times = vec![first.num_seconds_from_midnight()];
+        let mut t = first;
+        while let Some(n) = next(t).filter(|n| n.date_naive() == day0) {
+            times.push(n.num_seconds_from_midnight());
+            t = n;
+        }
+        let mut shortest = times.windows(2).map(|w| i64::from(w[1] - w[0])).min();
+        let span = i64::from(times[times.len() - 1] - times[0]);
+        let end = day0 + chrono::Duration::days(4 * 365 + 1);
+        let mut day = day0;
+        while let Some(n) = day
+            .and_hms_opt(23, 59, 59)
+            .and_then(|d| next(d.and_utc()))
+            .filter(|n| n.date_naive() <= end)
+        {
+            let gap = (n.date_naive() - day).num_days() * 86_400 - span;
+            shortest = Some(shortest.map_or(gap, |s| s.min(gap)));
+            day = n.date_naive();
+        }
+        shortest
+            .and_then(|s| u64::try_from(s).ok())
+            .map(Duration::from_secs)
     }
 
     /// The next due tick after firing the tick scheduled for `fired`, given the
@@ -115,24 +291,35 @@ impl CompiledSchedule {
     /// elapsed (the process was suspended across many ticks), the backlog is
     /// collapsed to the next occurrence strictly after `now`, so a long sleep
     /// produces a single catch-up run rather than a flood of backfilled runs.
-    /// Returns `None` when the schedule has no further occurrence.
+    /// `Ok(None)` when the schedule has ended; `Err` when a search failed.
+    pub fn try_next_due_after_tick(
+        &self,
+        fired: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, NextTickError> {
+        let Some(next) = self.try_next_after(fired)? else {
+            return Ok(None);
+        };
+        if next > now {
+            return Ok(Some(next));
+        }
+        // `next` already elapsed. If the occurrence after it is *also* in the
+        // past we are badly behind — collapse the backlog. Otherwise run the
+        // single just-missed `next` (possibly a touch late) and resume.
+        match self.try_next_after(next)? {
+            Some(after) if after <= now => self.try_next_after(now),
+            _ => Ok(Some(next)),
+        }
+    }
+
+    /// [`Self::try_next_due_after_tick`] with an error read as "no next tick".
+    /// Kept for API compatibility.
     pub fn next_due_after_tick(
         &self,
         fired: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Option<DateTime<Utc>> {
-        let next = self.next_after(fired)?;
-        if next > now {
-            // On schedule: the next occurrence is still ahead.
-            return Some(next);
-        }
-        // `next` already elapsed. If the occurrence after it is *also* in the
-        // past we are badly behind — collapse the backlog. Otherwise run the
-        // single just-missed `next` (possibly a touch late) and resume.
-        match self.next_after(next) {
-            Some(after) if after <= now => self.next_after(now),
-            _ => Some(next),
-        }
+        self.try_next_due_after_tick(fired, now).ok().flatten()
     }
 }
 
@@ -314,7 +501,12 @@ mod tests {
     #[test]
     fn dst_1111_half_hourly_keeps_cadence_on_new_york_fall_back() {
         assert_eq!(
-            ticks_1111("*/30 * * * *", "America/New_York", "2025-11-02T04:45:00Z", 6),
+            ticks_1111(
+                "*/30 * * * *",
+                "America/New_York",
+                "2025-11-02T04:45:00Z",
+                6
+            ),
             [
                 "2025-11-02T05:00:00Z",
                 "2025-11-02T05:30:00Z",
@@ -323,6 +515,136 @@ mod tests {
                 "2025-11-02T07:00:00Z",
                 "2025-11-02T07:30:00Z"
             ]
+        );
+    }
+
+    #[test]
+    fn a_sunday_to_sunday_range_is_refused() {
+        for cron in [
+            "0 0 * * SUN-SUN",
+            "0 0 * * sun-sun",
+            "0 0 * * 0-SUN",
+            "0 0 * * 1,SUN-SUN/2",
+            "0 0 0 * * SUN-SUN",
+        ] {
+            let err = CompiledSchedule::compile(&spec(cron, "UTC"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("would run every day"), "{cron}: {err}");
+        }
+        for cron in ["0 0 * * SUN", "0 0 * * 7-SUN", "0 0 * * SUN-MON", "@weekly"] {
+            assert!(
+                CompiledSchedule::compile(&spec(cron, "UTC")).is_ok(),
+                "{cron}"
+            );
+        }
+    }
+
+    #[test]
+    fn names_in_the_wrong_field_and_a_bare_l_are_refused() {
+        for cron in [
+            "mon * * * *",
+            "0 0 * * jan",
+            "0 0 * mon *",
+            "0 0 * * L",
+            "0 0 * * 1,L",
+        ] {
+            let err = CompiledSchedule::compile(&spec(cron, "UTC"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("invalid cron"), "{cron}: {err}");
+        }
+    }
+
+    #[test]
+    fn which_crons_run_once_in_a_repeated_hour() {
+        for (cron, once) in [
+            ("0 1,13 * * *", true),
+            ("58 1-2 * * *", true),
+            ("30 1 * * *", true),
+            ("0 * * * *", false),
+            ("*/30 1 * * *", false),
+            ("0 */2 * * *", false),
+            ("5/5 1 * * *", false),
+            ("10 0 1 * * *", true),
+            ("* 0 1 * * *", true),
+            ("0 0 1 1 1 * 2030", true),
+            ("@daily", true),
+            ("@HOURLY", false),
+            ("garbage", false),
+        ] {
+            assert_eq!(runs_once_in_repeated_hour(cron), once, "{cron}");
+        }
+    }
+
+    #[test]
+    fn a_year_field_ends_the_schedule_only_once_its_last_year_is_reached() {
+        let c = CompiledSchedule::compile(&spec("0 0 0 1 1 * 2030-2031", "UTC")).unwrap();
+        assert_eq!(
+            c.try_next_after(Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap()),
+            Ok(Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap()))
+        );
+        assert_eq!(
+            c.try_next_after(Utc.with_ymd_and_hms(2031, 6, 1, 0, 0, 0).unwrap()),
+            Ok(None)
+        );
+        assert_eq!(
+            c.next_after(Utc.with_ymd_and_hms(2031, 6, 1, 0, 0, 0).unwrap()),
+            None
+        );
+        assert_eq!(
+            c.try_next_due_after_tick(
+                Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(2031, 1, 1, 0, 0, 1).unwrap()
+            ),
+            Ok(None)
+        );
+        let err = CompiledSchedule::compile(&spec("0 0 0 1 1 * 2020", "UTC"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no upcoming occurrence"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_search_is_an_error_not_the_end() {
+        let c = CompiledSchedule::compile(&spec("0 0 * * *", "UTC")).unwrap();
+        let far = Utc.with_ymd_and_hms(9999, 12, 31, 0, 0, 0).unwrap();
+        assert!(matches!(
+            c.try_next_after(far),
+            Err(NextTickError::Search(_))
+        ));
+        assert!(c.try_next_due_after_tick(far, far).is_err());
+        assert_eq!(c.next_due_after_tick(far, far), None);
+        // An impossible date bounded by a future year is an error, not an end.
+        let err = CompiledSchedule::compile(&spec("0 0 0 30 2 * 2100", "UTC"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no upcoming occurrence") && err.contains("cron search failed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_tick_not_after_its_start_is_an_error() {
+        let t = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        assert_eq!(
+            strictly_after(t, t + chrono::Duration::seconds(1)),
+            Ok(t + chrono::Duration::seconds(1))
+        );
+        let e = strictly_after(t, t).unwrap_err();
+        assert_eq!(e, NextTickError::NotAfter { after: t, got: t });
+        assert!(e.to_string().contains("not after"));
+    }
+
+    #[test]
+    fn next_due_after_tick_collapses_through_try() {
+        let c = CompiledSchedule::compile(&spec("* * * * * *", "UTC")).unwrap();
+        let fired = Utc.with_ymd_and_hms(2026, 3, 10, 6, 0, 0).unwrap();
+        let now = fired + chrono::Duration::seconds(100);
+        assert_eq!(
+            c.try_next_due_after_tick(fired, now),
+            Ok(Some(now + chrono::Duration::seconds(1)))
         );
     }
 }

@@ -305,7 +305,7 @@ pgwire-replication = "0.5.0"
 byteorder = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 chrono-tz = "0.10"
-croner = "3"
+croner = { version = "=5.0.0", default-features = false, features = ["std", "chrono"] }
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 base64 = "0.22"
 aws-lc-rs = "1"
