@@ -58,7 +58,7 @@ fn object(fields: &[(&str, Cell<'_>)], row: usize) -> Map<String, Value> {
     map
 }
 
-type KeyAt<'a> = Box<dyn Fn(usize) -> usize + 'a>;
+pub(super) type KeyAt<'a> = Box<dyn Fn(usize) -> usize + 'a>;
 
 struct Cell<'a> {
     nulls: Option<&'a NullBuffer>,
@@ -243,15 +243,19 @@ fn dictionary_key<'a, K: ArrowDictionaryKeyType>(
     ))
 }
 
-fn dictionary(array: &dyn Array) -> Option<Kind<'_>> {
-    let (key, values) = dictionary_key::<Int8Type>(array)
+pub(super) fn dictionary_parts(array: &dyn Array) -> Option<(KeyAt<'_>, &dyn Array)> {
+    dictionary_key::<Int8Type>(array)
         .or_else(|| dictionary_key::<Int16Type>(array))
         .or_else(|| dictionary_key::<Int32Type>(array))
         .or_else(|| dictionary_key::<Int64Type>(array))
         .or_else(|| dictionary_key::<UInt8Type>(array))
         .or_else(|| dictionary_key::<UInt16Type>(array))
         .or_else(|| dictionary_key::<UInt32Type>(array))
-        .or_else(|| dictionary_key::<UInt64Type>(array))?;
+        .or_else(|| dictionary_key::<UInt64Type>(array))
+}
+
+fn dictionary(array: &dyn Array) -> Option<Kind<'_>> {
+    let (key, values) = dictionary_parts(array)?;
     if matches!(values.data_type(), DataType::Utf8View) {
         return None;
     }

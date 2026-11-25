@@ -861,16 +861,18 @@ fn assert_unpacks_like_its_values(array: &ArrayRef) {
         ),
         (map_of(array), map_of(&plain)),
     ] {
-        let (got, got_count) =
-            counted(|| record_batch_to_values(&batch_of(vec![("v", dictionary)])).unwrap());
+        let dictionary = batch_of(vec![("v", dictionary)]);
         let (want, want_count) =
             counted(|| record_batch_to_values(&batch_of(vec![("v", values)])).unwrap());
-        assert_eq!(
-            serde_json::to_string(&got).unwrap(),
-            serde_json::to_string(&want).unwrap()
-        );
-        assert_eq!(number_bits(&got), number_bits(&want));
-        assert_eq!(got_count, want_count);
+        for render in [record_batch_to_values, record_batch_to_values_json] {
+            let (got, got_count) = counted(|| render(&dictionary).unwrap());
+            assert_eq!(
+                serde_json::to_string(&got).unwrap(),
+                serde_json::to_string(&want).unwrap()
+            );
+            assert_eq!(number_bits(&got), number_bits(&want));
+            assert_eq!(got_count, want_count);
+        }
     }
 }
 
@@ -990,48 +992,136 @@ fn dictionaries_of_every_value_type_render_like_their_unpacked_values() {
         ),
     ];
     for values in values {
-        let keys = Int16Array::from(vec![Some(2), Some(0), None, Some(1), Some(2), Some(1)]);
-        assert_unpacks_like_its_values(&(Arc::new(DictionaryArray::new(keys, values)) as ArrayRef));
+        for values in [
+            values.clone(),
+            masked(&values, |i| i == 0),
+            values.slice(1, 2),
+        ] {
+            let keys = Int16Array::from(vec![Some(1), Some(0), None, Some(1), Some(0), Some(1)]);
+            assert_unpacks_like_its_values(
+                &(Arc::new(DictionaryArray::new(keys, values)) as ArrayRef),
+            );
+        }
     }
 }
 
 #[test]
-fn null_dictionary_values_on_the_json_hop_pin_known_defect_1109() {
+fn null_dictionary_values_render_null_on_every_path() {
     let keys = || Int32Array::from(vec![0, 1, 0]);
-    let ints: ArrayRef = Arc::new(DictionaryArray::new(
-        keys(),
-        Arc::new(Int32Array::from(vec![None, Some(7)])),
-    ));
-    let rows = record_batch_to_values(&batch_of(vec![("v", ints)])).unwrap();
-    assert_eq!(
-        serde_json::to_string(&rows).unwrap(),
-        r#"[{"v":0},{"v":7},{"v":0}]"#
-    );
+    let durations: ArrayRef = Arc::new(DurationSecondArray::from(vec![1, 2, 3]));
+    let dictionaries: Vec<(ArrayRef, &str)> = vec![
+        (
+            Arc::new(DictionaryArray::new(
+                keys(),
+                Arc::new(Int32Array::from(vec![None, Some(7)])),
+            )),
+            r#"[null,7,null]"#,
+        ),
+        (
+            Arc::new(DictionaryArray::new(
+                keys(),
+                Arc::new(StringArray::from(vec![None, Some("a")])),
+            )),
+            r#"[null,"a",null]"#,
+        ),
+        (
+            Arc::new(DictionaryArray::new(
+                keys(),
+                Arc::new(StringViewArray::from(vec![None, Some("a")])),
+            )),
+            r#"[null,"a",null]"#,
+        ),
+        (
+            Arc::new(DictionaryArray::new(
+                keys(),
+                Arc::new(Float32Array::from_iter_values_with_nulls(
+                    [f32::NAN, 1.5],
+                    Some(NullBuffer::from(vec![false, true])),
+                )),
+            )),
+            r#"[null,1.5,null]"#,
+        ),
+    ];
+    for (array, expected) in dictionaries {
+        for batch in [
+            batch_of(vec![("v", array.clone())]),
+            batch_of(vec![("v", array.clone()), ("d", durations.clone())]),
+        ] {
+            for render in [record_batch_to_values, record_batch_to_values_json] {
+                let (rows, count) = counted(|| render(&batch).unwrap());
+                let column: Vec<Value> = rows.iter().map(|r| r["v"].clone()).collect();
+                assert_eq!(serde_json::to_string(&column).unwrap(), expected);
+                assert_eq!(count, 0, "a NaN under a null value slot is not counted");
+            }
+        }
+    }
+}
 
-    let floats: ArrayRef = Arc::new(DictionaryArray::new(
-        keys(),
-        Arc::new(Float32Array::from_iter_values_with_nulls(
-            [f32::NAN, 1.5],
-            Some(NullBuffer::from(vec![false, true])),
-        )),
+#[test]
+fn nested_dictionaries_render_null_values_as_null() {
+    let inner: ArrayRef = Arc::new(DictionaryArray::new(
+        Int8Array::from(vec![0, 1, 2]),
+        Arc::new(StringArray::from(vec![Some("x"), None, Some("z")])),
     ));
-    let (rows, count) = counted(|| record_batch_to_values(&batch_of(vec![("v", floats)])).unwrap());
-    assert_eq!(
-        serde_json::to_string(&rows).unwrap(),
-        r#"[{"v":null},{"v":1.5},{"v":null}]"#
+    let outer: ArrayRef = Arc::new(DictionaryArray::new(
+        Int16Array::from(vec![Some(2), Some(1), None, Some(0), Some(1)]),
+        inner,
+    ));
+    let expected = r#"["z",null,null,"x",null]"#;
+    let ree: ArrayRef = Arc::new(
+        RunArray::try_new(
+            &Int32Array::from(vec![2, 3, 5]),
+            &DictionaryArray::new(
+                Int32Array::from(vec![Some(1), Some(0), None]),
+                Arc::new(Int32Array::from(vec![None, Some(9)])),
+            ),
+        )
+        .unwrap(),
     );
-    assert_eq!(count, 2);
+    for (array, expected) in [(outer, expected), (ree, "[9,9,null,null,null]")] {
+        for render in [record_batch_to_values, record_batch_to_values_json] {
+            let rows = render(&batch_of(vec![("v", array.clone())])).unwrap();
+            let column: Vec<Value> = rows.iter().map(|r| r["v"].clone()).collect();
+            assert_eq!(serde_json::to_string(&column).unwrap(), expected);
+            let rows = render(&one_row_list(array.clone())).unwrap();
+            assert_eq!(serde_json::to_string(&rows[0]["v"]).unwrap(), expected);
+        }
+    }
+}
 
-    let text: ArrayRef = Arc::new(DictionaryArray::new(
-        keys(),
+#[test]
+fn a_map_with_dictionary_keys_is_refused_whole() {
+    let keys: ArrayRef = Arc::new(DictionaryArray::new(
+        Int32Array::from(vec![0, 1, 0]),
+        Arc::new(StringArray::from(vec![Some("k"), None])),
+    ));
+    let values: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+    let map: ArrayRef = Arc::new(map_with(keys, &values, true, vec![0, 1, 3]));
+    let batch = batch_of(vec![("m", map)]);
+    assert!(convert(&batch).is_none());
+    let err = record_batch_to_values(&batch).unwrap_err().to_string();
+    assert!(err.contains("Only UTF8 keys"), "{err}");
+}
+
+#[test]
+fn plain_arrow_json_still_renders_a_null_dictionary_value_as_its_slot() {
+    let array: ArrayRef = Arc::new(DictionaryArray::new(
+        Int32Array::from(vec![0, 1]),
         Arc::new(StringArray::from(vec![None, Some("a")])),
     ));
-    let durations: ArrayRef = Arc::new(DurationSecondArray::from(vec![1, 2, 3]));
-    let rows =
-        record_batch_to_values(&batch_of(vec![("v", text.clone()), ("d", durations)])).unwrap();
-    assert_eq!(rows[0]["v"], Value::String(String::new()));
-    let rows = record_batch_to_values(&batch_of(vec![("v", text)])).unwrap();
-    assert_eq!(rows[0]["v"], Value::Null);
+    let batch = batch_of(vec![("v", array)]);
+    let mut out = Vec::new();
+    let mut writer = arrow_json::writer::WriterBuilder::new()
+        .with_explicit_nulls(true)
+        .build::<_, arrow_json::writer::JsonArray>(&mut out);
+    writer.write(&batch).unwrap();
+    writer.finish().unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        r#"[{"v":""},{"v":"a"}]"#,
+        "arrow-json now renders a null dictionary value as null (apache/arrow-rs#12259): \
+         delete the Dictionary arm and DictionaryValues encoder in ExactEncoderFactory (#1115)"
+    );
 }
 
 #[test]

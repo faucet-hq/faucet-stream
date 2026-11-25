@@ -101,11 +101,17 @@ for as its widened double (`0.10000000149011612`); it now uses the rule above.
 A dictionary column renders like the same column unpacked. A row whose key is
 null, or whose key points at a null value, is `null`.
 
-One case still renders wrong until an arrow-json release contains the upstream
-fix (#1115): a null in the values array of a dictionary whose value type is not
-`Utf8` / `LargeUtf8`, or of a `Utf8` dictionary in a batch that is converted
-through arrow-json because of another column, renders as `""` or `0` instead of
-`null`.
+This holds for every value type, nested inside lists, structs, maps and
+run-end-encoded arrays, and whatever other columns the batch holds. A `NaN`
+under a null value is not counted as a non-finite value. A map whose keys are
+dictionary-encoded is refused (the batch fails with a conversion error), as
+before.
+
+**Changed in this release (#1109).** A null in a dictionary's values array
+used to render as `""` (text) or the number under the null slot (`0`); it now
+renders `null` on every path. A pipeline that wrote such rows holds `""` / `0`
+for them, so `faucet verify` reports them as changed until one repair pass
+rewrites them.
 
 ## Float literals in JSON text
 
