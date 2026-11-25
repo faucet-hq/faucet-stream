@@ -109,24 +109,28 @@ pub(crate) fn bind_value<'q>(
     }
 }
 
-/// A table's column names in declared order, read on `conn` (so it works inside
-/// an open transaction on a single-connection pool).
-pub(crate) async fn table_columns(
-    conn: &mut sqlx::SqliteConnection,
-    table: &str,
-) -> Result<Vec<String>, FaucetError> {
-    let columns: Vec<String> =
-        sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
-            .bind(table)
-            .fetch_all(conn)
-            .await
-            .map_err(|e| FaucetError::Sink(format!("failed to query table columns: {e}")))?;
-    if columns.is_empty() {
-        return Err(FaucetError::Sink(format!(
-            "table '{table}' has no columns or does not exist"
-        )));
+/// Whether a declared column type has SQLite's TEXT affinity (the type names
+/// `CHAR`, `CLOB` or `TEXT`, and not `INT`, which is tested first).
+pub(crate) fn has_text_affinity(declared: &str) -> bool {
+    let t = declared.to_ascii_uppercase();
+    !t.contains("INT") && (t.contains("CHAR") || t.contains("CLOB") || t.contains("TEXT"))
+}
+
+/// Bind one statement parameter. A non-integer number bound for a
+/// TEXT-affinity column goes as its shortest decimal text: SQLite renders a
+/// bound REAL into such a column with 15 significant digits, which drops the
+/// last digits of a double. Every other value binds as [`bind_value`] does.
+pub(crate) fn bind_param<'q>(
+    q: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    p: &faucet_common_sql::Param<'_>,
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+    if let (Value::Number(n), Some(declared)) = (p.value.as_ref(), p.sql_type)
+        && has_text_affinity(declared)
+        && let Some(text) = faucet_core::fidelity::non_integer_text(n)
+    {
+        return q.bind(text);
     }
-    Ok(columns)
+    bind_value(q, &p.value)
 }
 
 /// The SQLite affinity for a [`SqlBaseType`] (advisory: `Boolean` is
@@ -318,11 +322,24 @@ pub(crate) struct SqliteExec<'c> {
 #[async_trait]
 impl SqlExecutor for SqliteExec<'_> {
     async fn columns(&mut self, target: &TableTarget) -> Result<Vec<TableColumn>, FaucetError> {
-        Ok(table_columns(self.conn, &target.name)
-            .await?
-            .into_iter()
-            .map(TableColumn::untyped)
-            .collect())
+        let columns: Vec<TableColumn> =
+            sqlx::query("SELECT name, type FROM pragma_table_info(?) ORDER BY cid")
+                .bind(&target.name)
+                .fetch_all(&mut *self.conn)
+                .await
+                .map_err(|e| FaucetError::Sink(format!("failed to query table columns: {e}")))?
+                .iter()
+                .map(|row| {
+                    TableColumn::new(row.get::<String, _>("name"), row.get::<String, _>("type"))
+                })
+                .collect();
+        if columns.is_empty() {
+            return Err(FaucetError::Sink(format!(
+                "table '{}' has no columns or does not exist",
+                target.name
+            )));
+        }
+        Ok(columns)
     }
 
     /// Declared types from `PRAGMA table_info`, so the cleanup key table
@@ -349,7 +366,7 @@ impl SqlExecutor for SqliteExec<'_> {
         let mut q = sqlx::query(&stmt.sql);
         for p in &stmt.params {
             // Native SQLite types so affinity and typed reads round-trip (#78/#4).
-            q = bind_value(q, &p.value);
+            q = bind_param(q, p);
         }
         let context = match stmt.kind {
             StatementKind::Insert | StatementKind::InsertJson | StatementKind::Upsert => {
@@ -372,7 +389,7 @@ impl SqlExecutor for SqliteExec<'_> {
     async fn fetch_text(&mut self, stmt: &Statement<'_>) -> Result<Vec<String>, FaucetError> {
         let mut q = sqlx::query(&stmt.sql);
         for p in &stmt.params {
-            q = bind_value(q, &p.value);
+            q = bind_param(q, p);
         }
         let rows = q
             .fetch_all(&mut *self.conn)
@@ -1461,6 +1478,18 @@ mod tests {
         let config = SqliteSinkConfig::new("sqlite::memory:", "t");
         let sink = SqliteSink::new(config).await.unwrap();
         assert!(!sink.supports_cleanup());
+    }
+
+    #[test]
+    fn text_affinity_follows_sqlite_type_name_rules() {
+        for declared in ["TEXT", "text", "VARCHAR(255)", "NCHAR(10)", "CLOB"] {
+            assert!(has_text_affinity(declared), "{declared}");
+        }
+        for declared in [
+            "", "REAL", "DOUBLE", "NUMERIC", "INTEGER", "BLOB", "CHARINT", "POINT",
+        ] {
+            assert!(!has_text_affinity(declared), "{declared}");
+        }
     }
 
     #[test]
