@@ -894,6 +894,7 @@ mod tests {
         assert_eq!(body["catalog"], json!("main"));
         // SQL-45: the row path no longer requests INLINE (capped at 25 MiB).
         assert_eq!(body["disposition"], json!("EXTERNAL_LINKS"));
+        assert_eq!(body["format"], json!("JSON_ARRAY"));
         assert_eq!(body["wait_timeout"], json!("50s"));
         let mut inline = cfg();
         inline.result_disposition = ResultDisposition::Inline;
