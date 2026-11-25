@@ -336,16 +336,22 @@ pub fn float64(v: f64) -> Value {
     }
 }
 
-/// A single-precision float through its shortest decimal form, so `0.1f32`
-/// renders `0.1`; `NaN` / `±Infinity` become a counted `null`.
+/// A single-precision float as the `f64` nearest its shortest decimal: the
+/// shortest decimal that reads back as the same `f32`, ties away from zero as
+/// Rust `Display` breaks them, so `0.1f32` renders `0.1` and the exact tie
+/// `2.48828125f32` renders `2.4882813`. When that `f64` would not cast back to
+/// the same `f32` (two values: `±7.038531e-26`) the widened value is used
+/// instead, so `float32(v) as f32 == v` for every finite `v`. `NaN` /
+/// `±Infinity` become a counted `null`.
 pub fn float32(v: f32) -> Value {
     if !v.is_finite() {
         record_non_finite();
         return Value::Null;
     }
-    v.to_string()
-        .parse::<f64>()
-        .map_or_else(|_| float64(f64::from(v)), float64)
+    match v.to_string().parse::<f64>() {
+        Ok(d) if (d as f32).to_bits() == v.to_bits() => float64(d),
+        _ => float64(f64::from(v)),
+    }
 }
 
 /// The text a sink binds for a JSON number that is not an integer: its
@@ -742,6 +748,90 @@ pub fn unscoped_non_finite() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PINNED_SINGLE_FLOATS: &[(u32, u64)] = &[
+        (0x401f_4000, 0x4003_e800_06b5_fca7),
+        (0x40de_2000, 0x401b_c400_035a_fe53),
+        (0x3b20_0000, 0x3f64_0000_06df_37f6),
+        (0x3980_0000, 0x3f30_0000_057f_5ff8),
+        (0xb980_0000, 0xbf30_0000_057f_5ff8),
+        (0x3b90_0000, 0x3f72_0000_036f_9bfb),
+        (0x3c88_0000, 0x3f91_0000_0897_05f4),
+        (0x3d04_0000, 0x3fa0_8000_044b_82fa),
+        (0x3e02_0000, 0x3fc0_4000_0abc_c771),
+        (0x3e81_0000, 0x3fd0_2000_055e_63b9),
+        (0x3f80_8000, 0x3ff0_1000_0d6b_f94d),
+        (0x4000_4000, 0x4000_0800_06b5_fca7),
+        (0x4080_2000, 0x4010_0400_035a_fe53),
+        (0x4c52_56d4, 0x418a_4ada_7000_0000),
+        (0x15ae_43fd, 0x3ab5_c87f_a000_0000),
+        (0x95ae_43fd, 0xbab5_c87f_a000_0000),
+        (0x0000_0000, 0x0000_0000_0000_0000),
+        (0x8000_0000, 0x8000_0000_0000_0000),
+        (0x7f7f_ffff, 0x47ef_ffff_e54d_aff8),
+        (0xff7f_ffff, 0xc7ef_ffff_e54d_aff8),
+        (0x0000_0001, 0x3696_d601_ad37_6ab9),
+        (0x0080_0000, 0x3810_0000_0b3a_eeab),
+        (0x007f_ffff, 0x380f_ffff_bb1d_d6a1),
+        (0x3dcc_cccd, 0x3fb9_9999_9999_999a),
+        (0x3f33_3333, 0x3fe6_6666_6666_6666),
+        (0x4b80_0000, 0x4170_0000_0000_0000),
+    ];
+
+    #[test]
+    fn single_floats_render_their_pinned_values() {
+        for &(bits, expected) in PINNED_SINGLE_FLOATS {
+            let rendered = float32(f32::from_bits(bits)).as_f64().unwrap();
+            assert_eq!(rendered.to_bits(), expected, "{bits:#010x}");
+            assert_eq!((rendered as f32).to_bits(), bits, "{bits:#010x}");
+        }
+        assert_eq!(
+            float32(f32::from_bits(0x401f_4000)).to_string(),
+            "2.4882813"
+        );
+        assert_eq!(
+            float32(f32::from_bits(0xb980_0000)).to_string(),
+            "-0.00024414063"
+        );
+    }
+
+    #[test]
+    fn single_floats_break_decimal_ties_away_from_zero_across_a_tie_dense_binade() {
+        let mut previous = f64::NEG_INFINITY;
+        for bits in (148u32 << 23)..(149u32 << 23) {
+            let v = f32::from_bits(bits);
+            let rendered = float32(v).as_f64().unwrap();
+            let tenths = (f64::from(v) * 10.0).round();
+            assert_eq!(
+                rendered.to_bits(),
+                (tenths / 10.0).to_bits(),
+                "{bits:#010x}"
+            );
+            assert_eq!((rendered as f32).to_bits(), bits, "{bits:#010x}");
+            assert!(rendered > previous, "{bits:#010x}");
+            previous = rendered;
+            if bits % 64 == 0 {
+                assert_eq!(
+                    float32(-v).as_f64().unwrap().to_bits(),
+                    (-rendered).to_bits()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_float_whose_shortest_decimal_casts_elsewhere_renders_its_exact_value() {
+        for bits in [0x15ae_43fd_u32, 0x95ae_43fd] {
+            let v = f32::from_bits(bits);
+            let shortest: f64 = v.to_string().parse().unwrap();
+            assert_ne!(
+                (shortest as f32).to_bits(),
+                bits,
+                "the shortest decimal casts away"
+            );
+            assert_eq!(float32(v), json!(f64::from(v)));
+        }
+    }
 
     #[test]
     fn from_slice_refuses_a_body_that_is_not_utf8() {

@@ -539,8 +539,9 @@ pub fn values_to_record_batch_inferred(records: &[Value]) -> Result<RecordBatch,
 /// one of: null, boolean, integers, `Float64`, strings, binary, decimals,
 /// timestamps (no zone or a zone that parses), times, dates, structs, lists
 /// (list, large list, fixed-size list), maps with string keys, and
-/// dictionaries of `Utf8` / `LargeUtf8` values without nulls. A batch holding
-/// anything else — `Float32` and `Float16` included — (or a duplicate field
+/// dictionaries of `Utf8` / `LargeUtf8` values without nulls.
+/// `Float32` and `Float16` values render through [`crate::fidelity::float32`]
+/// on both paths. A batch holding anything else (or a duplicate field
 /// name, or nesting deeper than 32 levels) is converted whole by writing it
 /// as JSON text with `arrow-json` (explicit nulls on) and parsing that text. The choice is made before any
 /// value is rendered, so a batch is never converted by both, and the two
@@ -688,9 +689,6 @@ impl arrow_json::writer::EncoderFactory for ExactEncoderFactory {
             }
             DataType::Float32 => {
                 let a = array.as_primitive::<Float32Type>();
-                if a.values().iter().all(|v| v.is_finite()) {
-                    return Ok(None);
-                }
                 nullable(
                     ValueEncoder(move |i| crate::fidelity::float32(a.value(i))),
                     array,
@@ -698,9 +696,6 @@ impl arrow_json::writer::EncoderFactory for ExactEncoderFactory {
             }
             DataType::Float16 => {
                 let a = array.as_primitive::<Float16Type>();
-                if a.values().iter().all(|v| v.is_finite()) {
-                    return Ok(None);
-                }
                 nullable(
                     ValueEncoder(move |i| crate::fidelity::float32(f32::from(a.value(i)))),
                     array,

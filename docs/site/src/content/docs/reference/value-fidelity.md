@@ -21,7 +21,7 @@ produced it, and every sink reads the same rendering back.
 | Integer that fits `i64` / `u64` | a JSON number | `9223372036854775807` |
 | Integer beyond `i64` / `u64` — 128-bit, `NUMERIC(38,0)`, `UInt128` | a **string** of its digits | `"123456789012345678901234567890"` |
 | Number with no declared scale — an unscaled Oracle `NUMBER`, a DynamoDB number, a number inside a JSON document or payload | a JSON number when the double it parses to names the same value, otherwise a string of its exact digits | `1.5`, `"0.12345678901234567890"` |
-| `FLOAT` / `DOUBLE` | a JSON number; a single-precision value keeps its shortest form, `-0.0` keeps its sign | `0.1` (not `0.10000000149011612`) |
+| `FLOAT` / `DOUBLE` | a JSON number; a single-precision value keeps its shortest form (see [Single-precision floats](#single-precision-floats)), `-0.0` keeps its sign | `0.1` (not `0.10000000149011612`) |
 | `NaN`, `±Infinity` (float or decimal) | **`null`, counted** — see below | `null` |
 | Instant — `TIMESTAMPTZ`, a zoned Arrow timestamp | RFC 3339 with an explicit offset (`Z` for UTC) | `"2026-09-18T12:34:56.123456Z"` |
 | Local date-time — a timestamp with no zone | ISO 8601 without an offset; an offset the backend never stored is not invented | `"2026-09-18T12:34:56.123456"` |
@@ -59,6 +59,42 @@ A document store whose own typed JSON round-trips its types keeps it:
 MongoDB reads as relaxed extended JSON, so a `Decimal128` is
 `{"$numberDecimal": "…"}` and a `Date` `{"$date": …}`, and the MongoDB sink
 restores them.
+
+## Single-precision floats
+
+A single-precision value (`FLOAT` / `REAL` / `FLOAT4`, Arrow `Float32`, Parquet
+`FLOAT`, Avro `float`) is the JSON number nearest the **shortest decimal that
+reads back as the same single-precision value**. When two decimals of that
+length are equally near (an exact tie in the last digit), the one away from
+zero is taken, as Rust's `Display` does: `2.48828125` renders `2.4882813`,
+`-0.000244140625` renders `-0.00024414063`. Two values are the exception:
+`±7.038531e-26` render as their exact value (`7.038530691851209e-26`), because
+the double nearest their shortest decimal converts to the neighbouring single
+value. So every rendering converts back to the same single-precision value.
+
+The rule is the same on every source and on both Arrow paths, whatever else
+the batch holds. A half-precision (Arrow `Float16`) value is widened to single
+precision first, which is exact, and rendered the same way.
+
+**Changed in this release (#1106).** Through Arrow (Parquet, Avro, ORC, Delta,
+Iceberg, the DuckDB and Databricks Arrow paths) an array with no `NaN` or
+infinity used to render about 0.108% of single-precision values with one digit
+too many (`55139152.0` instead of `55139150.0`). After upgrading:
+
+- the single-precision value is the same, so a `REAL` / `FLOAT4` destination
+  column is unaffected;
+- a double, decimal, JSON or text destination column already holds the old
+  number for those rows, so `faucet verify` with `float_tolerance: 0` reports
+  them as changed until one repair pass rewrites them or
+  `verify.normalize.float_tolerance` is set;
+- such a value used as an upsert key into a column that is not single
+  precision lands as a new row;
+- a masking `hash` or `tokenize` of such a value changes;
+- an incremental read whose bookmark holds such a value may read the boundary
+  row again once (duplicates, never loss).
+
+The `mysql-cdc` source rendered a single-precision value it had no column type
+for as its widened double (`0.10000000149011612`); it now uses the rule above.
 
 ## Float literals in JSON text
 

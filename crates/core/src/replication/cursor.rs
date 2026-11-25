@@ -855,4 +855,52 @@ mod tests {
         assert!(!strict_comparison("WHERE ts > @bookmark_old", "@bookmark"));
         assert!(strict_comparison("WHERE ts > :bookmark", ":bookmark"));
     }
+
+    #[test]
+    fn a_single_float_in_its_old_spelling_is_re_emitted_not_dropped() {
+        for (single, old_spelling) in [
+            (f32::from_bits(0x4c52_56d4), "55139152.0"),
+            (f32::from_bits(0x3980_0000), "0.00024414062"),
+        ] {
+            let old_value: Value = serde_json::from_str(old_spelling).unwrap();
+            let rendered = crate::fidelity::float32(single);
+            assert_ne!(rendered, old_value, "the spelling changed");
+            let stored_row = json!({"id": 1, "v": old_value.clone()});
+            let start = CursorBookmark {
+                value: old_value.clone(),
+                boundary: Some(vec![row_fingerprint(&stored_row)]),
+            };
+            let mut tracker = CursorTracker::new("v", start);
+            let same_row = json!({"id": 1, "v": rendered.clone()});
+            let later = json!({"id": 2, "v": crate::fidelity::float32(f32::from_bits(single.to_bits() + 1))});
+            assert!(tracker.admit(&same_row), "re-emitted, never dropped");
+            assert!(tracker.admit(&later));
+            let resumed = tracker.bookmark();
+            assert_eq!(resumed.value, later["v"]);
+            let mut again = CursorTracker::new("v", resumed);
+            assert!(
+                !again.admit(&later),
+                "a copy at the new spelling is deduplicated"
+            );
+        }
+        let old = |text: &str| {
+            serde_json::from_str::<Value>(text)
+                .unwrap()
+                .as_f64()
+                .unwrap()
+        };
+        let new = |bits: u32| {
+            crate::fidelity::float32(f32::from_bits(bits))
+                .as_f64()
+                .unwrap()
+        };
+        assert!(
+            new(0x4c52_56d4) < old("55139152.0"),
+            "stored start above the new spelling"
+        );
+        assert!(
+            new(0x3980_0000) > old("0.00024414062"),
+            "stored start below the new spelling"
+        );
+    }
 }
