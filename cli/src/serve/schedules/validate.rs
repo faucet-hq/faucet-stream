@@ -349,4 +349,36 @@ mod tests {
         assert_eq!(human(Duration::from_secs(60)), "1 minute");
         assert_eq!(human(Duration::from_secs(7200)), "2 hours");
     }
+    #[test]
+    fn dst_1111_serve_preview_ticks_once_on_london_spring_forward() {
+        let daily = compile("0 0 * * *", "Europe/London").unwrap();
+        let after: DateTime<Utc> = "2025-03-29T12:00:00Z".parse().unwrap();
+        let ticks: Vec<String> = next_ticks(&daily, after, 3)
+            .iter()
+            .map(|t| t.to_rfc3339())
+            .collect();
+        assert_eq!(
+            ticks,
+            [
+                "2025-03-30T00:00:00+00:00",
+                "2025-03-30T23:00:00+00:00",
+                "2025-03-31T23:00:00+00:00"
+            ]
+        );
+        assert_eq!(
+            shortest_gap(&daily, after),
+            Some(Duration::from_secs(23 * 3600))
+        );
+    }
+
+    #[test]
+    fn dst_1111_serve_preview_keeps_cadence_on_new_york_fall_back() {
+        let half = compile("*/30 * * * *", "America/New_York").unwrap();
+        let after: DateTime<Utc> = "2025-11-02T05:15:00Z".parse().unwrap();
+        let gaps: Vec<i64> = next_ticks(&half, after, 5)
+            .windows(2)
+            .map(|w| (w[1] - w[0]).num_minutes())
+            .collect();
+        assert_eq!(gaps, [30, 30, 30, 30]);
+    }
 }

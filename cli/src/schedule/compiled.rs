@@ -289,4 +289,40 @@ mod tests {
             "fall-back produced a duplicate same-day fire: {first} -> {second}"
         );
     }
+    fn ticks_1111(cron: &str, tz: &str, after: &str, n: usize) -> Vec<String> {
+        let c = CompiledSchedule::compile(&spec(cron, tz)).unwrap();
+        let start: DateTime<Utc> = after.parse().unwrap();
+        std::iter::successors(c.next_after(start), |t| c.next_after(*t))
+            .take(n)
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .collect()
+    }
+
+    #[test]
+    fn dst_1111_daily_midnight_fires_once_on_london_spring_forward() {
+        assert_eq!(
+            ticks_1111("0 0 * * *", "Europe/London", "2025-03-28T12:00:00Z", 4),
+            [
+                "2025-03-29T00:00:00Z",
+                "2025-03-30T00:00:00Z",
+                "2025-03-30T23:00:00Z",
+                "2025-03-31T23:00:00Z"
+            ]
+        );
+    }
+
+    #[test]
+    fn dst_1111_half_hourly_keeps_cadence_on_new_york_fall_back() {
+        assert_eq!(
+            ticks_1111("*/30 * * * *", "America/New_York", "2025-11-02T04:45:00Z", 6),
+            [
+                "2025-11-02T05:00:00Z",
+                "2025-11-02T05:30:00Z",
+                "2025-11-02T06:00:00Z",
+                "2025-11-02T06:30:00Z",
+                "2025-11-02T07:00:00Z",
+                "2025-11-02T07:30:00Z"
+            ]
+        );
+    }
 }
