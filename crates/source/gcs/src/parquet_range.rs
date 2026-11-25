@@ -38,6 +38,7 @@ pub(crate) struct GcsRangeReader {
     recorder: Option<Arc<faucet_core::observability::RoundtripRecorder>>,
     calls: faucet_core::CallContext,
     max_range_bytes: u64,
+    body_resume_attempts: u32,
 }
 
 impl GcsRangeReader {
@@ -66,6 +67,7 @@ impl GcsRangeReader {
             recorder,
             calls: faucet_core::CallContext::new(),
             max_range_bytes: faucet_core::file_format::DEFAULT_MAX_OBJECT_BYTES,
+            body_resume_attempts: faucet_common_gcs::DEFAULT_BODY_RESUME_ATTEMPTS,
         })
     }
 
@@ -73,6 +75,12 @@ impl GcsRangeReader {
     /// before any request.
     pub(crate) fn with_max_range_bytes(mut self, max: u64) -> Self {
         self.max_range_bytes = max;
+        self
+    }
+
+    /// Resume a range whose body drops at most `attempts` times.
+    pub(crate) fn with_body_resume_attempts(mut self, attempts: u32) -> Self {
+        self.body_resume_attempts = attempts;
         self
     }
 
@@ -108,6 +116,14 @@ impl GcsRangeReader {
         let mut request = self
             .storage
             .read_object(&self.bucket_path, self.key.clone())
+            .with_read_resume_policy(
+                faucet_common_gcs::BodyResume::new(
+                    self.body_resume_attempts,
+                    &self.bucket_path,
+                    &self.key,
+                )
+                .with_recorder(self.recorder.clone()),
+            )
             .set_read_range(ReadRange::segment(range.start, wanted));
         if let Some(generation) = self.generation {
             request = request.set_generation(generation);

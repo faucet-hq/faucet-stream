@@ -327,6 +327,7 @@ impl GcsSource {
         .await?
         .with_calls(self.calls.get())
         .with_max_range_bytes(self.config.max_object_bytes)
+        .with_body_resume_attempts(self.config.body_resume_attempts)
         .pinned_to(meta.generation);
         let object_len = reader.len();
         let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
@@ -398,6 +399,14 @@ impl GcsSource {
         let resp = self
             .storage
             .read_object(self.bucket_path(), key.to_string())
+            .with_read_resume_policy(
+                faucet_common_gcs::BodyResume::new(
+                    self.config.body_resume_attempts,
+                    &self.config.bucket,
+                    key,
+                )
+                .with_recorder(self.roundtrips.recorder()),
+            )
             .send()
             .within(&self.calls, "get")
             .await?

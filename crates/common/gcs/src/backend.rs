@@ -130,6 +130,10 @@ impl ObjectClient for GcsObjects {
         let mut resp = self
             .storage
             .read_object(self.bucket_path(), key.to_string())
+            .with_read_resume_policy(
+                crate::BodyResume::new(crate::DEFAULT_BODY_RESUME_ATTEMPTS, &self.bucket, key)
+                    .with_recorder(self.roundtrips.recorder()),
+            )
             .send()
             .within(&self.calls, "get")
             .await?
