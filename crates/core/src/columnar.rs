@@ -539,7 +539,7 @@ pub fn values_to_record_batch_inferred(records: &[Value]) -> Result<RecordBatch,
 /// one of: null, boolean, integers, `Float64`, strings, binary, decimals,
 /// timestamps (no zone or a zone that parses), times, dates, structs, lists
 /// (list, large list, fixed-size list), maps with string keys, and
-/// dictionaries of `Utf8` / `LargeUtf8` values without nulls.
+/// dictionaries of `Utf8` / `LargeUtf8` values (a null value renders `null`).
 /// `Float32` and `Float16` values render through [`crate::fidelity::float32`]
 /// on both paths. A batch holding anything else (or a duplicate field
 /// name, or nesting deeper than 32 levels) is converted whole by writing it

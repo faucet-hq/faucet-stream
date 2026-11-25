@@ -96,6 +96,17 @@ too many (`55139152.0` instead of `55139150.0`). After upgrading:
 The `mysql-cdc` source rendered a single-precision value it had no column type
 for as its widened double (`0.10000000149011612`); it now uses the rule above.
 
+## Dictionary-encoded columns
+
+A dictionary column renders like the same column unpacked. A row whose key is
+null, or whose key points at a null value, is `null`.
+
+One case still renders wrong until an arrow-json release contains the upstream
+fix (#1115): a null in the values array of a dictionary whose value type is not
+`Utf8` / `LargeUtf8`, or of a `Utf8` dictionary in a batch that is converted
+through arrow-json because of another column, renders as `""` or `0` instead of
+`null`.
+
 ## Float literals in JSON text
 
 A float literal in JSON input is read as the nearest double (`serde_json` with

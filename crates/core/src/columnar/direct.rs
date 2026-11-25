@@ -156,6 +156,7 @@ enum Kind<'a> {
     Dictionary {
         key: KeyAt<'a>,
         values: Text<'a>,
+        value_nulls: Option<&'a NullBuffer>,
     },
 }
 
@@ -215,7 +216,18 @@ impl Cell<'_> {
                 }
                 Value::Object(map)
             }
-            Kind::Dictionary { key, values } => Value::String(values.at(key(i)).to_owned()),
+            Kind::Dictionary {
+                key,
+                values,
+                value_nulls,
+            } => {
+                let k = key(i);
+                if value_nulls.is_some_and(|nulls| nulls.is_null(k)) {
+                    Value::Null
+                } else {
+                    Value::String(values.at(k).to_owned())
+                }
+            }
         }
     }
 }
@@ -240,12 +252,13 @@ fn dictionary(array: &dyn Array) -> Option<Kind<'_>> {
         .or_else(|| dictionary_key::<UInt16Type>(array))
         .or_else(|| dictionary_key::<UInt32Type>(array))
         .or_else(|| dictionary_key::<UInt64Type>(array))?;
-    if values.null_count() != 0 || matches!(values.data_type(), DataType::Utf8View) {
+    if matches!(values.data_type(), DataType::Utf8View) {
         return None;
     }
     Some(Kind::Dictionary {
         key,
         values: Text::of(values)?,
+        value_nulls: values.nulls(),
     })
 }
 

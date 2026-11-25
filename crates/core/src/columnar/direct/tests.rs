@@ -874,6 +874,89 @@ fn assert_unpacks_like_its_values(array: &ArrayRef) {
     }
 }
 
+fn text_values_with_nulls() -> Vec<ArrayRef> {
+    let words = [None, Some("a"), Some(""), Some("😀")];
+    let sliced: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("skipped"),
+        None,
+        Some("a"),
+        Some(""),
+        Some("😀"),
+    ]));
+    vec![
+        Arc::new(StringArray::from(words.to_vec())),
+        Arc::new(LargeStringArray::from(words.to_vec())),
+        sliced.slice(1, 4),
+    ]
+}
+
+#[test]
+fn null_dictionary_values_render_null() {
+    macro_rules! keyed {
+        ($($key:ty),*) => {$(
+            for values in text_values_with_nulls() {
+                let keys: PrimitiveArray<$key> =
+                    vec![Some(0), Some(1), None, Some(1), Some(3), Some(0), Some(2)]
+                        .into_iter()
+                        .collect();
+                let array: ArrayRef = Arc::new(DictionaryArray::new(keys, values));
+                let batch = batch_of(vec![("v", array.clone())]);
+                let rows = convert(&batch).expect("text dictionaries are built directly");
+                assert_eq!(
+                    serde_json::to_string(&rows).unwrap(),
+                    r#"[{"v":null},{"v":"a"},{"v":null},{"v":"a"},{"v":"😀"},{"v":null},{"v":""}]"#
+                );
+                assert_unpacks_like_its_values(&array);
+            }
+        )*};
+    }
+    keyed!(
+        Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type
+    );
+}
+
+#[test]
+fn a_key_under_a_null_slot_is_never_read() {
+    let values: ArrayRef = Arc::new(StringArray::from(vec![None, Some("a")]));
+    let signed = DictionaryArray::try_new(
+        Int32Array::from_iter_values_with_nulls(
+            [0, -5, 1, 99],
+            Some(NullBuffer::from(vec![true, false, true, false])),
+        ),
+        values.clone(),
+    )
+    .unwrap();
+    let unsigned = DictionaryArray::try_new(
+        UInt8Array::from_iter_values_with_nulls(
+            [200, 1, 255],
+            Some(NullBuffer::from(vec![false, true, false])),
+        ),
+        values,
+    )
+    .unwrap();
+    for (array, expected) in [
+        (
+            Arc::new(signed) as ArrayRef,
+            r#"[{"v":null},{"v":null},{"v":"a"},{"v":null}]"#,
+        ),
+        (
+            Arc::new(unsigned) as ArrayRef,
+            r#"[{"v":null},{"v":"a"},{"v":null}]"#,
+        ),
+    ] {
+        let rows = convert(&batch_of(vec![("v", array.clone())])).unwrap();
+        assert_eq!(serde_json::to_string(&rows).unwrap(), expected);
+        assert_eq!(
+            serde_json::to_string(&convert(&batch_of(vec![("l", list_of(&array))])).unwrap())
+                .unwrap(),
+            serde_json::to_string(
+                &convert(&batch_of(vec![("l", list_of(&unpacked(&array)))])).unwrap()
+            )
+            .unwrap()
+        );
+    }
+}
+
 #[test]
 fn dictionaries_of_every_value_type_render_like_their_unpacked_values() {
     let values: Vec<ArrayRef> = vec![
@@ -944,13 +1027,11 @@ fn null_dictionary_values_on_the_json_hop_pin_known_defect_1109() {
         Arc::new(StringArray::from(vec![None, Some("a")])),
     ));
     let durations: ArrayRef = Arc::new(DurationSecondArray::from(vec![1, 2, 3]));
-    for batch in [
-        batch_of(vec![("v", text.clone()), ("d", durations)]),
-        batch_of(vec![("v", text)]),
-    ] {
-        let rows = record_batch_to_values(&batch).unwrap();
-        assert_eq!(rows[0]["v"], Value::String(String::new()));
-    }
+    let rows =
+        record_batch_to_values(&batch_of(vec![("v", text.clone()), ("d", durations)])).unwrap();
+    assert_eq!(rows[0]["v"], Value::String(String::new()));
+    let rows = record_batch_to_values(&batch_of(vec![("v", text)])).unwrap();
+    assert_eq!(rows[0]["v"], Value::Null);
 }
 
 #[test]
@@ -1163,9 +1244,9 @@ fn unsupported_types_take_the_json_hop() {
         Int8Array::from(vec![0, 1, 0, 1]),
         Arc::new(StringViewArray::from(vec!["a", "b"])),
     );
-    let dictionary_with_null_values = DictionaryArray::new(
+    let dictionary_of_ints_with_null_values = DictionaryArray::new(
         Int8Array::from(vec![0, 1, 0, 1]),
-        Arc::new(StringArray::from(vec![Some("a"), None])),
+        Arc::new(Int32Array::from(vec![Some(1), None])),
     );
     let bad_zone = TimestampSecondArray::from(vec![1, 2, 3, 4]).with_timezone("Not/AZone");
     let integer_keys = map_with(ints.clone(), &ints, false, vec![0, 1, 2, 3, 4]);
@@ -1197,7 +1278,7 @@ fn unsupported_types_take_the_json_hop() {
         Arc::new(large_list_view),
         Arc::new(dictionary_of_ints),
         Arc::new(dictionary_of_views),
-        Arc::new(dictionary_with_null_values),
+        Arc::new(dictionary_of_ints_with_null_values),
         Arc::new(bad_zone),
         Arc::new(integer_keys),
         Arc::new(null_keys),
