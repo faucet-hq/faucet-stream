@@ -262,7 +262,12 @@ impl FileSource {
                 let body = resp
                     .bytes_stream()
                     .map(|r| r.map_err(std::io::Error::other));
-                Box::pin(tokio_util::io::StreamReader::new(body))
+                Box::pin(tokio::io::BufReader::with_capacity(
+                    faucet_core::file_format::READ_BUFFER_BYTES,
+                    self.calls
+                        .get()
+                        .reader(tokio_util::io::StreamReader::new(body)),
+                ))
             }
             None => Box::pin(tokio::io::BufReader::with_capacity(
                 faucet_core::file_format::READ_BUFFER_BYTES,

@@ -265,6 +265,8 @@ Discovers one dataset per file; shardable except for an `http(s)://` path; colum
 
 An `http(s)://` path is fetched through the pipeline's `CallContext` (#880):
 the run's cancel token stops an in-flight request and the backoff between
-retries, and any caller deadline ends both. `http_retries`, the connect /
+retries, and any caller deadline ends both. The response body is read under
+the same context, so a body that stops arriving mid-stream ends on cancel or at
+the deadline too, not only at the read (idle) timeout. `http_retries`, the connect /
 read timeouts and the `get` / `head` round-trip and throttle metrics are
 unchanged. Local paths make no backend calls.

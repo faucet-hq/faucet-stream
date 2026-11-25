@@ -129,6 +129,28 @@ async fn conformance_call_deadline() {
     .await;
 }
 
+/// The response headers arrive, then the body stops mid-stream: the read must
+/// still end at the deadline and on cancel, because the body is read under the
+/// call context too (#880), not only the request.
+#[tokio::test]
+async fn conformance_call_deadline_bounds_a_stalled_body() {
+    use faucet_conformance::hung::{Reply, StallingBodyServer};
+    let server = StallingBodyServer::start(|method, _target| {
+        if method == "HEAD" {
+            Reply::full("application/x-ndjson", "")
+        } else {
+            Reply::stall_body("application/x-ndjson", "{\"id\":1}\n", 4096)
+        }
+    })
+    .await
+    .expect("server");
+    let url = format!("{}/data.jsonl", server.http_url());
+    faucet_conformance::calls::assert_source_call_deadline(|| {
+        FileSource::new(FileSourceConfig::new(url.clone())).unwrap()
+    })
+    .await;
+}
+
 /// Check 22: the first page arrives before the body is exhausted. A local
 /// file's reads cannot be counted from outside the source, so the JSON Lines
 /// body is served over HTTP by a server that counts each line the socket
