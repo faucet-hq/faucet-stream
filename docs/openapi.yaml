@@ -4023,6 +4023,7 @@ paths:
                       kind: { type: string, enum: [sqlite, postgres, memory] }
                       persistent: { type: boolean }
                   queue_ok: { type: boolean }
+                  tzdata: { type: string, description: "The IANA tzdata release this server resolves named zones with, e.g. `2026f` (#1116). Each cluster member advertises its own as a `tzdata:<release>` capability." }
                   degraded:
                     type: object
                     nullable: true
@@ -4181,10 +4182,10 @@ components:
         paused: { type: boolean }
         template: { type: object }
         run: { type: object }
-        status: { type: string, enum: [active, paused, failing, retrying, needs_approval], description: "`needs_approval`: under --require-approval run the schedule is not ticked until an approved change makes it, with pinned template versions (#1051)." }
+        status: { type: string, enum: [active, paused, failing, retrying, needs_approval, held_tzdata], description: "`needs_approval`: under --require-approval run the schedule is not ticked until an approved change makes it, with pinned template versions (#1051). `held_tzdata`: during a rolling upgrade a replica on other tzdata may run the tick at another instant, so this one holds it (at most until the tick plus 1 h 5 min, #1116)." }
         next_tick: { type: string, format: date-time, nullable: true }
         last_tick: { type: string, format: date-time, nullable: true }
-        last_outcome: { type: string, nullable: true, description: "`started` / `skipped` / `failed` / `retrying` / `waiting` / `needs_approval`. A tenant viewing a fan-out sees its own result only (`unknown` when the latest tick did not include it)." }
+        last_outcome: { type: string, nullable: true, description: "`started` / `skipped` / `failed` / `retrying` / `waiting` / `needs_approval` / `held_tzdata`. A tenant viewing a fan-out sees its own result only (`unknown` when the latest tick did not include it)." }
         last_error: { type: string, nullable: true }
         consecutive_failures: { type: integer }
         missed_30d: { type: integer }

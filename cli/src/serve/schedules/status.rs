@@ -135,6 +135,9 @@ pub enum Outcome {
     Waiting(String),
     /// Not ticked: it needs an approval this server requires (#1051).
     NeedsApproval(String),
+    /// Held while a replica on other tzdata may fire it at another instant
+    /// (#1116).
+    HeldTzdata(String),
 }
 
 impl ScheduleStatus {
@@ -219,6 +222,12 @@ impl ScheduleStatus {
             Outcome::NeedsApproval(why) => {
                 if latest {
                     self.last_outcome = Some("needs_approval".into());
+                    self.last_error = Some(why.clone());
+                }
+            }
+            Outcome::HeldTzdata(why) => {
+                if latest {
+                    self.last_outcome = Some("held_tzdata".into());
                     self.last_error = Some(why.clone());
                 }
             }

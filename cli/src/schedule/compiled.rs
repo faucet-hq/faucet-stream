@@ -109,6 +109,11 @@ fn strictly_after(after: DateTime<Utc>, t: DateTime<Utc>) -> Result<DateTime<Utc
 }
 
 impl CompiledSchedule {
+    /// The schedule's time zone.
+    pub fn zone(&self) -> faucet_core::time::Zone {
+        self.tz.zone()
+    }
+
     /// Validate + compile. Every problem surfaces here, never mid-run.
     pub fn compile(spec: &ScheduleSpec) -> CliResult<Self> {
         let tz: Tz = spec.timezone.parse().map_err(|_| {

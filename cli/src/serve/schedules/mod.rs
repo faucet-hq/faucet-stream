@@ -19,6 +19,7 @@ pub mod runner;
 pub mod secrets;
 pub mod service;
 pub mod status;
+pub mod tzdata;
 pub mod validate;
 
 use crate::error::{CliError, CliResult};

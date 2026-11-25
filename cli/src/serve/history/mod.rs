@@ -322,6 +322,11 @@ pub struct RunRecord {
     /// the store; never shown, never re-run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_projection: Option<PolicyProjection>,
+    /// The tzdata release of the instance that recorded the run (#1116).
+    /// `None`: a release that predates it (tzdata 2025b), so a schedule
+    /// tick it started may sit at another UTC instant in a changed zone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tzdata: Option<String>,
 }
 
 /// A run's config reduced to what a data-flow policy reasons about (#1051):
@@ -381,6 +386,7 @@ impl RunRecord {
             feed: None,
             pipeline_name_suffix: None,
             policy_projection: None,
+            tzdata: Some(faucet_core::time::TZDATA_VERSION.to_string()),
         }
     }
 
@@ -478,6 +484,23 @@ pub const CAP_RUN_BUDGET: &str = "run_budget";
 /// A member writes its run and shard leases on the history database's clock,
 /// so a reclaimer compares them without its own clock's skew.
 pub const CAP_DB_CLOCK: &str = "db_clock_leases";
+/// The prefix of the capability naming a member's tzdata release
+/// (`tzdata:2026f`, #1116). Not in [`INSTANCE_CAPABILITIES`]: its value is
+/// the build's, added by [`instance_capabilities`].
+pub const CAP_TZDATA_PREFIX: &str = "tzdata:";
+
+/// Every capability this build advertises, its tzdata release included.
+pub fn instance_capabilities() -> Vec<String> {
+    INSTANCE_CAPABILITIES
+        .iter()
+        .map(|c| (*c).to_string())
+        .chain(std::iter::once(format!(
+            "{CAP_TZDATA_PREFIX}{}",
+            faucet_core::time::TZDATA_VERSION
+        )))
+        .collect()
+}
+
 /// What this build advertises in its heartbeat.
 pub const INSTANCE_CAPABILITIES: &[&str] = &[
     CAP_POLICY_PIN,
@@ -520,6 +543,15 @@ impl InstanceRecord {
         self.capabilities
             .as_ref()
             .is_some_and(|c| c.iter().any(|x| x == cap))
+    }
+
+    /// The tzdata release the member advertises; `None` for a release that
+    /// predates the capability or a value that does not parse.
+    pub fn tzdata(&self) -> Option<faucet_core::time::TzdataVersion> {
+        self.capabilities.as_ref()?.iter().find_map(|c| {
+            c.strip_prefix(CAP_TZDATA_PREFIX)
+                .and_then(|v| faucet_core::time::TzdataVersion::parse(v).ok())
+        })
     }
 }
 

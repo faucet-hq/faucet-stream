@@ -196,10 +196,15 @@ async fn submit_poll_get_completes_and_records_metrics() {
         .expect("the CLI declares a version")
         .to_string();
     assert_eq!(cli_version, env!("CARGO_PKG_VERSION"));
-    let build_info = format!("faucet_build_info{{version=\"{cli_version}\"}} 1");
+    let build_info = metrics
+        .lines()
+        .find(|l| l.starts_with("faucet_build_info{"))
+        .unwrap_or_default();
     assert!(
-        metrics.contains(&build_info),
-        "metrics missing {build_info}:\n{metrics}"
+        build_info.contains(&format!("version=\"{cli_version}\""))
+            && build_info.contains(&format!("tzdata=\"{}\"", faucet_core::time::TZDATA_VERSION))
+            && build_info.ends_with(" 1"),
+        "build-info series {build_info:?}:\n{metrics}"
     );
     assert_eq!(
         metrics.matches("faucet_build_info{").count(),

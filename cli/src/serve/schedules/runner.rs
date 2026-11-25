@@ -118,6 +118,13 @@ impl Entry {
         }
     }
 
+    /// The schedule's shortest gap between ticks, an hour when unknown.
+    fn period(&self) -> chrono::Duration {
+        super::validate::shortest_gap(&self.schedule, Utc::now())
+            .and_then(|d| chrono::Duration::from_std(d).ok())
+            .unwrap_or_else(|| chrono::Duration::hours(1))
+    }
+
     /// Why the entry cannot compute its next tick, if it cannot.
     pub fn compute_error(&self) -> Option<&str> {
         self.compute_error.as_deref()
@@ -496,6 +503,121 @@ fn hold(entry: &mut Entry, now: DateTime<Utc>) {
     entry.back_off(now);
 }
 
+/// What a due tick does while another tzdata release may be live (#1116).
+enum TzdataStep {
+    Fire,
+    FireLate,
+    Done,
+}
+
+/// Hold `tick` while a replica on other tzdata may run it at another instant:
+/// a tick that replica ran is recorded (so `catch_up` never replays it) and
+/// nothing starts; one nobody ran by `tick + delta + grace` runs late.
+async fn hold_for_tzdata(
+    state: &ServerState,
+    entry: &mut Entry,
+    tick: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> TzdataStep {
+    let zone = entry.schedule.zone();
+    let period = entry.period();
+    let name = entry.spec.name.clone();
+    let history = state.history();
+    let found = match super::tzdata::peer_for(state, &name, zone, period, tick, now).await {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::warn!(schedule = %name, %tick, error = %e, "could not check the tzdata of other replicas; holding the tick");
+            entry.back_off(now);
+            return TzdataStep::Done;
+        }
+    };
+    let Some((peer, runs)) = found else {
+        return TzdataStep::Fire;
+    };
+    let schedule = &entry.schedule;
+    let ours_at = |t: DateTime<Utc>| {
+        schedule
+            .try_next_after(t - chrono::Duration::seconds(1))
+            .ok()
+            .flatten()
+            == Some(t)
+    };
+    match super::tzdata::decide(
+        &peer,
+        tick,
+        now,
+        &runs,
+        faucet_core::time::TzdataVersion::current(),
+        ours_at,
+    ) {
+        super::tzdata::Decision::Delegated { run_id } => {
+            tracing::info!(schedule = %name, %tick, run = %run_id, peer = %peer.who(), "tick run by a replica on other tzdata; not starting it here");
+            metrics::tick(&name, "skipped");
+            status::record_tick(&*history, &name, &entry.last_tick(tick)).await;
+            status::record(
+                &*history,
+                &name,
+                tick,
+                Outcome::Skipped(format!(
+                    "run {run_id} started this slot on a replica with other tzdata"
+                )),
+            )
+            .await;
+            if let Some(range) = entry.advance(tick, now)
+                && let Err(e) =
+                    status::update(&*history, &name, |d| d.add_missed(range.clone())).await
+            {
+                tracing::warn!(schedule = %name, error = %e, "could not record missed ticks");
+            }
+            TzdataStep::Done
+        }
+        super::tzdata::Decision::Hold { until } => {
+            let why = format!(
+                "held until {until}: {} may run this slot at another instant (tzdata differs)",
+                peer.who()
+            );
+            if entry.retry_at.is_none() {
+                tracing::warn!(schedule = %name, %tick, peer = %peer.who(), %until, "holding the tick while a replica on other tzdata may run it");
+                metrics::tick(&name, "held_tzdata");
+                status::record(&*history, &name, tick, Outcome::HeldTzdata(why)).await;
+            }
+            let poll = now + chrono::Duration::from_std(TZDATA_POLL).unwrap_or_default();
+            entry.retry_at = Some(poll.min(until));
+            TzdataStep::Done
+        }
+        super::tzdata::Decision::FireLate => {
+            tracing::warn!(schedule = %name, %tick, peer = %peer.who(), "no replica ran the held tick; running it late");
+            TzdataStep::FireLate
+        }
+    }
+}
+
+/// How often a tick held for another tzdata release looks for that run.
+pub const TZDATA_POLL: Duration = Duration::from_secs(30);
+
+/// A held tick that ran late, recorded as a missed range so the missed-tick
+/// metric and alert see it (#1116).
+async fn record_late(
+    history: &dyn RunHistory,
+    name: &str,
+    tick: DateTime<Utc>,
+    now: DateTime<Utc>,
+) {
+    metrics::missed(name, 1);
+    let range = MissedRange {
+        from: tick,
+        to: tick,
+        count: 1,
+        reason: "held while a replica on other tzdata was live; nobody ran it, so it ran late"
+            .to_string(),
+        caught_up: true,
+        recorded_at: now,
+    };
+    if let Err(e) = status::update(history, name, |d| d.add_missed(range.clone())).await {
+        tracing::warn!(schedule = %name, error = %e, "could not record missed ticks");
+    }
+}
+
 /// Fire `entry`'s due tick (if any) and fold the outcome in.
 pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
     let history = state.history();
@@ -563,6 +685,11 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
         }
         return;
     }
+    let late = match hold_for_tzdata(state, entry, tick, now).await {
+        TzdataStep::Fire => false,
+        TzdataStep::FireLate => true,
+        TzdataStep::Done => return,
+    };
     let result =
         fire::fire_tick(state, &entry.spec, entry.owner.as_deref(), tick, now, &opts).await;
     let outcome = result.outcome();
@@ -604,7 +731,10 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
             metrics::healthy(&name, false);
             tracing::warn!(schedule = %name, %tick, errors = ?errors, "schedule tick refused; moving on to the next tick");
         }
-        Outcome::NeedsApproval(_) => {}
+        Outcome::NeedsApproval(_) | Outcome::HeldTzdata(_) => {}
+    }
+    if late && !matches!(outcome, Outcome::Retrying(_) | Outcome::Waiting(_)) {
+        record_late(&*history, &name, tick, now).await;
     }
     status::record_tick(&*history, &name, &entry.last_tick(tick)).await;
     status::record_with_targets(&*history, &name, tick, outcome, &targets).await;
@@ -987,6 +1117,141 @@ mod tests {
                 assert!(e.retry_at.is_some(), "a held tick is looked at again");
             }
         }
+    }
+
+    /// A server on a shared (SQL) history, backed in memory for the test.
+    async fn shared_state() -> ServerState {
+        let mut config = crate::serve::test_support::test_config();
+        config.history = crate::serve::config::HistoryBackendSpec::Sqlite("sqlite::memory:".into());
+        let state = crate::serve::test_support::state_from(&config);
+        assert!(state.persistent_history());
+        crate::templates::register(
+            &state.history(),
+            crate::templates::store::RegisterRequest {
+                id: Some("t".into()),
+                body: "version: 1\nkind: pipeline\nname: t\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: stdout }\ntests:\n  suite:\n    auto: { defaults_baseline: true }\n".into(),
+                format: crate::serve::load::ConfigFormat::Yaml,
+                description: None,
+                tags: Vec::new(),
+                launch: true,
+                created_by: None,
+            },
+        )
+        .await
+        .unwrap();
+        state
+    }
+
+    fn vancouver(now: DateTime<Utc>) -> Entry {
+        let s: ScheduleSpec = serde_json::from_value(json!({
+            "name": "morning", "cron": "0 9 * * *", "timezone": "America/Vancouver",
+            "catch_up": true, "template": {"id": "t"}
+        }))
+        .unwrap();
+        let compiled = super::super::validate::validate(&s).unwrap();
+        let mut e = Entry::new(s, None, Source::File, compiled, now);
+        e.resumed = true;
+        e
+    }
+
+    /// A run an older release (tzdata 2025b, no stamp) started for `tick`.
+    async fn old_release_run(state: &ServerState, id: &str, tick: &str) {
+        let labels = BTreeMap::from([
+            (fire::LABEL_SCHEDULE.to_string(), "morning".to_string()),
+            (fire::LABEL_TICK.to_string(), tick.to_string()),
+        ]);
+        let mut r =
+            crate::serve::history::RunRecord::queued(id.into(), None, labels, None, at(tick));
+        r.tzdata = None;
+        r.status = crate::serve::history::RunStatus::Completed;
+        state.history().upsert(&r).await.unwrap();
+    }
+
+    async fn runs_of(state: &ServerState) -> Vec<crate::serve::history::RunRecord> {
+        super::super::tzdata::recent_runs(state, "morning", at("2026-11-01T00:00:00Z"))
+            .await
+            .unwrap()
+    }
+
+    /// #1116: while a 2025b replica fires Vancouver's 09:00 at 17:00Z, a
+    /// newer one holds its 16:00Z tick, leaves the slot to that run, and a
+    /// restart with catch_up never replays it.
+    #[tokio::test]
+    async fn a_tick_an_older_replica_ran_is_delegated_and_never_replayed() {
+        let state = shared_state().await;
+        old_release_run(&state, "old-1", "2026-11-23T17:00:00Z").await;
+        let mut e = vancouver(at("2026-11-24T12:00:00Z"));
+        let tick = at("2026-11-24T16:00:00Z");
+        assert_eq!(e.due(tick), Some(tick));
+        step(&state, &mut e, tick).await;
+        assert_eq!(
+            outcome(&state, "morning").await.as_deref(),
+            Some("held_tzdata")
+        );
+        assert_eq!(runs_of(&state).await.len(), 1, "nothing started while held");
+        old_release_run(&state, "old-2", "2026-11-24T17:00:00Z").await;
+        let later = at("2026-11-24T17:00:30Z");
+        step(&state, &mut e, later).await;
+        assert_eq!(outcome(&state, "morning").await.as_deref(), Some("skipped"));
+        assert_eq!(
+            runs_of(&state).await.len(),
+            2,
+            "the older replica's run is the slot's run"
+        );
+        assert_eq!(e.next, Some(at("2026-11-25T16:00:00Z")));
+        let mut restarted = vancouver(at("2026-11-25T10:00:00Z"));
+        restarted.resumed = false;
+        step(&state, &mut restarted, at("2026-11-25T10:00:00Z")).await;
+        assert!(restarted.resumed);
+        assert_eq!(restarted.next, Some(at("2026-11-25T16:00:00Z")));
+        assert!(
+            status::read(&*state.history(), "morning")
+                .await
+                .missed
+                .is_empty()
+        );
+    }
+
+    /// #1116: when the older replica stops firing, the held tick runs at
+    /// `tick + 1 h + 5 min` and is recorded as a missed range.
+    #[tokio::test]
+    async fn a_held_tick_nobody_ran_runs_late() {
+        let state = shared_state().await;
+        old_release_run(&state, "old-1", "2026-11-23T17:00:00Z").await;
+        let mut e = vancouver(at("2026-11-24T12:00:00Z"));
+        let tick = at("2026-11-24T16:00:00Z");
+        step(&state, &mut e, tick).await;
+        assert_eq!(e.retry_at, Some(at("2026-11-24T16:00:30Z")));
+        step(&state, &mut e, at("2026-11-24T17:04:59Z")).await;
+        assert_eq!(runs_of(&state).await.len(), 1);
+        e.retry_at = None;
+        step(&state, &mut e, at("2026-11-24T17:05:00Z")).await;
+        let runs = runs_of(&state).await;
+        assert_eq!(runs.len(), 2, "it ran late");
+        let mine = runs.iter().find(|r| r.run_id != "old-1").unwrap();
+        assert_eq!(mine.labels[fire::LABEL_TICK], "2026-11-24T16:00:00Z");
+        assert_eq!(
+            mine.tzdata.as_deref(),
+            Some(faucet_core::time::TZDATA_VERSION)
+        );
+        let missed = status::read(&*state.history(), "morning").await.missed;
+        assert_eq!(missed.len(), 1);
+        assert!(missed[0].reason.contains("ran late"), "{:?}", missed[0]);
+    }
+
+    /// #1116: a tick outside every changed period, or with no older replica
+    /// about, fires at once.
+    #[tokio::test]
+    async fn ticks_fire_at_once_without_an_older_replica_or_outside_changed_periods() {
+        let state = shared_state().await;
+        let mut e = vancouver(at("2026-11-24T12:00:00Z"));
+        step(&state, &mut e, at("2026-11-24T16:00:00Z")).await;
+        assert_eq!(outcome(&state, "morning").await.as_deref(), Some("started"));
+        let state = shared_state().await;
+        old_release_run(&state, "old-1", "2026-06-30T16:00:00Z").await;
+        let mut summer = vancouver(at("2026-07-01T12:00:00Z"));
+        step(&state, &mut summer, at("2026-07-01T16:00:00Z")).await;
+        assert_eq!(outcome(&state, "morning").await.as_deref(), Some("started"));
     }
 
     #[tokio::test]

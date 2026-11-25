@@ -14,3 +14,4 @@ faucet_serve_history_call_timeouts_total: a bounded history call of the lease up
 faucet_feed_store_moved: a per-feed 0/1 gauge for a misconfiguration (its events are in another feed store); alerted on by FaucetFeedStoreMoved and shown as the feed's status and on /readyz
 faucet_feed_maintenance_behind: a per-feed 0/1 gauge (retention ran out of time); alerted on by FaucetFeedMaintenanceBehind, read with faucet_feed_trimmed_events_total
 faucet_serve_schedule_compute_errors_total: a rare event (the cron library could not compute a schedule's next tick); the schedule's healthy gauge drops to 0, which FaucetServeScheduleUnhealthy alerts on
+faucet_serve_tzdata_mixed: 1 only while a rolling upgrade spans two tzdata releases; alerted on by FaucetServeTzdataMixed

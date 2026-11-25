@@ -370,6 +370,7 @@ fn view(actor: &AuthContext, f: &Found, st: &ScheduleStatus, now: DateTime<Utc>)
             Some("failed") => "failing",
             Some("retrying") => "retrying",
             Some("needs_approval") => "needs_approval",
+            Some("held_tzdata") => "held_tzdata",
             _ => "active",
         }
     };

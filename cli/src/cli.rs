@@ -83,7 +83,7 @@ pub fn log_format() -> LogFormat {
 
 /// `faucet` — config-driven runner for faucet-stream pipelines.
 #[derive(Debug, Parser)]
-#[command(name = "faucet", version, about, long_about = None)]
+#[command(name = "faucet", version, long_version = long_version(), about, long_about = None)]
 pub struct Cli {
     /// Override the global log level (also honors `FAUCET_LOG`).
     #[arg(long, global = true, env = "FAUCET_LOG", default_value = "info")]
@@ -3838,4 +3838,32 @@ pub fn parse_log_retention(raw: &str) -> Result<u64, String> {
     raw.trim()
         .parse()
         .map_err(|e| format!("expected seconds or `auto`: {e}"))
+}
+
+/// `faucet --version`: the release and the tzdata named zones resolve with
+/// (#1116). `-V` prints the release alone.
+pub fn long_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        format!(
+            "{} (tzdata {})",
+            env!("CARGO_PKG_VERSION"),
+            faucet_core::time::TZDATA_VERSION
+        )
+    })
+}
+
+#[cfg(test)]
+mod long_version_tests {
+    #[test]
+    fn long_version_names_the_tzdata_release() {
+        assert_eq!(
+            super::long_version(),
+            format!(
+                "{} (tzdata {})",
+                env!("CARGO_PKG_VERSION"),
+                faucet_core::time::TZDATA_VERSION
+            )
+        );
+    }
 }

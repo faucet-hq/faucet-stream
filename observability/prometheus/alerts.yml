@@ -410,6 +410,20 @@ groups:
             tick cannot be computed (faucet_serve_schedule_compute_errors_total).
             Open the schedule in the console or the server log for the reason.
 
+      - alert: FaucetServeTzdataMixed
+        expr: max(faucet_serve_tzdata_mixed) == 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "faucet serve replicas on one history disagree on tzdata for 30 minutes"
+          description: >-
+            Live members report different tzdata releases, or one reports none
+            (a release on tzdata 2025b). Schedule ticks in zones whose rules
+            changed are held (status held_tzdata) and run at most 1 h 5 min
+            late. Finish the rolling upgrade; /readyz shows each member's
+            capabilities, including tzdata:<release>.
+
       - alert: FaucetServeScheduleRunnerRestarted
         expr: increase(faucet_serve_schedule_runner_restarts_total[1h]) > 0
         labels:

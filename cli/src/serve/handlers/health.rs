@@ -52,6 +52,7 @@ pub async fn readyz(State(state): State<ServerState>) -> impl IntoResponse {
             "persistent": state.persistent_history(),
         },
         "queue_ok": queue_ok,
+        "tzdata": faucet_core::time::TZDATA_VERSION,
         "degraded": degraded,
         "pending_finalize": state.pending_finalize_len(),
         "policy_seed": policy_seed,

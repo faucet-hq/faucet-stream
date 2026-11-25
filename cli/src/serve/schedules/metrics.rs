@@ -11,9 +11,14 @@ pub const OUTCOMES: &[&str] = &[
     "retried",
     "paused",
     "needs_approval",
+    "held_tzdata",
 ];
 
 pub fn describe() {
+    describe_gauge!(
+        "faucet_serve_tzdata_mixed",
+        "1 while live members report different tzdata releases or one reports none (#1116)"
+    );
     describe_gauge!(
         "faucet_serve_schedules_active",
         "Schedules this server ticks (not paused)"
@@ -93,6 +98,12 @@ pub fn active(n: usize) {
 pub fn tick(schedule: &str, outcome: &'static str) {
     counter!("faucet_serve_schedule_ticks_total", "schedule" => schedule.to_string(), "outcome" => outcome)
         .increment(1);
+}
+
+/// 1 while live members report different tzdata releases, or one reports
+/// none (#1116).
+pub fn tzdata_mixed(mixed: bool) {
+    gauge!("faucet_serve_tzdata_mixed").set(if mixed { 1.0 } else { 0.0 });
 }
 
 pub fn missed(schedule: &str, n: u64) {

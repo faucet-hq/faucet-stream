@@ -674,6 +674,14 @@ pub fn set_build_version(version: &'static str) -> bool {
     let first = BUILD_VERSION.set(version).is_ok();
     if first {
         if version != env!("CARGO_PKG_VERSION") {
+            #[cfg(feature = "time-zones")]
+            metrics::gauge!(
+                "faucet_build_info",
+                "version" => env!("CARGO_PKG_VERSION"),
+                "tzdata" => crate::time::TZDATA_VERSION,
+            )
+            .set(0.0);
+            #[cfg(not(feature = "time-zones"))]
             metrics::gauge!("faucet_build_info", "version" => env!("CARGO_PKG_VERSION")).set(0.0);
         }
         register_build_info();
@@ -696,11 +704,22 @@ pub fn build_version() -> &'static str {
 /// this automatically. Gauges are naturally idempotent under the `metrics`
 /// model — repeat calls just re-set the same value.
 ///
+/// With the `time-zones` feature it also carries `tzdata`, the IANA release
+/// named zones resolve with (#1116).
+///
 /// The version label is [`build_version`]: the application's version when it
 /// called [`set_build_version`] (the `faucet` CLI does), else `faucet-core`'s.
 /// Dashboards `group_left` the gauge onto every other metric to annotate
 /// panels with the running version.
 pub fn register_build_info() {
+    #[cfg(feature = "time-zones")]
+    metrics::gauge!(
+        "faucet_build_info",
+        "version" => build_version(),
+        "tzdata" => crate::time::TZDATA_VERSION,
+    )
+    .set(1.0);
+    #[cfg(not(feature = "time-zones"))]
     metrics::gauge!(
         "faucet_build_info",
         "version" => build_version(),
