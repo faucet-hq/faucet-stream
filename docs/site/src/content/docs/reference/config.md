@@ -254,6 +254,9 @@ strftime format produces a clean config error rather than a panic.
   schedule's `timezone`. `${now.date}` therefore reflects the date in the
   timezone the cron fires in (e.g. `America/Los_Angeles`), not UTC. Queued
   runs use their original scheduled time; `--once` uses the current wall clock.
+- Local times use the IANA tzdata compiled into the binary (`faucet
+  --version`). After an upgrade to newer tzdata, a tick near midnight in a
+  zone whose rules changed can render another date or hour.
 
 **Scope:** `${now.*}` tokens (and `${row_id.path}` parent-record references) are
 resolved only in source and sink config values. Using one in a `state:`,

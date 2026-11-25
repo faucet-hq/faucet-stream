@@ -1,0 +1,70 @@
+# Daily tzdata staleness check (#1116, #1118). Named zones resolve through
+# jiff-tzdb (our zone code) and vendor/chrono-tz (Arrow and ORC), both pinned
+# to supply-chain/tzdata-version. When IANA publishes a newer release this
+# opens (or updates) one issue; it never edits the repository. The update is a
+# reviewed PR: bump jiff-tzdb, replace vendor/chrono-tz/tz from the signed
+# IANA tarball, regenerate src/prebuilt, move the pin (vendor/README.md).
+name: tzdata
+
+on:
+  schedule:
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  staleness:
+    name: tzdata release check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compare the pin with IANA and crates.io
+        id: check
+        run: |
+          set -euo pipefail
+          pin=$(tr -d '[:space:]' < supply-chain/tzdata-version)
+          iana=$(curl -fsS --retry 3 https://data.iana.org/time-zones/tzdb/version | tr -d '[:space:]')
+          jiff=$(curl -fsS --retry 3 -H 'User-Agent: tzdata-staleness-check' \
+            https://crates.io/api/v1/crates/jiff-tzdb | jq -r '.crate.max_stable_version')
+          for v in "$pin" "$iana"; do
+            [[ "$v" =~ ^[0-9]{4}[a-z]$ ]] || { echo "unexpected tzdata release name: $v"; exit 1; }
+          done
+          [[ "$jiff" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "unexpected jiff-tzdb version: $jiff"; exit 1; }
+          echo "pin=$pin iana=$iana jiff-tzdb=$jiff"
+          {
+            echo "pin=$pin"
+            echo "iana=$iana"
+            echo "jiff=$jiff"
+            if [[ "$iana" > "$pin" ]]; then echo "stale=1"; else echo "stale=0"; fi
+          } >> "$GITHUB_OUTPUT"
+      - name: Open or update the tracking issue
+        if: steps.check.outputs.stale == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PIN: ${{ steps.check.outputs.pin }}
+          IANA: ${{ steps.check.outputs.iana }}
+          JIFF: ${{ steps.check.outputs.jiff }}
+        run: |
+          title="tzdata ${IANA} released"
+          body="IANA published tzdata ${IANA}; this repository is pinned to ${PIN} (supply-chain/tzdata-version). The newest jiff-tzdb on crates.io is ${JIFF}: check that its \`VERSION\` is ${IANA} before moving the pin.
+
+          Update in one PR, as vendor/README.md describes: bump jiff-tzdb, replace vendor/chrono-tz/tz from the signed IANA tarball, regenerate vendor/chrono-tz/src/prebuilt, move the pin, and list the changed zones in the release notes. The forced-agreement tests in faucet-core fail until all three agree."
+          existing=$(gh issue list --state open --search "in:title \"tzdata\" \"released\"" --json number,title \
+            --jq '.[] | select(.title | startswith("tzdata ")) | .number' | head -n1)
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --title "$title" --body "$body"
+          else
+            gh issue create --title "$title" --label bug --label tier-1 --body "$body"
+          fi

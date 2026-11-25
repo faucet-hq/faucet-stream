@@ -97,6 +97,17 @@ Refused, with a `config error: schedule: invalid cron …` message:
 Set `timezone` to any [IANA timezone name](https://www.iana.org/time-zones)
 (e.g. `America/Los_Angeles`, `Europe/Berlin`, `Asia/Tokyo`). The default is
 `UTC`. Ticks are UTC instants; the cron is read on the zone's wall clock.
+Names match exactly (`europe/london` is refused).
+
+Zone rules come from the IANA tzdata compiled into the binary, never from the
+host: `faucet --version` names the release (for example `2026f`), as do
+`/readyz` and `faucet_build_info{tzdata}`. A release that ships newer tzdata
+can move ticks in zones whose rules changed: tzdata 2026 releases changed
+`America/Vancouver`, `Edmonton`, `Yellowknife`, `Inuvik`, `Winnipeg`,
+`Rainy_River` and `Canada/Pacific`, `Mountain`, `Central` (no fall-back from
+2026-11-01), `America/Havana` and `Cuba` (no fall-back on 2026-11-01),
+`Africa/Casablanca` and `El_Aaiun` (UTC from 2026-09-20) and
+`Europe/Chisinau` and `Tiraspol` (EU transition times since 2022).
 
 What a cron does on a daylight-saving day depends on its kind:
 

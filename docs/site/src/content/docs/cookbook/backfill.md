@@ -110,6 +110,21 @@ names exactly the local day its window covers. Use `24h` when you want a fixed
 amount of elapsed time regardless of the calendar. A fall-back (repeated) hour
 resolves to the earliest instant, matching how `--from`/`--to` dates resolve.
 
+Zone rules come from the tzdata compiled into the binary (`faucet --version`
+names it). A newer release can plan a different window for a unit in a zone
+whose rules changed: in `Africa/Casablanca`, which kept UTC from 2026-09-20,
+the 1-day unit `20260919T230000Z` ended at `2026-09-20T23:00Z` under tzdata
+2025b and ends at `2026-09-21T00:00Z` now. The progress marker therefore
+records each finished unit's end (`{"status": "done_range", "end": ...}`) and
+a unit counts as done only with the same end. A marker written by an older
+release (`{"status": "done"}`, no end) still counts in UTC, in fixed-offset
+zones and for units outside every period where tzdata 2025b gave the zone
+another offset; any other unit runs again (duplicates, never a gap) with one
+warning naming the zone. An older release refuses a marker this one wrote
+rather than misread it. `POST /v1/backfill` labels each unit run
+`backfill_unit_end` and resubmits a unit whose earlier run covered another
+window under a key that names its end.
+
 :::note
 Changing between `1d` and `24h` changes the unit boundaries, so it also changes
 the progress-marker hash — an in-flight backfill will not resume across that

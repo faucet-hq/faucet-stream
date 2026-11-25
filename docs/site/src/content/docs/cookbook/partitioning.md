@@ -91,6 +91,11 @@ Windows are always half-open.
 Tokens: `start`, `end`, `start_date`, `end_date`, `start_unix`, `end_unix`,
 `index`, `id`.
 
+Zone rules come from the tzdata compiled into the binary. After an upgrade to
+newer tzdata, windows in a zone whose rules changed can start at other UTC
+instants, so their ids change and those windows are read afresh (duplicates,
+never a gap).
+
 ### `offset` — countable result sets
 
 ```yaml

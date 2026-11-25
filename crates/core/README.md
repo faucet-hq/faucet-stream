@@ -635,6 +635,21 @@ one module. Range constructors return `Option`, parsers return `TimeError`
 chrono strftime grammar `${now.strftime}` documents. New code should take and
 return these types rather than chrono ones.
 
+Named zones (`time-zones`) resolve through jiff's bundled IANA tzdata
+(`TZDATA_VERSION`, e.g. `2026f`; the host's zoneinfo is never read), not
+chrono-tz, whose last release bundles tzdata 2025b (#1116). `Zone::parse` is
+exact-case, `Zone::is_fixed` tells a fixed offset, and `Zone::resolve_local`
+reports an offset for a civil time only when it is the offset in force at the
+instant it names, so a fold or gap is never invented. The hidden `ChronoZone`
+adapter hands a `Zone` to code that takes a `chrono::TimeZone`.
+`TzdataVersion` parses and orders release names; `changed_since_2025b` lists,
+per zone, the UTC intervals where tzdata 2025b and the current release
+disagree (frozen, see `src/time/fixtures/README.md`), for state written by
+releases on 2025b. Arrow renderings keep using arrow's `Tz` (chrono-tz); this
+workspace builds it from `vendor/chrono-tz` with the same tzdata, and the
+tests fail unless both databases name the release in
+`supply-chain/tzdata-version` and agree on every offset 1970–2099.
+
 ## Declared column types
 
 A source that knows its column types implements `Source::declared_columns`,
@@ -955,7 +970,7 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `schema` | `infer_schema` from record samples |
 | `check` | `CheckContext`, `Probe`, `CheckReport` for `faucet doctor` |
 | `observability` | Pipeline-internal `tracing`/`metrics` decorators; `install_observability` |
-| `time-zones` | `faucet_core::time::Zone`: named IANA zones from the compiled-in database (pulls `chrono-tz`) |
+| `time-zones` | `faucet_core::time::Zone`: named IANA zones from the compiled-in database (pulls `jiff` with `jiff-tzdb`) |
 | `compression` | `CompressionConfig`, `compress_buf` (the `compression` feature) |
 | `file_format` | One format vocabulary for every file connector — `FileFormat` (incl. `from_path` extension detection), `decode` / `encode`, `ContainerDecoder` (Avro / ORC across many files, resolved against the first file's schema), `avro` (OCF read + write, explicit logical-type mapping, schema inference), `orc` (read-only, projection, stripe streaming), `budget` (`DecodeBudget`: `max_decoded_bytes`, what one object or batch may decode to; `decode_bounded` / `decode_owned_bounded` / `ContainerDecoder::with_max_decoded_bytes` apply it to Avro and Excel) |
 | `util` | `quote_ident`, `extract_records`, `check_http_response`, `redact_uri_credentials`, `encode_url_component` (percent-encode one URL path segment or query value) |
