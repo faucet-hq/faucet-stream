@@ -27,7 +27,7 @@ fn head(watermark: u64, bytes: u64, cursor: u64, age_secs: i64) -> (Head, Delive
         epoch: Epoch(1),
         claim: None,
         oldest_undelivered_at: (cursor <= watermark)
-            .then(|| now - chrono::Duration::seconds(age_secs)),
+            .then(|| (now - chrono::Duration::seconds(age_secs)).into()),
     };
     let head = Head {
         feed: FeedUid::new("f1").unwrap(),
@@ -35,7 +35,7 @@ fn head(watermark: u64, bytes: u64, cursor: u64, age_secs: i64) -> (Head, Delive
         watermark: Seq(watermark),
         bytes,
         oldest: Seq(1),
-        now,
+        now: now.into(),
         deliveries: vec![dh.clone()],
     };
     (head, dh)
@@ -137,7 +137,7 @@ fn a_delivery_is_claimed_only_when_its_flush_policy_is_met() {
         id: ClaimId::new("c1").unwrap(),
         to: Seq(9),
         owner: faucet_common_feed::ClaimOwner::new("serve:x").unwrap(),
-        expires_at: now,
+        expires_at: now.into(),
         attached: false,
     });
     assert_eq!(at(&claimed, &idle), Decision::CheckClaim);
@@ -350,7 +350,7 @@ fn ids_keys_and_limits_follow_the_definition() {
     assert_eq!(start_of(StartSpec::Latest), Start::Latest);
     assert_eq!(start_of(StartSpec::Seq(7)), Start::Seq(Seq(7)));
     let t = Utc::now();
-    assert_eq!(start_of(StartSpec::Time(t)), Start::Time(t));
+    assert_eq!(start_of(StartSpec::Time(t)), Start::Time(t.into()));
 }
 
 fn feed(tenant: Option<&str>) -> Feed {

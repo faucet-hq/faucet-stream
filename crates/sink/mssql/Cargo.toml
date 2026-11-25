@@ -29,7 +29,6 @@ tracing.workspace = true
 tiberius.workspace = true
 bb8.workspace = true
 rust_decimal.workspace = true
-chrono.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

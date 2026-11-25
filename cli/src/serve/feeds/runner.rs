@@ -130,7 +130,7 @@ pub fn decide(
     }
     let by_events = pending >= d.flush.max_events;
     let by_age = dh.oldest_undelivered_at.is_some_and(|t| {
-        (head.now - t).num_seconds() >= d.flush.max_age.secs().min(i64::MAX as u64) as i64
+        head.now.since(t).as_secs() >= d.flush.max_age.secs().min(i64::MAX as u64) as i64
     });
     let maybe_bytes = undelivered_bytes >= d.flush.max_bytes.bytes();
     if !(by_events || by_age || maybe_bytes) {
@@ -1249,7 +1249,7 @@ impl Scheduler {
             depth = depth.max(lag);
             let age = dh
                 .oldest_undelivered_at
-                .map(|t| (head.now - t).num_milliseconds().max(0) as f64 / 1000.0)
+                .map(|t| head.now.since(t).as_millis().max(0) as f64 / 1000.0)
                 .unwrap_or(0.0);
             oldest = oldest.max(age);
             metrics::lag(&label, name, lag);

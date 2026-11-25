@@ -12,7 +12,6 @@ use crate::types::{
     NewEvent, Seq, Start, StoreLimits, TenantId,
 };
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use faucet_core::io::CallContext;
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -212,8 +211,8 @@ fn owner(name: &str) -> ClaimOwner {
     ClaimOwner::new(format!("test:{name}")).expect("a valid owner")
 }
 
-fn millis(ms: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp_millis(ms).expect("a valid timestamp")
+fn millis(ms: i64) -> crate::types::Timestamp {
+    crate::types::Timestamp::from_unix_millis(ms).expect("a valid timestamp")
 }
 
 fn full_limit(result: Result<AppendAck>) -> FullLimit {
@@ -1286,7 +1285,13 @@ pub async fn bound_seq_at_and_heads(backend: &dyn Backend) {
     };
     assert_eq!(at(millis(0)).await, Seq(1));
     assert_eq!(at(between).await, Seq(6));
-    assert_eq!(at(before + chrono::Duration::days(1)).await, Seq(8));
+    assert_eq!(
+        at(before
+            .checked_add(faucet_core::time::Span::from_days(1).unwrap())
+            .unwrap())
+        .await,
+        Seq(8)
+    );
     let timed = DeliveryUid::generate(feed.clone());
     let state = f
         .store

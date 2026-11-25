@@ -1033,7 +1033,7 @@ fn build_events(
             None => piece.payload,
         };
         let mut event = NewEvent::new(piece.content_type, payload)
-            .received_at(received_at)
+            .received_at(received_at.into())
             .sealed(sealed);
         if sealed {
             event = event.plain_size(sizes[i]);

@@ -397,7 +397,7 @@ pub fn start_of(start: crate::serve::history::feeds::StartSpec) -> Start {
         StartSpec::Earliest => Start::Earliest,
         StartSpec::Latest => Start::Latest,
         StartSpec::Seq(n) => Start::Seq(faucet_common_feed::Seq(n)),
-        StartSpec::Time(t) => Start::Time(t),
+        StartSpec::Time(t) => Start::Time(t.into()),
     }
 }
 

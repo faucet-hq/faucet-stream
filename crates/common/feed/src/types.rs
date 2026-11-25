@@ -1,14 +1,13 @@
 //! The feed store's data types.
 
 use crate::error::FeedError;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
 /// A point in time as the store reports it.
-pub type Timestamp = DateTime<Utc>;
+pub type Timestamp = faucet_core::time::Timestamp;
 
 const MAX_ID_LEN: usize = 128;
 
@@ -222,7 +221,7 @@ impl NewEvent {
     /// An event received now.
     pub fn new(content_type: impl Into<String>, payload: impl Into<Vec<u8>>) -> Self {
         Self {
-            received_at: Utc::now(),
+            received_at: Timestamp::now(),
             content_type: content_type.into(),
             headers: BTreeMap::new(),
             payload: payload.into(),

@@ -174,7 +174,7 @@ pub(crate) fn count_of(value: i64) -> u64 {
 }
 
 pub(crate) fn time_of(ms: i64) -> Result<Timestamp> {
-    chrono::DateTime::from_timestamp_millis(ms)
+    Timestamp::from_unix_millis(ms)
         .ok_or_else(|| FeedError::Corrupt(format!("timestamp {ms} is out of range")))
 }
 
@@ -392,7 +392,7 @@ macro_rules! impl_feed_store {
                      WHERE feed = ? AND lane = 0 AND stored_at >= ?"
                 ))
                 .bind(feed.as_str())
-                .bind(time.timestamp_millis())
+                .bind(time.unix_millis())
                 .fetch_one(&mut **tx)
                 .await
                 .map_err(Self::be)?;
@@ -867,7 +867,7 @@ macro_rules! impl_feed_store {
                             .bind(feed.as_str())
                             .bind(seq)
                             .bind(id.clone())
-                            .bind(event.received_at.timestamp_millis())
+                            .bind(event.received_at.unix_millis())
                             .bind(event.content_type)
                             .bind(headers)
                             .bind(event.payload)
@@ -1016,7 +1016,7 @@ macro_rules! impl_feed_store {
                         let holder: Option<String> = row.try_get(12).map_err(Self::be)?;
                         let expires: Option<i64> = row.try_get(13).map_err(Self::be)?;
                         let undelivered: Option<i64> = row.try_get(14).map_err(Self::be)?;
-                        let now = head.now.timestamp_millis();
+                        let now = head.now.unix_millis();
                         let claim = match (claim_id, claim_to, claim_owner, expires) {
                             (Some(id), Some(to), Some(owner), Some(expires)) if expires > now => {
                                 Some(ClaimInfo {
