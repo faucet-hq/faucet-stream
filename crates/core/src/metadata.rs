@@ -622,6 +622,12 @@ mod tests {
         assert_eq!(r0["_faucet_source"], "rest");
         assert!(r0["_faucet_extracted_at"].is_string());
         assert!(r0["_faucet_loaded_at"].is_string());
+        let loaded = r0["_faucet_loaded_at"].as_str().unwrap();
+        let spelled = loaded.len() == 24 && loaded.ends_with('Z') && loaded.as_bytes()[19] == b'.';
+        assert!(
+            spelled,
+            "loaded_at must be RFC 3339 millis with Z: {loaded}"
+        );
         // Sequence is monotonic across records.
         assert_eq!(
             stamped[0]["_faucet_sequence"].as_u64().unwrap() + 1,
