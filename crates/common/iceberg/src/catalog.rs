@@ -33,6 +33,7 @@ use crate::config::{CatalogConfig, CatalogInner};
 /// - The catalog client fails to initialise (bad URI, auth failure, etc.).
 pub async fn build_catalog(cfg: &CatalogConfig) -> Result<Arc<dyn Catalog>, FaucetError> {
     faucet_core::ensure_crypto_provider();
+    crate::config::warn_unread_properties(cfg.kind(), &cfg.inner().properties);
     match cfg {
         CatalogConfig::Rest(inner) => build_rest(inner).await,
         CatalogConfig::Glue(inner) => build_glue(inner).await,
@@ -61,6 +62,16 @@ async fn build_rest(inner: &CatalogInner) -> Result<Arc<dyn Catalog>, FaucetErro
     if let Some(credential) = &inner.credential {
         // REST catalog treats a `token` property as the bearer token.
         props.insert("token".to_string(), credential.clone());
+    }
+    if let Some(delegation) = inner.access_delegation
+        && !props
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case(crate::config::ACCESS_DELEGATION_PROP))
+    {
+        props.insert(
+            crate::config::ACCESS_DELEGATION_PROP.to_string(),
+            delegation.header_value().to_string(),
+        );
     }
 
     if let Some(policy) =
@@ -395,6 +406,7 @@ mod tests {
             warehouse: None,
             credential: None,
             properties: Default::default(),
+            access_delegation: None,
         }
     }
 
@@ -447,6 +459,7 @@ mod tests {
                     .iter()
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
+                access_delegation: None,
             })
         };
         let dir = tempfile::tempdir().unwrap();

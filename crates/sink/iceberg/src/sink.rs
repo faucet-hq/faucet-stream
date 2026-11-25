@@ -101,6 +101,13 @@ struct SinkState {
 
     /// Record fields the table schema lacks, already warned about once.
     warned_fields: std::collections::HashSet<String>,
+
+    /// The storage preflight ran on a handle of this instance.
+    preflighted: bool,
+
+    /// The handle kept after a commit could not carry the storage settings
+    /// over: the next writer must reload the table, or fail.
+    storage_stale: bool,
 }
 
 impl SinkState {
@@ -112,7 +119,26 @@ impl SinkState {
             pending_commit: None,
             poisoned: None,
             warned_fields: std::collections::HashSet::new(),
+            preflighted: false,
+            storage_stale: false,
         }
+    }
+
+    /// Keep `committed`'s metadata with `storage`'s `FileIO`; when the handle
+    /// cannot be rebuilt keep `committed` and make the next writer reload.
+    fn keep_committed(&mut self, committed: Table, storage: &Table) {
+        self.table = Some(match with_storage_of(&committed, storage) {
+            Ok(table) => table,
+            Err(e) => {
+                tracing::warn!(
+                    table = %faucet_common_iceberg::preflight::table_name(&committed),
+                    "iceberg: could not carry the storage settings over to the committed table \
+                     handle ({e}); the next write reloads the table and fails if that reload fails"
+                );
+                self.storage_stale = true;
+                committed
+            }
+        });
     }
 
     /// Fail when an earlier write poisoned the sink.
@@ -166,6 +192,24 @@ const MAX_PROPERTY_SCOPE: usize = 200;
 /// The key an earlier release wrote a long scope's token under.
 fn legacy_token_property(scope: &str) -> String {
     format!("{}.{scope}", faucet_core::idempotency::ICEBERG_TOKEN_PROP)
+}
+
+/// `committed`'s metadata and metadata location with `storage`'s `FileIO`.
+///
+/// A commit returns a handle whose `FileIO` holds only the catalog's own
+/// properties (a commit response carries no table config), so a catalog's
+/// vended credentials would be lost. The rebuilt handle has no KMS client and
+/// runs on the current tokio runtime, as the catalog's handles do.
+fn with_storage_of(committed: &Table, storage: &Table) -> Result<Table, iceberg::Error> {
+    let builder = Table::builder()
+        .identifier(committed.identifier().clone())
+        .metadata(committed.metadata_ref())
+        .file_io(storage.file_io().clone())
+        .runtime(iceberg::Runtime::try_current()?);
+    match committed.metadata_location() {
+        Some(location) => builder.metadata_location(location.to_string()).build(),
+        None => builder.build(),
+    }
 }
 
 // ── IcebergSink ───────────────────────────────────────────────────────────────
@@ -243,11 +287,179 @@ impl IcebergDriver {
             None
         };
 
-        Ok(Self {
+        let driver = Self {
             config,
             catalog,
-            state: Mutex::new(SinkState::new(preloaded)),
+            state: Mutex::new(SinkState::new(None)),
+        };
+        if let Some(table) = preloaded {
+            let verdict = driver.storage_verdict(&table).await;
+            driver.apply_verdict(verdict)?;
+            let mut state = driver.state.lock().await;
+            state.table = Some(table);
+            state.preflighted = true;
+        }
+        Ok(driver)
+    }
+
+    /// The table's storage checked against the configured credentials.
+    async fn storage_verdict(
+        &self,
+        table: &Table,
+    ) -> faucet_common_iceberg::preflight::StorageVerdict {
+        let inner = self.config.catalog.inner();
+        let expect = faucet_common_iceberg::preflight::StorageExpectation::new(
+            &inner.properties,
+            inner.access_delegation,
+        );
+        faucet_common_iceberg::preflight::check_table_storage(table, &expect).await
+    }
+
+    /// Fail on a refusal, log a warning.
+    fn apply_verdict(
+        &self,
+        verdict: faucet_common_iceberg::preflight::StorageVerdict,
+    ) -> Result<(), FaucetError> {
+        use faucet_common_iceberg::preflight::StorageVerdict;
+        match verdict {
+            StorageVerdict::Refuse(e) => Err(e),
+            StorageVerdict::Warn(w) => {
+                tracing::warn!(table = %self.config.table, "{w}");
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// `faucet doctor`'s `storage` probe: the table's storage checked with the
+    /// credentials the catalog hands out, bounded by `ctx.timeout`.
+    async fn storage_probe(
+        &self,
+        calls: &CallSlot,
+        ctx: &faucet_core::check::CheckContext,
+        tid: &TableIdent,
+    ) -> faucet_core::check::Probe {
+        use faucet_common_iceberg::preflight::StorageVerdict;
+        use faucet_core::check::Probe;
+        let started = std::time::Instant::now();
+        let hint = "Give the storage credentials: have the catalog vend them \
+                    (catalog.access_delegation: vended_credentials) or set them in \
+                    catalog.properties.";
+        let checked = tokio::time::timeout(ctx.timeout, async {
+            let table = self
+                .catalog
+                .load_table(tid)
+                .within(calls, "catalog")
+                .await?
+                .map_err(|e| FaucetError::Sink(format!("iceberg: load_table failed: {e}")))?;
+            calls
+                .call_once("probe", async { Ok(self.storage_verdict(&table).await) })
+                .await
         })
+        .await;
+        match checked {
+            Ok(Ok(StorageVerdict::Refuse(e))) => {
+                Probe::fail_hint("storage", started.elapsed(), e.to_string(), hint)
+            }
+            Ok(Ok(StorageVerdict::Warn(w))) => {
+                Probe::fail_hint("storage", started.elapsed(), w, hint)
+            }
+            Ok(Ok(_)) => Probe::pass("storage", started.elapsed()),
+            Ok(Err(e)) => Probe::fail_hint("storage", started.elapsed(), e.to_string(), hint),
+            Err(_) => Probe::fail_hint(
+                "storage",
+                started.elapsed(),
+                format!("iceberg storage probe timed out after {:?}", ctx.timeout),
+                "Check network reachability to the object store.",
+            ),
+        }
+    }
+
+    /// Run the storage preflight once per instance, before its first writer.
+    async fn preflight(
+        &self,
+        calls: &CallSlot,
+        state: &mut SinkState,
+        table: &Table,
+    ) -> Result<(), FaucetError> {
+        if state.preflighted {
+            return Ok(());
+        }
+        let verdict = calls
+            .call_once("probe", async { Ok(self.storage_verdict(table).await) })
+            .await;
+        match verdict {
+            Ok(v) => self.apply_verdict(v)?,
+            Err(e @ FaucetError::Cancelled { .. }) => return Err(e),
+            Err(e) => tracing::warn!(
+                table = %self.config.table,
+                "iceberg: the storage check of table '{}' did not finish ({e}); the first write \
+                 will show whether the storage works",
+                self.config.table
+            ),
+        }
+        state.preflighted = true;
+        Ok(())
+    }
+
+    /// Reload the table only to take fresh storage settings: its metadata and
+    /// metadata location stay those of `table`, so a catalog that lags behind a
+    /// commit of this run can never bring an older schema back.
+    async fn refresh_storage(
+        &self,
+        calls: &CallSlot,
+        state: &mut SinkState,
+        table: Table,
+    ) -> Result<Table, FaucetError> {
+        let ident = table.identifier().clone();
+        let name = faucet_common_iceberg::preflight::table_name(&table);
+        let reloaded = calls
+            .call_once("catalog", async {
+                Ok(self.catalog.load_table(&ident).await)
+            })
+            .await;
+        let failure = match reloaded {
+            Ok(Ok(fresh)) if fresh.metadata().uuid() != table.metadata().uuid() => {
+                return Err(FaucetError::Sink(format!(
+                    "iceberg: table '{name}' was replaced by another table (uuid changed) during \
+                     the run; nothing of this page was written"
+                )));
+            }
+            Ok(Ok(fresh)) => match with_storage_of(&table, &fresh) {
+                Ok(refreshed) => {
+                    state.storage_stale = false;
+                    state.table = Some(refreshed.clone());
+                    return Ok(refreshed);
+                }
+                Err(e) => e.to_string(),
+            },
+            Ok(Err(e))
+                if matches!(
+                    e.kind(),
+                    ErrorKind::TableNotFound | ErrorKind::NamespaceNotFound
+                ) =>
+            {
+                return Err(FaucetError::Sink(format!(
+                    "iceberg: table '{name}' no longer exists in the catalog; nothing of this \
+                     page was written"
+                )));
+            }
+            Ok(Err(e)) => e.to_string(),
+            Err(e @ FaucetError::Cancelled { .. }) => return Err(e),
+            Err(e) => e.to_string(),
+        };
+        if state.storage_stale {
+            return Err(FaucetError::Sink(format!(
+                "iceberg: could not reload table '{name}' to restore its storage settings: \
+                 {failure}"
+            )));
+        }
+        tracing::warn!(
+            table = %name,
+            "iceberg: could not refresh the storage credentials of table '{name}' before \
+             writing ({failure}); continuing with the previous ones"
+        );
+        Ok(table)
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -295,24 +507,39 @@ impl IcebergDriver {
         Ok(Some(builder.build()))
     }
 
-    /// Resolve the table from state, creating it when `create_if_missing` is
-    /// set and no table exists yet.
-    ///
-    /// Returns a reference-counted clone of the resolved `Table`. Mutates
-    /// `state.table` in place on first creation.
-    async fn resolve_table(
+    /// The table to write `records` to: loaded or created on the first write;
+    /// before a new writer opens, its storage credentials are refreshed when
+    /// the catalog vended them (they expire) or the handle lost them, and the
+    /// storage is checked once per instance.
+    async fn table_for_write(
         &self,
         calls: &CallSlot,
         state: &mut SinkState,
         records: &[Value],
     ) -> Result<Table, FaucetError> {
-        if let Some(ref table) = state.table {
-            return Ok(table.clone());
+        let table = match state.table.clone() {
+            None => {
+                let table = calls
+                    .call_once("catalog", self.load_or_create_table(records))
+                    .await?;
+                state.table = Some(table.clone());
+                table
+            }
+            Some(table)
+                if state.writer.is_none()
+                    && (state.storage_stale
+                        || faucet_common_iceberg::holds_vended_credentials(
+                            table.file_io().config().props(),
+                            &self.config.catalog.inner().properties,
+                        )) =>
+            {
+                self.refresh_storage(calls, state, table).await?
+            }
+            Some(table) => table,
+        };
+        if state.writer.is_none() {
+            self.preflight(calls, state, &table).await?;
         }
-        let table = calls
-            .call_once("catalog", self.load_or_create_table(records))
-            .await?;
-        state.table = Some(table.clone());
         Ok(table)
     }
 
@@ -428,7 +655,7 @@ impl IcebergDriver {
             return Ok(0);
         }
 
-        let table = self.resolve_table(calls, state, records).await?;
+        let table = self.table_for_write(calls, state, records).await?;
         self.ensure_writer(calls, state, &table).await?;
 
         // Convert to Arrow using the table's current schema.
@@ -596,9 +823,9 @@ impl IcebergDriver {
             }
         };
 
-        // Update the stored table handle so subsequent writes use the latest
-        // metadata (snapshot ID, manifest list, etc.).
-        state.table = Some(updated_table);
+        // The committed metadata, with the storage settings of the handle the
+        // data files were written through.
+        state.keep_committed(updated_table, &table);
         Ok(())
     }
 }
@@ -838,6 +1065,7 @@ impl SinkDriver for IcebergDriver {
             Err(spent) => Err(spent.to_string()),
         });
 
+        let exists = matches!(probe_result, Ok(Ok(true)));
         let probe = match probe_result {
             // The catalog responded — it's reachable, so the probe passes
             // whether or not the target table exists yet (create_if_missing
@@ -856,8 +1084,18 @@ impl SinkDriver for IcebergDriver {
                 "Check network reachability to the catalog endpoint.",
             ),
         };
-
-        Ok(CheckReport::single(probe))
+        let catalog_passed = matches!(probe.status, faucet_core::check::ProbeStatus::Pass);
+        let mut report = CheckReport::single(probe);
+        if catalog_passed {
+            report.probes.push(match exists {
+                true => self.storage_probe(calls, ctx, &tid).await,
+                false => Probe::skip(
+                    "storage",
+                    "the table does not exist yet; its storage is checked when the run creates it",
+                ),
+            });
+        }
+        Ok(report)
     }
 
     fn write_modes(&self) -> &'static [faucet_core::WriteMode] {
@@ -1054,7 +1292,7 @@ impl SchemaDriver for IcebergDriver {
         calls
             .call_once("write", Self::close_writer(&mut state))
             .await?;
-        state.table = Some(evolved);
+        state.keep_committed(evolved, &table);
         Ok(())
     }
 }
@@ -1115,7 +1353,7 @@ impl IcebergDriver {
 
         // Resolve table (and potentially create it) from the full record set so
         // schema inference uses all records.
-        let table = self.resolve_table(calls, &mut state, records).await?;
+        let table = self.table_for_write(calls, &mut state, records).await?;
         let arrow_schema = iceberg_to_arrow_schema(table.metadata().current_schema())?;
         state.warn_dropped_fields(&arrow_schema, records);
 
@@ -1546,6 +1784,123 @@ mod tests {
 
         let result = IcebergSink::build_partition_spec(&pfs, &iceberg_schema).unwrap();
         assert!(result.is_some(), "should produce a partition spec");
+    }
+
+    // ── Storage settings across commits (#1110) ─────────────────────────────
+
+    fn local_table(location: &str, props: &[(&str, &str)]) -> Table {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, TableMetadataBuilder, Type};
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+        let metadata = TableMetadataBuilder::from_table_creation(
+            TableCreation::builder()
+                .name("t".to_string())
+                .location(location.to_string())
+                .schema(schema)
+                .build(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let mut io = iceberg::io::FileIOBuilder::new(Arc::new(iceberg::io::LocalFsStorageFactory));
+        for (k, v) in props {
+            io = io.with_prop(*k, *v);
+        }
+        Table::builder()
+            .identifier(TableIdent::from_strs(["ns", "t"]).unwrap())
+            .metadata(metadata)
+            .metadata_location(format!("{location}/metadata/v1.json"))
+            .file_io(io.build())
+            .runtime(iceberg::Runtime::try_current().unwrap())
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_committed_handle_keeps_the_storage_or_marks_it_stale() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (committed, storage) = rt.block_on(async {
+            (
+                local_table("/tmp/wh/committed", &[]),
+                local_table("/tmp/wh/storage", &[("s3.session-token", "vended")]),
+            )
+        });
+        let token = |t: &Table| {
+            t.file_io()
+                .config()
+                .props()
+                .get("s3.session-token")
+                .cloned()
+        };
+
+        let rebuilt = rt.block_on(async { with_storage_of(&committed, &storage).unwrap() });
+        assert_eq!(rebuilt.metadata().uuid(), committed.metadata().uuid());
+        assert_eq!(rebuilt.metadata_location(), committed.metadata_location());
+        assert_eq!(token(&rebuilt).as_deref(), Some("vended"));
+
+        let mut state = SinkState::new(None);
+        rt.block_on(async { state.keep_committed(committed.clone(), &storage) });
+        assert!(!state.storage_stale);
+        assert_eq!(
+            token(state.table.as_ref().unwrap()).as_deref(),
+            Some("vended")
+        );
+
+        // Outside a runtime the handle cannot be rebuilt.
+        let mut state = SinkState::new(None);
+        state.keep_committed(committed.clone(), &storage);
+        assert!(state.storage_stale, "the next writer must reload");
+        let kept = state.table.as_ref().unwrap();
+        assert_eq!(kept.metadata().uuid(), committed.metadata().uuid());
+        assert_eq!(token(kept), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_reload_fails_the_write_only_when_the_handle_lost_its_storage() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"defaults": {}, "overrides": {}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let config: IcebergSinkConfig = serde_json::from_value(serde_json::json!({
+            "catalog": {"type": "rest", "uri": server.uri()},
+            "namespace": ["ns"],
+            "table": "t"
+        }))
+        .unwrap();
+        let driver = IcebergDriver::new(config).await.unwrap();
+        let calls = CallSlot::default();
+        let table = local_table("/tmp/wh/t", &[]);
+
+        let mut state = SinkState::new(None);
+        let kept = driver
+            .refresh_storage(&calls, &mut state, table.clone())
+            .await
+            .unwrap();
+        assert_eq!(kept.metadata().uuid(), table.metadata().uuid());
+
+        state.storage_stale = true;
+        let err = driver
+            .refresh_storage(&calls, &mut state, table)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not reload table 'ns.t'"), "{err}");
     }
 
     // ── max_token_for_scope (exactly-once watermark resolution) ─────────────

@@ -1,0 +1,47 @@
+version: 1
+name: postgres-to-iceberg-vended
+# Stream a PostgreSQL table into an Apache Iceberg table through a REST catalog
+# that vends storage credentials. faucet holds no storage keys: the catalog
+# hands out short-lived ones with each table, and the sink takes fresh ones
+# before each new data file, so a run longer than their lifetime keeps writing.
+#
+# Run:
+#   faucet doctor cli/examples/postgres_to_iceberg_rest_vended.yaml
+#   faucet run cli/examples/postgres_to_iceberg_rest_vended.yaml
+#
+# Prereqs:
+#   - A PostgreSQL instance reachable at localhost:5432.
+#   - A REST catalog that vends credentials, at http://localhost:8181/catalog,
+#     with a warehouse named `lake` on an S3-compatible store.
+#   - The store reachable from this host at http://localhost:9000.
+
+pipeline:
+  source:
+    type: postgres
+    config:
+      connection_url: "postgres://faucet:faucet@localhost:5432/appdb"
+      query: "SELECT * FROM users"
+      batch_size: 10000
+
+  sink:
+    type: iceberg
+    config:
+      catalog:
+        type: rest
+        uri: "http://localhost:8181/catalog"
+        warehouse: "lake"
+        # Ask for short-lived storage credentials with each table. Catalogs
+        # that vend them unasked need no setting.
+        access_delegation: vended_credentials
+        # How to reach the store; no keys. Static s3.access-key-id /
+        # s3.secret-access-key would be mixed with the vended session token,
+        # which the store refuses.
+        properties:
+          s3.endpoint: "http://localhost:9000"
+          s3.region: us-east-1
+          s3.path-style-access: "true"
+      namespace: ["analytics"]
+      table: "users"
+      create_if_missing: true
+      write_mode: append
+      batch_size: 10000

@@ -171,6 +171,153 @@ pub fn check_glue_client(
     Ok(())
 }
 
+// ── Properties faucet reads ──────────────────────────────────────────────────
+
+/// Storage property names `iceberg-rust` 0.11 and its OpenDAL storage read,
+/// plus faucet's own legacy GCS endpoint name.
+const STORAGE_PROPS: &[&str] = &[
+    "s3.endpoint",
+    "s3.access-key-id",
+    "s3.secret-access-key",
+    "s3.session-token",
+    "s3.region",
+    "client.region",
+    "s3.path-style-access",
+    "s3.sse.type",
+    "s3.sse.key",
+    "s3.sse.md5",
+    "client.assume-role.arn",
+    "client.assume-role.external-id",
+    "client.assume-role.session-name",
+    "s3.allow-anonymous",
+    "s3.disable-ec2-metadata",
+    "s3.disable-config-load",
+    "gcs.project-id",
+    "gcs.service.host",
+    "gcs.service.path",
+    "gcs.user-project",
+    "gcs.no-auth",
+    "gcs.credentials-json",
+    "gcs.oauth2.token",
+    "gcs.allow-anonymous",
+    "gcs.disable-vm-metadata",
+    "gcs.disable-config-load",
+    "adls.connection-string",
+    "adls.account-name",
+    "adls.account-key",
+    "adls.sas-token",
+    "adls.tenant-id",
+    "adls.client-id",
+    "adls.client-secret",
+    "adls.authority-host",
+    "oss.endpoint",
+    "oss.access-key-id",
+    "oss.access-key-secret",
+    "hf.token",
+    "hf.endpoint",
+    "hf.revision",
+];
+
+/// Names each catalog client reads from `catalog.properties` (besides the
+/// storage ones). `uri` and `warehouse` are read when written there too.
+fn catalog_props(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "rest" => &[
+            "uri",
+            "warehouse",
+            "prefix",
+            "token",
+            "credential",
+            "oauth2-server-uri",
+            "scope",
+            "audience",
+            "resource",
+            "rest.auth.type",
+            "disable-header-redaction",
+        ],
+        "glue" => &[
+            "uri",
+            "warehouse",
+            "catalog_id",
+            "profile_name",
+            "region_name",
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "aws_session_token",
+        ],
+        "sql" => &[
+            "uri",
+            "warehouse",
+            "sql.bind-style",
+            "sql_bind_style",
+            "sql.schema-version",
+            "pool.max-connections",
+            "pool.idle-timeout",
+            "pool.test-before-acquire",
+        ],
+        "hms" => &[
+            "uri",
+            "warehouse",
+            "thrift_transport",
+            "hms.lock-timeout-ms",
+        ],
+        _ => &[],
+    }
+}
+
+/// What to say about a name another Iceberg client reads and faucet does not.
+fn unread_hint(name: &str) -> Option<&'static str> {
+    match name {
+        "rest.vended-credentials-enabled" => {
+            Some("; set access_delegation: vended_credentials on the catalog")
+        }
+        "io-impl" | "py-io-impl" => Some("; faucet picks the storage from each file's scheme"),
+        "s3.remote-signing-enabled" => {
+            Some("; S3 remote signing is not supported, use vended credentials or static keys")
+        }
+        _ => None,
+    }
+}
+
+/// The `catalog.properties` names a `kind` catalog does not read, sorted, each
+/// with a hint when faucet has its own setting for it.
+pub fn unread_properties(
+    kind: &str,
+    props: &HashMap<String, String>,
+) -> Vec<(String, Option<&'static str>)> {
+    let mut unread: Vec<(String, Option<&'static str>)> = props
+        .keys()
+        .filter(|k| {
+            !(STORAGE_PROPS.contains(&k.as_str())
+                || catalog_props(kind).contains(&k.as_str())
+                || (kind == "rest" && k.starts_with("header.")))
+        })
+        .map(|k| (k.clone(), unread_hint(k)))
+        .collect();
+    unread.sort();
+    unread
+}
+
+/// Warn once per process for each `catalog.properties` name a `kind` catalog
+/// does not read.
+pub fn warn_unread_properties(kind: &str, props: &HashMap<String, String>) {
+    static WARNED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+    for (name, hint) in unread_properties(kind, props) {
+        let key = (kind.to_string(), name.clone());
+        let mut warned = WARNED.lock().unwrap_or_else(|p| p.into_inner());
+        if warned.contains(&key) {
+            continue;
+        }
+        warned.push(key);
+        tracing::warn!(
+            catalog = kind,
+            property = %name,
+            "iceberg: catalog.properties.{name} is not read by faucet{}",
+            hint.unwrap_or("")
+        );
+    }
+}
+
 // ── Catalog config ────────────────────────────────────────────────────────────
 
 /// Configuration fields shared by every catalog variant.
@@ -222,6 +369,73 @@ pub struct CatalogInner {
         "warehouse": "path"
     }))]
     pub properties: HashMap<String, String>,
+
+    /// REST catalog only: how the catalog should give faucet access to table
+    /// storage. `vended_credentials` asks for short-lived storage credentials
+    /// with each table (it sends `X-Iceberg-Access-Delegation:
+    /// vended-credentials`). A catalog that hands them out unasked needs no
+    /// setting. Refused on the `glue`, `sql` and `hms` catalogs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_delegation: Option<AccessDelegation>,
+}
+
+/// How a REST catalog gives the client access to table storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AccessDelegation {
+    /// Short-lived storage credentials returned with each table.
+    VendedCredentials,
+}
+
+impl AccessDelegation {
+    /// The `X-Iceberg-Access-Delegation` header value.
+    pub fn header_value(self) -> &'static str {
+        match self {
+            AccessDelegation::VendedCredentials => "vended-credentials",
+        }
+    }
+}
+
+/// The `catalog.properties` key that sends the access-delegation header (the
+/// REST catalog client forwards every `header.*` property).
+pub const ACCESS_DELEGATION_PROP: &str = "header.X-Iceberg-Access-Delegation";
+
+/// The storage properties that carry a credential that expires: an S3 session
+/// token, a GCS OAuth token, an ADLS SAS token.
+pub const EXPIRING_CREDENTIAL_PROPS: [&str; 3] =
+    ["s3.session-token", "gcs.oauth2.token", "adls.sas-token"];
+
+/// Whether `storage` (a table's merged storage properties) holds an expiring
+/// credential the user did not write in `user` (`catalog.properties`): one the
+/// catalog handed out, which has to be fetched again before it expires.
+pub fn holds_vended_credentials(
+    storage: &HashMap<String, String>,
+    user: &HashMap<String, String>,
+) -> bool {
+    EXPIRING_CREDENTIAL_PROPS.iter().any(|k| {
+        storage
+            .get(*k)
+            .filter(|v| !v.trim().is_empty())
+            .is_some_and(|v| user.get(*k) != Some(v))
+    })
+}
+
+fn truthy(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes" | "on" | "t"
+    )
+}
+
+/// The `header.X-Iceberg-Access-Delegation` values set in `props`, whatever
+/// the letter case of the key.
+fn delegation_headers(props: &HashMap<String, String>) -> Vec<&str> {
+    props
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case(ACCESS_DELEGATION_PROP))
+        .map(|(_, v)| v.as_str())
+        .collect()
 }
 
 /// Iceberg catalog type and its connection settings.
@@ -331,6 +545,39 @@ impl CatalogConfig {
             return Err(FaucetError::Config(format!(
                 "iceberg: catalog '{kind}' requires a non-empty `uri`"
             )));
+        }
+        let inner = self.inner();
+        let headers = delegation_headers(&inner.properties);
+        let remote_signing = headers
+            .iter()
+            .any(|v| v.to_ascii_lowercase().contains("remote-signing"))
+            || inner
+                .properties
+                .get("s3.remote-signing-enabled")
+                .is_some_and(|v| truthy(v));
+        if remote_signing {
+            return Err(FaucetError::Config(
+                "iceberg: S3 remote signing is not supported; use access_delegation: \
+                 vended_credentials or static keys in catalog.properties"
+                    .to_string(),
+            ));
+        }
+        if let Some(delegation) = inner.access_delegation {
+            if !matches!(self, CatalogConfig::Rest(_)) {
+                return Err(FaucetError::Config(format!(
+                    "iceberg: access_delegation applies to the rest catalog only (catalog '{kind}')"
+                )));
+            }
+            if headers
+                .iter()
+                .any(|v| !v.trim().eq_ignore_ascii_case(delegation.header_value()))
+            {
+                return Err(FaucetError::Config(
+                    "iceberg: catalog.properties sets the X-Iceberg-Access-Delegation header to \
+                     another value than access_delegation"
+                        .to_string(),
+                ));
+            }
         }
         if !matches!(self, CatalogConfig::Rest(_)) {
             let warehouse = self.inner().warehouse.as_deref().unwrap_or("");
@@ -506,6 +753,244 @@ mod tests {
             .filter(|r| r.kind == ResourceKind::Url && policy.check(r).is_err())
             .count();
         assert_eq!(refused, 4);
+    }
+
+    #[test]
+    fn access_delegation_is_a_rest_setting_that_names_its_header() {
+        let rest = cat(serde_json::json!({
+            "type": "rest", "uri": "http://c", "access_delegation": "vended_credentials"
+        }));
+        assert_eq!(
+            rest.inner().access_delegation,
+            Some(AccessDelegation::VendedCredentials)
+        );
+        assert_eq!(
+            AccessDelegation::VendedCredentials.header_value(),
+            "vended-credentials"
+        );
+        rest.validate_connection().unwrap();
+        let json = serde_json::to_value(&rest).unwrap();
+        assert_eq!(json["access_delegation"], "vended_credentials");
+        let plain =
+            serde_json::to_value(cat(serde_json::json!({"type": "rest", "uri": "http://c"})))
+                .unwrap();
+        assert!(plain.get("access_delegation").is_none());
+        let unknown = serde_json::from_value::<CatalogConfig>(serde_json::json!({
+            "type": "rest", "uri": "http://c", "access_delegation": "remote_signing"
+        }));
+        assert!(unknown.is_err());
+
+        for kind in ["glue", "sql", "hms"] {
+            let err = cat(serde_json::json!({
+                "type": kind, "uri": "thrift://h", "warehouse": "s3://b/w",
+                "access_delegation": "vended_credentials"
+            }))
+            .validate_connection()
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(&format!("rest catalog only (catalog '{kind}')")),
+                "{err}"
+            );
+        }
+        let same = cat(serde_json::json!({
+            "type": "rest", "uri": "http://c", "access_delegation": "vended_credentials",
+            "properties": {"header.x-iceberg-access-delegation": " Vended-Credentials "}
+        }));
+        same.validate_connection().unwrap();
+        let other = cat(serde_json::json!({
+            "type": "rest", "uri": "http://c", "access_delegation": "vended_credentials",
+            "properties": {"header.X-ICEBERG-ACCESS-DELEGATION": "something-else"}
+        }))
+        .validate_connection()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            other.contains("another value than access_delegation"),
+            "{other}"
+        );
+    }
+
+    #[test]
+    fn remote_signing_is_refused_by_name() {
+        for props in [
+            serde_json::json!({"header.X-Iceberg-Access-Delegation": "remote-signing"}),
+            serde_json::json!({"header.x-iceberg-access-delegation": "vended-credentials,remote-signing"}),
+            serde_json::json!({"s3.remote-signing-enabled": "true"}),
+        ] {
+            let err =
+                cat(serde_json::json!({"type": "rest", "uri": "http://c", "properties": props}))
+                    .validate_connection()
+                    .unwrap_err()
+                    .to_string();
+            assert!(err.contains("S3 remote signing is not supported"), "{err}");
+        }
+        cat(serde_json::json!({
+            "type": "rest", "uri": "http://c", "properties": {"s3.remote-signing-enabled": "false"}
+        }))
+        .validate_connection()
+        .unwrap();
+    }
+
+    #[test]
+    fn vended_credentials_are_the_expiring_ones_the_user_did_not_write() {
+        let p = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let keys = p(&[("s3.access-key-id", "a"), ("s3.secret-access-key", "s")]);
+        assert!(!holds_vended_credentials(&keys, &keys));
+        assert!(!holds_vended_credentials(&keys, &HashMap::new()));
+        for key in EXPIRING_CREDENTIAL_PROPS {
+            let storage = p(&[(key, "vended")]);
+            assert!(holds_vended_credentials(&storage, &HashMap::new()), "{key}");
+            assert!(!holds_vended_credentials(&storage, &storage), "{key}");
+            assert!(
+                holds_vended_credentials(&storage, &p(&[(key, "mine")])),
+                "{key}"
+            );
+            assert!(
+                !holds_vended_credentials(&p(&[(key, " ")]), &HashMap::new()),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn properties_no_catalog_reads_are_named_with_a_hint() {
+        let p = |keys: &[&str]| -> HashMap<String, String> {
+            keys.iter()
+                .map(|k| (k.to_string(), "x".to_string()))
+                .collect()
+        };
+        let foreign = p(&[
+            "rest.vended-credentials-enabled",
+            "io-impl",
+            "py-io-impl",
+            "s3.remote-signing-enabled",
+            "s3.endpoint",
+            "header.X-Custom",
+            "token",
+            "typo.key",
+        ]);
+        let unread = unread_properties("rest", &foreign);
+        let names: Vec<&str> = unread.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "io-impl",
+                "py-io-impl",
+                "rest.vended-credentials-enabled",
+                "s3.remote-signing-enabled",
+                "typo.key"
+            ]
+        );
+        assert!(unread[2].1.unwrap().contains("access_delegation"));
+        assert!(unread[0].1.unwrap().contains("scheme"));
+        assert!(unread[3].1.unwrap().contains("remote signing"));
+        assert!(unread[4].1.is_none());
+        assert_eq!(
+            unread_properties("sql", &p(&["header.X-Custom", "sql_bind_style", "uri"])),
+            vec![("header.X-Custom".to_string(), None)]
+        );
+        assert!(unread_properties("glue", &p(&["aws_session_token", "catalog_id"])).is_empty());
+        assert!(
+            unread_properties("hms", &p(&["hms.lock-timeout-ms", "thrift_transport"])).is_empty()
+        );
+        warn_unread_properties("rest", &foreign);
+        warn_unread_properties("rest", &foreign);
+    }
+
+    #[cfg(feature = "storage-opendal")]
+    #[test]
+    fn every_upstream_property_name_is_read() {
+        use iceberg::io::*;
+        let all = [
+            S3_ENDPOINT,
+            S3_ACCESS_KEY_ID,
+            S3_SECRET_ACCESS_KEY,
+            S3_SESSION_TOKEN,
+            S3_REGION,
+            CLIENT_REGION,
+            S3_PATH_STYLE_ACCESS,
+            S3_SSE_TYPE,
+            S3_SSE_KEY,
+            S3_SSE_MD5,
+            S3_ASSUME_ROLE_ARN,
+            S3_ASSUME_ROLE_EXTERNAL_ID,
+            S3_ASSUME_ROLE_SESSION_NAME,
+            S3_ALLOW_ANONYMOUS,
+            S3_DISABLE_EC2_METADATA,
+            S3_DISABLE_CONFIG_LOAD,
+            GCS_PROJECT_ID,
+            GCS_SERVICE_HOST,
+            GCS_USER_PROJECT,
+            GCS_NO_AUTH,
+            GCS_CREDENTIALS_JSON,
+            GCS_TOKEN,
+            GCS_ALLOW_ANONYMOUS,
+            GCS_DISABLE_VM_METADATA,
+            GCS_DISABLE_CONFIG_LOAD,
+            ADLS_CONNECTION_STRING,
+            ADLS_ACCOUNT_NAME,
+            ADLS_ACCOUNT_KEY,
+            ADLS_SAS_TOKEN,
+            ADLS_TENANT_ID,
+            ADLS_CLIENT_ID,
+            ADLS_CLIENT_SECRET,
+            ADLS_AUTHORITY_HOST,
+            OSS_ENDPOINT,
+            OSS_ACCESS_KEY_ID,
+            OSS_ACCESS_KEY_SECRET,
+            HF_TOKEN,
+            HF_ENDPOINT,
+            HF_REVISION,
+        ];
+        for name in all {
+            assert!(STORAGE_PROPS.contains(&name), "{name}");
+        }
+        #[cfg(feature = "catalog-rest")]
+        for name in [
+            iceberg_catalog_rest::REST_CATALOG_PROP_URI,
+            iceberg_catalog_rest::REST_CATALOG_PROP_WAREHOUSE,
+            iceberg_catalog_rest::REST_CATALOG_PROP_DISABLE_HEADER_REDACTION,
+            iceberg_catalog_rest::REST_CATALOG_PROP_AUTH_TYPE,
+        ] {
+            assert!(catalog_props("rest").contains(&name), "{name}");
+        }
+        #[cfg(feature = "catalog-glue")]
+        for name in [
+            iceberg_catalog_glue::GLUE_CATALOG_PROP_URI,
+            iceberg_catalog_glue::GLUE_CATALOG_PROP_CATALOG_ID,
+            iceberg_catalog_glue::GLUE_CATALOG_PROP_WAREHOUSE,
+            iceberg_catalog_glue::AWS_PROFILE_NAME,
+            iceberg_catalog_glue::AWS_REGION_NAME,
+            iceberg_catalog_glue::AWS_ACCESS_KEY_ID,
+            iceberg_catalog_glue::AWS_SECRET_ACCESS_KEY,
+            iceberg_catalog_glue::AWS_SESSION_TOKEN,
+        ] {
+            assert!(catalog_props("glue").contains(&name), "{name}");
+        }
+        #[cfg(feature = "catalog-sql")]
+        for name in [
+            iceberg_catalog_sql::SQL_CATALOG_PROP_URI,
+            iceberg_catalog_sql::SQL_CATALOG_PROP_WAREHOUSE,
+            iceberg_catalog_sql::SQL_CATALOG_PROP_BIND_STYLE,
+            iceberg_catalog_sql::SQL_CATALOG_PROP_SCHEMA_VERSION,
+        ] {
+            assert!(catalog_props("sql").contains(&name), "{name}");
+        }
+        #[cfg(feature = "catalog-hms")]
+        for name in [
+            iceberg_catalog_hms::HMS_CATALOG_PROP_URI,
+            iceberg_catalog_hms::HMS_CATALOG_PROP_THRIFT_TRANSPORT,
+            iceberg_catalog_hms::HMS_CATALOG_PROP_WAREHOUSE,
+            crate::HMS_LOCK_TIMEOUT_PROP,
+        ] {
+            assert!(catalog_props("hms").contains(&name), "{name}");
+        }
     }
 
     #[test]

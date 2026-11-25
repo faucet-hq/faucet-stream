@@ -1194,6 +1194,12 @@ first request only — the link already carries them.
 |-------|---------|---------|
 | `null_values` | `[]` | Fields equal to a listed string decode as `null`. Headers are never mapped. |
 
+**`iceberg` (source and sink) — `catalog.access_delegation`**
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `catalog.access_delegation` | none | REST catalog only. `vended_credentials` asks the catalog for short-lived storage credentials with each table (`X-Iceberg-Access-Delegation: vended-credentials`). A catalog that vends unasked needs no setting. Refused on `glue` / `sql` / `hms`, and together with a `header.X-Iceberg-Access-Delegation` property of another value. |
+
 ## `dlq`
 
 Optional dead-letter queue under `pipeline:` (or per matrix row). See the

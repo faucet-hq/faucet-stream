@@ -5038,6 +5038,7 @@ dependencies = [
  "iceberg-catalog-rest",
  "iceberg-catalog-sql",
  "iceberg-storage-opendal",
+ "opendal",
  "pilota",
  "reqsign-core",
  "schemars 1.2.1",
@@ -5050,6 +5051,7 @@ dependencies = [
  "url",
  "volo-thrift",
  "wiremock",
+ "yaml_serde",
 ]
 
 [[package]]
@@ -5481,6 +5483,7 @@ dependencies = [
  "gcloud-googleapis",
  "gcloud-spanner",
  "iceberg",
+ "iceberg-catalog-rest",
  "iceberg-catalog-sql",
  "lapin",
  "object_store",
@@ -5883,6 +5886,7 @@ dependencies = [
  "faucet-core",
  "futures",
  "iceberg",
+ "iceberg-catalog-rest",
  "iceberg-catalog-sql",
  "iceberg-storage-opendal",
  "parquet 58.4.2",
@@ -5897,6 +5901,7 @@ dependencies = [
  "tracing",
  "typetag",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -6699,6 +6704,7 @@ dependencies = [
  "faucet-core",
  "futures",
  "iceberg",
+ "iceberg-catalog-rest",
  "iceberg-catalog-sql",
  "parquet 58.4.2",
  "schemars 1.2.1",

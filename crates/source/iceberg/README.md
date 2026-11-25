@@ -110,7 +110,11 @@ iceberg-rust applies Parquet **position** and **equality** delete files during t
 
 ## Preflight (`faucet doctor`)
 
-`check()` loads the table metadata (no data read), then verifies every `columns` entry exists and that `filter` types against the current schema.
+`check()` loads the table metadata (no data read), then verifies every `columns` entry exists and that `filter` types against the current schema. A second `storage` probe checks the table's storage with the credentials reads will use (see [Vended credentials](#vended-credentials)).
+
+## Vended credentials
+
+On a REST catalog that vends storage credentials (the sink's [Vended credentials](https://crates.io/crates/faucet-sink-iceberg#vended-credentials) section has the config, including `catalog.access_delegation: vended_credentials`), the source reads with the credentials the catalog returns with the table. Before the first page of each source instance it checks the table's storage once (a `HEAD` of the current metadata file, S3 and GCS table locations): no storage credentials at all, or static `s3.access-key-id` / `s3.secret-access-key` in `catalog.properties` together with a vended session token the store refuses, fail the read before any page with a message naming the fix; any other probe failure is a warning. The table is loaded once per read, so a scan that takes longer than the credentials live fails part-way.
 
 ## Library usage
 
@@ -157,7 +161,7 @@ Declares `discover` and `shardable` (hash of data-file path), plus columnar (Arr
 Catalog calls, scan planning and every batch read run through the pipeline's
 `CallContext` (#880): the run's cancel token stops a stalled call, any caller
 deadline ends it, and catalog and planning calls are metered as round trips
-(`load`, `plan`, `list`, `catalog`). The catalog client's and file IO's own
+(`load`, `plan`, `list`, `catalog`, and `probe` for the storage check). The catalog client's and file IO's own
 timeouts and retry are unchanged.
 
 ## Caller configs under `faucet serve`

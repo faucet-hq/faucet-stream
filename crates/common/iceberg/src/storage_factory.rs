@@ -451,6 +451,7 @@ mod tests {
             warehouse: warehouse.map(str::to_string),
             credential: None,
             properties: HashMap::from([("s3.region".to_string(), "us-east-1".to_string())]),
+            access_delegation: None,
         }
     }
 
