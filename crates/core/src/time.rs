@@ -2,9 +2,11 @@
 //!
 //! Every instant, clock, civil value and zone our own code handles is meant to
 //! go through the types here, so the library underneath can change in one
-//! place. Today they wrap `chrono` (and `chrono-tz` behind the `time-zones`
-//! feature) and call exactly the chrono functions call sites call directly, so
-//! output is identical by construction:
+//! place. Instants, clocks and civil values wrap `chrono` and call exactly the
+//! chrono functions call sites call directly, so output is identical by
+//! construction. Named zones (feature `time-zones`) resolve through jiff's
+//! bundled tzdata (`TZDATA_VERSION`), never the host's, and reach chrono
+//! code through the hidden `ChronoZone` adapter (#1116):
 //!
 //! - [`Timestamp`] serializes `#[serde(transparent)]` over
 //!   `chrono::DateTime<Utc>`, so a stored value keeps its spelling.
@@ -517,9 +519,13 @@ impl fmt::Display for CivilDateTime {
 }
 
 #[cfg(feature = "time-zones")]
+mod tzdata;
+#[cfg(feature = "time-zones")]
 mod zone;
 #[cfg(feature = "time-zones")]
-pub use zone::{LocalTime, Zone};
+pub use tzdata::{TZDATA_BEFORE_ADVERTISING, TZDATA_VERSION, TzdataVersion, changed_since_2025b};
+#[cfg(feature = "time-zones")]
+pub use zone::{ChronoZone, ChronoZoneOffset, LocalTime, Zone};
 
 #[cfg(test)]
 mod tests;

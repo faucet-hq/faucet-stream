@@ -28,7 +28,7 @@ pub async fn run(args: BackfillArgs) -> CliResult<()> {
     let spec = cfg.backfill.clone().unwrap_or_default();
     let tz = match args.timezone.as_deref().or(spec.timezone.as_deref()) {
         Some(name) => parse_timezone(name)?,
-        None => chrono_tz::Tz::UTC,
+        None => faucet_core::time::ChronoZone::UTC,
     };
     let window = match args.window.as_deref().or(spec.window.as_deref()) {
         Some(w) => Some(parse_window(w)?),
@@ -99,7 +99,7 @@ fn build_range(
     to_bookmark: &Option<String>,
     bookmark_field: Option<String>,
     window: Option<crate::backfill::plan::WindowStep>,
-    tz: chrono_tz::Tz,
+    tz: faucet_core::time::ChronoZone,
 ) -> CliResult<BackfillRange> {
     match (from, to, from_bookmark) {
         (Some(f), Some(t), None) => Ok(BackfillRange::Time {
@@ -177,7 +177,7 @@ fn report(outcome: &BackfillOutcome, json: bool) -> CliResult<()> {
 mod tests {
     use super::*;
 
-    fn utc() -> chrono_tz::Tz {
+    fn utc() -> faucet_core::time::ChronoZone {
         "UTC".parse().unwrap()
     }
 

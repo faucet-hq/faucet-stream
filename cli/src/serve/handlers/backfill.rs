@@ -229,7 +229,7 @@ pub async fn submit_backfill(
     let spec = loaded.cfg.backfill.clone().unwrap_or_default();
     let tz = match req.timezone.as_deref().or(spec.timezone.as_deref()) {
         Some(name) => parse_timezone(name).map_err(|e| ServeError::BadConfig(e.to_string()))?,
-        None => chrono_tz::Tz::UTC,
+        None => faucet_core::time::ChronoZone::UTC,
     };
     let window = match req.window.as_deref().or(spec.window.as_deref()) {
         Some(w) => Some(parse_window(w).map_err(|e| ServeError::BadConfig(e.to_string()))?),
@@ -574,7 +574,7 @@ mod tests {
 
     #[test]
     fn rewrite_substitutes_namespaces_and_forces_at_least_once() {
-        let utc: chrono_tz::Tz = "UTC".parse().unwrap();
+        let utc: faucet_core::time::ChronoZone = "UTC".parse().unwrap();
         let unit = crate::backfill::plan::BackfillUnit {
             id: "20260601T000000Z".into(),
             start: parse_boundary("2026-06-01T00:00:00Z", utc).unwrap(),
@@ -608,7 +608,7 @@ mod tests {
 
     #[test]
     fn rewrite_drops_sla_and_profiling_from_the_config_and_its_rows() {
-        let utc: chrono_tz::Tz = "UTC".parse().unwrap();
+        let utc: faucet_core::time::ChronoZone = "UTC".parse().unwrap();
         let unit = crate::backfill::plan::BackfillUnit {
             id: "20260601T000000Z".into(),
             start: parse_boundary("2026-06-01T00:00:00Z", utc).unwrap(),
@@ -646,7 +646,7 @@ mod tests {
 
     #[test]
     fn rewrite_rejects_unknown_token() {
-        let utc: chrono_tz::Tz = "UTC".parse().unwrap();
+        let utc: faucet_core::time::ChronoZone = "UTC".parse().unwrap();
         let unit = crate::backfill::plan::BackfillUnit {
             id: "u".into(),
             start: parse_boundary("2026-06-01", utc).unwrap(),

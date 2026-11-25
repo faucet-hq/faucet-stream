@@ -127,8 +127,8 @@ pub fn shared_destination_error(row: &str, kind: &str, dest: &str) -> String {
 }
 
 /// Parse an IANA timezone name.
-pub fn parse_timezone(name: &str) -> CliResult<chrono_tz::Tz> {
-    name.parse::<chrono_tz::Tz>().map_err(|_| {
+pub fn parse_timezone(name: &str) -> CliResult<faucet_core::time::ChronoZone> {
+    name.parse::<faucet_core::time::ChronoZone>().map_err(|_| {
         CliError::Config(format!(
             "'{name}' is not a valid IANA timezone (e.g. UTC, America/New_York)"
         ))

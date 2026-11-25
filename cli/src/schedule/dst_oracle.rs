@@ -5,7 +5,7 @@
 //! and lists only.
 
 use chrono::{DateTime, Datelike, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
-use chrono_tz::Tz;
+use faucet_core::time::ChronoZone as Tz;
 
 /// Zones whose rules differ between time-zone databases (#1116); kept out of
 /// the golden rows and the sweep so a backend change does not trip them.

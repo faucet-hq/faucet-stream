@@ -5,9 +5,9 @@
 use crate::error::{CliError, CliResult};
 use crate::schedule::spec::{OverlapPolicy, ScheduleOnFailure, ScheduleSpec};
 use chrono::{DateTime, Datelike, LocalResult, TimeZone, Timelike, Utc};
-use chrono_tz::Tz;
 use croner::Cron;
 use croner::parser::{CronParser, Seconds};
+use faucet_core::time::ChronoZone as Tz;
 use std::time::Duration;
 
 /// Matches skipped in the later pass of one repeated hour before the search gives up.

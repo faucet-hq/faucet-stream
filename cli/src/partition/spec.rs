@@ -162,7 +162,7 @@ impl PartitionSpec {
             } => {
                 crate::chunking::parse_window(chunk_size)?;
                 if let Some(tz) = timezone {
-                    tz.parse::<chrono_tz::Tz>().map_err(|_| {
+                    tz.parse::<faucet_core::time::ChronoZone>().map_err(|_| {
                         CliError::Config(format!(
                             "'{tz}' is not a valid IANA timezone (e.g. UTC, America/New_York)"
                         ))

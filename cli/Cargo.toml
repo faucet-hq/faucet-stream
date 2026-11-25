@@ -575,7 +575,7 @@ templates-sync-object-store = ["templates-sync", "dep:object_store"]
 
 [dependencies]
 regex = { workspace = true, optional = true }
-faucet-core.workspace = true
+faucet-core = { workspace = true, features = ["time-zones"] }
 faucet-auth.workspace = true
 faucet-registry.workspace = true
 faucet-source-rest = { workspace = true, optional = true }
@@ -715,9 +715,6 @@ azure_security_keyvault_secrets = { workspace = true, optional = true }
 azure_identity = { workspace = true, optional = true }
 azure_core = { workspace = true, optional = true }
 chrono = { workspace = true }
-# Base dep (not optional): `faucet backfill` (#282) computes window boundaries
-# timezone-correctly in every build; `faucet schedule` reuses it.
-chrono-tz = { workspace = true }
 croner = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }

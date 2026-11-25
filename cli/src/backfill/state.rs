@@ -116,7 +116,7 @@ mod tests {
     use crate::backfill::plan::{parse_boundary, plan_windows};
 
     fn units(n: usize) -> Vec<BackfillUnit> {
-        let utc: chrono_tz::Tz = "UTC".parse().unwrap();
+        let utc: faucet_core::time::ChronoZone = "UTC".parse().unwrap();
         let from = parse_boundary("2026-06-01", utc).unwrap();
         let to = parse_boundary(&format!("2026-06-{:02}", n + 1), utc).unwrap();
         plan_windows(
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn legacy_done_unit_whose_window_grew_is_read_again() {
-        let casablanca: chrono_tz::Tz = "Africa/Casablanca".parse().unwrap();
+        let casablanca: faucet_core::time::ChronoZone = "Africa/Casablanca".parse().unwrap();
         let from = parse_boundary("2026-09-20", casablanca).unwrap();
         let to = parse_boundary("2026-09-22", casablanca).unwrap();
         let plan = plan_windows(

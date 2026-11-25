@@ -6,7 +6,7 @@
 use super::compiled::CompiledSchedule;
 use super::dst_oracle::{self, Pattern};
 use chrono::{DateTime, Utc};
-use chrono_tz::Tz;
+use faucet_core::time::ChronoZone as Tz;
 
 fn compiled(cron: &str, tz: &str) -> CompiledSchedule {
     let spec = crate::yaml::from_str(&format!("cron: \"{cron}\"\ntimezone: \"{tz}\"\n")).unwrap();
@@ -567,11 +567,28 @@ fn sweep(zones: &[&str], from: DateTime<Utc>, to: DateTime<Utc>) -> usize {
 /// Every zone's transitions in 2024 and 2025 (about 5 s in a debug build).
 #[test]
 fn engine_matches_the_oracle_in_every_zone() {
-    let zones: Vec<&str> = chrono_tz::TZ_VARIANTS.iter().map(|z| z.name()).collect();
+    let zones: Vec<&str> = faucet_core::time::Zone::names().collect();
     let checked = sweep(
         &zones,
         at("2024-01-01T00:00:00Z"),
         at("2026-01-01T00:00:00Z"),
     );
     assert!(checked > 5_000, "only {checked} windows checked");
+}
+
+/// Zones tzdata 2026 changed (#1116): ticks follow the current rules.
+#[test]
+fn ticks_follow_tzdata_2026_changes() {
+    assert_eq!(
+        ticks("0 9 * * *", "America/Vancouver", "2026-11-01T12:00:00Z", 2),
+        ["2026-11-01T16:00Z", "2026-11-02T16:00Z"]
+    );
+    assert_eq!(
+        ticks("0 9 * * *", "America/Havana", "2026-11-01T12:00:00Z", 2),
+        ["2026-11-01T13:00Z", "2026-11-02T13:00Z"]
+    );
+    assert_eq!(
+        ticks("0 3 * * *", "Africa/Casablanca", "2026-09-20T12:00:00Z", 1),
+        ["2026-09-21T03:00Z"]
+    );
 }

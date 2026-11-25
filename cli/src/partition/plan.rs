@@ -92,7 +92,7 @@ pub fn plan(spec: &PartitionSpec) -> CliResult<Vec<PartitionChunk>> {
             chunk_size,
             timezone,
         } => {
-            let tz: chrono_tz::Tz = timezone
+            let tz: faucet_core::time::ChronoZone = timezone
                 .as_deref()
                 .unwrap_or("UTC")
                 .parse()

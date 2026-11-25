@@ -383,7 +383,7 @@ mod zones {
         assert_eq!(err.to_string(), "time zone: unknown zone 'utc'");
         assert!(Zone::parse("Mars/Olympus").is_err());
         let z = Zone::parse("Asia/Kolkata").unwrap();
-        assert_eq!(Zone::from_chrono(z.to_chrono()), z);
+        assert_eq!(z.chrono().zone(), z);
     }
 
     #[test]

@@ -41,7 +41,7 @@ pub enum BackfillRange {
         from: DateTime<FixedOffset>,
         to: DateTime<FixedOffset>,
         window: Option<crate::backfill::plan::WindowStep>,
-        tz: chrono_tz::Tz,
+        tz: faucet_core::time::ChronoZone,
     },
     /// Explicit bookmark range (`--from-bookmark` / `--to-bookmark`): seed
     /// the unit's scoped state with `from`, optionally drop records whose
@@ -891,7 +891,7 @@ pipeline:
         to: &str,
         window: Option<crate::backfill::plan::WindowStep>,
     ) -> BackfillRange {
-        let tz: chrono_tz::Tz = "UTC".parse().unwrap();
+        let tz: faucet_core::time::ChronoZone = "UTC".parse().unwrap();
         BackfillRange::Time {
             from: crate::backfill::plan::parse_boundary(from, tz).unwrap(),
             to: crate::backfill::plan::parse_boundary(to, tz).unwrap(),
@@ -1125,7 +1125,7 @@ matrix:
     fn unit_node_is_namespaced_and_at_least_once() {
         let cfg = parse_cfg(SCOPED);
         let root = select_root(expand(&cfg).unwrap(), None).unwrap();
-        let tz: chrono_tz::Tz = "UTC".parse().unwrap();
+        let tz: faucet_core::time::ChronoZone = "UTC".parse().unwrap();
         let unit = BackfillUnit {
             id: "20260601T000000Z".into(),
             start: crate::backfill::plan::parse_boundary("2026-06-01", tz).unwrap(),
@@ -1170,7 +1170,7 @@ matrix:
         let key = unit_state_key("orders", "h", "bookmark");
         store.put(&key, &json!(500)).await.unwrap();
 
-        let tz: chrono_tz::Tz = "UTC".parse().unwrap();
+        let tz: faucet_core::time::ChronoZone = "UTC".parse().unwrap();
         let unit = BackfillUnit {
             id: "bookmark".into(),
             start: crate::backfill::plan::parse_boundary("2026-06-01", tz).unwrap(),
