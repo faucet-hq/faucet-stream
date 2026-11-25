@@ -1438,7 +1438,8 @@ where
             .map(|(store, key)| (store.as_ref(), key.as_str())),
         crate::checkpoint::Hold::None,
         (pipeline, row, run_id),
-    );
+    )
+    .with_row_accounts(row_accounts.as_deref());
 
     let ctx = std::collections::HashMap::new();
     let mut batches = source.stream_batches(&ctx, DEFAULT_BATCH_SIZE);
@@ -1664,6 +1665,7 @@ where
         },
         (pipeline, row, run_id),
     )
+    .with_row_accounts(row_accounts.as_deref())
     .without_unwind_sink_flush();
 
     tracing::info!(
@@ -2132,6 +2134,7 @@ where
         },
         (&pipeline_name, &row, &run_id),
     )
+    .with_row_accounts(row_accounts.as_deref())
     .with_retry(
         retry_policy
             .as_ref()
@@ -8656,6 +8659,84 @@ mod cleanup_tests {
         assert_eq!(result.records_written, 3);
         let snap = accounts.snapshot();
         assert_eq!((snap.offered, snap.accepted, snap.unaccounted), (3, 3, 0));
+    }
+
+    /// Fails its second flush; forwards everything else.
+    struct SecondFlushFails<S>(S, std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl<S: Sink> Sink for SecondFlushFails<S> {
+        crate::forward_sink!(0; except flush);
+        async fn flush(&self) -> Result<(), FaucetError> {
+            match self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                1 => Err(FaucetError::Sink("store refused".into())),
+                _ => self.0.flush().await,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_native_run_confirms_the_rows_of_completed_checkpoints() {
+        let mut source = NativeCsvSource::new(3);
+        source.bookmark_every = true;
+        let sink = SecondFlushFails(NativeRecordingSink::new(false), Default::default());
+        let accounts = Arc::new(crate::accounting::RowAccounts::default());
+        let err = Pipeline::new(&source, &sink)
+            .with_row_accounts(Arc::clone(&accounts))
+            .run()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("store refused"), "{err}");
+        assert!(
+            !sink.0.loads.lock().unwrap().is_empty(),
+            "the native path ran"
+        );
+        let rows = accounts.snapshot();
+        assert_eq!((rows.accepted, rows.confirmed), (2, 1));
+    }
+
+    #[tokio::test]
+    async fn a_failed_row_run_confirms_the_rows_of_completed_checkpoints() {
+        struct Bookmarked;
+        #[async_trait]
+        impl Source for Bookmarked {
+            async fn fetch_with_context(
+                &self,
+                _ctx: &std::collections::HashMap<String, Value>,
+            ) -> Result<Vec<Value>, FaucetError> {
+                unreachable!()
+            }
+            fn stream_pages<'a>(
+                &'a self,
+                _ctx: &'a std::collections::HashMap<String, Value>,
+                _batch_size: usize,
+            ) -> std::pin::Pin<
+                Box<dyn futures_core::Stream<Item = Result<StreamPage, FaucetError>> + Send + 'a>,
+            > {
+                Box::pin(async_stream::try_stream! {
+                    yield StreamPage { records: vec![json!({"i": 1}), json!({"i": 2})], bookmark: Some(json!(1)) };
+                    yield StreamPage { records: vec![json!({"i": 3})], bookmark: Some(json!(2)) };
+                    yield StreamPage { records: vec![json!({"i": 4})], bookmark: Some(json!(3)) };
+                })
+            }
+        }
+        struct Plain;
+        #[async_trait]
+        impl Sink for Plain {
+            async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+                Ok(records.len())
+            }
+        }
+        let sink = SecondFlushFails(Plain, Default::default());
+        let accounts = Arc::new(crate::accounting::RowAccounts::default());
+        let err = Pipeline::new(&Bookmarked, &sink)
+            .with_row_accounts(Arc::clone(&accounts))
+            .run()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("store refused"), "{err}");
+        let rows = accounts.snapshot();
+        assert_eq!((rows.accepted, rows.confirmed), (3, 2));
     }
 
     /// A source whose native batches carry no row count.

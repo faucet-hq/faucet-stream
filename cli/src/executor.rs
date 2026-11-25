@@ -577,6 +577,7 @@ impl RunObservers {
         let padded = (self.limit_padded.load(Ordering::Relaxed) as u64).min(rows.accepted);
         rows.accepted -= padded;
         rows.skipped += padded;
+        rows.confirmed = rows.confirmed.min(rows.accepted);
         rows
     }
 

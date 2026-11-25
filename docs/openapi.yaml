@@ -4595,7 +4595,10 @@ components:
         lost by a sink without saying so; any non-zero value failed the run.
         `transform_in` / `transform_out` count the transform chain's input and
         output. `non_finite` counts values (not rows) with no JSON rendering —
-        `NaN`, `±Infinity` — the source wrote as `null` (#885).
+        `NaN`, `±Infinity` — the source wrote as `null` (#885). `confirmed`
+        counts the accepted rows of pages whose checkpoint completed (sink
+        flush, then the state write): a failed invocation committed at least
+        these rows, while its `records_written` stays 0.
       properties:
         transform_in: { type: integer }
         transform_out: { type: integer }
@@ -4608,6 +4611,7 @@ components:
         dropped: { type: integer }
         unaccounted: { type: integer }
         non_finite: { type: integer }
+        confirmed: { type: integer }
     InvocationRecord:
       type: object
       properties:

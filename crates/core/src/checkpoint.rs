@@ -56,6 +56,7 @@ pub(crate) struct Checkpointer<'a, Si: Sink + ?Sized> {
     row: &'a str,
     run_id: &'a str,
     dlq_labels: Vec<Label>,
+    accounts: Option<&'a crate::accounting::RowAccounts>,
 }
 
 impl<'a, Si: Sink + ?Sized> Checkpointer<'a, Si> {
@@ -92,6 +93,24 @@ impl<'a, Si: Sink + ?Sized> Checkpointer<'a, Si> {
             row,
             run_id,
             dlq_labels,
+            accounts: None,
+        }
+    }
+
+    /// Mark the run's accepted rows confirmed at each completed checkpoint.
+    pub(crate) fn with_row_accounts(
+        mut self,
+        accounts: Option<&'a crate::accounting::RowAccounts>,
+    ) -> Self {
+        self.accounts = accounts;
+        self
+    }
+
+    fn confirm(&self) {
+        if self.hold == Hold::None
+            && let Some(a) = self.accounts
+        {
+            a.confirm();
         }
     }
 
@@ -162,6 +181,7 @@ impl<'a, Si: Sink + ?Sized> Checkpointer<'a, Si> {
             }
             self.update_lag(bookmark);
         }
+        self.confirm();
         Ok(())
     }
 
@@ -194,7 +214,9 @@ impl<'a, Si: Sink + ?Sized> Checkpointer<'a, Si> {
         if cancelled && self.hold == Hold::Overwrite {
             return Ok(());
         }
-        self.sink.flush().await
+        self.sink.flush().await?;
+        self.confirm();
+        Ok(())
     }
 
     /// Error exit: best-effort DLQ flush, then the main sink unless held; a

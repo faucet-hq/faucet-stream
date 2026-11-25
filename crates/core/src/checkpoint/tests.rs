@@ -264,3 +264,46 @@ fn the_dlq_flush_timer_does_not_count_the_state_write() {
     assert_eq!(seconds.len(), 1, "{seconds:?}");
     assert!(seconds[0] < 0.25, "{seconds:?}");
 }
+
+fn accepted(accounts: &crate::accounting::RowAccounts, n: usize) {
+    let mut page = crate::accounting::PageAccount::new(n);
+    page.accepted = n;
+    page.settle(Some(accounts), ("p", "r", "c")).unwrap();
+}
+
+#[tokio::test]
+async fn rows_are_confirmed_only_once_their_checkpoint_completed() {
+    let (_, sink, dlq, store) = fixture();
+    let accounts = crate::accounting::RowAccounts::new();
+    let ck = Checkpointer::new(&sink, Some(&dlq), Some((&store, "k")), Hold::None, IDS)
+        .with_row_accounts(Some(&accounts));
+    accepted(&accounts, 3);
+    assert_eq!(accounts.snapshot().confirmed, 0);
+    ck.page(&json!(1), Stored::Bare).await.unwrap();
+    assert_eq!(accounts.snapshot().confirmed, 3);
+    accepted(&accounts, 2);
+    ck.finish(false).await.unwrap();
+    assert_eq!(accounts.snapshot().confirmed, 5);
+}
+
+#[tokio::test]
+async fn a_failed_flush_or_a_held_run_confirms_nothing() {
+    let (log, _, dlq, store) = fixture();
+    let accounts = crate::accounting::RowAccounts::new();
+    let sink = Flushing::new("sink", &log).failing(2, || FaucetError::Sink("down".into()));
+    let ck = Checkpointer::new(&sink, Some(&dlq), Some((&store, "k")), Hold::None, IDS)
+        .with_row_accounts(Some(&accounts));
+    accepted(&accounts, 4);
+    assert!(ck.page(&json!(1), Stored::Bare).await.is_err());
+    assert!(ck.finish(false).await.is_err());
+    assert_eq!(accounts.snapshot().confirmed, 0);
+
+    let (_, sink, dlq, store) = fixture();
+    let held = crate::accounting::RowAccounts::new();
+    let ck = Checkpointer::new(&sink, Some(&dlq), Some((&store, "k")), Hold::Overwrite, IDS)
+        .with_row_accounts(Some(&held));
+    accepted(&held, 4);
+    ck.page(&json!(1), Stored::Bare).await.unwrap();
+    ck.finish(false).await.unwrap();
+    assert_eq!(held.snapshot().confirmed, 0);
+}

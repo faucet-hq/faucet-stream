@@ -985,7 +985,11 @@ how many the sink `accepted`, merged into another row of the same page by a
 keyed write (`coalesced`), declined by design (`skipped`), failed per row to the
 DLQ (`failed`), a quality / contract / drift / policy pass `quarantined`, or a
 poison-pill `drop` action `dropped`; `unaccounted` rows were lost by a sink
-without saying so and fail the run; `transform_in` / `transform_out` count the
+without saying so and fail the run; `confirmed` counts the accepted rows of
+pages whose checkpoint completed (sink flush, then the state write), so a failed
+invocation committed at least that many rows while its `records_written` stays
+0 (`faucet run` prints `at least N rows were committed before the failure`;
+topology runs do not report it); `transform_in` / `transform_out` count the
 transform chain's input and output, the same view `faucet run --output json`
 prints — and, for a source with a head, `source_lag` at the end of the
 invocation (`bytes` / `events` / `seconds`, #733).
