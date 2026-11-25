@@ -170,11 +170,15 @@ fn check_literal(token: &str) -> Result<(), String> {
     }
 }
 
+/// The most significant digits a finite double's exact decimal expansion has.
+const MAX_F64_DIGITS: usize = 767;
+
 /// Whether `token` names the value it parsed to. An integer literal must stay
-/// an integer. A decimal literal of `n` significant digits is faithful when the
-/// parsed double, rounded to `n` significant digits, spells it again — so the
-/// `%.17g` rendering `0.10000000000000001` is accepted like `0.1`, while a
-/// literal whose digits the double cannot carry is refused.
+/// an integer. A decimal literal of `n` significant digits that parsed to the
+/// double `d` is faithful when it is a rendering of `d` itself: the shortest
+/// text that reads back as `d`, or `d` correctly rounded to `n` digits (so the
+/// `%.17g` rendering `0.10000000000000001` is accepted like `0.1`). A literal
+/// whose digits the double cannot carry is refused.
 fn literal_is_faithful(token: &str, parsed: &serde_json::Number) -> bool {
     let literal = canonical_decimal(token);
     let is_integer = !token.contains(['.', 'e', 'E']);
@@ -183,8 +187,15 @@ fn literal_is_faithful(token: &str, parsed: &serde_json::Number) -> bool {
             if is_integer {
                 return false;
             }
-            let digits = literal.as_ref().map_or(1, |(_, d, _)| d.len().max(1));
-            canonical_decimal(&format!("{:.*e}", digits - 1, f)) == literal
+            let Some(literal) = literal else {
+                return false;
+            };
+            let digits = literal.1.len().max(1);
+            if digits > MAX_F64_DIGITS {
+                return false;
+            }
+            let renders = |text: String| canonical_decimal(&text).as_ref() == Some(&literal);
+            renders(format!("{:.*e}", digits - 1, f)) || renders(format!("{f:e}"))
         }
         _ => canonical_decimal(&parsed.to_string()) == literal,
     }
@@ -669,5 +680,162 @@ mod tests {
         assert!(may_hold_long_literal(b"\"id\":\"1234567890123456\""));
         let quiet = "2026-11-24T10:00:00.123456Z 550e8400-e29b-41d4-a716-446655440000 ".repeat(8);
         assert!(!may_hold_long_literal(quiet.as_bytes()));
+    }
+
+    fn faithful(text: &str) -> bool {
+        unfaithful_literals(text.as_bytes()).is_empty()
+    }
+
+    fn reads_back(text: &str, f: f64) -> bool {
+        serde_json::from_str::<f64>(text).is_ok_and(|g| g.to_bits() == f.to_bits())
+    }
+
+    fn check_renderings(f: f64) -> Vec<String> {
+        let mut bad = Vec::new();
+        let mut forms = vec![format!("{f:e}"), format!("{f:.16e}"), format!("{f:.25e}")];
+        if f.abs() < 1e17 && f.abs() > 1e-7 {
+            let plain = format!("{f}");
+            if plain.contains('.') {
+                forms.push(plain);
+            }
+        }
+        for text in forms {
+            if !reads_back(&text, f) || !faithful(&text) {
+                bad.push(text);
+            }
+        }
+        bad
+    }
+
+    #[test]
+    fn shortest_float_renderings_stay_numbers() {
+        assert!(faithful("90.28571428571429"));
+        assert!(reads_back("90.28571428571429", 632.0 / 7.0));
+        let bad: Vec<String> = (0..3000u32)
+            .flat_map(|i| check_renderings(f64::from(i) / 7.0))
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "{} literals: {:?}",
+            bad.len(),
+            &bad[..bad.len().min(5)]
+        );
+    }
+
+    #[test]
+    fn every_rendering_of_a_random_double_is_faithful() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut bad = Vec::new();
+        let mut seen = 0;
+        while seen < 200_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let f = f64::from_bits(state);
+            if !f.is_finite() {
+                continue;
+            }
+            seen += 1;
+            bad.extend(check_renderings(f));
+        }
+        assert!(
+            bad.is_empty(),
+            "{} literals: {:?}",
+            bad.len(),
+            &bad[..bad.len().min(5)]
+        );
+    }
+
+    #[test]
+    fn powers_of_two_and_subnormals_are_faithful() {
+        let mut bad = Vec::new();
+        for e in -1074..=1023 {
+            bad.extend(check_renderings(2f64.powi(e)));
+            bad.extend(check_renderings(-(2f64.powi(e))));
+        }
+        for f in [
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            5e-324,
+            -0.0,
+            0.1,
+            1e21,
+            1e-7,
+            1e22,
+            1e23,
+        ] {
+            bad.extend(check_renderings(f));
+        }
+        assert!(
+            bad.is_empty(),
+            "{} literals: {:?}",
+            bad.len(),
+            &bad[..bad.len().min(5)]
+        );
+        assert!(faithful("5.960464477539063e-8"));
+        assert!(faithful("0.00000005960464477539063"));
+    }
+
+    #[test]
+    fn a_double_halfway_between_two_literals_accepts_its_own_renderings() {
+        // 1727756845721204.25 is a double: its shortest text rounds the tie
+        // up, its 17-digit rounding goes to even. Both are its renderings.
+        assert!(faithful("1727756845721204.3"));
+        assert!(faithful("1727756845721204.2"));
+        assert!(faithful("1727756845721204.25"));
+        assert!(!faithful("1727756845721204.4"));
+        assert!(!faithful("1727756845721204.1"));
+        assert!(faithful("123456789.34570313") && faithful("123456789.34570312"));
+        let mut bad = Vec::new();
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..20_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let mantissa = (state >> 12) | 1;
+            for exp in [49, 50, 51] {
+                let f = f64::from_bits(((1023 + exp) << 52) | (mantissa & ((1 << 52) - 1)));
+                bad.extend(check_renderings(f));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{} literals: {:?}",
+            bad.len(),
+            &bad[..bad.len().min(5)]
+        );
+    }
+
+    #[test]
+    fn literals_a_double_cannot_carry_are_still_refused() {
+        for text in [
+            "1234567890123456.7",
+            "0.12345678901234567890",
+            "90.285714285714291",
+            "90.2857142857142912",
+            "9007199254740993.1",
+            "100000000000000000000",
+            "0.1000000000000000055511151231257828",
+        ] {
+            assert!(!faithful(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_literal_longer_than_any_double_is_refused_without_formatting() {
+        let long = format!("0.{}", "7".repeat(70_000));
+        assert!(!faithful(&long));
+        assert!(check_literal(&long).is_err());
+        assert!(faithful(&format!("{:.766e}", 5e-324)));
+        assert!(!faithful(&format!("{:.766e}1", 5e-324)));
+    }
+
+    #[test]
+    fn literals_that_round_to_the_largest_double_parse() {
+        assert!(reads_back("1.7976931348623158e308", f64::MAX));
+        assert!(reads_back(
+            "1.7976931348623157e270",
+            1.797_693_134_862_315_7e270
+        ));
     }
 }

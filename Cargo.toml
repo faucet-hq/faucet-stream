@@ -274,7 +274,7 @@ faucet-source-mssql-cdc = { path = "crates/source/mssql-cdc", version = "1" }
 
 # Shared external deps
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 serde_path_to_error = "0.1.20"
 yaml_serde = "0.10"
 tokio = { version = "1", features = ["time"] }
