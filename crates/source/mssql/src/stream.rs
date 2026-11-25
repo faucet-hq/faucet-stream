@@ -217,13 +217,7 @@ impl MssqlSource {
                     .map_err(fail)?
                     .unwrap_or_default()
                     .iter()
-                    .map(|c| {
-                        let real = matches!(
-                            c.column_type(),
-                            tiberius::ColumnType::Float4 | tiberius::ColumnType::Floatn
-                        );
-                        (c.name().to_string(), real)
-                    })
+                    .map(|c| (c.name().to_string(), may_be_real(c.column_type())))
                     .collect::<Vec<_>>();
                 stream.into_results().await.map_err(fail)?;
                 Ok(typed)
@@ -238,6 +232,18 @@ impl MssqlSource {
         }
         single_column(&typed?, column)
     }
+}
+
+/// Whether a `SELECT TOP 0` column may be single precision. TDS reports
+/// every nullable float as `Floatn` and tiberius does not expose its width,
+/// so `Floatn` counts as `real`: the bound `min(D, F)` is never above the
+/// bookmark, so a `float(53)` column re-reads rows in `[F, D)`, never loses
+/// one.
+fn may_be_real(t: tiberius::ColumnType) -> bool {
+    matches!(
+        t,
+        tiberius::ColumnType::Float4 | tiberius::ColumnType::Floatn
+    )
 }
 
 /// Whether a `sp_describe_first_result_set` type is single precision:
@@ -1132,6 +1138,15 @@ mod tests {
         ] {
             assert!(!is_real_type_name(t), "{t}");
         }
+    }
+
+    #[test]
+    fn a_nullable_float_of_unknown_width_may_be_real() {
+        use tiberius::ColumnType as T;
+        assert!(may_be_real(T::Float4));
+        assert!(may_be_real(T::Floatn));
+        assert!(!may_be_real(T::Float8));
+        assert!(!may_be_real(T::Decimaln));
     }
 
     #[test]

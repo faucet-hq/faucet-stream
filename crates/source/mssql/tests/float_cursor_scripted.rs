@@ -132,3 +132,24 @@ async fn an_integer_or_text_bookmark_is_not_described() {
         assert!(!server.saw("SELECT TOP 0"), "{initial}");
     }
 }
+
+#[tokio::test]
+async fn a_nullable_double_seen_only_by_top_0_is_read_with_the_lower_bound() {
+    let server = TdsServer::start().await.unwrap();
+    server.on(
+        QUERY,
+        Reply::rows(
+            &[("id", TdsType::Int), ("c", TdsType::Float)],
+            vec![vec![TdsValue::Int(1), TdsValue::Float(0.75)]],
+        ),
+    );
+    server.on(
+        "SELECT TOP 0",
+        Reply::rows(&[("id", TdsType::Int), ("c", TdsType::Float)], vec![]),
+    );
+    server.on("sp_describe_first_result_set", Reply::error("no probe"));
+    let src = source(&server, json!(0.7)).await;
+    let (rows, _) = src.fetch_all_incremental().await.unwrap();
+    assert_eq!(rows.len(), 1, "the width is unknown, so the read goes on");
+    assert!(server.saw("SELECT TOP 0"), "{:?}", server.requests());
+}

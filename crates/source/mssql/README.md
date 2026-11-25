@@ -176,7 +176,13 @@ and in every `@bookmark`: the stored `0.7` sits above the column's
 bookmark. The value comes from
 [`faucet_core::fidelity::f32_cursor_bound`](https://docs.rs/faucet-core/latest/faucet_core/fidelity/fn.f32_cursor_bound.html):
 it is never above the bookmark, so a wrong describe costs a re-read row, never
-a lost one. A failed describe, or a `column` that names no column or two of
+a lost one. The `SELECT TOP 0` probe cannot tell a nullable `real` from a
+nullable `float(53)`: SQL Server reports both as one variable-width float
+type, without its width. The probe therefore treats every nullable float
+cursor as `real`. For a `float(53)` column this re-reads the rows whose value
+lies between the single-precision bound and the bookmark (a gap of about one
+part in 10⁷ of the value), on every run until the bookmark moves; nothing is
+skipped. A query `sp_describe_first_result_set` can describe is typed exactly. A failed describe, or a `column` that names no column or two of
 them, fails the read. Integer, decimal, text and timestamp cursors are not
 described and are compared exactly as before.
 
