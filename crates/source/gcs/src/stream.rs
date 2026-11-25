@@ -327,6 +327,7 @@ impl GcsSource {
         .await?
         .with_calls(self.calls.get())
         .with_max_range_bytes(self.config.max_object_bytes)
+        .with_body_resume_attempts(self.config.body_resume_attempts)
         .pinned_to(meta.generation);
         let object_len = reader.len();
         let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
@@ -395,9 +396,17 @@ impl GcsSource {
         key: &str,
     ) -> Result<std::pin::Pin<Box<dyn tokio::io::AsyncBufRead + Send + Unpin>>, FaucetError> {
         self.roundtrips.record("get");
+        let resume = faucet_common_gcs::BodyResume::new(
+            self.config.body_resume_attempts,
+            &self.config.bucket,
+            key,
+        )
+        .with_recorder(self.roundtrips.recorder());
+        let received = resume.progress();
         let resp = self
             .storage
             .read_object(self.bucket_path(), key.to_string())
+            .with_read_resume_policy(resume)
             .send()
             .within(&self.calls, "get")
             .await?
@@ -444,6 +453,9 @@ impl GcsSource {
 
         let bytes_stream = resp
             .into_stream()
+            .inspect_ok(move |chunk| {
+                received.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            })
             .map_err(|e| std::io::Error::other(e.to_string()));
         // Wrap the RAW byte stream in the verifier first so length/checksum
         // cover the stored bytes (below any client-side decompression).

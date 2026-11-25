@@ -239,3 +239,58 @@ fn is_scaled_decimal(t: &str) -> bool {
         && t.split_once('.')
             .is_some_and(|(_, frac)| frac.len() > 1 && frac.ends_with('0'))
 }
+
+#[tokio::test]
+async fn a_double_keeps_every_digit_in_a_column_of_any_affinity() {
+    let (_dir, url) = fresh_db(
+        "CREATE TABLE f (id INTEGER PRIMARY KEY, as_text TEXT, as_varchar VARCHAR(40), \
+         as_real REAL, as_numeric NUMERIC, as_none)",
+    )
+    .await;
+    let sink = SqliteSink::new(
+        SqliteSinkConfig::new(&url, "f").column_mapping(SqliteColumnMapping::AutoMap),
+    )
+    .await
+    .expect("sink");
+    let values: Vec<f64> = (1..400u32).map(|i| f64::from(i) / 7.0).collect();
+    let page: Vec<Value> = values
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            serde_json::json!({"id": i, "as_text": f, "as_varchar": f, "as_real": f, "as_numeric": f, "as_none": f})
+        })
+        .collect();
+    sink.write_batch(&page).await.expect("write");
+    sink.flush().await.expect("flush");
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("connect");
+    let rows = sqlx::query(
+        "SELECT as_text, as_varchar, as_real, CAST(as_numeric AS REAL), as_none, typeof(as_text), \
+         typeof(as_real) \
+         FROM f ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("rows");
+    assert_eq!(rows.len(), values.len());
+    for (row, want) in rows.iter().zip(&values) {
+        for col in 0..2 {
+            let text: String = row.try_get(col).expect("text");
+            assert_eq!(
+                text.parse::<f64>().map(f64::to_bits),
+                Ok(want.to_bits()),
+                "{text}"
+            );
+        }
+        for col in 2..5 {
+            let real: f64 = row.try_get(col).expect("real");
+            assert_eq!(real.to_bits(), want.to_bits(), "column {col}");
+        }
+        assert_eq!(row.try_get::<String, _>(5).expect("typeof"), "text");
+        assert_eq!(row.try_get::<String, _>(6).expect("typeof"), "real");
+    }
+}

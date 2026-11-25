@@ -142,6 +142,15 @@ pub struct GcsSourceConfig {
     /// before any of its records is emitted.
     #[serde(default)]
     pub verify_checksum: bool,
+    /// How many times in a row one object read may resume after its body
+    /// drops mid-stream without any new bytes arriving; a drop that follows
+    /// new bytes starts the count again. A resume re-requests the bytes not
+    /// yet received, pinned to the object generation the read started on, so
+    /// a replaced object fails the read instead of being spliced. Each resume
+    /// counts as a source retry and logs a warning; past the limit the read
+    /// fails with the body error. `0` never resumes. Default 3.
+    #[serde(default = "default_body_resume_attempts")]
+    pub body_resume_attempts: u32,
     /// Largest object, once decompressed, that a format read whole (JSON
     /// array, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet, and
     /// JSON Lines under `verify_checksum`) may reach; a larger one fails with
@@ -205,6 +214,10 @@ fn default_max_object_bytes() -> u64 {
     faucet_core::file_format::DEFAULT_MAX_OBJECT_BYTES
 }
 
+fn default_body_resume_attempts() -> u32 {
+    faucet_common_gcs::DEFAULT_BODY_RESUME_ATTEMPTS
+}
+
 fn default_concurrency() -> usize {
     10
 }
@@ -224,6 +237,7 @@ impl GcsSourceConfig {
             batch_size: default_batch_size(),
             verify_length: true,
             verify_checksum: false,
+            body_resume_attempts: default_body_resume_attempts(),
             max_object_bytes: default_max_object_bytes(),
             max_decoded_bytes: None,
             storage_host: None,
@@ -323,6 +337,13 @@ impl GcsSourceConfig {
     /// Sets [`verify_length`](Self::verify_length).
     pub fn verify_length(mut self, verify: bool) -> Self {
         self.verify_length = verify;
+        self
+    }
+
+    /// Sets [`body_resume_attempts`](Self::body_resume_attempts) (default 3;
+    /// `0` never resumes a dropped body).
+    pub fn body_resume_attempts(mut self, attempts: u32) -> Self {
+        self.body_resume_attempts = attempts;
         self
     }
 
@@ -487,6 +508,23 @@ mod tests {
         assert_eq!(out["verify_length"], serde_json::json!(false));
         assert_eq!(out["verify_checksum"], serde_json::json!(true));
         assert!(out.get("verify").is_none(), "no nested block: {out}");
+    }
+
+    #[test]
+    fn body_resume_attempts_defaults_to_three_and_is_settable() {
+        let config: GcsSourceConfig = serde_json::from_str(r#"{"bucket": "b"}"#).unwrap();
+        assert_eq!(config.body_resume_attempts, 3);
+        assert_eq!(GcsSourceConfig::new("b").body_resume_attempts, 3);
+
+        let config: GcsSourceConfig =
+            serde_json::from_str(r#"{"bucket": "b", "body_resume_attempts": 0}"#).unwrap();
+        assert_eq!(config.body_resume_attempts, 0);
+        assert_eq!(
+            GcsSourceConfig::new("b")
+                .body_resume_attempts(7)
+                .body_resume_attempts,
+            7
+        );
     }
 
     #[test]

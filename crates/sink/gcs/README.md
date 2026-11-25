@@ -487,6 +487,9 @@ Every object-store request — uploads, listings, copies, deletes, downloads —
 runs through the pipeline's `CallContext` (#880): each is sent once, any caller
 deadline ends it, and round trips are still metered as `put` / `list` / `head` /
 `get` / `copy` / `delete`. The client's own timeouts and retry are unchanged.
+A download whose body drops mid-stream is resumed from the last byte received
+at most 3 times in a row without new bytes, each resume logged and counted as
+a `get`, then fails.
 
 ## Caller configs under `faucet serve`
 

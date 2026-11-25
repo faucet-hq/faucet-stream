@@ -120,6 +120,14 @@ engine.apply_plans(&mut Exec { conn: &mut tx }, &target, &plans).await?;
 The backend keeps transactions, bulk-load paths (`COPY`), overwrite swaps and
 catalog queries, and words its own errors per `StatementKind`.
 
+`plan_keyed_borrowed` / `plan_keyed_partial_borrowed` with
+`apply_plans_borrowed` and `report_borrowed` plan the same groups without
+copying a group that only repeats its rows: a clean upsert page (every row
+keyed, no repeated key, no delete, no delete-marker field) is bound straight
+from the page. Any other group owns its rows, as `plan_keyed` builds them.
+`SqlSinkDriver` uses the borrowed plans unless the rollback journal is on;
+a journaling write keeps owned plans, which `SqlExecutor::journal_plan` reads.
+
 ## Instants into columns without a zone
 
 `temporal::naive_temporal(sql_type)` recognises a zone-less `timestamp` /

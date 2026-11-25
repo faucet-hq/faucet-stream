@@ -30364,6 +30364,16 @@
                       ],
                       "default": false
                     },
+                    "body_resume_attempts": {
+                      "description": "How many times in a row one object read may resume after its body\ndrops mid-stream without any new bytes arriving; a drop that follows\nnew bytes starts the count again. A resume re-requests the bytes not\nyet received, pinned to the object generation the read started on, so\na replaced object fails the read instead of being spliced. Each resume\ncounts as a source retry and logs a warning; past the limit the read\nfails with the body error. `0` never resumes. Default 3.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint32",
+                      "minimum": 0,
+                      "default": 3
+                    },
                     "max_object_bytes": {
                       "description": "Largest object, once decompressed, that a format read whole (JSON\narray, raw text, CSV, XML, Excel, Avro, ORC, buffered Parquet, and\nJSON Lines under `verify_checksum`) may reach; a larger one fails with\nan error instead of exhausting memory. It also bounds one line of a\nstreamed JSON Lines object, so an object with no newline fails the same\nway. Default 2 GiB.",
                       "type": [

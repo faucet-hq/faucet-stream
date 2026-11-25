@@ -9,7 +9,7 @@ description = "Reference faucet-stream WASM transform (Rust): adds a field and u
 crate-type = ["cdylib"]
 
 [dependencies]
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 [profile.release]
 opt-level = "s"

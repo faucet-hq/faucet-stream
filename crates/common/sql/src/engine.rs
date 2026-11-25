@@ -13,7 +13,7 @@
 use crate::dialect::{SqlDialect, TableTarget};
 use crate::mapping::{ColumnIndex, MatchedRow, TableColumn, group_by_present, union_columns};
 use crate::statement::{Param, Statement, StatementKind};
-use faucet_core::write_mode::{KeyTuple, WritePlan, WriteSpec};
+use faucet_core::write_mode::{KeyTuple, WritePlan, WritePlanRef, WriteSpec};
 use faucet_core::{FaucetError, RowOutcome, SeenKeys, SqlBaseType, WriteMode, WriteReport};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -174,6 +174,56 @@ impl Drop for PageScope<'_> {
     }
 }
 
+/// Either plan type, as the engine reads one.
+trait PlanView: Sync {
+    fn upserts(&self) -> &[Value];
+    fn deletes(&self) -> &[KeyTuple];
+    fn as_owned(&self) -> Option<&WritePlan>;
+    fn to_owned_plan(&self) -> WritePlan;
+}
+
+impl PlanView for WritePlan {
+    fn upserts(&self) -> &[Value] {
+        &self.upserts
+    }
+    fn deletes(&self) -> &[KeyTuple] {
+        &self.deletes
+    }
+    fn as_owned(&self) -> Option<&WritePlan> {
+        Some(self)
+    }
+    fn to_owned_plan(&self) -> WritePlan {
+        WritePlan {
+            upserts: self.upserts.clone(),
+            deletes: self.deletes.clone(),
+            failed: self.failed.clone(),
+        }
+    }
+}
+
+impl PlanView for WritePlanRef<'_> {
+    fn upserts(&self) -> &[Value] {
+        &self.upserts
+    }
+    fn deletes(&self) -> &[KeyTuple] {
+        &self.deletes
+    }
+    fn as_owned(&self) -> Option<&WritePlan> {
+        None
+    }
+    fn to_owned_plan(&self) -> WritePlan {
+        WritePlan {
+            upserts: self.upserts.to_vec(),
+            deletes: self.deletes.clone(),
+            failed: self.failed.clone(),
+        }
+    }
+}
+
+fn owned_plans(plans: Vec<WritePlanRef<'_>>) -> Vec<WritePlan> {
+    plans.into_iter().map(WritePlanRef::into_owned).collect()
+}
+
 impl<D: std::fmt::Debug> std::fmt::Debug for SqlSinkEngine<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqlSinkEngine")
@@ -293,6 +343,15 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
     /// The page's keyed write groups in page order, failing on the first row
     /// whose key could not be read.
     pub fn plan_keyed(&self, records: &[Value]) -> Result<Vec<WritePlan>, FaucetError> {
+        Ok(owned_plans(self.plan_keyed_borrowed(records)?))
+    }
+
+    /// [`plan_keyed`](Self::plan_keyed) without copying a group that only
+    /// repeats its rows (a clean upsert page).
+    pub fn plan_keyed_borrowed<'a>(
+        &self,
+        records: &'a [Value],
+    ) -> Result<Vec<WritePlanRef<'a>>, FaucetError> {
         let failed = faucet_core::key_failures(records, &self.write);
         if let Some((idx, msg)) = failed.first() {
             return Err(FaucetError::Sink(format!(
@@ -301,7 +360,10 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
                 self.write.write_mode.as_str()
             )));
         }
-        Ok(faucet_core::plan_writes_ordered(records, &self.write))
+        Ok(faucet_core::plan_writes_ordered_borrowed(
+            records,
+            &self.write,
+        ))
     }
 
     /// The page's keyed write groups in page order, plus a per-row failure
@@ -310,6 +372,16 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         &self,
         records: &[Value],
     ) -> (Vec<WritePlan>, Vec<(usize, FaucetError)>) {
+        let (plans, failed) = self.plan_keyed_partial_borrowed(records);
+        (owned_plans(plans), failed)
+    }
+
+    /// [`plan_keyed_partial`](Self::plan_keyed_partial) without copying a
+    /// group that only repeats its rows.
+    pub fn plan_keyed_partial_borrowed<'a>(
+        &self,
+        records: &'a [Value],
+    ) -> (Vec<WritePlanRef<'a>>, Vec<(usize, FaucetError)>) {
         let failed = faucet_core::key_failures(records, &self.write)
             .into_iter()
             .map(|(idx, msg)| {
@@ -324,7 +396,7 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
             })
             .collect();
         (
-            faucet_core::plan_writes_ordered(records, &self.write),
+            faucet_core::plan_writes_ordered_borrowed(records, &self.write),
             failed,
         )
     }
@@ -616,10 +688,29 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
     /// row per planned upsert or delete and coalesces the rest (same key,
     /// last write wins); an append accepts what it wrote.
     pub fn report(&self, offered: usize, written: usize, plans: &[WritePlan]) -> WriteReport {
+        self.report_views(offered, written, plans)
+    }
+
+    /// [`report`](Self::report) for borrowed plans.
+    pub fn report_borrowed(
+        &self,
+        offered: usize,
+        written: usize,
+        plans: &[WritePlanRef<'_>],
+    ) -> WriteReport {
+        self.report_views(offered, written, plans)
+    }
+
+    fn report_views<P: PlanView>(
+        &self,
+        offered: usize,
+        written: usize,
+        plans: &[P],
+    ) -> WriteReport {
         if self.is_keyed() {
             let planned: usize = plans
                 .iter()
-                .map(|p| p.upserts.len() + p.deletes.len())
+                .map(|p| p.upserts().len() + p.deletes().len())
                 .sum();
             WriteReport::keyed(offered, planned)
         } else {
@@ -692,6 +783,26 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
         target: &TableTarget,
         plans: &[WritePlan],
     ) -> Result<usize, FaucetError> {
+        self.apply_plan_views(exec, target, plans).await
+    }
+
+    /// [`apply_plans`](Self::apply_plans) for borrowed plans. A journaling
+    /// write spec journals an owned copy of each group.
+    pub async fn apply_plans_borrowed<E: SqlExecutor + ?Sized>(
+        &self,
+        exec: &mut E,
+        target: &TableTarget,
+        plans: &[WritePlanRef<'_>],
+    ) -> Result<usize, FaucetError> {
+        self.apply_plan_views(exec, target, plans).await
+    }
+
+    async fn apply_plan_views<E: SqlExecutor + ?Sized, P: PlanView>(
+        &self,
+        exec: &mut E,
+        target: &TableTarget,
+        plans: &[P],
+    ) -> Result<usize, FaucetError> {
         // The groups share one table: read its columns and key types once,
         // not once per group (a CDC page alternating upserts and deletes is
         // one group per row).
@@ -702,26 +813,34 @@ impl<D: SqlDialect> SqlSinkEngine<D> {
             if self.write.journals()
                 && let Some(run_id) = self.write.rollback_run_id()
             {
-                exec.journal_plan(plan, run_id).await?;
+                let copy;
+                let owned = match plan.as_owned() {
+                    Some(owned) => owned,
+                    None => {
+                        copy = plan.to_owned_plan();
+                        &copy
+                    }
+                };
+                exec.journal_plan(owned, run_id).await?;
             }
-            if !plan.upserts.is_empty() {
+            if !plan.upserts().is_empty() {
                 if columns.is_none() {
                     columns = Some(exec.columns(target).await?);
                 }
                 let columns = columns.as_deref().unwrap_or_default();
                 let (written, statements) =
-                    self.insert_statements(target, columns, &plan.upserts, true)?;
+                    self.insert_statements(target, columns, plan.upserts(), true)?;
                 for stmt in &statements {
                     exec.execute(stmt).await?;
                 }
                 affected += written;
             }
-            if !plan.deletes.is_empty() {
+            if !plan.deletes().is_empty() {
                 if key_types.is_none() {
                     key_types = Some(exec.key_types(target, &self.write.key).await?);
                 }
                 let key_types = key_types.as_deref().unwrap_or_default();
-                for stmt in &self.delete_statements(target, key_types, &plan.deletes)? {
+                for stmt in &self.delete_statements(target, key_types, plan.deletes())? {
                     affected += exec.execute(stmt).await? as usize;
                 }
             }

@@ -38,6 +38,7 @@ pub(crate) struct GcsRangeReader {
     recorder: Option<Arc<faucet_core::observability::RoundtripRecorder>>,
     calls: faucet_core::CallContext,
     max_range_bytes: u64,
+    body_resume_attempts: u32,
 }
 
 impl GcsRangeReader {
@@ -66,6 +67,7 @@ impl GcsRangeReader {
             recorder,
             calls: faucet_core::CallContext::new(),
             max_range_bytes: faucet_core::file_format::DEFAULT_MAX_OBJECT_BYTES,
+            body_resume_attempts: faucet_common_gcs::DEFAULT_BODY_RESUME_ATTEMPTS,
         })
     }
 
@@ -73,6 +75,12 @@ impl GcsRangeReader {
     /// before any request.
     pub(crate) fn with_max_range_bytes(mut self, max: u64) -> Self {
         self.max_range_bytes = max;
+        self
+    }
+
+    /// Resume a range whose body drops at most `attempts` times.
+    pub(crate) fn with_body_resume_attempts(mut self, attempts: u32) -> Self {
+        self.body_resume_attempts = attempts;
         self
     }
 
@@ -105,9 +113,17 @@ impl GcsRangeReader {
         if let Some(r) = &self.recorder {
             r.record("get");
         }
+        let resume = faucet_common_gcs::BodyResume::new(
+            self.body_resume_attempts,
+            bucket_name(&self.bucket_path),
+            &self.key,
+        )
+        .with_recorder(self.recorder.clone());
+        let received = resume.progress();
         let mut request = self
             .storage
             .read_object(&self.bucket_path, self.key.clone())
+            .with_read_resume_policy(resume)
             .set_read_range(ReadRange::segment(range.start, wanted));
         if let Some(generation) = self.generation {
             request = request.set_generation(generation);
@@ -124,6 +140,10 @@ impl GcsRangeReader {
                 loop {
                     match stream.try_next().await {
                         Ok(Some(chunk)) => {
+                            received.fetch_add(
+                                chunk.len() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                             buf.extend_from_slice(&chunk);
                             if buf.len() as u64 > wanted {
                                 // More than asked for: stop rather than buffer
@@ -229,6 +249,10 @@ impl AsyncFileReader for GcsRangeReader {
         }
         .boxed()
     }
+}
+
+fn bucket_name(bucket_path: &str) -> &str {
+    bucket_path.rsplit('/').next().unwrap_or(bucket_path)
 }
 
 #[cfg(test)]

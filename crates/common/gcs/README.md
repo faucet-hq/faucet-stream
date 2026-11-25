@@ -51,6 +51,18 @@ pub async fn build_storage_control(
 
 `crc32c_of_bytes(&[u8]) -> u32` and `open_with_crc32c(&Path) -> io::Result<(tokio::fs::File, u32)>` (reads the file in chunks, then rewinds it) give an upload's CRC32C so it can be declared up front with `write_object(..).with_known_crc32c(crc)`. `google-cloud-storage` 1.19+ otherwise sends a single-shot upload's checksum as a third multipart part, which a server that reads only metadata + media (`fake-gcs-server`) stores as object content; declared up front, it travels in the metadata part, where every server checks it against the bytes it stored.
 
+### Bounded body resume
+
+`BodyResume::new(attempts, bucket, key).with_recorder(recorder)` is the
+read-resume policy every pipeline `read_object` installs
+(`with_read_resume_policy`). The storage client re-requests a dropped body
+from the last byte received, pinned to the first response's generation, and by
+default does so without limit. This policy keeps the client's rule for which
+errors are resumable, stops after `attempts` resumes in a row with no new bytes (`0` never resumes;
+a reader reports bytes through `BodyResume::progress`),
+counts each as a `get` round trip and a retry of class `connection`, and logs a
+warning naming the object and the attempt. `DEFAULT_BODY_RESUME_ATTEMPTS` is 3.
+
 ## Storage backend for the file writer
 
 `GcsBackend` is the `StorageBackend` the shared file writer in
@@ -68,6 +80,8 @@ sink is a `FileSink<GcsBackend>` (RFC 0013, #886). Build it with
   round-trip recorder (`put`, `get`, `head`, `list`, `copy`, `delete`); a
   429 / 5xx (or gRPC `RESOURCE_EXHAUSTED` / `UNAVAILABLE` / `INTERNAL`) is a
   typed, retryable `FaucetError::HttpStatus`.
+- A download whose body drops mid-stream resumes at most
+  `DEFAULT_BODY_RESUME_ATTEMPTS` (3) times, then fails.
 - The preflight probe lists one object of the bucket.
 
 ## Who depends on this

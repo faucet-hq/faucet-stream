@@ -15,7 +15,7 @@ Reach for it when you want a zero-dependency, embedded landing table on local di
 - **Transactional batches** — every chunk is one multi-row `INSERT` wrapped in a `BEGIN`/`COMMIT`, so a batch commits all-or-nothing.
 - **High write throughput** — multi-row INSERTs, WAL journal mode, and a configurable `busy_timeout` (60 s by default) keep the single writer fast and lock-tolerant.
 - **Parameter-limit aware** — in `auto_map` mode the sink splits each chunk so `rows × columns` never exceeds SQLite's `SQLITE_MAX_VARIABLE_NUMBER`, so wide tables never fail with "too many SQL variables".
-- **Native-typed binds** — in `auto_map` mode strings bind as `TEXT`, JSON numbers as `INTEGER`/`REAL`, booleans as `INTEGER` 0/1; arrays/objects bind as JSON text — so column affinity round-trips correctly.
+- **Native-typed binds** — in `auto_map` mode strings bind as `TEXT`, JSON numbers as `INTEGER`/`REAL`, booleans as `INTEGER` 0/1; arrays/objects bind as JSON text — so column affinity round-trips correctly. A non-integer number bound for a `TEXT`-affinity column (`TEXT`, `VARCHAR`, `CLOB`) goes as its shortest decimal text, because SQLite itself would render a bound `REAL` there with 15 significant digits and drop the rest.
 - **Write modes** — `append` (default), `upsert` (`INSERT … ON CONFLICT … DO UPDATE`), and `delete`, all keyed on a UNIQUE/PRIMARY KEY column set.
 - **Effectively-once delivery** — pairs with a CDC source to commit records and a watermark token in one transaction.
 - **Dead-letter queue** — per-row error reporting routes failing rows to a DLQ instead of failing the whole batch.

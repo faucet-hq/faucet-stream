@@ -406,6 +406,11 @@ pub trait SqlDriver: Send + Sync {
     }
 }
 
+enum KeyedPlans<'a> {
+    Owned(Vec<WritePlan>),
+    Borrowed(Vec<faucet_core::WritePlanRef<'a>>),
+}
+
 /// A [`SqlDriver`] as a [`SinkDriver`] (RFC 0014). See the [module docs](self).
 pub struct SqlSinkDriver<D> {
     driver: D,
@@ -598,12 +603,60 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
         Ok(())
     }
 
+    /// The page's keyed write groups: borrowed from the page, or owned when
+    /// the rollback journal reads them.
+    fn plan_keyed<'a>(&self, records: &'a [Value]) -> Result<KeyedPlans<'a>, FaucetError> {
+        if self.engine().write_spec().journals() {
+            Ok(KeyedPlans::Owned(self.engine().plan_keyed(records)?))
+        } else {
+            Ok(KeyedPlans::Borrowed(
+                self.engine().plan_keyed_borrowed(records)?,
+            ))
+        }
+    }
+
+    fn plan_keyed_partial<'a>(
+        &self,
+        records: &'a [Value],
+    ) -> (KeyedPlans<'a>, Vec<(usize, FaucetError)>) {
+        if self.engine().write_spec().journals() {
+            let (plans, failed) = self.engine().plan_keyed_partial(records);
+            (KeyedPlans::Owned(plans), failed)
+        } else {
+            let (plans, failed) = self.engine().plan_keyed_partial_borrowed(records);
+            (KeyedPlans::Borrowed(plans), failed)
+        }
+    }
+
+    async fn apply_on(
+        &self,
+        conn: &mut D::Conn<'_>,
+        target: &TableTarget,
+        plans: &KeyedPlans<'_>,
+    ) -> Result<usize, FaucetError> {
+        match plans {
+            KeyedPlans::Owned(plans) => self.engine().apply_plans(conn, target, plans).await,
+            KeyedPlans::Borrowed(plans) => {
+                self.engine()
+                    .apply_plans_borrowed(conn, target, plans)
+                    .await
+            }
+        }
+    }
+
+    fn report_keyed(&self, offered: usize, written: usize, plans: &KeyedPlans<'_>) -> WriteReport {
+        match plans {
+            KeyedPlans::Owned(plans) => self.engine().report(offered, written, plans),
+            KeyedPlans::Borrowed(plans) => self.engine().report_borrowed(offered, written, plans),
+        }
+    }
+
     /// Apply keyed write groups in one transaction.
-    async fn apply_plans(&self, plans: &[WritePlan]) -> Result<usize, FaucetError> {
+    async fn apply_plans(&self, plans: &KeyedPlans<'_>) -> Result<usize, FaucetError> {
         self.driver.prepare_keyed_write().await?;
         let mut conn = self.driver.begin().await?;
         let target = self.driver.target(&self.layout().table);
-        let n = self.engine().apply_plans(&mut conn, &target, plans).await?;
+        let n = self.apply_on(&mut conn, &target, plans).await?;
         self.driver.commit(conn).await?;
         Ok(n)
     }
@@ -617,9 +670,9 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
         }
         self.ensure_table_ready(records).await?;
         if self.engine().is_keyed() {
-            let plans = self.engine().plan_keyed(records)?;
+            let plans = self.plan_keyed(records)?;
             let written = self.apply_plans(&plans).await?;
-            return Ok(self.engine().report(records.len(), written, &plans));
+            return Ok(self.report_keyed(records.len(), written, &plans));
         }
         let chunk = match self.layout().batch_size {
             0 => records.len(),
@@ -677,7 +730,7 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
         if self.driver.splits_keyed_pages() {
             let columns = self.live_columns(&table).await?;
             if !self.driver.refuses_rows(&table, records, &columns, false) {
-                let (plans, failed) = self.engine().plan_keyed_partial(records);
+                let (plans, failed) = self.plan_keyed_partial(records);
                 self.apply_plans(&plans).await?;
                 let mut outcomes: Vec<faucet_core::RowOutcome> =
                     records.iter().map(|_| Ok(())).collect();
@@ -688,14 +741,14 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
             }
             let split = self.driver.split_page(&table, records, &columns, false);
             let mut outcomes = split.outcomes;
-            let (plans, failed) = self.engine().plan_keyed_partial(&split.writable);
+            let (plans, failed) = self.plan_keyed_partial(&split.writable);
             self.apply_plans(&plans).await?;
             for (idx, e) in failed {
                 outcomes[split.positions[idx]] = Err(e);
             }
             return Ok(PageWrite::from_outcomes(outcomes));
         }
-        let (plans, failed) = self.engine().plan_keyed_partial(records);
+        let (plans, failed) = self.plan_keyed_partial(records);
         self.apply_plans(&plans).await?;
         let ok = records.len() - failed.len();
         Ok(PageWrite::accepted(ok).with_failures(failed))
@@ -929,7 +982,7 @@ impl<D: SqlDriver> CommitTokenDriver for SqlSinkDriver<D> {
             self.ensure_table_ready(rows).await?;
             self.ensure_token_table().await?;
             let plans = if self.engine().is_keyed() {
-                Some(self.engine().plan_keyed(rows)?)
+                Some(self.plan_keyed(rows)?)
             } else {
                 None
             };
@@ -940,7 +993,7 @@ impl<D: SqlDriver> CommitTokenDriver for SqlSinkDriver<D> {
             let written = match &plans {
                 Some(plans) => {
                     let target = self.driver.target(&self.layout().table);
-                    self.engine().apply_plans(&mut conn, &target, plans).await?
+                    self.apply_on(&mut conn, &target, plans).await?
                 }
                 None => {
                     let target = self.driver.target(&self.effective_table());
@@ -951,9 +1004,10 @@ impl<D: SqlDriver> CommitTokenDriver for SqlSinkDriver<D> {
             };
             self.driver.write_token(&mut conn, scope, token).await?;
             self.driver.commit(conn).await?;
-            Ok(self
-                .engine()
-                .report(rows.len(), written, plans.as_deref().unwrap_or(&[])))
+            Ok(match &plans {
+                Some(plans) => self.report_keyed(rows.len(), written, plans),
+                None => self.engine().report(rows.len(), written, &[]),
+            })
         })
         .await
     }
@@ -1071,6 +1125,17 @@ mod tests {
             self.split_keyed = split;
             self
         }
+        fn journaling(mut self) -> Self {
+            let mut write = self.engine.write_spec().clone();
+            write.rollback = Some(faucet_core::rollback::RollbackWriteSpec {
+                run_id: "r1".into(),
+                run_id_column: "_faucet_run_id".into(),
+                journal: true,
+                keep_previous: false,
+            });
+            self.engine = SqlSinkEngine::new(Sqlite, write);
+            self
+        }
         fn log(&self) -> Vec<String> {
             self.log.lock().unwrap().clone()
         }
@@ -1086,6 +1151,14 @@ mod tests {
         async fn execute(&mut self, stmt: &Statement<'_>) -> Result<u64, FaucetError> {
             self.0.log.lock().unwrap().push(stmt.sql.clone());
             Ok(1)
+        }
+        async fn journal_plan(&mut self, plan: &WritePlan, _: &str) -> Result<(), FaucetError> {
+            self.0
+                .log
+                .lock()
+                .unwrap()
+                .push(format!("JOURNAL {:?} {:?}", plan.upserts, plan.deletes));
+            Ok(())
         }
     }
 
@@ -1310,6 +1383,73 @@ mod tests {
                 }
                 assert_eq!(seen[0], seen[1], "keyed = {keyed}, page = {page:?}");
                 assert_eq!(seen[0].0.len(), page.len());
+            }
+        }
+    }
+
+    /// The borrowed plan (journal off) and the owned plan (journal on) run
+    /// the same statements and report the same rows on every keyed path.
+    #[tokio::test]
+    #[allow(deprecated)] // the exactly-once hook the engine still drives (#888)
+    async fn a_keyed_page_writes_the_same_with_the_journal_on_and_off() {
+        let pages = [
+            vec![json!({"id": 1}), json!({"id": 2}), json!({"id": 3})],
+            vec![json!({"id": 1}), json!({"id": 1}), json!({"id": 2})],
+            vec![json!({"id": 1}), json!({"x": 2}), json!({"id": 3})],
+            vec![json!({"x": 1})],
+        ];
+        for split in [false, true] {
+            for page in &pages {
+                let mut seen = Vec::new();
+                for journal in [false, true] {
+                    let build = || {
+                        let mut mem = Mem::new(SqlLayout::new("t"), true).keyed(split);
+                        if journal {
+                            mem = mem.journaling();
+                        }
+                        DriverSink::new(SqlSinkDriver::new(mem))
+                    };
+                    let statements = |sink: &DriverSink<SqlSinkDriver<Mem>>| {
+                        let log = sink.driver().driver().log();
+                        let journals = log.iter().filter(|l| l.starts_with("JOURNAL")).count();
+                        let sql: Vec<String> = log
+                            .into_iter()
+                            .filter(|l| !l.starts_with("JOURNAL"))
+                            .collect();
+                        (sql, journals)
+                    };
+
+                    let sink = build();
+                    let partial: Vec<Result<(), String>> = sink
+                        .write_batch_partial(page)
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .map(|o| o.map_err(|e| e.to_string()))
+                        .collect();
+                    let (partial_sql, partial_journals) = statements(&sink);
+                    let keyed = page.iter().filter(|r| r.get("id").is_some()).count();
+                    assert_eq!(partial_journals > 0, journal && keyed > 0, "{page:?}");
+
+                    let sink = build();
+                    let whole = sink
+                        .write_batch_reported(page)
+                        .await
+                        .map(|r| (r.accepted, r.coalesced))
+                        .map_err(|e| e.to_string());
+                    let (whole_sql, _) = statements(&sink);
+
+                    let sink = build();
+                    let tokened = sink
+                        .write_batch_idempotent_reported(page, "scope", "0000001")
+                        .await
+                        .map(|r| (r.accepted, r.coalesced))
+                        .map_err(|e| e.to_string());
+                    let (tokened_sql, _) = statements(&sink);
+
+                    seen.push((partial, partial_sql, whole, whole_sql, tokened, tokened_sql));
+                }
+                assert_eq!(seen[0], seen[1], "split = {split}, page = {page:?}");
             }
         }
     }

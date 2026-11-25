@@ -6,9 +6,11 @@
 mod backend;
 mod checksum;
 mod json_control;
+mod resume;
 
 pub use backend::{GcsBackend, GcsBackendBuilder, MAX_REWRITE_CALLS};
 pub use checksum::{crc32c_of_bytes, open_with_crc32c};
+pub use resume::{BodyResume, DEFAULT_BODY_RESUME_ATTEMPTS};
 
 use faucet_core::FaucetError;
 use google_cloud_storage::client::{Storage, StorageControl};

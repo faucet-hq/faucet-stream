@@ -120,3 +120,44 @@ async fn avro_to_parquet_runs_on_the_columnar_path() {
     let n: usize = reader.build().unwrap().map(|b| b.unwrap().num_rows()).sum();
     assert_eq!(n, 5);
 }
+
+#[tokio::test]
+async fn shortest_float_literals_reach_parquet_and_json_lines_as_numbers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut lines = String::new();
+    for i in 0..3000u32 {
+        let balance = f64::from(i) / 7.0;
+        lines.push_str(&format!(
+            "{{\"recordId\":{i},\"accountBalance\":{balance:?}}}\n"
+        ));
+    }
+    assert!(lines.contains("\"accountBalance\":90.28571428571429}"));
+    let input = write(dir.path(), "in.jsonl", lines.as_bytes());
+
+    for name in ["out.parquet", "out.jsonl"] {
+        let out = dir.path().join(name).to_string_lossy().into_owned();
+        let src = FileSource::new(FileSourceConfig::new(input.clone())).unwrap();
+        let sink = faucet_sink_file::FileSink::new(
+            serde_json::from_value(json!({ "path": out })).unwrap(),
+        )
+        .unwrap();
+        let result = Pipeline::new(&src, &sink).run().await.unwrap();
+        assert_eq!(result.records_written, 3000, "{name}");
+        let landed = FileSource::new(FileSourceConfig::new(out))
+            .unwrap()
+            .fetch_all()
+            .await
+            .unwrap();
+        assert_eq!(landed.len(), 3000, "{name}");
+        for row in &landed {
+            let i = row["recordId"].as_u64().unwrap();
+            let want = (i as f64) / 7.0;
+            assert_eq!(
+                row["accountBalance"].as_f64().map(f64::to_bits),
+                Some(want.to_bits()),
+                "{name}: record {i} holds {}",
+                row["accountBalance"]
+            );
+        }
+    }
+}
