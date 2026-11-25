@@ -60,6 +60,17 @@ MongoDB reads as relaxed extended JSON, so a `Decimal128` is
 `{"$numberDecimal": "…"}` and a `Date` `{"$date": …}`, and the MongoDB sink
 restores them.
 
+## Float literals in JSON text
+
+A float literal in JSON input is read as the nearest double (`serde_json` with
+its `float_roundtrip` feature, which every faucet crate turns on). It stays a
+number when it is a rendering of that double: the shortest text that reads back
+as it (what Python, JavaScript and Rust print), or the double rounded to the
+literal's own digit count (a `%.17g` rendering, an exact expansion). A literal
+that carries digits the double cannot hold (`1234567890123456.7`,
+`0.12345678901234567890`) becomes a string of its exact digits, and so does an
+integer literal past `u64`.
+
 ## Non-finite values
 
 JSON cannot hold `NaN` or an infinity. A source writes such a value as `null`

@@ -23,7 +23,7 @@ Turn on only the connectors you need:
 faucet-registry = { version = "1", features = ["source-postgres", "sink-jsonl"] }
 faucet-core = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 ```
 
 Each connector has a `source-<kind>` / `sink-<kind>` feature. `source` and

@@ -101,6 +101,11 @@ No filesystem, network, environment, or wall-clock access exists in v1.
 
 ## Writing a module (Rust)
 
+Build the module with `serde_json`'s `float_roundtrip` feature
+(`serde_json = { version = "1", features = ["float_roundtrip"] }`). Without it
+`serde_json` can read a long float literal one unit in the last place away from
+the nearest double, and the module would hand back a changed number.
+
 ```rust
 use serde_json::Value;
 use std::alloc::{alloc as sys_alloc, dealloc, Layout};

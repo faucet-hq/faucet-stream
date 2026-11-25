@@ -1181,6 +1181,33 @@ mod tests {
     }
 
     #[test]
+    fn shortest_float_literals_parse_as_the_nearest_double() {
+        let v = from_str(r#"{"recordId":632,"accountBalance":90.28571428571429}"#).unwrap();
+        assert_eq!(v, json!({"recordId": 632, "accountBalance": 632.0 / 7.0}));
+        let v = from_slice(br#"{"recordId":1,"accountBalance":0.14285714285714285}"#).unwrap();
+        assert_eq!(
+            v["accountBalance"].as_f64().map(f64::to_bits),
+            Some((1.0f64 / 7.0).to_bits())
+        );
+        for i in 0..3000u32 {
+            let f = f64::from(i) / 7.0;
+            let text = format!("[{f:?},{f:e},{f:.16e}]");
+            let parsed = from_str(&text).unwrap();
+            for item in parsed.as_array().unwrap() {
+                assert_eq!(item.as_f64().map(f64::to_bits), Some(f.to_bits()), "{text}");
+            }
+            let stored = parse_json(format!("{f:?}").as_bytes()).unwrap();
+            assert_eq!(
+                stored.as_f64().map(f64::to_bits),
+                Some(f.to_bits()),
+                "{f:?}"
+            );
+        }
+        let exact = from_str_allow_non_finite("[NaN, 90.28571428571429]").unwrap();
+        assert_eq!(exact, json!([null, 632.0 / 7.0]));
+    }
+
+    #[test]
     fn serialized_json_keeps_unfaithful_literals_as_strings() {
         let v = from_str(
             r#"{"id": 18446744073709551616, "amt": 0.12345678901234567890, "d": 0.10000000000000001, "s": "1234567890123456789", "n": [1, 2.5]}"#,

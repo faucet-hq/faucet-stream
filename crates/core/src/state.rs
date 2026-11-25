@@ -1595,6 +1595,22 @@ mod tests {
         assert_eq!(got, value);
     }
 
+    #[tokio::test]
+    async fn file_round_trip_keeps_every_bit_of_a_float_bookmark() {
+        let dir = TempDir::new().unwrap();
+        let s = FileStateStore::new(dir.path());
+        for i in (1..3000u32).step_by(37) {
+            let f = f64::from(i) / 7.0;
+            s.put("floats", &json!({ "cursor": f })).await.unwrap();
+            let got = s.get("floats").await.unwrap().unwrap();
+            assert_eq!(
+                got["cursor"].as_f64().map(f64::to_bits),
+                Some(f.to_bits()),
+                "{f}"
+            );
+        }
+    }
+
     #[test]
     fn temp_path_is_unique_and_not_pid_derived() {
         // Regression for F50: the temp filename must not embed the process id.
