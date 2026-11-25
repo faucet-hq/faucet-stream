@@ -11,7 +11,7 @@ use serde_json::{Map, Value as Json};
 ///
 /// - `NULL` → `null`
 /// - `Int(i64)` / `UInt(u64)` → JSON number
-/// - `Float(f32)` / `Double(f64)` → JSON number (NaN/Inf → `null`)
+/// - `Float(f32)` → its shortest single-precision decimal; `Double(f64)` → JSON number (NaN/Inf → `null`)
 /// - `Bytes(Vec<u8>)` → UTF-8 string if valid, else base64-encoded string
 /// - `Date(y, mo, d, h, mi, s, micro)` → `"YYYY-MM-DD HH:MM:SS.ffffff"`
 /// - `Time(neg, days, h, mi, s, micro)` → `"[-]HHH:MM:SS.ffffff"`
@@ -20,7 +20,7 @@ pub fn value_to_json(v: &Value) -> Json {
         Value::NULL => Json::Null,
         Value::Int(i) => Json::from(*i),
         Value::UInt(u) => Json::from(*u),
-        Value::Float(f) => faucet_core::fidelity::float64(f64::from(*f)),
+        Value::Float(f) => faucet_core::fidelity::float32(*f),
         Value::Double(d) => faucet_core::fidelity::float64(*d),
         Value::Bytes(b) => match std::str::from_utf8(b) {
             // Text-like columns decode as UTF-8 strings; binary falls back to base64.
@@ -611,6 +611,18 @@ mod tests {
         // Time(neg=false, days=1, h=2, ...) → 1*24 + 2 = 26 hours.
         let v = value_to_json(&Value::Time(false, 1, 2, 3, 4, 0));
         assert_eq!(v, Json::String("26:03:04.000000".into()));
+    }
+
+    #[test]
+    fn an_unhinted_float_renders_its_shortest_single_precision_form() {
+        for f in [0.1f32, 0.7, 55_139_150.0, -1.5e-7, f32::MAX] {
+            assert_eq!(
+                value_to_json(&Value::Float(f)),
+                faucet_core::fidelity::float32(f)
+            );
+        }
+        assert_eq!(value_to_json(&Value::Float(0.1)).to_string(), "0.1");
+        assert_eq!(value_to_json(&Value::Float(0.7)).to_string(), "0.7");
     }
 
     #[test]
