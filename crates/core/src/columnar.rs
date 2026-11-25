@@ -22,6 +22,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use serde_json::Value;
 use std::sync::Arc;
 
+mod direct;
+
 /// A page of records in **columnar** (Arrow) form, the columnar analogue of
 /// [`StreamPage`](crate::StreamPage).
 ///
@@ -523,17 +525,34 @@ pub fn values_to_record_batch_inferred(records: &[Value]) -> Result<RecordBatch,
 
 /// Decode a [`RecordBatch`] into JSON objects (one per row).
 ///
-/// Uses `arrow-json`'s array writer with **explicit nulls enabled**, so a
-/// null-valued column is emitted as `"key": null` rather than omitted — without
-/// this a `SELECT *`-style identity would silently delete every explicit-null
-/// field (audit #321 H6). An empty batch returns an empty `Vec`.
+/// A null-valued column is emitted as `"key": null` rather than omitted —
+/// without this a `SELECT *`-style identity would silently delete every
+/// explicit-null field (audit #321 H6). An empty batch returns an empty `Vec`.
 ///
 /// Values follow the canonical renderings of [`crate::fidelity`]: decimals are
 /// exact strings (`"12345678901234567890.12"`) rather than JSON numbers, which
 /// `serde_json` would round through `f64`; non-finite floats become a counted
 /// `null`; binary columns are base64; timestamps and times carry their unit's
 /// native precision, and a zoned timestamp its offset.
+///
+/// The values are built straight from the Arrow arrays when every column is
+/// one of: null, boolean, integers, `Float64`, strings, binary, decimals,
+/// timestamps (no zone or a zone that parses), times, dates, structs, lists
+/// (list, large list, fixed-size list), maps with string keys, and
+/// dictionaries of `Utf8` / `LargeUtf8` values without nulls. A batch holding
+/// anything else — `Float32` and `Float16` included — (or a duplicate field
+/// name, or nesting deeper than 32 levels) is converted whole by writing it
+/// as JSON text with `arrow-json` (explicit nulls on) and parsing that text. The choice is made before any
+/// value is rendered, so a batch is never converted by both, and the two
+/// produce the same values, key order, non-finite count and errors.
 pub fn record_batch_to_values(batch: &RecordBatch) -> Result<Vec<Value>, FaucetError> {
+    match direct::convert(batch) {
+        Some(values) => Ok(values),
+        None => record_batch_to_values_json(batch),
+    }
+}
+
+pub(crate) fn record_batch_to_values_json(batch: &RecordBatch) -> Result<Vec<Value>, FaucetError> {
     let mut buf = Vec::with_capacity(batch.get_array_memory_size().min(JSON_HOP_PRESIZE_CAP));
     {
         let mut writer = arrow_json::writer::WriterBuilder::new()
