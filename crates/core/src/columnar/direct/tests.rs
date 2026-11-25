@@ -1448,3 +1448,54 @@ fn timing_of_single_floats() {
     let direct = convert(&batch).map(|_| median(&|| convert(&batch).unwrap().len()));
     eprintln!("100k rows x 4 Float32: json hop {json:?}, public {public:?}, direct {direct:?}");
 }
+
+#[test]
+fn run_end_encoded_null_runs_render_null() {
+    let ends = Int32Array::from(vec![2, 3, 5]);
+    let cases: Vec<(ArrayRef, &str, u64)> = vec![
+        (
+            Arc::new(
+                RunArray::try_new(&ends, &Int32Array::from(vec![Some(4), None, Some(6)])).unwrap(),
+            ),
+            "[4,4,null,6,6]",
+            0,
+        ),
+        (
+            Arc::new(
+                RunArray::try_new(&ends, &StringArray::from(vec![None, Some("b"), Some("c")]))
+                    .unwrap(),
+            ),
+            r#"[null,null,"b","c","c"]"#,
+            0,
+        ),
+        (
+            Arc::new(
+                RunArray::try_new(
+                    &ends,
+                    &Float64Array::from_iter_values_with_nulls(
+                        [1.5, f64::NAN, 2.5],
+                        Some(NullBuffer::from(vec![true, false, true])),
+                    ),
+                )
+                .unwrap(),
+            ),
+            "[1.5,1.5,null,2.5,2.5]",
+            0,
+        ),
+    ];
+    for (array, expected, non_finite) in cases {
+        let sliced = array.slice(1, 3);
+        let full: Vec<Value> = serde_json::from_str(expected).unwrap();
+        let sliced_expected = serde_json::to_string(&full[1..4]).unwrap();
+        for (array, expected) in [(array, expected.to_owned()), (sliced, sliced_expected)] {
+            let batch = batch_of(vec![("v", array)]);
+            assert!(convert(&batch).is_none(), "run-end-encoded takes the hop");
+            for render in [record_batch_to_values, record_batch_to_values_json] {
+                let (rows, count) = counted(|| render(&batch).unwrap());
+                let column: Vec<Value> = rows.iter().map(|r| r["v"].clone()).collect();
+                assert_eq!(serde_json::to_string(&column).unwrap(), expected);
+                assert_eq!(count, non_finite, "a NaN under a null run is not counted");
+            }
+        }
+    }
+}
