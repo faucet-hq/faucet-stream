@@ -229,6 +229,42 @@ async fn failed_statement_reports_code_and_message() {
     assert!(err.contains("FAILED") && err.contains("BAD_REQUEST") && err.contains("nope"));
 }
 
+fn large_rows() -> (Value, Vec<u8>) {
+    let rows: Vec<Vec<String>> = (0..150_000).map(|i| vec![i.to_string()]).collect();
+    let value = json!({ "data_array": rows });
+    let body = serde_json::to_vec(&value).unwrap();
+    assert!(body.len() >= faucet_core::http::BLOCKING_DECODE_BYTES);
+    (value, body)
+}
+
+#[tokio::test]
+async fn a_large_response_decodes_whole_and_a_broken_one_is_a_sink_error() {
+    let server = MockServer::start().await;
+    let (value, body) = large_rows();
+    let mut broken = body.clone();
+    broken.truncate(faucet_core::http::BLOCKING_DECODE_BYTES + 1);
+    let inline = serde_json::from_slice::<Value>(&broken).unwrap_err();
+    Mock::given(method("GET"))
+        .and(path("/chunks/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/chunks/2"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(broken))
+        .mount(&server)
+        .await;
+    let c = client(&server.uri(), opts());
+    assert_eq!(c.fetch_chunk("/chunks/1").await.unwrap(), value);
+    let err = c.fetch_chunk("/chunks/2").await.unwrap_err();
+    assert!(matches!(err, FaucetError::Sink(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .ends_with(&format!("databricks: could not parse response: {inline}")),
+        "{err}"
+    );
+}
+
 #[tokio::test]
 async fn unknown_state_and_missing_id_are_errors() {
     let server = MockServer::start().await;

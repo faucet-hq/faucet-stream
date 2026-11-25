@@ -303,6 +303,70 @@ async fn an_unparseable_external_chunk_is_an_error() {
     assert!(err.to_string().contains("external-link chunk"), "{err}");
 }
 
+fn large_chunk() -> (Vec<Vec<Value>>, Vec<u8>) {
+    let rows: Vec<Vec<Value>> = (0..150_000).map(|i| vec![json!(i.to_string())]).collect();
+    let body = serde_json::to_vec(&rows).unwrap();
+    assert!(body.len() >= faucet_core::http::BLOCKING_DECODE_BYTES);
+    (rows, body)
+}
+
+async fn source_with_chunk(server: &MockServer, chunk: Vec<u8>) -> DatabricksSource {
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "statement_id": "s12",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": manifest(&[("id", "INT")]),
+            "result": { "external_links": [{
+                "external_link": format!("{}/presigned/big", server.uri())
+            }] }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/presigned/big"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(chunk))
+        .mount(server)
+        .await;
+    source(&server.uri(), "SELECT id FROM t").await
+}
+
+/// A chunk large enough to be decoded on a blocking thread yields every row
+/// in order.
+#[tokio::test]
+async fn a_large_external_chunk_yields_every_row_in_order() {
+    let server = MockServer::start().await;
+    let (rows, body) = large_chunk();
+    let src = source_with_chunk(&server, body).await;
+    let got = src.fetch_with_context(&HashMap::new()).await.unwrap();
+    assert_eq!(got.len(), rows.len());
+    for (i, r) in got.iter().enumerate() {
+        assert_eq!(r["id"], json!(i as i64), "row {i}");
+    }
+}
+
+/// A large chunk that is not valid JSON fails with the same text a small one
+/// does.
+#[tokio::test]
+async fn a_large_unparseable_external_chunk_is_an_error() {
+    let server = MockServer::start().await;
+    let (_, mut body) = large_chunk();
+    body.truncate(faucet_core::http::BLOCKING_DECODE_BYTES + 1);
+    let inline = serde_json::from_slice::<Vec<Vec<Value>>>(&body).unwrap_err();
+    let src = source_with_chunk(&server, body).await;
+    let err = src.fetch_with_context(&HashMap::new()).await.unwrap_err();
+    assert!(
+        matches!(err, faucet_core::FaucetError::Source(_)),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().ends_with(&format!(
+            "databricks: could not parse an external-link chunk: {inline}"
+        )),
+        "{err}"
+    );
+}
+
 #[tokio::test]
 async fn failed_statement_is_typed_error() {
     let server = MockServer::start().await;

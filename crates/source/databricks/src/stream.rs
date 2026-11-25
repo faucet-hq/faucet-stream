@@ -364,11 +364,9 @@ impl DatabricksSource {
     /// Fetch a presigned `JSON_ARRAY` chunk: a JSON array of row arrays.
     async fn fetch_json_link(&self, url: &str) -> Result<Vec<Vec<Value>>, FaucetError> {
         let body = self.get_external(url).await?;
-        serde_json::from_slice(&body).map_err(|e| {
-            FaucetError::Source(format!(
-                "databricks: could not parse an external-link chunk: {e}"
-            ))
-        })
+        faucet_core::http::decode_json(body)
+            .await
+            .map_err(chunk_parse_error)
     }
 
     /// Every row of one result chunk: its inline `data_array` plus the rows of
@@ -413,6 +411,16 @@ fn default_state_key(config: &DatabricksSourceConfig) -> String {
         "databricks:{:016x}",
         faucet_core::shard::shard_hash(&material)
     )
+}
+
+fn chunk_parse_error(e: FaucetError) -> FaucetError {
+    let detail = match e {
+        FaucetError::Json(e) => e.to_string(),
+        other => other.to_string(),
+    };
+    FaucetError::Source(format!(
+        "databricks: could not parse an external-link chunk: {detail}"
+    ))
 }
 
 /// Decode a raw result chunk.
@@ -866,6 +874,25 @@ mod tests {
         assert_eq!(value_to_param_string(&json!(true)), json!("true"));
         assert_eq!(value_to_param_string(&json!("x")), json!("x"));
         assert_eq!(value_to_param_string(&Value::Null), Value::Null);
+    }
+
+    #[test]
+    fn a_chunk_parse_failure_keeps_its_text() {
+        let serde = serde_json::from_str::<Value>("{").unwrap_err();
+        let text = format!("databricks: could not parse an external-link chunk: {serde}");
+        let e = chunk_parse_error(FaucetError::Json(serde));
+        assert!(matches!(e, FaucetError::Source(_)), "{e:?}");
+        assert!(e.to_string().ends_with(&text), "{e}");
+
+        let died = FaucetError::Sink("decoding a response body failed: gone".into());
+        let e = chunk_parse_error(died);
+        assert!(matches!(e, FaucetError::Source(_)), "{e:?}");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("databricks: could not parse an external-link chunk: ")
+                && msg.contains("decoding a response body failed: gone"),
+            "{msg}"
+        );
     }
 
     #[test]
