@@ -124,12 +124,12 @@ pub struct KafkaSinkConfig {
     )]
     #[schemars(with = "u64")]
     pub linger: Duration,
-    /// Maximum number of in-flight `FuturesUnordered` send futures during a
-    /// single [`Sink::write_batch`](faucet_core::Sink::write_batch) call.
+    /// Page-level cap on records awaiting a delivery report during a single
+    /// [`Sink::write_batch`](faucet_core::Sink::write_batch) call.
     /// Defaults to [`DEFAULT_BATCH_SIZE`].
     ///
     /// When `batch_size > 0`, the producer's `queue.buffering.max.messages`
-    /// librdkafka property is also set to this value (so the broker-side
+    /// librdkafka property is also set to this value (so the producer's
     /// buffer matches the sink-side send window) unless the user has
     /// already set it via `extra_client_config`. `QueueFull` errors still
     /// flow through the existing retry path (`queue_full_backoff` /
@@ -137,9 +137,8 @@ pub struct KafkaSinkConfig {
     /// to apply backpressure earlier inside the sink loop instead of
     /// queueing the request and waiting for librdkafka to push back.
     ///
-    /// `batch_size = 0` is the "no batching" sentinel: every record in the
-    /// incoming slice is enqueued into the `FuturesUnordered` immediately
-    /// (bounded only by `max_in_flight`) and the librdkafka
+    /// `batch_size = 0` is the "no batching" sentinel: the window is bounded
+    /// only by `max_in_flight` and the librdkafka
     /// `queue.buffering.max.messages` knob is left at its default. Use it
     /// for sources that emit a single page per run (small lookup tables,
     /// one-shot drains) where forcing additional backpressure adds latency.
@@ -157,11 +156,13 @@ pub struct KafkaSinkConfig {
     )]
     #[schemars(with = "u64")]
     pub message_timeout: Duration,
-    /// Hard ceiling on concurrent in-flight sends inside one
-    /// [`Sink::write_batch`](faucet_core::Sink::write_batch) call. Defaults to
-    /// 100 and must be at least 1. When [`Self::batch_size`] is non-zero the
-    /// effective window is `min(max_in_flight, batch_size)`, so this is the
-    /// cap that applies under the `batch_size = 0` sentinel.
+    /// Hard ceiling on records enqueued but not yet confirmed delivered
+    /// inside one [`Sink::write_batch`](faucet_core::Sink::write_batch) call.
+    /// Defaults to 1000 and must be at least 1. When [`Self::batch_size`] is
+    /// non-zero the effective window is `min(max_in_flight, batch_size)`, so
+    /// this is the cap that applies under the `batch_size = 0` sentinel. A
+    /// small window caps how many records one produce request can carry;
+    /// `1` sends one record at a time.
     #[serde(default = "default_max_in_flight")]
     pub max_in_flight: usize,
     /// How long to wait before retrying a send that librdkafka rejected with
@@ -351,7 +352,7 @@ fn default_message_timeout() -> Duration {
     Duration::from_secs(30)
 }
 fn default_max_in_flight() -> usize {
-    100
+    DEFAULT_BATCH_SIZE
 }
 fn default_queue_full_backoff() -> Duration {
     Duration::from_millis(100)
@@ -587,9 +588,8 @@ impl KafkaSinkConfig {
     /// Set the in-flight send-window cap for
     /// [`Sink::write_batch`](faucet_core::Sink::write_batch).
     ///
-    /// Pass `0` to opt out of the explicit cap — every record in the slice
-    /// is enqueued into the `FuturesUnordered` immediately (bounded only by
-    /// `max_in_flight`) and the librdkafka `queue.buffering.max.messages`
+    /// Pass `0` to opt out of the explicit cap — the window is bounded only
+    /// by `max_in_flight` and the librdkafka `queue.buffering.max.messages`
     /// knob is left at its default.
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
@@ -598,6 +598,15 @@ impl KafkaSinkConfig {
 }
 
 impl KafkaSinkConfig {
+    /// Records one page may have enqueued and not yet confirmed.
+    pub(crate) fn in_flight_window(&self) -> usize {
+        if self.batch_size > 0 {
+            self.max_in_flight.min(self.batch_size)
+        } else {
+            self.max_in_flight
+        }
+    }
+
     /// What a failed batch write leaves behind (#737): each record is its own send.
     pub fn batch_atomicity(&self) -> faucet_core::BatchAtomicity {
         faucet_core::BatchAtomicity::BestEffort
@@ -828,6 +837,29 @@ mod tests {
         }"#;
         let parsed: KafkaSinkConfig = serde_json::from_str(raw).unwrap();
         assert_eq!(parsed.batch_size, DEFAULT_BATCH_SIZE);
+    }
+
+    #[test]
+    fn the_in_flight_window_defaults_to_a_whole_page() {
+        let raw = r#"{
+            "brokers": "b:9092",
+            "topic": { "type": "fixed", "name": "out" }
+        }"#;
+        let parsed: KafkaSinkConfig = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.max_in_flight, DEFAULT_BATCH_SIZE);
+        assert_eq!(parsed.in_flight_window(), DEFAULT_BATCH_SIZE);
+    }
+
+    #[test]
+    fn the_in_flight_window_is_the_smaller_of_both_caps() {
+        let mut c = minimal().with_batch_size(500);
+        c.max_in_flight = 1000;
+        assert_eq!(c.in_flight_window(), 500);
+        c.max_in_flight = 7;
+        assert_eq!(c.in_flight_window(), 7);
+        let mut unbatched = minimal().with_batch_size(0);
+        unbatched.max_in_flight = 250;
+        assert_eq!(unbatched.in_flight_window(), 250);
     }
 
     #[test]

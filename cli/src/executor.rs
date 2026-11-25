@@ -835,6 +835,9 @@ async fn run_expanded_unredacted(
         .map(|(id, n)| (id.clone(), Arc::new(n.clone())))
         .collect();
 
+    let compiled_governance =
+        crate::governance::CompiledGovernance::for_rows(shared_nodes.values());
+
     // Per-parent projection: what to keep from each captured record so the
     // fan-out buffer holds only the fields children reference (#160).
     let projections = build_projections(&nodes_by_id, &children_of);
@@ -1392,6 +1395,7 @@ async fn run_expanded_unredacted(
                     let unit_cancel = level_cancel.child_token();
                     let dlq_sinks = Arc::clone(&dlq_sinks);
                     let state_stores = Arc::clone(&state_stores);
+                    let compiled_governance = compiled_governance.clone();
                     let untrusted = untrusted_targets();
                     let handle = joinset.spawn(
                         UNTRUSTED_TARGETS
@@ -1401,21 +1405,23 @@ async fn run_expanded_unredacted(
                                     state_stores,
                                     DLQ_SINKS.scope(
                                         dlq_sinks,
-                                        inherit_feed(Box::pin(async move {
-                                            let _permit = permit;
-                                            run_unit(
-                                                &unit,
-                                                capture,
-                                                &captured,
-                                                &discovered,
-                                                &collected,
-                                                &opts2,
-                                                unit_cancel,
-                                                suppress_overwrite,
-                                                overwrite_grouped,
-                                            )
-                                            .await
-                                        })),
+                                        inherit_feed(Box::pin(compiled_governance.scope(
+                                            async move {
+                                                let _permit = permit;
+                                                run_unit(
+                                                    &unit,
+                                                    capture,
+                                                    &captured,
+                                                    &discovered,
+                                                    &collected,
+                                                    &opts2,
+                                                    unit_cancel,
+                                                    suppress_overwrite,
+                                                    overwrite_grouped,
+                                                )
+                                                .await
+                                            },
+                                        ))),
                                     ),
                                 )),
                             )

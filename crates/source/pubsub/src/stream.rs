@@ -129,6 +129,37 @@ async fn ack_messages(
     }
 }
 
+/// A held message's payload: all a lease, an ack and a renewal never read.
+trait HeldPayload: Clone {
+    fn payload(&mut self) -> (&mut Vec<u8>, &mut std::collections::HashMap<String, String>);
+}
+
+impl HeldPayload for ReceivedMessage {
+    fn payload(&mut self) -> (&mut Vec<u8>, &mut std::collections::HashMap<String, String>) {
+        (&mut self.message.data, &mut self.message.attributes)
+    }
+}
+
+/// Drop a decoded message's data and attributes; it is kept only to be acked
+/// and to have its lease renewed.
+fn strip_payload<T: HeldPayload>(m: &mut T) {
+    let (data, attributes) = m.payload();
+    *data = Vec::new();
+    *attributes = std::collections::HashMap::new();
+}
+
+/// A copy of `m` without its data and attributes, for the lease extender.
+fn lease_handle<T: HeldPayload>(m: &mut T) -> T {
+    let (data, attributes) = m.payload();
+    let data = std::mem::take(data);
+    let attributes = std::mem::take(attributes);
+    let handle = m.clone();
+    let (d, a) = m.payload();
+    *d = data;
+    *a = attributes;
+    handle
+}
+
 /// Renew the ack deadline of every held message. Best-effort. Thin SDK shim.
 async fn renew_deadlines(acks: CallContext, messages: Vec<ReceivedMessage>, secs: i32) {
     use futures::StreamExt;
@@ -306,14 +337,16 @@ impl faucet_core::Source for PubsubSource {
                     continue;
                 }
                 last_activity = Instant::now();
+                let mut messages = messages;
                 if lease.is_some() {
-                    let mut pulled = messages.clone();
+                    let mut pulled: Vec<ReceivedMessage> =
+                        messages.iter_mut().map(lease_handle).collect();
                     pulled.extend(page_msgs.iter().cloned());
                     hold(&pulled, &pending);
                 }
 
                 let mut messages = messages.into_iter();
-                while let Some(m) = messages.next() {
+                while let Some(mut m) = messages.next() {
                     let record = record_with_policy(
                         &MessageParts {
                             data: &m.message.data,
@@ -330,6 +363,7 @@ impl faucet_core::Source for PubsubSource {
                     if let Some(record) = record {
                         buffer.push(record);
                     }
+                    strip_payload(&mut m);
                     page_msgs.push(m);
                     total += 1;
 
@@ -465,6 +499,46 @@ impl faucet_core::Source for PubsubSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Held {
+        ack_id: String,
+        data: Vec<u8>,
+        attributes: std::collections::HashMap<String, String>,
+    }
+
+    impl HeldPayload for Held {
+        fn payload(&mut self) -> (&mut Vec<u8>, &mut std::collections::HashMap<String, String>) {
+            (&mut self.data, &mut self.attributes)
+        }
+    }
+
+    fn held() -> Held {
+        Held {
+            ack_id: "a-1".into(),
+            data: b"payload".to_vec(),
+            attributes: [("k".to_string(), "v".to_string())].into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn lease_handle_leaves_the_message_whole_and_copies_no_payload() {
+        let mut m = held();
+        let handle = lease_handle(&mut m);
+        assert_eq!(m, held());
+        assert_eq!(handle.ack_id, "a-1");
+        assert!(handle.data.is_empty());
+        assert!(handle.attributes.is_empty());
+    }
+
+    #[test]
+    fn strip_payload_keeps_the_ack_id() {
+        let mut m = held();
+        strip_payload(&mut m);
+        assert_eq!(m.ack_id, "a-1");
+        assert!(m.data.is_empty() && m.data.capacity() == 0);
+        assert!(m.attributes.is_empty());
+    }
 
     #[test]
     fn only_deadline_exceeded_is_an_empty_pull() {

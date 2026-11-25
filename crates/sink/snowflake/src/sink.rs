@@ -373,7 +373,10 @@ impl SnowflakeDriver {
     /// table created with unquoted identifiers stores `ID`, while most sources
     /// emit `id` (#862 H-11) — and offset-bearing ISO strings in
     /// `TIMESTAMP_NTZ` columns are converted to UTC wall time.
-    fn normalize_records(&self, records: &[Value]) -> Result<Vec<Value>, FaucetError> {
+    fn normalize_records<'r>(
+        &self,
+        records: &'r [Value],
+    ) -> Result<std::borrow::Cow<'r, [Value]>, FaucetError> {
         let (names, ntz) = self
             .columns
             .lock()
@@ -385,7 +388,7 @@ impl SnowflakeDriver {
             })
             .unwrap_or_default();
         if names.is_empty() {
-            return Ok(records.to_vec());
+            return Ok(std::borrow::Cow::Borrowed(records));
         }
         let index = fold_index(&names);
         records
@@ -416,7 +419,8 @@ impl SnowflakeDriver {
                 }
                 Ok(Value::Object(out))
             })
-            .collect()
+            .collect::<Result<Vec<Value>, FaucetError>>()
+            .map(std::borrow::Cow::Owned)
     }
 
     fn new(config: SnowflakeSinkConfig) -> Result<Self, FaucetError> {
@@ -766,7 +770,7 @@ impl SnowflakeDriver {
     fn build_insert(&self, records: &[Value]) -> Result<(String, String), FaucetError> {
         let records = self.normalize_records(records)?;
         let sql = self.insert_from(&records, "?")?;
-        Ok((sql, Value::Array(records).to_string()))
+        Ok((sql, payload_json(&records)?))
     }
 
     /// The page INSERT with its JSON payload inlined as an escaped string
@@ -774,7 +778,7 @@ impl SnowflakeDriver {
     /// accepts no bindings (SQL-44).
     fn build_insert_inline(&self, records: &[Value]) -> Result<String, FaucetError> {
         let records = self.normalize_records(records)?;
-        let payload = Value::Array(records.clone()).to_string();
+        let payload = payload_json(&records)?;
         self.insert_from(&records, &idempotent::sql_string_literal(&payload))
     }
 
@@ -810,8 +814,28 @@ impl SnowflakeDriver {
 /// plus one more for every `'` or `\` a SQL string literal doubles, so the
 /// bound is right for both the bound and the inlined form.
 fn payload_len(row: &Value) -> usize {
-    let text = serde_json::to_string(row).unwrap_or_default();
-    text.len() + text.bytes().filter(|b| matches!(b, b'\'' | b'\\')).count()
+    let mut count = PayloadCount(0);
+    serde_json::to_writer(&mut count, row).map_or(0, |()| count.0)
+}
+
+/// A row's payload bytes; quotes and backslashes count twice.
+struct PayloadCount(usize);
+
+impl std::io::Write for PayloadCount {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len() + buf.iter().filter(|b| matches!(b, b'\'' | b'\\')).count();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `records` as the JSON array text the INSERT parses.
+fn payload_json(records: &[Value]) -> Result<String, FaucetError> {
+    serde_json::to_string(records)
+        .map_err(|e| FaucetError::Sink(format!("snowflake: cannot serialize the page: {e}")))
 }
 
 /// Split `rows` into consecutive ranges whose serialized JSON stays within
@@ -1015,7 +1039,9 @@ impl SnowflakeSink {
         self.driver().build_insert(records)
     }
     fn normalize_records(&self, records: &[Value]) -> Result<Vec<Value>, FaucetError> {
-        self.driver().normalize_records(records)
+        self.driver()
+            .normalize_records(records)
+            .map(std::borrow::Cow::into_owned)
     }
     fn column_union(records: &[Value]) -> Result<Vec<String>, FaucetError> {
         SnowflakeDriver::column_union(records)
@@ -1656,6 +1682,9 @@ mod tests {
             r#"{"s":"\u0001'\\"}"#
         );
         assert_eq!(payload_len(&escaped), 17 + 4);
+        let mut count = PayloadCount(5);
+        std::io::Write::flush(&mut count).unwrap();
+        assert_eq!(count.0, 5);
     }
 
     #[test]

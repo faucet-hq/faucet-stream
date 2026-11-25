@@ -76,7 +76,30 @@ pub fn text_to_json_with(
     text: &str,
     money_fraction_digits: Option<u32>,
 ) -> Result<Value, FaucetError> {
-    Ok(match type_oid {
+    Ok(typed_json(type_oid, text, money_fraction_digits)?
+        .unwrap_or_else(|| Value::String(text.into())))
+}
+
+/// [`text_to_json_with`] for a cell the caller owns: a value that stays raw
+/// text keeps the cell's allocation.
+pub fn text_into_json_with(
+    type_oid: u32,
+    text: String,
+    money_fraction_digits: Option<u32>,
+) -> Result<Value, FaucetError> {
+    Ok(match typed_json(type_oid, &text, money_fraction_digits)? {
+        Some(value) => value,
+        None => Value::String(text),
+    })
+}
+
+/// The typed rendering of a cell, or `None` when it stays raw text.
+fn typed_json(
+    type_oid: u32,
+    text: &str,
+    money_fraction_digits: Option<u32>,
+) -> Result<Option<Value>, FaucetError> {
+    Ok(Some(match type_oid {
         OID_BOOL => match text {
             "t" => Value::Bool(true),
             "f" => Value::Bool(false),
@@ -138,10 +161,10 @@ pub fn text_to_json_with(
                 }
                 Value::Array(out)
             } else {
-                Value::String(text.into())
+                return Ok(None);
             }
         }
-    })
+    }))
 }
 
 /// The number of fractional digits the server's `lc_monetary` locale prints,
@@ -731,5 +754,45 @@ mod tests {
         // \x followed by an odd number of hex digits is rejected (lines 202-205).
         let err = text_to_json(OID_BYTEA, "\\xABC").unwrap_err();
         assert!(err.to_string().contains("odd length"), "{err}");
+    }
+
+    #[test]
+    fn an_owned_cell_converts_like_a_borrowed_one() {
+        let cells: &[(u32, &str)] = &[
+            (OID_BOOL, "t"),
+            (OID_BOOL, "maybe"),
+            (OID_INT4, "42"),
+            (OID_INT8, "nope"),
+            (OID_FLOAT8, "1.5"),
+            (OID_FLOAT8, "NaN"),
+            (OID_NUMERIC, "12.340"),
+            (OID_MONEY, "$1,234.50"),
+            (OID_BYTEA, "\\x6869"),
+            (OID_BYTEA, "6869"),
+            (OID_TIMESTAMPTZ, "2026-01-02 03:04:05+00"),
+            (OID_DATE, "infinity"),
+            (OID_JSONB, r#"{"a":[1,2]}"#),
+            (OID_JSON, "{"),
+            (25, "plain text"),
+            (1043, ""),
+            (1007, "{1,2,NULL}"),
+            (1009, r#"{"a,b",c}"#),
+            (1009, "not an array"),
+            (1009, "{{a},{b}}"),
+            (3904, "[1,5)"),
+            (999_999, "anything"),
+        ];
+        for digits in [None, Some(2)] {
+            for (oid, text) in cells {
+                let borrowed = text_to_json_with(*oid, text, digits).map_err(|e| e.to_string());
+                let owned = text_into_json_with(*oid, (*text).to_owned(), digits)
+                    .map_err(|e| e.to_string());
+                assert_eq!(owned, borrowed, "oid {oid} text {text:?}");
+            }
+        }
+        assert_eq!(
+            text_into_json_with(25, "kept".to_owned(), None).unwrap(),
+            json!("kept")
+        );
     }
 }

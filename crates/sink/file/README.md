@@ -83,7 +83,8 @@ CSV keeps its rows in a side file and rewrites
 the header in front of them (so a later record can still add a column),
 Parquet copies its row groups into a new file, and the whole-document formats
 (JSON array, XML, Excel, Avro) re-encode the file's records, which they keep in
-memory — bound that with `max_records_per_file` or `max_bytes_per_file`.
+memory — bound that with `max_records_per_file` or `max_bytes_per_file`. A
+whole-document file that reaches 1,000,000 records logs one warning naming it.
 
 Batch atomicity is `atomic` without rollover (a page is visible entirely or not
 at all) and `best_effort` with rollover (a page can span files and an earlier

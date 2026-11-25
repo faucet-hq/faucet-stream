@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use faucet_common_azure::build_store;
+use faucet_core::file_format::JsonLineError;
 use faucet_core::{FaucetError, Stream, StreamPage};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use object_store::path::Path as ObjectPath;
@@ -763,23 +764,15 @@ impl faucet_core::Source for AzureBlobSource {
                         // One line is bounded by `max_object_bytes`, so an
                         // object with no newline fails instead of being
                         // buffered whole.
-                        let mut lines = faucet_core::file_format::capped_lines(reader, self.config.max_object_bytes);
-                        let mut line_num: usize = 0;
-                        while let Some(line) = lines
-                            .next_line()
-                            .await
-                            .map_err(|e| FaucetError::Source(format!(
+                        let mut lines = faucet_core::file_format::json_lines(reader, self.config.max_object_bytes);
+                        while let Some(value) = lines.next_value().await.map_err(|e| match e {
+                            JsonLineError::Parse { line: line_num, error: e } => FaucetError::Source(format!(
+                                "azure JSON parse error in '{key}' at line {line_num}: {e}",
+                            )),
+                            JsonLineError::Read(e) => FaucetError::Source(format!(
                                 "azure read body error for key '{key}': {e}"
-                            )))?
-                        {
-                            line_num += 1;
-                            let trimmed = line.trim();
-                            if trimmed.is_empty() { continue; }
-                            let value: Value = faucet_core::fidelity::from_str(trimmed).map_err(|e| {
-                                FaucetError::Source(format!(
-                                    "azure JSON parse error in '{key}' at line {line_num}: {e}",
-                                ))
-                            })?;
+                            )),
+                        })? {
                             buffer.push(value);
                             if batch_size != 0 && buffer.len() >= chunk {
                                 let page = std::mem::replace(

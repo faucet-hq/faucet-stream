@@ -42,6 +42,9 @@ pub(crate) fn decode_body(body: &str) -> Value {
     faucet_core::fidelity::from_str(body).unwrap_or_else(|_| Value::String(body.to_string()))
 }
 
+/// `DeleteMessageBatch` requests one page may have open at once.
+const DELETE_CONCURRENCY: usize = 8;
+
 /// Pause after an empty short-poll receive.
 const EMPTY_RECEIVE_BACKOFF: Duration = Duration::from_millis(500);
 
@@ -159,51 +162,62 @@ impl SqsSource {
         })
     }
 
-    /// Delete a page's receipt handles, chunked to the 10-entry API cap. A
-    /// whole-request failure propagates as a typed error; per-entry failures
-    /// are logged and left for SQS to redeliver (at-least-once).
+    /// Delete a page's receipt handles, chunked to the 10-entry API cap, up to
+    /// [`DELETE_CONCURRENCY`] requests at a time. A whole-request failure
+    /// propagates as a typed error; per-entry failures are logged and left for
+    /// SQS to redeliver (at-least-once).
     async fn delete_handles(&self, handles: &[String]) -> Result<(), FaucetError> {
-        for chunk in handles.chunks(MAX_RECEIVE_BATCH as usize) {
-            let entries: Vec<DeleteMessageBatchRequestEntry> = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, rh)| {
-                    DeleteMessageBatchRequestEntry::builder()
-                        .id(i.to_string())
-                        .receipt_handle(rh)
-                        .build()
-                        .map_err(|e| {
-                            FaucetError::Source(format!("sqs: delete entry build failed: {e}"))
-                        })
-                })
-                .collect::<Result<_, _>>()?;
-            let out = self
-                .calls
-                .call("delete", || async {
-                    Ok(self
-                        .client
-                        .delete_message_batch()
-                        .queue_url(&self.config.queue_url)
-                        .set_entries(Some(entries.clone()))
-                        .send()
-                        .await)
-                })
-                .await?
-                .map_err(|e| {
-                    FaucetError::Source(format!(
-                        "sqs: DeleteMessageBatch on '{}' failed: {}",
-                        self.config.queue_url,
-                        e.into_service_error()
-                    ))
-                })?;
-            for f in out.failed() {
-                tracing::warn!(
-                    queue = %self.config.queue_url,
-                    id = f.id(),
-                    code = f.code(),
-                    "sqs: message delete failed; message will be redelivered"
-                );
-            }
+        faucet_core::batching::map_concurrent(
+            handles
+                .chunks(MAX_RECEIVE_BATCH as usize)
+                .map(<[String]>::to_vec),
+            DELETE_CONCURRENCY,
+            |chunk| async move { self.delete_chunk(&chunk).await },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn delete_chunk(&self, chunk: &[String]) -> Result<(), FaucetError> {
+        let entries: Vec<DeleteMessageBatchRequestEntry> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, rh)| {
+                DeleteMessageBatchRequestEntry::builder()
+                    .id(i.to_string())
+                    .receipt_handle(rh)
+                    .build()
+                    .map_err(|e| {
+                        FaucetError::Source(format!("sqs: delete entry build failed: {e}"))
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        let out = self
+            .calls
+            .call("delete", || async {
+                Ok(self
+                    .client
+                    .delete_message_batch()
+                    .queue_url(&self.config.queue_url)
+                    .set_entries(Some(entries.clone()))
+                    .send()
+                    .await)
+            })
+            .await?
+            .map_err(|e| {
+                FaucetError::Source(format!(
+                    "sqs: DeleteMessageBatch on '{}' failed: {}",
+                    self.config.queue_url,
+                    e.into_service_error()
+                ))
+            })?;
+        for f in out.failed() {
+            tracing::warn!(
+                queue = %self.config.queue_url,
+                id = f.id(),
+                code = f.code(),
+                "sqs: message delete failed; message will be redelivered"
+            );
         }
         Ok(())
     }

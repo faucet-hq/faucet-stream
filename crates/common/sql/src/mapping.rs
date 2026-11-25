@@ -151,6 +151,8 @@ pub struct ColumnIndex<'c> {
     folded: HashMap<String, usize>,
     /// Upper-cased names (`UpperFold` only).
     upper: Vec<String>,
+    /// ASCII-lower-cased names, by column (`CaseInsensitive` / `FoldUnique`).
+    lower: Vec<String>,
 }
 
 impl<'c> ColumnIndex<'c> {
@@ -158,12 +160,16 @@ impl<'c> ColumnIndex<'c> {
     pub fn new(columns: &'c [TableColumn], matching: ColumnMatching) -> Self {
         let exact = columns.iter().map(|c| c.name.as_str()).collect();
         let mut folded: HashMap<String, usize> = HashMap::new();
+        let mut lower = Vec::new();
         if matches!(
             matching,
             ColumnMatching::CaseInsensitive | ColumnMatching::FoldUnique
         ) {
+            lower.reserve(columns.len());
             for c in columns {
-                *folded.entry(c.name.to_ascii_lowercase()).or_default() += 1;
+                let name = c.name.to_ascii_lowercase();
+                *folded.entry(name.clone()).or_default() += 1;
+                lower.push(name);
             }
         }
         let upper = if matching == ColumnMatching::UpperFold {
@@ -177,13 +183,48 @@ impl<'c> ColumnIndex<'c> {
             exact,
             folded,
             upper,
+            lower,
         }
     }
 
     /// The `(column index, value)` cells `obj` carries, in table order; the
     /// same result as [`field_for`] per column.
     pub fn match_record<'a>(&self, obj: &'a Map<String, Value>) -> Vec<(usize, &'a Value)> {
-        let alternate: HashMap<String, &'a Value> = match self.matching {
+        let mut alternate: Option<HashMap<String, &'a Value>> = None;
+        let mut cells = Vec::with_capacity(self.columns.len().min(obj.len()));
+        for (i, c) in self.columns.iter().enumerate() {
+            if let Some(v) = obj.get(&c.name) {
+                cells.push((i, v));
+                continue;
+            }
+            let v = match self.matching {
+                ColumnMatching::Exact => None,
+                ColumnMatching::CaseInsensitive | ColumnMatching::FoldUnique => alternate
+                    .get_or_insert_with(|| self.alternate(obj))
+                    .get(&self.lower[i])
+                    .copied(),
+                ColumnMatching::UpperFold => {
+                    if c.name != c.name.to_uppercase() {
+                        None
+                    } else {
+                        alternate
+                            .get_or_insert_with(|| self.alternate(obj))
+                            .get(&c.name)
+                            .copied()
+                    }
+                }
+            };
+            if let Some(v) = v {
+                cells.push((i, v));
+            }
+        }
+        cells
+    }
+
+    /// `obj`'s fields under their folded names, for the columns no field
+    /// names exactly.
+    fn alternate<'a>(&self, obj: &'a Map<String, Value>) -> HashMap<String, &'a Value> {
+        match self.matching {
             ColumnMatching::Exact => HashMap::new(),
             ColumnMatching::CaseInsensitive => {
                 let mut m = HashMap::with_capacity(obj.len());
@@ -211,30 +252,7 @@ impl<'c> ColumnIndex<'c> {
                 }
                 m
             }
-        };
-        self.columns
-            .iter()
-            .enumerate()
-            .filter_map(|(i, c)| {
-                if let Some(v) = obj.get(&c.name) {
-                    return Some((i, v));
-                }
-                let v = match self.matching {
-                    ColumnMatching::Exact => None,
-                    ColumnMatching::CaseInsensitive | ColumnMatching::FoldUnique => {
-                        alternate.get(&c.name.to_ascii_lowercase()).copied()
-                    }
-                    ColumnMatching::UpperFold => {
-                        if c.name != c.name.to_uppercase() {
-                            None
-                        } else {
-                            alternate.get(&c.name).copied()
-                        }
-                    }
-                };
-                v.map(|v| (i, v))
-            })
-            .collect()
+        }
     }
 
     /// Record fields that land in no column.
@@ -332,12 +350,13 @@ pub fn map_records<'a>(
     records: &'a [Value],
     matching: ColumnMatching,
 ) -> Result<Vec<MatchedRow<'a>>, MapError> {
+    let index_of = ColumnIndex::new(columns, matching);
     records
         .iter()
         .enumerate()
         .map(|(index, record)| {
             let obj = record.as_object().ok_or(MapError::NotObject { index })?;
-            let cells = match_record(columns, obj, matching);
+            let cells = index_of.match_record(obj);
             if cells.is_empty() {
                 return Err(MapError::NoMatch { index });
             }

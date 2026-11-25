@@ -109,6 +109,55 @@ impl CursorBookmark {
     }
 }
 
+/// The rows emitted at one cursor value: a count per fingerprint, plus any
+/// stored entries that are not fingerprints this code writes (kept as found).
+#[derive(Debug, Clone, Default)]
+struct Boundary {
+    rows: HashMap<u128, usize>,
+    opaque: Vec<String>,
+}
+
+impl Boundary {
+    fn from_stored(items: Vec<String>) -> Self {
+        let mut boundary = Self::default();
+        for item in items {
+            match parse_fingerprint(&item) {
+                Some(fp) => *boundary.rows.entry(fp).or_insert(0) += 1,
+                None => boundary.opaque.push(item),
+            }
+        }
+        boundary
+    }
+
+    fn len(&self) -> usize {
+        self.rows.values().sum::<usize>() + self.opaque.len()
+    }
+
+    fn stored(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .rows
+            .iter()
+            .flat_map(|(fp, n)| std::iter::repeat_n(fingerprint_text(*fp), *n))
+            .chain(self.opaque.iter().cloned())
+            .collect();
+        v.sort_unstable();
+        v
+    }
+}
+
+fn fingerprint_text(fp: u128) -> String {
+    format!("{fp:032x}")
+}
+
+/// The fingerprint a stored entry spells, when it is spelled as
+/// [`row_fingerprint`] writes it.
+fn parse_fingerprint(text: &str) -> Option<u128> {
+    if text.len() != 32 || !text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    u128::from_str_radix(text, 16).ok()
+}
+
 /// Filters rows read in cursor order against a starting [`CursorBookmark`]
 /// and tracks the position after the last row admitted.
 #[derive(Debug)]
@@ -116,36 +165,26 @@ pub struct CursorTracker {
     column: String,
     start: Value,
     /// Copies of each row still to refuse at the starting value.
-    start_boundary: Option<HashMap<String, usize>>,
+    start_boundary: Option<HashMap<u128, usize>>,
     value: Value,
-    boundary: Option<HashMap<String, usize>>,
+    boundary: Option<Boundary>,
     boundary_rows: usize,
     missing: usize,
     overflow_warned: bool,
 }
 
-fn count(items: Vec<String>) -> HashMap<String, usize> {
-    let mut m = HashMap::new();
-    for fp in items {
-        *m.entry(fp).or_insert(0) += 1;
-    }
-    m
-}
-
 impl CursorTracker {
     /// Track `column` from `start`.
     pub fn new(column: impl Into<String>, start: CursorBookmark) -> Self {
-        let start_boundary = start.boundary.map(count);
-        let boundary_rows = start_boundary
-            .as_ref()
-            .map_or(0, |b| b.values().sum::<usize>());
+        let boundary = start.boundary.map(Boundary::from_stored);
+        let boundary_rows = boundary.as_ref().map_or(0, Boundary::len);
         Self {
             boundary_rows,
             column: column.into(),
             value: start.value.clone(),
-            boundary: start_boundary.clone(),
+            start_boundary: boundary.as_ref().map(|b| b.rows.clone()),
+            boundary,
             start: start.value,
-            start_boundary,
             missing: 0,
             overflow_warned: false,
         }
@@ -159,7 +198,7 @@ impl CursorTracker {
             self.missing += 1;
             return true;
         };
-        let fingerprint = row_fingerprint(row);
+        let fingerprint = fingerprint(row);
         if *v == self.start
             && let Some(left) = self
                 .start_boundary
@@ -172,7 +211,7 @@ impl CursorTracker {
         }
         if *v == self.value {
             if let Some(b) = self.boundary.as_mut() {
-                *b.entry(fingerprint).or_insert(0) += 1;
+                *b.rows.entry(fingerprint).or_insert(0) += 1;
                 self.boundary_rows += 1;
                 if self.boundary_rows > MAX_BOUNDARY_ROWS {
                     self.boundary = None;
@@ -189,7 +228,10 @@ impl CursorTracker {
             }
         } else {
             self.value = v.clone();
-            self.boundary = Some(HashMap::from([(fingerprint, 1)]));
+            self.boundary = Some(Boundary {
+                rows: HashMap::from([(fingerprint, 1)]),
+                opaque: Vec::new(),
+            });
             self.boundary_rows = 1;
         }
         true
@@ -199,14 +241,7 @@ impl CursorTracker {
     pub fn bookmark(&self) -> CursorBookmark {
         CursorBookmark {
             value: self.value.clone(),
-            boundary: self.boundary.as_ref().map(|b| {
-                let mut v: Vec<String> = b
-                    .iter()
-                    .flat_map(|(fp, n)| std::iter::repeat_n(fp.clone(), *n))
-                    .collect();
-                v.sort_unstable();
-                v
-            }),
+            boundary: self.boundary.as_ref().map(Boundary::stored),
         }
     }
 
@@ -218,40 +253,92 @@ impl CursorTracker {
 
 /// A 128-bit fingerprint of a whole row, independent of field order.
 pub fn row_fingerprint(row: &Value) -> String {
-    let mut text = String::new();
-    canonical(row, &mut text);
-    let a = fnv1a_64(text.as_bytes(), FNV_BASIS_A);
-    let b = fnv1a_64(text.as_bytes(), FNV_BASIS_B);
-    format!("{a:016x}{b:016x}")
+    fingerprint_text(fingerprint(row))
 }
 
-fn canonical(v: &Value, out: &mut String) {
+/// [`row_fingerprint`] as a number: two FNV-1a hashes of the row's canonical
+/// text, fed as it is produced.
+fn fingerprint(row: &Value) -> u128 {
+    let mut hash = Hash2 {
+        a: FNV_BASIS_A,
+        b: FNV_BASIS_B,
+    };
+    canonical(row, &mut hash);
+    (u128::from(hash.a) << 64) | u128::from(hash.b)
+}
+
+struct Hash2 {
+    a: u64,
+    b: u64,
+}
+
+impl Hash2 {
+    fn feed(&mut self, bytes: &[u8]) {
+        self.a = fnv1a_64(bytes, self.a);
+        self.b = fnv1a_64(bytes, self.b);
+    }
+
+    /// Feed `value`'s compact JSON text.
+    fn json<T: serde::Serialize + ?Sized>(&mut self, value: &T) {
+        // The writer never fails and these values always serialize.
+        let _ = serde_json::to_writer(self, value);
+    }
+}
+
+impl std::io::Write for Hash2 {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.feed(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Objects up to this many fields are ordered without a heap allocation.
+const INLINE_FIELDS: usize = 32;
+static NULL: Value = Value::Null;
+
+fn canonical(v: &Value, out: &mut Hash2) {
     match v {
         Value::Object(o) => {
-            let mut keys: Vec<&String> = o.keys().collect();
-            keys.sort_unstable();
-            out.push('{');
-            for (i, k) in keys.into_iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
+            let mut inline = [("", &NULL); INLINE_FIELDS];
+            let mut heap;
+            let fields: &mut [(&str, &Value)] = if o.len() <= INLINE_FIELDS {
+                for (slot, (k, v)) in inline.iter_mut().zip(o) {
+                    *slot = (k.as_str(), v);
                 }
-                out.push_str(&Value::String(k.clone()).to_string());
-                out.push(':');
-                canonical(&o[k], out);
+                &mut inline[..o.len()]
+            } else {
+                heap = o.iter().map(|(k, v)| (k.as_str(), v)).collect::<Vec<_>>();
+                &mut heap
+            };
+            if !fields.is_sorted_by(|a, b| a.0 <= b.0) {
+                fields.sort_unstable_by(|a, b| a.0.cmp(b.0));
             }
-            out.push('}');
+            out.feed(b"{");
+            for (i, (k, v)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.feed(b",");
+                }
+                out.json(*k);
+                out.feed(b":");
+                canonical(v, out);
+            }
+            out.feed(b"}");
         }
         Value::Array(a) => {
-            out.push('[');
+            out.feed(b"[");
             for (i, x) in a.iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    out.feed(b",");
                 }
                 canonical(x, out);
             }
-            out.push(']');
+            out.feed(b"]");
         }
-        scalar => out.push_str(&scalar.to_string()),
+        scalar => out.json(scalar),
     }
 }
 
@@ -381,6 +468,17 @@ fn nearest_operator_right(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn the_row_hash_writer_takes_every_byte_and_flushes_nothing() {
+        use std::io::Write as _;
+        let mut hash = super::Hash2 { a: 1, b: 2 };
+        assert_eq!(hash.write(b"abc").unwrap(), 3);
+        hash.flush().unwrap();
+        let mut fed = super::Hash2 { a: 1, b: 2 };
+        fed.feed(b"abc");
+        assert_eq!((hash.a, hash.b), (fed.a, fed.b));
+    }
+
+    #[test]
     fn strict_comparison_handles_an_empty_token_a_leading_token_and_non_comparisons() {
         let t = "${bookmark}";
         assert!(!strict_comparison("ts > 1", ""));
@@ -392,6 +490,175 @@ mod tests {
         assert!(!strict_comparison("WHERE ts >= ${bookmark} -- note", t));
     }
     use super::*;
+
+    /// The fingerprint as it was computed before the canonical text was fed
+    /// to the hashes directly; stored bookmarks hold these values.
+    fn reference_fingerprint(row: &Value) -> String {
+        fn canonical(v: &Value, out: &mut String) {
+            match v {
+                Value::Object(o) => {
+                    let mut keys: Vec<&String> = o.keys().collect();
+                    keys.sort_unstable();
+                    out.push('{');
+                    for (i, k) in keys.into_iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        out.push_str(&Value::String(k.clone()).to_string());
+                        out.push(':');
+                        canonical(&o[k], out);
+                    }
+                    out.push('}');
+                }
+                Value::Array(a) => {
+                    out.push('[');
+                    for (i, x) in a.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        canonical(x, out);
+                    }
+                    out.push(']');
+                }
+                scalar => out.push_str(&scalar.to_string()),
+            }
+        }
+        let mut text = String::new();
+        canonical(row, &mut text);
+        let a = fnv1a_64(text.as_bytes(), FNV_BASIS_A);
+        let b = fnv1a_64(text.as_bytes(), FNV_BASIS_B);
+        format!("{a:016x}{b:016x}")
+    }
+
+    fn varied_rows() -> Vec<Value> {
+        let wide: serde_json::Map<String, Value> = (0..40)
+            .rev()
+            .map(|i| (format!("field_{i:02}"), json!(i)))
+            .collect();
+        vec![
+            json!({}),
+            json!({"id": 1, "name": "a"}),
+            json!({"name": "a", "id": 1}),
+            json!({"z": null, "a": true, "m": false}),
+            json!({"f": 0.1, "g": -0.0, "h": 1e300, "i": 1.5e-7, "j": 2.0}),
+            json!({"big": 18446744073709551615u64, "neg": i64::MIN, "zero": 0}),
+            json!({"text": "unicode ✓ \"quoted\" \\ back\n\ttab \u{1} \u{7f} é 日本"}),
+            json!({"ключ": "значение", "": "empty key", "a\"b": 1}),
+            json!({"nested": {"b": [1, {"y": null, "x": [[], {}]}], "a": "x"}, "list": []}),
+            json!({"ts": "2026-03-04T05:06:07.123456Z", "amount": "12.500", "n": null}),
+            json!([{"b": 1, "a": 2}, "s", 3]),
+            json!("scalar"),
+            json!(null),
+            Value::Object(wide),
+        ]
+    }
+
+    #[test]
+    fn fingerprints_match_the_frozen_values() {
+        let expected = FROZEN_FINGERPRINTS;
+        let rows = varied_rows();
+        assert_eq!(rows.len(), expected.len());
+        for (row, want) in rows.iter().zip(expected) {
+            assert_eq!(row_fingerprint(row), *want, "{row}");
+        }
+    }
+
+    #[test]
+    fn streamed_fingerprints_equal_the_text_built_ones() {
+        let mut rows = varied_rows();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..500 {
+            let mut o = serde_json::Map::new();
+            for _ in 0..(next() % 50) {
+                let key = format!(
+                    "k{}{}",
+                    next() % 97,
+                    char::from_u32(0x20 + (next() % 0x2000) as u32).unwrap_or('k')
+                );
+                let value = match next() % 7 {
+                    0 => Value::Null,
+                    1 => json!(next() as i64),
+                    2 => json!(next()),
+                    3 => json!(f64::from_bits(next())),
+                    4 => json!(format!(
+                        "s{}\"\\\n{}",
+                        next(),
+                        char::from_u32((next() % 0xd000) as u32).unwrap_or('x')
+                    )),
+                    5 => json!([next() % 3, {"b": next() % 5, "a": null}]),
+                    _ => json!({"z": next() % 2 == 0, "y": {"q": next() as u32}}),
+                };
+                o.insert(key, value);
+            }
+            rows.push(Value::Object(o));
+        }
+        for row in &rows {
+            assert_eq!(row_fingerprint(row), reference_fingerprint(row), "{row}");
+        }
+    }
+
+    #[test]
+    fn stored_entries_that_are_not_fingerprints_are_kept_until_the_value_moves() {
+        let row = json!({"id": 1, "ts": 5});
+        let fp = row_fingerprint(&row);
+        let start = CursorBookmark {
+            value: json!(5),
+            boundary: Some(vec![
+                "hand-edited".into(),
+                fp.to_uppercase(),
+                fp.clone(),
+                fp.clone(),
+            ]),
+        };
+        let mut t = CursorTracker::new("ts", start);
+        let mut kept = vec![
+            fp.clone(),
+            fp.clone(),
+            fp.to_uppercase(),
+            "hand-edited".into(),
+        ];
+        kept.sort_unstable();
+        assert_eq!(t.bookmark().boundary, Some(kept.clone()));
+        assert!(!t.admit(&row));
+        assert!(!t.admit(&row));
+        assert!(t.admit(&row), "a third copy is new");
+        kept.push(fp.clone());
+        kept.sort_unstable();
+        assert_eq!(t.bookmark().boundary, Some(kept));
+        assert!(t.admit(&json!({"id": 2, "ts": 6})));
+        assert_eq!(
+            t.bookmark().boundary,
+            Some(vec![row_fingerprint(&json!({"id": 2, "ts": 6}))])
+        );
+        assert_eq!(parse_fingerprint(&fp), Some(fingerprint(&row)));
+        assert_eq!(parse_fingerprint("abc"), None);
+        assert_eq!(parse_fingerprint(&"+".repeat(32)), None);
+    }
+
+    /// Computed with the text-building implementation; stored bookmarks hold
+    /// values like these, so they never change.
+    const FROZEN_FINGERPRINTS: &[&str] = &[
+        "08f44b07b5901a25353239cb03fa4df0",
+        "d4549314424cc2f522de57722bd2650e",
+        "d4549314424cc2f522de57722bd2650e",
+        "28bc017b9bfd421bc73634c6ca0e2274",
+        "d36feb4ef0b2f0ca29b02e2850cb0613",
+        "5b6e48fcca49f86e54d59fd48e8da1eb",
+        "6bb56eeeefcbb7031a3a9b5537f54874",
+        "8dace894988deebcf5cedc6a68d787fb",
+        "1dee9420075aea120d6ccc35a02bd255",
+        "ac4a76d93332e9bfa4a896b019c97c24",
+        "3467135a6f16904ffc3e18a983aa3e18",
+        "e105a86512a71a8daaeb049db53ff050",
+        "5b9bc4ba528108e4f475ab4d403a5051",
+        "ba564ed0a0ded1896b68aa2e4e32e962",
+    ];
     use serde_json::json;
 
     fn tracker(start: Value) -> CursorTracker {

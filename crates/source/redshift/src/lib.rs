@@ -11,6 +11,7 @@
 
 pub mod config;
 pub mod convert;
+mod plan;
 pub mod stream;
 
 pub use faucet_core::{FaucetError, Source};

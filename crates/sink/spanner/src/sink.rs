@@ -28,6 +28,7 @@ use gcloud_spanner::statement::{Statement, ToKind};
 use gcloud_spanner::value::CommitTimestamp;
 use prost_types::value::Kind;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,9 +47,24 @@ struct TableMeta {
     columns: Vec<(String, SpannerType, bool)>,
     /// PRIMARY KEY column names, in key order.
     pk: Vec<String>,
+    /// The column names, indexed for per-field lookups.
+    resolver: faucet_core::columns::ColumnResolver,
 }
 
 impl TableMeta {
+    fn new(table: String, columns: Vec<(String, SpannerType, bool)>, pk: Vec<String>) -> Self {
+        let resolver = faucet_core::columns::ColumnResolver::new(
+            columns.iter().map(|(c, _, _)| c.clone()).collect(),
+            faucet_core::ColumnMatching::CaseInsensitive,
+        );
+        Self {
+            table,
+            columns,
+            pk,
+            resolver,
+        }
+    }
+
     fn type_of(&self, col: &str) -> Option<&SpannerType> {
         self.column(col).map(|(_, ty, _)| ty)
     }
@@ -61,11 +77,7 @@ impl TableMeta {
     /// case-insensitive, so the exact spelling, else one equal ignoring ASCII
     /// case.
     fn column(&self, name: &str) -> Option<&(String, SpannerType, bool)> {
-        self.columns.iter().find(|(c, _, _)| c == name).or_else(|| {
-            self.columns
-                .iter()
-                .find(|(c, _, _)| c.eq_ignore_ascii_case(name))
-        })
+        self.resolver.index_of(name).map(|i| &self.columns[i])
     }
 
     fn names(&self) -> Vec<String> {
@@ -85,9 +97,59 @@ impl TableMeta {
 
 /// `record` with each field renamed to the spelling of the column it
 /// addresses (exact, else equal ignoring case), so the mutation and its key
-/// read the value the table will hold. Two fields that both fold onto one
-/// column with neither spelled exactly are an error: picking one would drop
-/// the other silently.
+/// read the value the table will hold; borrowed when no field needs renaming.
+/// Two fields that both fold onto one column with neither spelled exactly are
+/// an error: picking one would drop the other silently.
+fn canonical_object<'a>(
+    record: &'a Value,
+    meta: &TableMeta,
+) -> Result<Cow<'a, serde_json::Map<String, Value>>, String> {
+    let obj = record
+        .as_object()
+        .ok_or_else(|| "record is not a JSON object".to_string())?;
+    if let Some(fold) = meta.resolver.ambiguous_fold(obj) {
+        return Err(format!(
+            "fields `{}` and `{}` both name column `{}`; keep one of them",
+            fold.first, fold.second, fold.column
+        ));
+    }
+    Ok(meta.resolver.canonical_record(obj))
+}
+
+/// A page with every record renamed by [`canonical_object`]; the page itself
+/// when no record needs it. `refused(index, record, reason)` decides what a
+/// record that cannot be renamed becomes: an error for the page, a
+/// replacement, or itself.
+fn canonical_page<'a>(
+    records: &'a [Value],
+    meta: &TableMeta,
+    mut refused: impl FnMut(usize, &Value, String) -> Result<Option<Value>, FaucetError>,
+) -> Result<Cow<'a, [Value]>, FaucetError> {
+    let mut owned: Option<Vec<Value>> = None;
+    for (idx, record) in records.iter().enumerate() {
+        let replacement = match canonical_object(record, meta) {
+            Ok(Cow::Borrowed(_)) => None,
+            Ok(Cow::Owned(renamed)) => Some(Value::Object(renamed)),
+            Err(reason) => refused(idx, record, reason)?,
+        };
+        match (replacement, owned.as_mut()) {
+            (Some(value), Some(page)) => page.push(value),
+            (Some(value), None) => {
+                let mut page = Vec::with_capacity(records.len());
+                page.extend_from_slice(&records[..idx]);
+                page.push(value);
+                owned = Some(page);
+            }
+            (None, Some(page)) => page.push(record.clone()),
+            (None, None) => {}
+        }
+    }
+    Ok(owned.map_or(Cow::Borrowed(records), Cow::Owned))
+}
+
+/// [`canonical_object`] by scanning every column per record. The reference
+/// the indexed lookup is checked against.
+#[cfg(test)]
 fn canonical_record(record: &Value, names: &[String]) -> Result<Value, String> {
     let obj = record
         .as_object()
@@ -143,10 +205,7 @@ fn build_row_mutation(
     op: WriteOp,
     warned: &mut HashSet<String>,
 ) -> Result<Planned, String> {
-    let record = canonical_record(record, &meta.names())?;
-    let obj = record
-        .as_object()
-        .ok_or_else(|| "record is not a JSON object".to_string())?;
+    let obj = canonical_object(record, meta)?;
 
     let mut cols: Vec<&str> = Vec::new();
     let mut vals: Vec<EncodedKind> = Vec::new();
@@ -712,7 +771,7 @@ impl SpannerDriver {
                 );
             }
         }
-        Ok(Some(TableMeta { table, columns, pk }))
+        Ok(Some(TableMeta::new(table, columns, pk)))
     }
 
     /// Cached metadata, fetched on first use. Errors when the table is absent
@@ -788,19 +847,12 @@ impl SpannerDriver {
         }
 
         validate_key_matches_pk(&self.config.write.key, &meta.pk, table)?;
-        let names = meta.names();
-        let records = records
-            .iter()
-            .enumerate()
-            .map(|(idx, r)| {
-                canonical_record(r, &names).map_err(|msg| {
-                    FaucetError::Sink(format!(
-                        "spanner {}: row {idx}: {msg}",
-                        self.config.write.write_mode.as_str()
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let records = canonical_page(records, meta, |idx, _, msg| {
+            Err(FaucetError::Sink(format!(
+                "spanner {}: row {idx}: {msg}",
+                self.config.write.write_mode.as_str()
+            )))
+        })?;
         let spec = self.keyed_spec(meta);
         let plan = faucet_core::plan_writes(&records, &spec);
         if let Some((idx, msg)) = plan.failed.first() {
@@ -1520,21 +1572,14 @@ impl SpannerDriver {
         let meta = self.require_meta(calls, records).await?;
         let table = &meta.table;
         let mode = self.config.write.write_mode.as_str();
-        let names = meta.names();
         let mut ambiguous: Vec<(usize, String)> = Vec::new();
-        let canonical: Vec<Value> = records
-            .iter()
-            .enumerate()
-            .map(|(idx, r)| match canonical_record(r, &names) {
-                Ok(v) => v,
-                Err(msg) if r.is_object() => {
-                    ambiguous.push((idx, msg));
-                    Value::Null
-                }
-                Err(_) => r.clone(),
-            })
-            .collect();
-        let records = canonical.as_slice();
+        let canonical = canonical_page(records, &meta, |idx, r, msg| {
+            Ok(r.is_object().then(|| {
+                ambiguous.push((idx, msg));
+                Value::Null
+            }))
+        })?;
+        let records: &[Value] = &canonical;
         let spec = self.keyed_spec(&meta);
         let mut planned: Vec<Planned> = Vec::with_capacity(records.len());
         if matches!(self.config.write.write_mode, faucet_core::WriteMode::Append) {
@@ -1724,28 +1769,28 @@ mod tests {
     use serde_json::json;
 
     fn meta() -> TableMeta {
-        TableMeta {
-            table: "t".into(),
-            columns: vec![
+        TableMeta::new(
+            "t".into(),
+            vec![
                 ("id".into(), SpannerType::Int64, false),
                 ("name".into(), SpannerType::String, true),
                 ("score".into(), SpannerType::Float64, true),
                 ("meta".into(), SpannerType::Json, true),
             ],
-            pk: vec!["id".into()],
-        }
+            vec!["id".into()],
+        )
     }
 
     fn composite_meta() -> TableMeta {
-        TableMeta {
-            table: "t".into(),
-            columns: vec![
+        TableMeta::new(
+            "t".into(),
+            vec![
                 ("tenant".into(), SpannerType::String, false),
                 ("id".into(), SpannerType::Int64, false),
                 ("v".into(), SpannerType::String, true),
             ],
-            pk: vec!["tenant".into(), "id".into()],
-        }
+            vec!["tenant".into(), "id".into()],
+        )
     }
 
     fn write_columns(m: &Mutation) -> Vec<String> {
@@ -1784,14 +1829,14 @@ mod tests {
     }
 
     fn mixed_case_meta() -> TableMeta {
-        TableMeta {
-            table: "Users".into(),
-            columns: vec![
+        TableMeta::new(
+            "Users".into(),
+            vec![
                 ("UserId".into(), SpannerType::Int64, false),
                 ("Email".into(), SpannerType::String, true),
             ],
-            pk: vec!["UserId".into()],
-        }
+            vec!["UserId".into()],
+        )
     }
 
     fn written_columns(p: &Planned) -> Vec<String> {
@@ -1821,6 +1866,87 @@ mod tests {
         assert_eq!(
             m.canonical_key(&["userid".into()]),
             vec!["UserId".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_indexed_rename_matches_a_scan_of_every_column() {
+        let wide = TableMeta::new(
+            "Wide".into(),
+            vec![
+                ("UserId".into(), SpannerType::Int64, false),
+                ("Email".into(), SpannerType::String, true),
+                ("Ab".into(), SpannerType::String, true),
+                ("AB".into(), SpannerType::String, true),
+            ],
+            vec!["UserId".into()],
+        );
+        let records = [
+            json!({"UserId": 1, "Email": "a"}),
+            json!({"userid": 1, "EMAIL": "a", "extra": true}),
+            json!({"UserId": 1, "userid": 2}),
+            json!({"userid": 1, "USERID": 2}),
+            json!({"email": "a", "eMail": "b", "userid": 1, "USERID": 2}),
+            json!({"Ab": "x", "aB": "y"}),
+            json!({"ab": "x", "aB": "y"}),
+            json!({"AB": "x", "Ab": "y", "ab": "z"}),
+            json!({"unrelated": 1}),
+            json!({}),
+            json!([1, 2]),
+            json!("text"),
+        ];
+        for m in [mixed_case_meta(), wide, meta()] {
+            for record in &records {
+                let expected = canonical_record(record, &m.names());
+                let got = canonical_object(record, &m).map(|o| Value::Object(o.into_owned()));
+                assert_eq!(got, expected, "{record} into {}", m.table);
+            }
+        }
+    }
+
+    #[test]
+    fn a_page_is_copied_only_when_a_record_is_renamed() {
+        let m = mixed_case_meta();
+        let settled = [json!({"UserId": 1}), json!({"UserId": 2, "Email": "b"})];
+        let page = canonical_page(&settled, &m, |_, _, msg| Err(FaucetError::Sink(msg))).unwrap();
+        assert!(matches!(page, Cow::Borrowed(_)));
+
+        let mixed = [
+            json!({"UserId": 1}),
+            json!({"userid": 2}),
+            json!("text"),
+            json!({"userid": 3, "USERID": 4}),
+            json!({"UserId": 5}),
+        ];
+        let mut refused = Vec::new();
+        let page = canonical_page(&mixed, &m, |idx, record, msg| {
+            Ok(record.is_object().then(|| {
+                refused.push((idx, msg));
+                Value::Null
+            }))
+        })
+        .unwrap();
+        assert_eq!(
+            page.as_ref(),
+            [
+                json!({"UserId": 1}),
+                json!({"UserId": 2}),
+                json!("text"),
+                Value::Null,
+                json!({"UserId": 5}),
+            ]
+        );
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].0, 3);
+        assert!(refused[0].1.contains("both name column `UserId`"));
+
+        let err = canonical_page(&mixed, &m, |idx, _, msg| {
+            Err(FaucetError::Sink(format!("row {idx}: {msg}")))
+        })
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Sink error: row 2: record is not a JSON object"
         );
     }
 
@@ -2263,15 +2389,15 @@ mod tests {
 
     #[test]
     fn written_keys_match_their_canonical_live_form() {
-        let meta = TableMeta {
-            table: "t".into(),
-            columns: vec![
+        let meta = TableMeta::new(
+            "t".into(),
+            vec![
                 ("id".into(), SpannerType::Int64, false),
                 ("at".into(), SpannerType::Timestamp, false),
                 ("amt".into(), SpannerType::Numeric, false),
             ],
-            pk: vec!["id".into(), "at".into(), "amt".into(), "gone".into()],
-        };
+            vec!["id".into(), "at".into(), "amt".into(), "gone".into()],
+        );
         let s = |v: &str| Kind::StringValue(v.into());
         let written = canonical_tuple(
             vec![s("007"), s("2024-01-01T00:00:00+00:00"), s("1.50"), s("x")],

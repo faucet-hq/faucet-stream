@@ -66,6 +66,58 @@ pub fn estimate_page_bytes(records: &[Value]) -> u64 {
     records.iter().map(estimate_json_bytes).sum()
 }
 
+/// The estimated size of the page a sink decorator is writing, left by a
+/// layer beneath it that already walked the same records.
+#[derive(Clone, Default)]
+pub(crate) struct PageBytesHint(std::sync::Arc<Mutex<Option<(usize, usize, u64)>>>);
+
+tokio::task_local! {
+    static PAGE_BYTES: PageBytesHint;
+}
+
+impl PageBytesHint {
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<(usize, usize, u64)>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The size left for exactly this slice during the write that just
+    /// returned, if any.
+    pub(crate) fn take(&self, records: &[Value]) -> Option<u64> {
+        let (ptr, len, bytes) = self.slot().take()?;
+        (ptr == records.as_ptr() as usize && len == records.len()).then_some(bytes)
+    }
+}
+
+/// Run a sink write with `hint` open for the layers beneath to fill. The hint
+/// is cleared first, so a size read after the write was left during it, while
+/// the caller's borrow kept the slice unchanged.
+pub(crate) async fn with_page_bytes_hint<F: std::future::Future>(
+    hint: Option<PageBytesHint>,
+    write: F,
+) -> F::Output {
+    match hint {
+        Some(hint) => {
+            *hint.slot() = None;
+            PAGE_BYTES.scope(hint, write).await
+        }
+        None => write.await,
+    }
+}
+
+/// [`estimate_page_bytes`], also left for the sink decorator above (if one
+/// is listening) so it does not walk the same records again.
+pub(crate) fn estimate_page_bytes_shared(records: &[Value]) -> u64 {
+    let bytes = estimate_page_bytes(records);
+    leave_page_bytes(records, bytes);
+    bytes
+}
+
+pub(crate) fn leave_page_bytes(records: &[Value], bytes: u64) {
+    let _ = PAGE_BYTES.try_with(|hint| {
+        *hint.slot() = Some((records.as_ptr() as usize, records.len(), bytes));
+    });
+}
+
 fn digits_u64(mut u: u64) -> u64 {
     let mut n = 1;
     while u >= 10 {
@@ -348,6 +400,46 @@ impl UsageMeter {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn a_page_size_left_during_a_write_is_taken_only_for_the_same_slice() {
+        let page = vec![json!({"a": 1}), json!({"b": "two"})];
+        let other = vec![json!({"a": 1}), json!({"b": "two"})];
+        let hint = PageBytesHint::default();
+        let bytes = with_page_bytes_hint(Some(hint.clone()), async {
+            estimate_page_bytes_shared(&page)
+        })
+        .await;
+        assert_eq!(bytes, estimate_page_bytes(&page));
+        assert_eq!(hint.take(&page), Some(bytes));
+        assert_eq!(hint.take(&page), None, "taken once");
+
+        with_page_bytes_hint(Some(hint.clone()), async {
+            estimate_page_bytes_shared(&other)
+        })
+        .await;
+        assert_eq!(hint.take(&page), None, "left for another slice");
+
+        with_page_bytes_hint(Some(hint.clone()), async {
+            estimate_page_bytes_shared(&page)
+        })
+        .await;
+        with_page_bytes_hint(Some(hint.clone()), async {}).await;
+        assert_eq!(hint.take(&page), None, "cleared when the next write starts");
+
+        with_page_bytes_hint(Some(hint.clone()), async {
+            estimate_page_bytes_shared(&page[..1])
+        })
+        .await;
+        assert_eq!(hint.take(&page), None, "a prefix is another slice");
+
+        assert_eq!(
+            with_page_bytes_hint(None, async { estimate_page_bytes_shared(&page) }).await,
+            bytes
+        );
+        assert_eq!(estimate_page_bytes_shared(&page), bytes, "no listener");
+        assert_eq!(hint.take(&page), None);
+    }
 
     #[test]
     fn byte_estimate_tracks_serialized_size() {

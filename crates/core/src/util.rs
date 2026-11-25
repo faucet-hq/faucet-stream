@@ -94,23 +94,132 @@ pub fn extract_records_owned(
             other => vec![other],
         });
     };
-    let Some((segments, wildcard)) = plain_path(p) else {
-        return extract_records(&body, path);
-    };
-    let mut node = &mut body;
-    for seg in &segments {
-        match node.as_object_mut().and_then(|m| m.get_mut(*seg)) {
-            Some(next) => node = next,
-            None => return extract_records(&body, path),
+    match plain_path(p).and_then(|(segments, wildcard)| take_plain(&mut body, &segments, wildcard))
+    {
+        Some(records) => Ok(records),
+        None => extract_records(&body, path),
+    }
+}
+
+/// [`extract_records`] that moves the records out of `body` when nothing read
+/// from the body afterwards can see them, and copies them otherwise.
+///
+/// `later_reads` lists every JSONPath the caller still evaluates against
+/// `body` after this call (a cursor, a total, a next link). The records are
+/// moved only when `path` is a plain path (`$.a.b`, `$.a.b[*]`) and every
+/// later path descends through a different key; with no `path` the body
+/// itself is the records, so they are moved only when `later_reads` is empty.
+/// After a move the records' place in `body` holds an empty array (or `null`
+/// for a non-wildcard path), so a caller that reads the whole body afterwards
+/// must use [`extract_records`]. The returned records are the same either way.
+pub fn take_records(
+    body: &mut Value,
+    path: Option<&str>,
+    later_reads: &[&str],
+) -> Result<Vec<Value>, FaucetError> {
+    let Some(p) = path else {
+        if !later_reads.is_empty() {
+            return extract_records(body, None);
         }
+        return Ok(match std::mem::take(body) {
+            Value::Array(arr) => arr,
+            other => vec![other],
+        });
+    };
+    let Some((segments, wildcard)) = plain_path(p) else {
+        return extract_records(body, path);
+    };
+    if !segments.iter().all(|s| member_name_len(s) == s.len())
+        || later_reads.iter().any(|l| !diverges(&segments, l))
+    {
+        return extract_records(body, path);
+    }
+    match take_plain(body, &segments, wildcard) {
+        Some(records) => Ok(records),
+        None => extract_records(body, path),
+    }
+}
+
+fn take_plain(body: &mut Value, segments: &[&str], wildcard: bool) -> Option<Vec<Value>> {
+    let mut node = body;
+    for seg in segments {
+        node = node.as_object_mut()?.get_mut(*seg)?;
     }
     if !wildcard {
-        return Ok(vec![std::mem::take(node)]);
+        return Some(vec![std::mem::take(node)]);
     }
     match node {
-        Value::Array(arr) => Ok(std::mem::take(arr)),
-        _ => extract_records(&body, path),
+        Value::Array(arr) => Some(std::mem::take(arr)),
+        _ => None,
     }
+}
+
+/// Whether JSONPath `other` provably descends through a key the plain path
+/// `segments` does not: its leading `.name` steps differ from `segments`
+/// before either ends, and nothing in it (a filter, another `$`) can read
+/// back into the records.
+fn diverges(segments: &[&str], other: &str) -> bool {
+    let Some(mut rest) = other.strip_prefix('$') else {
+        return false;
+    };
+    if rest.contains(['?', '$']) {
+        return false;
+    }
+    for seg in segments {
+        let Some(after_dot) = rest.strip_prefix('.') else {
+            return false;
+        };
+        let len = member_name_len(after_dot);
+        if len == 0 {
+            return false;
+        }
+        let (name, tail) = after_dot.split_at(len);
+        if tail.starts_with('(') {
+            return false;
+        }
+        if name != *seg {
+            return true;
+        }
+        rest = tail;
+    }
+    false
+}
+
+/// Length of the JSONPath shorthand member name `s` starts with (a letter or
+/// `_`, then letters, digits and `_`); 0 when it starts with none.
+fn member_name_len(s: &str) -> usize {
+    match s.as_bytes().first() {
+        Some(b) if b.is_ascii_alphabetic() || *b == b'_' => s
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count(),
+        _ => 0,
+    }
+}
+
+/// Feed `value`'s JSON text into `hasher` exactly as
+/// `value.to_string().hash(hasher)` does, without building the string.
+pub fn hash_value<H: std::hash::Hasher>(value: &Value, hasher: &mut H) {
+    struct HashWriter<'a, H>(&'a mut H);
+    impl<H: std::hash::Hasher> std::fmt::Write for HashWriter<'_, H> {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0.write(s.as_bytes());
+            Ok(())
+        }
+    }
+    let _ = std::fmt::Write::write_fmt(&mut HashWriter(hasher), format_args!("{value}"));
+    hasher.write_u8(0xff);
+}
+
+/// Content fingerprint of a page's records, for pagination loop guards. It is
+/// compared within one run only and never stored.
+pub fn records_fingerprint(records: &[Value]) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for r in records {
+        hash_value(r, &mut hasher);
+    }
+    hasher.finish()
 }
 
 /// `$` + `.name` segments + an optional trailing `[*]`; `None` for anything

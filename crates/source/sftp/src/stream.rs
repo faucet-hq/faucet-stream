@@ -12,6 +12,7 @@ use faucet_common_sftp::{
 };
 #[cfg(feature = "arrow")]
 use faucet_core::CallExt as _;
+use faucet_core::file_format::JsonLineError;
 use faucet_core::{FaucetError, Stream, StreamPage};
 use futures::stream::StreamExt;
 use serde_json::Value;
@@ -542,27 +543,21 @@ impl faucet_core::Source for SftpSource {
                         // One line is bounded by `max_object_bytes`, so a
                         // file with no newline fails instead of being
                         // buffered whole.
-                        let mut lines = faucet_core::file_format::capped_lines(
+                        let mut lines = faucet_core::file_format::json_lines(
                             reads.reader(ChunkedReader::new(*handle)),
                             self.config.max_object_bytes,
                         );
-                        let mut line_num = 0usize;
-                        while let Some(line) = lines.next_line().await.map_err(|e| {
-                            explained(
-                                &conn,
-                                FaucetError::Source(format!("SFTP read '{file}' failed: {e}")),
-                            )
-                        })? {
-                            line_num += 1;
-                            let trimmed = line.trim();
-                            if trimmed.is_empty() {
-                                continue;
-                            }
-                            let value: Value = faucet_core::fidelity::from_str(trimmed).map_err(|e| {
+                        while let Some(value) = lines.next_value().await.map_err(|e| match e {
+                            JsonLineError::Parse { line: line_num, error: e } => {
                                 FaucetError::Source(format!(
                                     "SFTP JSON parse error in '{file}' at line {line_num}: {e}"
                                 ))
-                            })?;
+                            }
+                            JsonLineError::Read(e) => explained(
+                                &conn,
+                                FaucetError::Source(format!("SFTP read '{file}' failed: {e}")),
+                            ),
+                        })? {
                             buffer.push(value);
                             if batch_size != 0 && buffer.len() >= chunk {
                                 let page = std::mem::replace(

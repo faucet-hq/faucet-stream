@@ -663,6 +663,25 @@ impl SqlDriver for SqliteDriver {
         &self.engine
     }
 
+    /// The default split's rule (a record matching no column), without its
+    /// copy of the page.
+    fn refuses_rows(
+        &self,
+        target: &TableTarget,
+        records: &[Value],
+        columns: &[TableColumn],
+        require_match: bool,
+    ) -> bool {
+        faucet_common_sql::page_refuses(
+            &Sqlite,
+            &target.name,
+            records,
+            columns,
+            require_match,
+            |_, _, _| None,
+        )
+    }
+
     fn layout(&self) -> &SqlLayout {
         &self.layout
     }

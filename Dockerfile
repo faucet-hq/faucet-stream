@@ -50,9 +50,10 @@ ARG SINKS=""
 # `full` feature, which enables every feature in its manifest. Keep it exactly
 # `full` — scripts/full-feature-coverage.py fails CI otherwise (#845).
 ARG DEFAULT_FEATURES="full"
-# Cargo profile of the binary: `release`, or `release-lto` (fat LTO, about a
+# Cargo profile of the binary: `dist` (thin LTO, what the release archives
+# use), `release` (no LTO, fastest to link), or `release-lto` (fat LTO, about a
 # quarter smaller; linking a full build that way needs more than 16 GB).
-ARG CARGO_PROFILE="release"
+ARG CARGO_PROFILE="dist"
 # Raw override — when set, wins over everything above.
 ARG FEATURES=""
 
@@ -74,7 +75,7 @@ ARG FEATURES
 # `triggers-redis` / `triggers-kafka`, which pull heavy (and for Kafka, native)
 # dependency trees — add them explicitly when a lean image needs them. The
 # complete image below includes all three.
-ARG EXTRAS="observability,state,transforms,compression,quality,contract,masking,cli-progress,serve,serve-ui,schedule,catalog,serve-history-postgres,serve-history-sqlite,notify,lineage,templates,mcp,triggers"
+ARG EXTRAS="observability,state,transforms,compression,quality,contract,masking,cli-progress,mimalloc,serve,serve-ui,schedule,catalog,serve-history-postgres,serve-history-sqlite,notify,lineage,templates,mcp,triggers"
 
 # Native build prerequisites: cmake + a C/C++ toolchain (bundled DuckDB, some
 # -sys crates), OpenSSL/SASL/curl headers (librdkafka for the kafka feature).

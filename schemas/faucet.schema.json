@@ -34139,7 +34139,7 @@
                       "default": 0
                     },
                     "batch_size": {
-                      "description": "Maximum number of in-flight `FuturesUnordered` send futures during a\nsingle [`Sink::write_batch`](faucet_core::Sink::write_batch) call.\nDefaults to [`DEFAULT_BATCH_SIZE`].\n\nWhen `batch_size > 0`, the producer's `queue.buffering.max.messages`\nlibrdkafka property is also set to this value (so the broker-side\nbuffer matches the sink-side send window) unless the user has\nalready set it via `extra_client_config`. `QueueFull` errors still\nflow through the existing retry path (`queue_full_backoff` /\n`queue_full_max_retries`) — the only effect of the in-flight cap is\nto apply backpressure earlier inside the sink loop instead of\nqueueing the request and waiting for librdkafka to push back.\n\n`batch_size = 0` is the \"no batching\" sentinel: every record in the\nincoming slice is enqueued into the `FuturesUnordered` immediately\n(bounded only by `max_in_flight`) and the librdkafka\n`queue.buffering.max.messages` knob is left at its default. Use it\nfor sources that emit a single page per run (small lookup tables,\none-shot drains) where forcing additional backpressure adds latency.",
+                      "description": "Page-level cap on records awaiting a delivery report during a single\n[`Sink::write_batch`](faucet_core::Sink::write_batch) call.\nDefaults to [`DEFAULT_BATCH_SIZE`].\n\nWhen `batch_size > 0`, the producer's `queue.buffering.max.messages`\nlibrdkafka property is also set to this value (so the producer's\nbuffer matches the sink-side send window) unless the user has\nalready set it via `extra_client_config`. `QueueFull` errors still\nflow through the existing retry path (`queue_full_backoff` /\n`queue_full_max_retries`) — the only effect of the in-flight cap is\nto apply backpressure earlier inside the sink loop instead of\nqueueing the request and waiting for librdkafka to push back.\n\n`batch_size = 0` is the \"no batching\" sentinel: the window is bounded\nonly by `max_in_flight` and the librdkafka\n`queue.buffering.max.messages` knob is left at its default. Use it\nfor sources that emit a single page per run (small lookup tables,\none-shot drains) where forcing additional backpressure adds latency.",
                       "type": [
                         "integer",
                         "string"
@@ -34159,14 +34159,14 @@
                       "default": 30
                     },
                     "max_in_flight": {
-                      "description": "Hard ceiling on concurrent in-flight sends inside one\n[`Sink::write_batch`](faucet_core::Sink::write_batch) call. Defaults to\n100 and must be at least 1. When [`Self::batch_size`] is non-zero the\neffective window is `min(max_in_flight, batch_size)`, so this is the\ncap that applies under the `batch_size = 0` sentinel.",
+                      "description": "Hard ceiling on records enqueued but not yet confirmed delivered\ninside one [`Sink::write_batch`](faucet_core::Sink::write_batch) call.\nDefaults to 1000 and must be at least 1. When [`Self::batch_size`] is\nnon-zero the effective window is `min(max_in_flight, batch_size)`, so\nthis is the cap that applies under the `batch_size = 0` sentinel. A\nsmall window caps how many records one produce request can carry;\n`1` sends one record at a time.",
                       "type": [
                         "integer",
                         "string"
                       ],
                       "format": "uint",
                       "minimum": 0,
-                      "default": 100
+                      "default": 1000
                     },
                     "queue_full_backoff": {
                       "description": "How long to wait before retrying a send that librdkafka rejected with\n`QueueFull`. Defaults to 100 ms. See\n[`Self::queue_full_max_retries`].\n\n**Config granularity is whole seconds**, so the sub-second default is\nnot expressible in YAML — omit the key to keep 100 ms (`0` retries\nimmediately with no pause).",

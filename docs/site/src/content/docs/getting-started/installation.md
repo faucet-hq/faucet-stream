@@ -191,6 +191,10 @@ cargo install faucet-cli --no-default-features \
 cargo install faucet-cli --features "serve,schedule,transform-sql,lineage"
 ```
 
+The default build (and `full`) links the `faucet` binary with the mimalloc allocator
+(feature `mimalloc`). A `--no-default-features` build uses the system allocator unless you add
+`mimalloc` to its feature list.
+
 Run `faucet list` to see which sources, sinks, and transforms are compiled into your binary,
 and the [connector catalog](/faucet-stream/reference/connectors/) for every feature name.
 

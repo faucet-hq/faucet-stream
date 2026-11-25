@@ -379,6 +379,15 @@ pub trait SqlDriver: Send + Sync {
             .split_writable(target, records, columns, require_match, |_, _, _| None)
     }
 
+    /// Whether [`split_page`](Self::split_page) with the same arguments would
+    /// fail any row. When it answers `false` the page is written as offered,
+    /// without the split's copy. Default `true` (the page is split to find
+    /// out); a driver overrides it together with `split_page`, from the same
+    /// rule ([`page_refuses`](crate::page_refuses)).
+    fn refuses_rows(&self, _: &TableTarget, _: &[Value], _: &[TableColumn], _: bool) -> bool {
+        true
+    }
+
     /// Whether a keyed page on the dead-letter path is split by
     /// [`split_page`](Self::split_page) before it is planned (a backend that
     /// refuses some values per row). Default: no.
@@ -655,12 +664,28 @@ impl<D: SqlDriver> SqlSinkDriver<D> {
                 return Ok(PageWrite::accepted(records.len()));
             }
             let columns = self.live_columns(&table).await?;
+            if !self.driver.refuses_rows(&table, records, &columns, true) {
+                self.write_rows(records).await?;
+                return Ok(PageWrite::from_outcomes(
+                    records.iter().map(|_| Ok(())).collect(),
+                ));
+            }
             let split = self.driver.split_page(&table, records, &columns, true);
             self.write_rows(&split.writable).await?;
             return Ok(PageWrite::from_outcomes(split.outcomes));
         }
         if self.driver.splits_keyed_pages() {
             let columns = self.live_columns(&table).await?;
+            if !self.driver.refuses_rows(&table, records, &columns, false) {
+                let (plans, failed) = self.engine().plan_keyed_partial(records);
+                self.apply_plans(&plans).await?;
+                let mut outcomes: Vec<faucet_core::RowOutcome> =
+                    records.iter().map(|_| Ok(())).collect();
+                for (idx, e) in failed {
+                    outcomes[idx] = Err(e);
+                }
+                return Ok(PageWrite::from_outcomes(outcomes));
+            }
             let split = self.driver.split_page(&table, records, &columns, false);
             let mut outcomes = split.outcomes;
             let (plans, failed) = self.engine().plan_keyed_partial(&split.writable);
@@ -1017,6 +1042,7 @@ mod tests {
         layout: SqlLayout,
         exists: bool,
         split_keyed: bool,
+        fast_refusals: bool,
         siblings: Vec<String>,
         log: Mutex<Vec<String>>,
     }
@@ -1028,6 +1054,7 @@ mod tests {
                 layout,
                 exists,
                 split_keyed: false,
+                fast_refusals: false,
                 siblings: Vec::new(),
                 log: Mutex::new(Vec::new()),
             }
@@ -1114,6 +1141,23 @@ mod tests {
         }
         fn splits_keyed_pages(&self) -> bool {
             self.split_keyed
+        }
+        fn refuses_rows(
+            &self,
+            target: &TableTarget,
+            records: &[Value],
+            columns: &[TableColumn],
+            require_match: bool,
+        ) -> bool {
+            !self.fast_refusals
+                || crate::page_refuses(
+                    self.engine.dialect(),
+                    &target.name,
+                    records,
+                    columns,
+                    require_match,
+                    |_, _, _| None,
+                )
         }
         async fn overwrite_staging_tables(&self) -> Result<Vec<String>, FaucetError> {
             Ok(self.siblings.clone())
@@ -1232,6 +1276,41 @@ mod tests {
                 outcomes[0].is_ok() && outcomes[1].is_err() && outcomes[2].is_ok(),
                 "split = {split}: {outcomes:?}"
             );
+        }
+    }
+
+    /// A driver that answers `refuses_rows` writes the same statements and
+    /// reports the same outcomes as one that always splits the page.
+    #[tokio::test]
+    async fn a_page_without_refusals_is_written_as_offered() {
+        let pages = [
+            vec![json!({"id": 1}), json!({"id": 2, "extra": true})],
+            vec![json!({"id": 1}), json!({"x": 2}), json!({"id": 3})],
+            vec![json!({"x": 1})],
+            vec![],
+        ];
+        for keyed in [false, true] {
+            for page in &pages {
+                let mut seen = Vec::new();
+                for fast in [false, true] {
+                    let mut mem = Mem::new(SqlLayout::new("t"), true);
+                    if keyed {
+                        mem = mem.keyed(true);
+                    }
+                    mem.fast_refusals = fast;
+                    let sink = DriverSink::new(SqlSinkDriver::new(mem));
+                    let outcomes: Vec<Result<(), String>> = sink
+                        .write_batch_partial(page)
+                        .await
+                        .unwrap()
+                        .into_iter()
+                        .map(|o| o.map_err(|e| e.to_string()))
+                        .collect();
+                    seen.push((outcomes, sink.driver().driver().log()));
+                }
+                assert_eq!(seen[0], seen[1], "keyed = {keyed}, page = {page:?}");
+                assert_eq!(seen[0].0.len(), page.len());
+            }
         }
     }
 

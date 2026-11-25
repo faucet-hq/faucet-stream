@@ -986,7 +986,16 @@ impl Client {
     /// ([`crate::fidelity::from_slice`]).
     pub async fn json_value(&self, resp: Response) -> Result<serde_json::Value, FaucetError> {
         let bytes = self.bytes(resp).await?;
-        Ok(crate::fidelity::from_slice(&bytes)?)
+        if bytes.len() < BLOCKING_DECODE_BYTES {
+            return Ok(crate::fidelity::from_slice(&bytes)?);
+        }
+        let counter = crate::fidelity::NonFiniteCounter::current();
+        let parsed = tokio::task::spawn_blocking(move || {
+            crate::fidelity::propagate(&counter, || crate::fidelity::from_slice(&bytes))
+        })
+        .await
+        .map_err(decode_task_error)?;
+        Ok(parsed?)
     }
 }
 
@@ -1127,6 +1136,39 @@ pub async fn status_error(resp: Response) -> FaucetError {
     }
 }
 
+/// Body size from which a JSON decode runs on a blocking thread instead of the
+/// async worker.
+pub const BLOCKING_DECODE_BYTES: usize = 1 << 20;
+
+fn decode_task_error(e: tokio::task::JoinError) -> FaucetError {
+    FaucetError::Source(format!("decoding a response body failed: {e}"))
+}
+
+/// Decode a JSON body into `T`; a body of [`BLOCKING_DECODE_BYTES`] or more is
+/// decoded on a blocking thread so it does not hold an async worker.
+pub async fn decode_json<T>(bytes: Vec<u8>) -> Result<T, FaucetError>
+where
+    T: DeserializeOwned + Send + 'static,
+{
+    if bytes.len() < BLOCKING_DECODE_BYTES {
+        return Ok(serde_json::from_slice(&bytes)?);
+    }
+    let parsed = tokio::task::spawn_blocking(move || serde_json::from_slice(&bytes))
+        .await
+        .map_err(decode_task_error)?;
+    Ok(parsed?)
+}
+
+/// Read a whole response body under `limit` (as [`read_body_limited`]) and
+/// decode it as JSON ([`decode_json`]) — the one bounded entry point for a
+/// connector holding a raw `reqwest` response.
+pub async fn read_json_limited<T>(resp: Response, limit: Option<u64>) -> Result<T, FaucetError>
+where
+    T: DeserializeOwned + Send + 'static,
+{
+    decode_json(read_limited(resp, limit).await?).await
+}
+
 /// Read a whole response body, refusing one above `limit` bytes (`None` lifts
 /// the limit) — for a connector holding a raw `reqwest` response.
 pub async fn read_body_limited(resp: Response, limit: Option<u64>) -> Result<Vec<u8>, FaucetError> {
@@ -1169,6 +1211,21 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::routing::{any, get};
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn a_decode_task_that_dies_is_a_source_error() {
+        let join = tokio::task::spawn_blocking(|| {
+            std::panic::panic_any("decoder died");
+        })
+        .await
+        .unwrap_err();
+        let err = decode_task_error(join);
+        assert!(matches!(err, FaucetError::Source(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("decoding a response body failed"),
+            "{err}"
+        );
+    }
 
     type Seen = Arc<Mutex<Vec<(String, Vec<(String, String)>)>>>;
 
@@ -2349,5 +2406,75 @@ mod tests {
             ..Default::default()
         };
         assert!(ClientBuilder::new().tls(&insecure).build().is_ok());
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn large_json_bodies_decode_off_the_worker_to_the_same_value() {
+        let big: Vec<serde_json::Value> = (0..40_000)
+            .map(|i| serde_json::json!({"id": i, "n": 12345678901234567890123u128.to_string(), "f": 1.5}))
+            .collect();
+        let big_text = format!(
+            "{{\"rows\":{},\"wide\":123456789012345678901234567890}}",
+            serde_json::to_string(&big).unwrap()
+        );
+        assert!(big_text.len() > BLOCKING_DECODE_BYTES);
+        let served = big_text.clone();
+        let base = serve(
+            Router::new()
+                .route(
+                    "/big",
+                    get(move || {
+                        let body = served.clone();
+                        async move { body }
+                    }),
+                )
+                .route("/small", get(|| async { r#"{"a":[1,2]}"# }))
+                .route(
+                    "/bad",
+                    get(|| async { "{".repeat(BLOCKING_DECODE_BYTES + 1) }),
+                ),
+        )
+        .await;
+        let client = Client::new().unwrap();
+        let get_resp = |path: &'static str| {
+            let client = client.clone();
+            let url = format!("{base}{path}");
+            async move { client.send(client.get(url)).await.unwrap() }
+        };
+
+        let value = client.json_value(get_resp("/big").await).await.unwrap();
+        assert_eq!(
+            value,
+            crate::fidelity::from_slice(big_text.as_bytes()).unwrap()
+        );
+        assert_eq!(value["wide"], "123456789012345678901234567890");
+
+        let typed: serde_json::Value = read_json_limited(get_resp("/big").await, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            typed,
+            serde_json::from_slice::<serde_json::Value>(big_text.as_bytes()).unwrap()
+        );
+        let small: serde_json::Value = read_json_limited(get_resp("/small").await, Some(64))
+            .await
+            .unwrap();
+        assert_eq!(small, serde_json::json!({"a": [1, 2]}));
+
+        let err = read_json_limited::<serde_json::Value>(get_resp("/big").await, Some(1024))
+            .await
+            .unwrap_err();
+        let limit = match &err {
+            FaucetError::Custom(inner) => inner.downcast_ref::<ResponseTooLarge>().map(|t| t.limit),
+            _ => None,
+        };
+        assert_eq!(limit, Some(1024), "{err:?}");
+
+        for bad in [
+            read_json_limited::<serde_json::Value>(get_resp("/bad").await, None).await,
+            decode_json::<serde_json::Value>(b"{".to_vec()).await,
+            client.json_value(get_resp("/bad").await).await,
+        ] {
+            assert!(matches!(bad, Err(FaucetError::Json(_))), "{bad:?}");
+        }
     }
 }

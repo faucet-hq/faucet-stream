@@ -615,3 +615,29 @@ async fn an_incomplete_search_or_scroll_fails_the_read() {
         .unwrap();
     assert_eq!(records.len(), 1);
 }
+
+/// The initial search asks for index (`_doc`) order, the order the scroll API
+/// reads fastest; the scroll follow-ups carry no sort of their own.
+#[tokio::test]
+async fn the_initial_search_sorts_by_doc_order() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/idx/_search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "hits": {"hits": [{"_source": {"id": 1}}]}
+        })))
+        .mount(&server)
+        .await;
+    let config =
+        ElasticsearchSourceConfig::new(server.uri(), "idx").query(json!({"term": {"kind": "a"}}));
+    let source = ElasticsearchSource::new(config).unwrap();
+    let rows = source.fetch_all().await.unwrap();
+    assert_eq!(rows, vec![json!({"id": 1})]);
+
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body,
+        json!({"query": {"term": {"kind": "a"}}, "sort": ["_doc"]})
+    );
+}

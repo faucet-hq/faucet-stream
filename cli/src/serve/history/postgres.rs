@@ -21,6 +21,15 @@ impl PostgresHistory {
         let pool = PgPoolOptions::new()
             .max_connections(super::sql::POOL_MAX_CONNECTIONS)
             .max_lifetime(super::sql::POOL_MAX_LIFETIME)
+            .after_connect(move |conn, _| {
+                Box::pin(async move {
+                    let keepalive = super::sql::session_keepalive_sql(lease_ttl);
+                    if let Err(e) = sqlx::Executor::execute(&mut *conn, keepalive.as_str()).await {
+                        tracing::debug!(error = %e, "run history: TCP keepalive not set for this session");
+                    }
+                    Ok(())
+                })
+            })
             .before_acquire(|conn, meta| {
                 Box::pin(async move {
                     Ok(super::sql::usable_connection(conn)

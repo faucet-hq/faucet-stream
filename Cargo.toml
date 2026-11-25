@@ -284,7 +284,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 async-trait = "0.1.92"
 aho-corasick = "1"
 regex = "1"
-reqwest = { version = "0.13", features = ["json", "form", "query"] }
+reqwest = { version = "0.13", features = ["json", "form", "query", "gzip"] }
 futures-core = "0.3"
 jsonpath-rust = "1.0.1"
 quick-xml = { version = "0.42", features = ["serialize"] }
@@ -459,6 +459,10 @@ ratatui = "0.30"
 # Inline per-row progress line for `faucet run` (#385, CLI-only `cli-progress`
 # feature). Draws to stderr so piped stdout stays clean.
 indicatif = "0.18"
+
+# Global allocator of the `faucet` binary (CLI-only `mimalloc` feature). Records
+# are trees of small allocations, so the allocator is a large share of CPU.
+mimalloc = { version = "0.1.52", default-features = false }
 
 # The profile 'dist' builds the release archives with.
 [profile.dist]

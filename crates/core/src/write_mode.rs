@@ -243,9 +243,9 @@ pub struct WritePlan {
     pub failed: Vec<(usize, String)>,
 }
 
-#[derive(Clone)]
+/// What a key's last row does: upsert the page row at an index, or delete.
 enum Action {
-    Upsert(Value),
+    Upsert(usize),
     Delete(KeyTuple),
 }
 
@@ -327,7 +327,7 @@ fn plan_writes_by(
         let action = if is_delete {
             Action::Delete(key_tuple)
         } else {
-            Action::Upsert(strip_marker(rec.clone(), spec.delete_marker.as_ref()))
+            Action::Upsert(i)
         };
 
         match index.get(&canon) {
@@ -341,7 +341,9 @@ fn plan_writes_by(
 
     for action in order {
         match action {
-            Action::Upsert(v) => plan.upserts.push(v),
+            Action::Upsert(i) => plan
+                .upserts
+                .push(strip_marker(page[i].clone(), spec.delete_marker.as_ref())),
             Action::Delete(k) => plan.deletes.push(k),
         }
     }
@@ -365,7 +367,7 @@ pub fn plan_writes_ordered(page: &[Value], spec: &WriteSpec) -> Vec<WritePlan> {
         plans.push(plan);
     };
     for (i, rec) in page.iter().enumerate() {
-        if extract_key(rec, &spec.key).is_err() {
+        if key_error(rec, &spec.key).is_some() {
             continue;
         }
         let is_delete = match spec.write_mode {
@@ -394,7 +396,7 @@ pub fn plan_writes_ordered(page: &[Value], spec: &WriteSpec) -> Vec<WritePlan> {
 pub fn key_failures(page: &[Value], spec: &WriteSpec) -> Vec<(usize, String)> {
     page.iter()
         .enumerate()
-        .filter_map(|(i, rec)| extract_key(rec, &spec.key).err().map(|m| (i, m)))
+        .filter_map(|(i, rec)| key_error(rec, &spec.key).map(|m| (i, m)))
         .collect()
 }
 
@@ -402,6 +404,18 @@ pub fn key_failures(page: &[Value], spec: &WriteSpec) -> Vec<(usize, String)> {
 /// missing or null — the same rule [`plan_writes`] applies.
 pub fn record_key(rec: &Value, key: &[String]) -> Option<KeyTuple> {
     extract_key(rec, key).ok()
+}
+
+/// Why [`extract_key`] refuses `rec`, without building the key.
+fn key_error(rec: &Value, key: &[String]) -> Option<String> {
+    let Some(obj) = rec.as_object() else {
+        return Some("record is not a JSON object".to_string());
+    };
+    key.iter().find_map(|col| match obj.get(col) {
+        None => Some(format!("missing key column '{col}'")),
+        Some(Value::Null) => Some(format!("null value for key column '{col}'")),
+        Some(_) => None,
+    })
 }
 
 /// Pull the key columns out of a record in `key` order. Missing key or null
@@ -497,6 +511,97 @@ pub fn key_to_filter(k: &KeyTuple) -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The plan as it was built when every row was cloned as it was read.
+    fn reference_plan(page: &[Value], spec: &WriteSpec) -> WritePlan {
+        enum Action {
+            Upsert(Value),
+            Delete(KeyTuple),
+        }
+        let mut plan = WritePlan::default();
+        let mut index: HashMap<String, usize> = HashMap::new();
+        let mut order: Vec<Action> = Vec::new();
+        for (i, rec) in page.iter().enumerate() {
+            let key_tuple = match extract_key(rec, &spec.key) {
+                Ok(k) => k,
+                Err(msg) => {
+                    plan.failed.push((i, msg));
+                    continue;
+                }
+            };
+            let canon = canonical(&key_tuple);
+            let is_delete = spec.write_mode == WriteMode::Delete
+                || (spec.write_mode == WriteMode::Upsert
+                    && is_delete_marked(rec, spec.delete_marker.as_ref()));
+            let action = if is_delete {
+                Action::Delete(key_tuple)
+            } else {
+                Action::Upsert(strip_marker(rec.clone(), spec.delete_marker.as_ref()))
+            };
+            match index.get(&canon) {
+                Some(&slot) => order[slot] = action,
+                None => {
+                    index.insert(canon, order.len());
+                    order.push(action);
+                }
+            }
+        }
+        for action in order {
+            match action {
+                Action::Upsert(v) => plan.upserts.push(v),
+                Action::Delete(k) => plan.deletes.push(k),
+            }
+        }
+        plan
+    }
+
+    #[test]
+    fn plans_and_key_failures_match_the_row_cloning_planner() {
+        let page = vec![
+            serde_json::json!({"id": 1, "v": "a", "__op": "u"}),
+            serde_json::json!({"id": 2, "v": "b"}),
+            serde_json::json!({"id": 1, "v": "c", "__op": "d"}),
+            serde_json::json!({"id": "1", "v": "d"}),
+            serde_json::json!({"v": "no key"}),
+            serde_json::json!({"id": null, "v": "null key"}),
+            serde_json::json!("not an object"),
+            serde_json::json!({"id": 2, "v": "e", "__op": "u"}),
+            serde_json::json!({"id": 3, "tenant": "x", "__op": "d"}),
+            serde_json::json!({"id": 3, "tenant": "x", "v": "back"}),
+            serde_json::json!({"id": 1.0, "tenant": null}),
+        ];
+        let marker = DeleteMarker {
+            field: "__op".into(),
+            values: vec!["d".into()],
+        };
+        for write_mode in [WriteMode::Upsert, WriteMode::Delete] {
+            for key in [vec!["id".to_string()], vec!["id".into(), "tenant".into()]] {
+                for delete_marker in [None, Some(marker.clone())] {
+                    let spec = WriteSpec {
+                        write_mode,
+                        key: key.clone(),
+                        delete_marker,
+                        ..WriteSpec::default()
+                    };
+                    let plan = plan_writes(&page, &spec);
+                    let reference = reference_plan(&page, &spec);
+                    assert_eq!(plan.upserts, reference.upserts, "{spec:?}");
+                    assert_eq!(plan.deletes, reference.deletes, "{spec:?}");
+                    assert_eq!(plan.failed, reference.failed, "{spec:?}");
+                    assert_eq!(key_failures(&page, &spec), reference.failed, "{spec:?}");
+                    for rec in &page {
+                        assert_eq!(key_error(rec, &key), extract_key(rec, &key).err());
+                    }
+                    let ordered = plan_writes_ordered(&page, &spec);
+                    let rows: usize = ordered
+                        .iter()
+                        .map(|p| p.upserts.len() + p.deletes.len())
+                        .sum();
+                    assert!(rows > 0 && ordered.iter().all(|p| p.failed.is_empty()));
+                }
+            }
+        }
+    }
     use serde_json::json;
 
     #[test]

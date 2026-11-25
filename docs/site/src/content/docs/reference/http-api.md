@@ -2059,6 +2059,11 @@ the history refused; kept and retried with a backoff),
 `faucet_serve_policy_seed_pending` (the `--policy` file is not in the policy
 store yet), `faucet_serve_run_reload_retries_total` (claimed runs whose
 config could not be re-loaded yet and is retried in place),
+`faucet_serve_lease_renewal_timeouts_total` (lease renewals and lost-lease
+checks the history did not answer in time),
+`faucet_serve_lease_upkeep_skipped_total` (lease ticks that found the previous
+tick's upkeep still running), `faucet_serve_history_call_timeouts_total`
+(history calls of the lease upkeep cut off at their time limit),
 `faucet_serve_policy_merge_failures_total{tenant}` (a tenant's policy no
 longer merges with the server's; its runs are refused) and
 `faucet_serve_history_unreachable` (the last

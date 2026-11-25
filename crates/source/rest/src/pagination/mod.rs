@@ -341,12 +341,7 @@ fn warn_repeat(kind: &str, seen: TokenSeen, token: &str) {
 /// Fingerprint of a page's extracted records for
 /// [`PaginationState::current_records_fingerprint`].
 pub fn records_fingerprint(records: &[Value]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for r in records {
-        r.to_string().hash(&mut h);
-    }
-    h.finish()
+    faucet_core::util::records_fingerprint(records)
 }
 
 /// The page fingerprint the stagnation guards compare: the records when the
@@ -783,6 +778,48 @@ impl PaginationStyle {
             );
         }
         records
+    }
+
+    /// Whether [`advance`](Self::advance) can compare this page's content
+    /// fingerprint (the content-stagnation guards).
+    pub(crate) fn reads_page_fingerprint(&self) -> bool {
+        match self {
+            PaginationStyle::PageNumber { .. } | PaginationStyle::OffsetInBody { .. } => true,
+            PaginationStyle::Offset { total_path, .. } => total_path.is_none(),
+            _ => false,
+        }
+    }
+
+    /// Every JSONPath [`advance`](Self::advance) evaluates against the
+    /// response body.
+    pub(crate) fn body_paths(&self) -> Vec<&str> {
+        match self {
+            PaginationStyle::Cursor {
+                next_token_path, ..
+            }
+            | PaginationStyle::CursorInBody {
+                next_token_path, ..
+            } => vec![next_token_path],
+            PaginationStyle::NextLinkInBody { next_link_path } => vec![next_link_path],
+            PaginationStyle::Offset {
+                total_path,
+                rows_path,
+                ..
+            }
+            | PaginationStyle::OffsetInBody {
+                total_path,
+                rows_path,
+                ..
+            } => total_path
+                .iter()
+                .chain(rows_path)
+                .map(String::as_str)
+                .collect(),
+            PaginationStyle::None
+            | PaginationStyle::LinkHeader
+            | PaginationStyle::PageNumber { .. }
+            | PaginationStyle::RecordFieldCursor { .. } => Vec::new(),
+        }
     }
 
     /// The JSONPath a cursor style reads its next-page token from
@@ -1237,6 +1274,73 @@ mod new_style_tests {
         assert_eq!(state.record_field_cursor, Some(json!(4)));
         style.update_record_cursor(&[json!({"seq": 2})], &mut state);
         assert_eq!(state.record_field_cursor, Some(json!(2)));
+    }
+
+    fn every_style() -> Vec<PaginationStyle> {
+        serde_json::from_value(serde_json::json!([
+            { "type": "None" },
+            { "type": "LinkHeader" },
+            { "type": "Cursor", "next_token_path": "$.meta.next", "param_name": "c" },
+            { "type": "CursorInBody", "next_token_path": "$.meta.next",
+              "body_cursor_field": "after" },
+            { "type": "NextLinkInBody", "next_link_path": "$.meta.link" },
+            { "type": "PageNumber", "param_name": "p", "start_page": 1,
+              "page_size": null, "page_size_param": null },
+            { "type": "Offset", "offset_param": "o", "limit_param": "l", "limit": 2,
+              "total_path": null },
+            { "type": "Offset", "offset_param": "o", "limit_param": "l", "limit": 2,
+              "total_path": "$.meta.total", "rows_path": "$.rows" },
+            { "type": "OffsetInBody", "offset_field": "o", "limit_field": "l", "limit": 2 },
+            { "type": "OffsetInBody", "offset_field": "o", "limit_field": "l", "limit": 2,
+              "total_path": "$.meta.total", "rows_path": "$.rows" },
+            { "type": "RecordFieldCursor", "field": "id", "param": "after", "page_size": 2 },
+        ]))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_the_styles_that_declare_it_consume_the_page_fingerprint() {
+        let body = serde_json::json!({
+            "data": [{ "id": 1 }, { "id": 2 }],
+            "rows": [1, 2],
+            "meta": { "next": "c2", "link": "https://api.example.com/p2", "total": 9 }
+        });
+        for style in every_style() {
+            let mut state = PaginationState {
+                current_records_fingerprint: Some(7),
+                record_field_cursor: Some(serde_json::json!(2)),
+                ..PaginationState::default()
+            };
+            style
+                .advance(&body, &HeaderMap::new(), &mut state, 2)
+                .unwrap();
+            assert_eq!(
+                state.current_records_fingerprint.is_none(),
+                style.reads_page_fingerprint(),
+                "{}",
+                style.style_name()
+            );
+        }
+    }
+
+    #[test]
+    fn body_paths_lists_every_path_advance_reads() {
+        let styles = every_style();
+        let got: Vec<Vec<&str>> = styles.iter().map(PaginationStyle::body_paths).collect();
+        let want: Vec<Vec<&str>> = vec![
+            vec![],
+            vec![],
+            vec!["$.meta.next"],
+            vec!["$.meta.next"],
+            vec!["$.meta.link"],
+            vec![],
+            vec![],
+            vec!["$.meta.total", "$.rows"],
+            vec![],
+            vec!["$.meta.total", "$.rows"],
+            vec![],
+        ];
+        assert_eq!(got, want);
     }
 
     #[test]

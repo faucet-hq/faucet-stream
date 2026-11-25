@@ -9,6 +9,8 @@
 //! with [`column_for_field`] / [`field_for_column`].
 
 use serde_json::{Map, Value};
+use std::borrow::Cow;
+use std::collections::HashMap;
 
 /// How a record field is compared with a destination column name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -147,6 +149,202 @@ pub fn canonical_record(
         }
     }
     out
+}
+
+/// Two record fields that both address `column` ignoring ASCII case while
+/// neither spells it exactly (see [`ColumnResolver::ambiguous_fold`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AmbiguousFold<'r, 'c> {
+    /// The column both fields address.
+    pub column: &'c str,
+    /// The first such field, in record order.
+    pub first: &'r str,
+    /// The second such field, in record order.
+    pub second: &'r str,
+}
+
+/// One destination's columns, indexed once so each record field resolves
+/// without scanning the column list.
+///
+/// Every lookup answers exactly as the free functions of this module do for
+/// the same columns and rule ([`column_for_field`], [`field_for_column`],
+/// [`canonical_record`]).
+#[derive(Debug, Clone)]
+pub struct ColumnResolver {
+    columns: Vec<String>,
+    matching: ColumnMatching,
+    exact: HashMap<String, usize>,
+    folded: HashMap<u64, Vec<usize>>,
+    upper: HashMap<String, usize>,
+}
+
+fn fold_hash(name: &str) -> u64 {
+    name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b.to_ascii_lowercase())).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+impl ColumnResolver {
+    /// Index `columns` (in destination order) for lookups under `matching`.
+    pub fn new(columns: Vec<String>, matching: ColumnMatching) -> Self {
+        let mut exact = HashMap::with_capacity(columns.len());
+        let mut folded: HashMap<u64, Vec<usize>> = HashMap::with_capacity(columns.len());
+        let mut upper = HashMap::new();
+        for (i, column) in columns.iter().enumerate() {
+            exact.entry(column.clone()).or_insert(i);
+            folded.entry(fold_hash(column)).or_default().push(i);
+            if matching == ColumnMatching::UpperFold && *column == column.to_uppercase() {
+                upper.entry(column.clone()).or_insert(i);
+            }
+        }
+        Self {
+            columns,
+            matching,
+            exact,
+            folded,
+            upper,
+        }
+    }
+
+    /// The columns, in destination order.
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    /// The rule fields are matched by.
+    pub fn matching(&self) -> ColumnMatching {
+        self.matching
+    }
+
+    fn fold_matches<'s>(&'s self, name: &'s str) -> impl Iterator<Item = usize> + 's {
+        self.folded
+            .get(&fold_hash(name))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(move |i| self.columns[*i].eq_ignore_ascii_case(name))
+    }
+
+    /// The position of the column `field` addresses.
+    pub fn index_of(&self, field: &str) -> Option<usize> {
+        if let Some(i) = self.exact.get(field) {
+            return Some(*i);
+        }
+        match self.matching {
+            ColumnMatching::Exact => None,
+            ColumnMatching::CaseInsensitive => self.fold_matches(field).next(),
+            ColumnMatching::FoldUnique => {
+                let mut folded = self.fold_matches(field);
+                match (folded.next(), folded.next()) {
+                    (Some(i), None) => Some(i),
+                    _ => None,
+                }
+            }
+            ColumnMatching::UpperFold => self.upper.get(field.to_uppercase().as_str()).copied(),
+        }
+    }
+
+    /// The column `field` addresses ([`column_for_field`]).
+    pub fn column_for_field(&self, field: &str) -> Option<&str> {
+        self.index_of(field).map(|i| self.columns[i].as_str())
+    }
+
+    /// The field (and its value) of `obj` whose value lands in `column`
+    /// ([`field_for_column`]).
+    pub fn field_for_column<'a>(
+        &self,
+        column: &str,
+        obj: &'a Map<String, Value>,
+    ) -> Option<(&'a str, &'a Value)> {
+        if let Some((k, v)) = obj.get_key_value(column) {
+            return Some((k.as_str(), v));
+        }
+        let found = match self.matching {
+            ColumnMatching::Exact => None,
+            ColumnMatching::CaseInsensitive => {
+                obj.iter().find(|(k, _)| k.eq_ignore_ascii_case(column))
+            }
+            ColumnMatching::FoldUnique => obj.iter().rfind(|(k, _)| {
+                k.eq_ignore_ascii_case(column)
+                    && !self.exact.contains_key(k.as_str())
+                    && self.fold_matches(k).count() == 1
+            }),
+            ColumnMatching::UpperFold => {
+                if column != column.to_uppercase() {
+                    return None;
+                }
+                obj.iter().find(|(k, _)| {
+                    k.to_uppercase() == column && !self.exact.contains_key(k.as_str())
+                })
+            }
+        };
+        found.map(|(k, v)| (k.as_str(), v))
+    }
+
+    fn resolution(&self, field: &str, obj: &Map<String, Value>) -> Resolution<'_> {
+        match self.column_for_field(field) {
+            None => Resolution::Unmatched,
+            Some(column) if column == field => Resolution::Column(column),
+            Some(column) => match self.field_for_column(column, obj) {
+                Some((winner, _)) if winner == field => Resolution::Column(column),
+                _ => Resolution::Shadowed(column),
+            },
+        }
+    }
+
+    /// `obj` keyed the way the destination sees it ([`canonical_record`]),
+    /// borrowed when every field already is.
+    pub fn canonical_record<'a>(&self, obj: &'a Map<String, Value>) -> Cow<'a, Map<String, Value>> {
+        let settled = obj.keys().all(|field| match self.index_of(field) {
+            None => true,
+            Some(i) => self.columns[i] == *field,
+        });
+        if settled {
+            return Cow::Borrowed(obj);
+        }
+        let mut out = Map::with_capacity(obj.len());
+        for (field, value) in obj {
+            match self.resolution(field, obj) {
+                Resolution::Column(c) => {
+                    out.insert(c.to_owned(), value.clone());
+                }
+                Resolution::Unmatched => {
+                    out.entry(field.to_owned()).or_insert_with(|| value.clone());
+                }
+                Resolution::Shadowed(_) => {}
+            }
+        }
+        Cow::Owned(out)
+    }
+
+    /// The first column (in destination order) that `obj` does not carry
+    /// under its exact name while two or more of its fields equal it ignoring
+    /// ASCII case: writing either one would drop the other.
+    pub fn ambiguous_fold<'r>(&self, obj: &'r Map<String, Value>) -> Option<AmbiguousFold<'r, '_>> {
+        let mut folds: Vec<(usize, &'r str, Option<&'r str>)> = Vec::new();
+        for field in obj.keys() {
+            for i in self.fold_matches(field) {
+                if obj.contains_key(self.columns[i].as_str()) {
+                    continue;
+                }
+                match folds.iter_mut().find(|(column, _, _)| *column == i) {
+                    Some((_, _, second)) => {
+                        second.get_or_insert(field.as_str());
+                    }
+                    None => folds.push((i, field.as_str(), None)),
+                }
+            }
+        }
+        folds
+            .into_iter()
+            .filter_map(|(i, first, second)| Some((i, first, second?)))
+            .min_by_key(|(i, _, _)| *i)
+            .map(|(i, first, second)| AmbiguousFold {
+                column: self.columns[i].as_str(),
+                first,
+                second,
+            })
+    }
 }
 
 #[cfg(test)]

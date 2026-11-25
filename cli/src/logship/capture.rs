@@ -138,12 +138,13 @@ where
     let mut v = EventLineVisitor::default();
     event.record(&mut v);
     let meta = event.metadata();
-    let body = if v.fields.is_empty() {
-        v.message
-    } else {
-        format!("{}{}", v.message, v.fields)
+    let mut body = v.message;
+    body.push_str(&v.fields);
+    let redacted = match crate::secrets::registry::redact(&body) {
+        std::borrow::Cow::Owned(redacted) => Some(redacted),
+        std::borrow::Cow::Borrowed(_) => None,
     };
-    let body = crate::logship::truncate_line(crate::secrets::registry::redact(&body).into_owned());
+    let body = crate::logship::truncate_line(redacted.unwrap_or(body));
     let mut attrs = BTreeMap::new();
     if let Some(scope) = ctx.event_scope(event) {
         for span in scope.from_root() {
@@ -203,9 +204,11 @@ pub fn is_shipping_noise(target: &str) -> bool {
         "opentelemetry",
         "rustls",
     ];
-    NOISE
-        .iter()
-        .any(|n| target == *n || target.starts_with(&format!("{n}::")))
+    NOISE.iter().any(|n| {
+        target
+            .strip_prefix(n)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+    })
 }
 
 #[cfg(test)]
@@ -235,6 +238,50 @@ mod tests {
         fn on_event(&self, e: &Event<'_>, ctx: Context<'_, S>) {
             self.0.lock().unwrap().push(capture(e, &ctx));
         }
+    }
+
+    #[test]
+    fn noise_targets_match_whole_path_segments() {
+        let reference = |target: &str| {
+            [
+                "faucet_cli::logship",
+                "faucet_cli::serve::log_export",
+                "h2",
+                "hyper",
+                "hyper_util",
+                "tonic",
+                "tower",
+                "reqwest",
+                "opentelemetry",
+                "rustls",
+            ]
+            .iter()
+            .any(|n| target == *n || target.starts_with(&format!("{n}::")))
+        };
+        for target in [
+            "h2",
+            "h2::proto",
+            "h2x",
+            "h2:",
+            "hyper",
+            "hyper_util::client",
+            "hyperion::x",
+            "faucet_cli::logship",
+            "faucet_cli::logship::session",
+            "faucet_cli::logshipper",
+            "faucet_cli::serve::log_export::x",
+            "faucet_cli::serve",
+            "tower",
+            "tower_http::trace",
+            "rustls::conn",
+            "opentelemetry_sdk",
+            "",
+            "::h2",
+        ] {
+            assert_eq!(is_shipping_noise(target), reference(target), "{target:?}");
+        }
+        assert!(is_shipping_noise("tonic::transport"));
+        assert!(!is_shipping_noise("tower_http::trace"));
     }
 
     #[test]

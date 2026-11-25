@@ -110,7 +110,7 @@ impl MongoSource {
                         .deserialize_current()
                         .map_err(source_err("MongoDB deserialization failed"))?;
 
-                    let value = bson_document_to_json_value(&doc)?;
+                    let value = bson_document_to_json_value(doc)?;
                     records.push(value);
                 }
                 Ok(records)
@@ -191,7 +191,7 @@ impl faucet_core::Source for MongoSource {
                     let doc = cursor
                         .deserialize_current()
                         .map_err(source_err("MongoDB deserialization failed"))?;
-                    records.push(bson_document_to_json_value(&doc)?);
+                    records.push(bson_document_to_json_value(doc)?);
                 }
                 Ok(records)
             })
@@ -299,7 +299,7 @@ impl faucet_core::Source for MongoSource {
                             let doc = cursor.deserialize_current().map_err(|e| {
                                 FaucetError::Source(format!("MongoDB deserialization failed: {e}"))
                             })?;
-                            page.push(bson_document_to_json_value(&doc)?);
+                            page.push(bson_document_to_json_value(doc)?);
                         }
                         Ok((page, true))
                     })
@@ -387,7 +387,7 @@ impl faucet_core::Source for MongoSource {
                         let doc = cursor
                             .deserialize_current()
                             .map_err(discover_err("decode", &name))?;
-                        sample.push(bson_document_to_json_value(&doc)?);
+                        sample.push(bson_document_to_json_value(doc)?);
                     }
 
                     datasets.push(descriptor_for_collection(&name, &sample, Some(estimated)));
@@ -494,10 +494,8 @@ fn json_value_to_document(val: &Value) -> Result<Document, FaucetError> {
 }
 
 /// Convert a `bson::Document` to a `serde_json::Value`.
-fn bson_document_to_json_value(doc: &Document) -> Result<Value, FaucetError> {
-    let bson = Bson::Document(doc.clone());
-    let relaxed = bson.into_relaxed_extjson();
-    Ok(relaxed)
+fn bson_document_to_json_value(doc: Document) -> Result<Value, FaucetError> {
+    Ok(Bson::Document(doc).into_relaxed_extjson())
 }
 
 /// Whether discovery lists a collection: not a `system.*` collection and not
@@ -550,7 +548,7 @@ mod tests {
             .iter()
             .map(
                 |r| match mongodb::bson::Bson::try_from(r.clone()).unwrap() {
-                    mongodb::bson::Bson::Document(d) => bson_document_to_json_value(&d).unwrap(),
+                    mongodb::bson::Bson::Document(d) => bson_document_to_json_value(d).unwrap(),
                     other => panic!("not a document: {other:?}"),
                 },
             )
@@ -586,7 +584,7 @@ mod tests {
         let mut doc = Document::new();
         doc.insert("name", "Bob");
         doc.insert("score", 42);
-        let value = bson_document_to_json_value(&doc).unwrap();
+        let value = bson_document_to_json_value(doc).unwrap();
         assert_eq!(value["name"], "Bob");
         assert_eq!(value["score"], 42);
     }
@@ -598,7 +596,7 @@ mod tests {
         let inner = doc.get_document("user").unwrap();
         assert_eq!(inner.get_str("name").unwrap(), "Alice");
 
-        let back = bson_document_to_json_value(&doc).unwrap();
+        let back = bson_document_to_json_value(doc).unwrap();
         assert_eq!(back["user"]["name"], "Alice");
         assert_eq!(back["user"]["tags"][0], "admin");
     }
@@ -748,7 +746,7 @@ mod tests {
         let mut doc = Document::new();
         let oid = ObjectId::parse_str("64ab00112233445566778899").unwrap();
         doc.insert("_id", oid);
-        let value = bson_document_to_json_value(&doc).unwrap();
+        let value = bson_document_to_json_value(doc).unwrap();
         // Relaxed extended JSON renders an ObjectId as {"$oid": "<hex>"}.
         assert_eq!(value["_id"]["$oid"], "64ab00112233445566778899");
     }
@@ -759,7 +757,7 @@ mod tests {
         let mut doc = Document::new();
         // 1_000_000 ms past the epoch.
         doc.insert("created_at", DateTime::from_millis(1_000_000));
-        let value = bson_document_to_json_value(&doc).unwrap();
+        let value = bson_document_to_json_value(doc).unwrap();
         // Relaxed extended JSON renders a post-1970 datetime as
         // {"$date": "<RFC3339>"}.
         assert!(
@@ -777,7 +775,7 @@ mod tests {
         let mut nested = Document::new();
         nested.insert("k", 7i32);
         doc.insert("nested", nested);
-        let value = bson_document_to_json_value(&doc).unwrap();
+        let value = bson_document_to_json_value(doc).unwrap();
         assert_eq!(value["missing"], Value::Null);
         assert_eq!(value["tags"], json!(["a", "b"]));
         assert_eq!(value["nested"]["k"], 7);
@@ -787,7 +785,7 @@ mod tests {
     fn bson_int64_converts_to_number() {
         let mut doc = Document::new();
         doc.insert("big", 9_000_000_000i64);
-        let value = bson_document_to_json_value(&doc).unwrap();
+        let value = bson_document_to_json_value(doc).unwrap();
         // Relaxed extended JSON renders an i64 as a bare JSON number.
         assert_eq!(value["big"], json!(9_000_000_000i64));
     }

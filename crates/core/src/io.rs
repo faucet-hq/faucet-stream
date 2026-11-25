@@ -511,6 +511,8 @@ pub struct CallSlot {
     local: CallContext,
     installed: OnceLock<CallContext>,
     recorder: OnceLock<Arc<RoundtripRecorder>>,
+    /// The effective context, kept once nothing can change it any more.
+    effective: OnceLock<CallContext>,
 }
 
 // Set-once cells over immutable contexts; a panic cannot leave a torn value.
@@ -524,6 +526,7 @@ impl CallSlot {
             local,
             installed: OnceLock::new(),
             recorder: OnceLock::new(),
+            effective: OnceLock::new(),
         }
     }
 
@@ -535,6 +538,7 @@ impl CallSlot {
     /// Replace the connector-owned settings (from a builder method).
     pub fn set_local(&mut self, local: CallContext) {
         self.local = local;
+        self.effective = OnceLock::new();
     }
 
     /// Install the pipeline's context. The first call wins.
@@ -552,14 +556,23 @@ impl CallSlot {
     /// The effective context: the connector's settings over the installed
     /// context, with the separately installed recorder as a fallback.
     pub fn get(&self) -> CallContext {
-        let mut ctx = match self.installed.get() {
+        if let Some(ctx) = self.effective.get() {
+            return ctx.clone();
+        }
+        let base = self.installed.get();
+        let mut ctx = match base {
             Some(base) => self.local.inherit(base),
             None => self.local.clone(),
         };
-        if ctx.inner.recorder.is_none()
-            && let Some(r) = self.recorder.get()
-        {
-            ctx = ctx.with_recorder(Arc::clone(r));
+        let mut settled = base.is_some();
+        if ctx.inner.recorder.is_none() {
+            match self.recorder.get() {
+                Some(r) => ctx = ctx.with_recorder(Arc::clone(r)),
+                None => settled = false,
+            }
+        }
+        if settled {
+            let _ = self.effective.set(ctx.clone());
         }
         ctx
     }
@@ -703,6 +716,15 @@ mod tests {
     use crate::observability::RoundtripSide;
     use crate::resilience::BackoffKind;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn call_slot_keeps_its_auto_traits() {
+        fn assert_auto<
+            T: Send + Sync + Unpin + std::panic::UnwindSafe + std::panic::RefUnwindSafe,
+        >() {
+        }
+        assert_auto::<CallSlot>();
+    }
 
     fn fast(max_attempts: u32) -> RetryPolicy {
         RetryPolicy {
@@ -1290,5 +1312,43 @@ mod tests {
         token.cancel();
         let r: Result<(), _> = slot.call("op", || async { Ok(()) }).await;
         assert!(matches!(r, Err(FaucetError::Cancelled { .. })));
+    }
+    #[test]
+    fn a_slot_keeps_its_effective_context_only_once_nothing_can_change_it() {
+        let same = |a: &CallContext, b: &CallContext| Arc::ptr_eq(&a.inner, &b.inner);
+        let rec = || Arc::new(RoundtripRecorder::new(RoundtripSide::Sink, "p", "r", "c"));
+
+        // Installed without a recorder: a recorder installed later still shows.
+        let mut slot = CallSlot::new(CallContext::new().with_timeout(Duration::from_secs(3)));
+        assert!(
+            same(&slot.get(), &slot.get()),
+            "uninstalled: the local context"
+        );
+        slot.install(CallContext::new().with_retry(fast(4)));
+        assert!(slot.get().recorder().is_none());
+        assert!(
+            !same(&slot.get(), &slot.get()),
+            "not settled without a recorder"
+        );
+        slot.install_recorder(rec());
+        let first = slot.get();
+        assert!(first.recorder().is_some());
+        assert_eq!(first.timeout(), Some(Duration::from_secs(3)));
+        assert_eq!(first.retry().unwrap().max_attempts, 4);
+        assert!(same(&first, &slot.get()), "settled: one shared context");
+
+        // New local settings replace the kept context.
+        slot.set_local(CallContext::new().with_timeout(Duration::from_secs(9)));
+        assert_eq!(slot.get().timeout(), Some(Duration::from_secs(9)));
+        assert_eq!(slot.get().retry().unwrap().max_attempts, 4);
+        assert!(slot.get().recorder().is_some());
+
+        // An installed context that carries its own recorder settles at once.
+        let slot = CallSlot::new(CallContext::new());
+        slot.install_recorder(rec());
+        assert!(slot.get().recorder().is_some());
+        assert!(!same(&slot.get(), &slot.get()), "nothing installed yet");
+        slot.install(CallContext::new().with_recorder(rec()));
+        assert!(same(&slot.get(), &slot.get()));
     }
 }

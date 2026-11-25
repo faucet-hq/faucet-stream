@@ -29,6 +29,29 @@ pub const DEFAULT_TABLE: &str = "faucet_state";
 pub struct PostgresStateStore {
     pool: PgPool,
     table: String,
+    sql: Statements,
+}
+
+/// The statements of one table, rendered once.
+#[derive(Debug, Clone)]
+struct Statements {
+    select: String,
+    upsert: String,
+    delete: String,
+    compare_update: String,
+    insert_absent: String,
+}
+
+impl Statements {
+    fn of(table: &str) -> Self {
+        Self {
+            select: select_sql(table),
+            upsert: upsert_sql(table),
+            delete: delete_sql(table),
+            compare_update: compare_update_sql(table),
+            insert_absent: insert_absent_sql(table),
+        }
+    }
 }
 
 impl PostgresStateStore {
@@ -58,6 +81,7 @@ impl PostgresStateStore {
             })?;
         Ok(Self {
             pool,
+            sql: Statements::of(table),
             table: table.to_owned(),
         })
     }
@@ -67,7 +91,11 @@ impl PostgresStateStore {
     pub fn from_pool(pool: PgPool, table: impl Into<String>) -> Result<Self, FaucetError> {
         let table = table.into();
         validate_table_name(&table)?;
-        Ok(Self { pool, table })
+        Ok(Self {
+            pool,
+            sql: Statements::of(&table),
+            table,
+        })
     }
 
     /// Returns the table name in use.
@@ -210,7 +238,7 @@ pub(crate) fn unwrap_nul(value: Value) -> Result<Value, FaucetError> {
 impl StateStore for PostgresStateStore {
     async fn get(&self, key: &str) -> Result<Option<Value>, FaucetError> {
         validate_state_key(key)?;
-        let row = sqlx::query(&select_sql(&self.table))
+        let row = sqlx::query(&self.sql.select)
             .bind(key)
             .fetch_optional(&self.pool)
             .await
@@ -233,7 +261,7 @@ impl StateStore for PostgresStateStore {
     async fn put(&self, key: &str, value: &Value) -> Result<(), FaucetError> {
         validate_state_key(key)?;
         let stored = wrap_nul(value)?;
-        sqlx::query(&upsert_sql(&self.table))
+        sqlx::query(&self.sql.upsert)
             .bind(key)
             .bind(stored.as_ref())
             .execute(&self.pool)
@@ -247,7 +275,7 @@ impl StateStore for PostgresStateStore {
 
     async fn delete(&self, key: &str) -> Result<(), FaucetError> {
         validate_state_key(key)?;
-        sqlx::query(&delete_sql(&self.table))
+        sqlx::query(&self.sql.delete)
             .bind(key)
             .execute(&self.pool)
             .await
@@ -289,14 +317,14 @@ impl StateStore for PostgresStateStore {
     ) -> Result<bool, FaucetError> {
         validate_state_key(key)?;
         let sql = match expected {
-            Some(_) => compare_update_sql(&self.table),
-            None => insert_absent_sql(&self.table),
+            Some(_) => &self.sql.compare_update,
+            None => &self.sql.insert_absent,
         };
         // Both sides in their stored form, so a NUL-escaped value compares
         // against its envelope.
         let stored = wrap_nul(value)?;
         let old = expected.map(wrap_nul).transpose()?;
-        let mut query = sqlx::query(&sql).bind(key).bind(stored.as_ref());
+        let mut query = sqlx::query(sql).bind(key).bind(stored.as_ref());
         if let Some(old) = &old {
             query = query.bind(old.as_ref());
         }
@@ -318,10 +346,10 @@ impl StateStore for PostgresStateStore {
         }
         let err = |e: sqlx::Error| FaucetError::State(format!("Postgres batch UPSERT failed: {e}"));
         let mut tx = self.pool.begin().await.map_err(err)?;
-        let sql = upsert_sql(&self.table);
+        let sql = &self.sql.upsert;
         for (key, value) in entries {
             let stored = wrap_nul(value)?;
-            sqlx::query(&sql)
+            sqlx::query(sql)
                 .bind(key)
                 .bind(stored.as_ref())
                 .execute(&mut *tx)
@@ -392,6 +420,24 @@ impl PostgresStateStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn postgres_state_store_keeps_its_auto_traits() {
+        fn assert_auto<T: Send + Sync + Unpin>() {}
+        assert_auto::<PostgresStateStore>();
+    }
+
+    #[test]
+    fn a_stores_statements_are_the_per_call_renderings() {
+        for table in ["faucet_state", "My\"Table", "schema.tbl"] {
+            let sql = Statements::of(table);
+            assert_eq!(sql.select, select_sql(table));
+            assert_eq!(sql.upsert, upsert_sql(table));
+            assert_eq!(sql.delete, delete_sql(table));
+            assert_eq!(sql.compare_update, compare_update_sql(table));
+            assert_eq!(sql.insert_absent, insert_absent_sql(table));
+        }
+    }
 
     #[test]
     fn nul_values_round_trip_through_the_envelope() {

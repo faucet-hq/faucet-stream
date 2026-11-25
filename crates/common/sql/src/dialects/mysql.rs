@@ -59,6 +59,10 @@ impl SqlDialect for Mysql {
         "?".to_string()
     }
 
+    fn write_placeholder(&self, out: &mut String, _n: usize, _sql_type: Option<&str>) {
+        out.push('?');
+    }
+
     fn param_limit(&self) -> usize {
         PARAM_LIMIT
     }

@@ -65,6 +65,15 @@ impl SqlDialect for Mssql {
         }
     }
 
+    fn write_placeholder(&self, out: &mut String, n: usize, sql_type: Option<&str>) {
+        use std::fmt::Write as _;
+        // Writing to a `String` cannot fail.
+        let _ = match sql_type {
+            Some(ty) => write!(out, "CAST(@P{n} AS {ty})"),
+            None => write!(out, "@P{n}"),
+        };
+    }
+
     fn param_limit(&self) -> usize {
         PARAM_LIMIT - SP_EXECUTESQL_RESERVED
     }

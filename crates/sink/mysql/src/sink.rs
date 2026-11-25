@@ -137,10 +137,10 @@ impl SqlExecutor for MysqlExec<'_> {
                 Value::String(s) if let Some(t) = p.sql_type.and_then(|t| instant_text(s, t)) => {
                     q.bind(t)
                 }
-                _ if p.non_integer_text().is_some() => {
-                    q.bind(p.non_integer_text().expect("checked"))
-                }
-                v => bind_value(q, v),
+                v => match p.non_integer_text() {
+                    Some(text) => q.bind(text),
+                    None => bind_value(q, v),
+                },
             };
         }
         let context = statement_context(stmt.kind);
@@ -173,10 +173,10 @@ impl SqlExecutor for MysqlExec<'_> {
                 Value::String(s) if let Some(t) = p.sql_type.and_then(|t| instant_text(s, t)) => {
                     q.bind(t)
                 }
-                _ if p.non_integer_text().is_some() => {
-                    q.bind(p.non_integer_text().expect("checked"))
-                }
-                v => bind_value(q, v),
+                v => match p.non_integer_text() {
+                    Some(text) => q.bind(text),
+                    None => bind_value(q, v),
+                },
             };
         }
         let rows = q
@@ -676,14 +676,25 @@ fn split_columns(
         records,
         columns,
         require_match,
-        |idx, col, v| match v {
-            Value::String(s) if is_binary_type(&col.sql_type) => binary
-                .resolve(s)
-                .err()
-                .map(|e| format!("mysql: row {idx}: column {}: {e}", col.name)),
-            _ => None,
-        },
+        |idx, col, v| cell_refusal(idx, col, v, binary),
     )
+}
+
+/// Why `v` cannot be bound into `col`: only a binary-column string
+/// `binary_encoding` refuses.
+fn cell_refusal(
+    idx: usize,
+    col: &TableColumn,
+    v: &Value,
+    binary: BinaryEncoding,
+) -> Option<String> {
+    match v {
+        Value::String(s) if is_binary_type(&col.sql_type) => binary
+            .resolve(s)
+            .err()
+            .map(|e| format!("mysql: row {idx}: column {}: {e}", col.name)),
+        _ => None,
+    }
 }
 
 /// [`split_columns`] over `(name, data_type)` pairs.
@@ -704,16 +715,13 @@ fn split_writable(
 /// time zone for `DATETIME`, so a `DATETIME` gets the UTC wall-clock time and
 /// a `TIMESTAMP` the instant at `+00:00`.
 pub(crate) fn instant_text(value: &str, data_type: &str) -> Option<String> {
-    let base = data_type
-        .trim()
-        .split(|c: char| c == '(' || c.is_whitespace())
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let suffix = match base.as_str() {
-        "datetime" => "",
-        "timestamp" => "+00:00",
-        _ => return None,
+    let base = base_type(data_type);
+    let suffix = if base.eq_ignore_ascii_case("datetime") {
+        ""
+    } else if base.eq_ignore_ascii_case("timestamp") {
+        "+00:00"
+    } else {
+        return None;
     };
     let utc = chrono::DateTime::parse_from_rfc3339(value)
         .ok()?
@@ -724,16 +732,27 @@ pub(crate) fn instant_text(value: &str, data_type: &str) -> Option<String> {
 /// Whether a MySQL `DATA_TYPE` (or a full `COLUMN_TYPE` such as
 /// `varbinary(32)`) stores raw bytes.
 pub(crate) fn is_binary_type(data_type: &str) -> bool {
-    let base = data_type
+    let base = base_type(data_type);
+    [
+        "binary",
+        "varbinary",
+        "tinyblob",
+        "blob",
+        "mediumblob",
+        "longblob",
+    ]
+    .iter()
+    .any(|t| base.eq_ignore_ascii_case(t))
+}
+
+/// The type name of a `DATA_TYPE` / `COLUMN_TYPE`, without its length or
+/// attributes, in the case it was given.
+fn base_type(data_type: &str) -> &str {
+    data_type
         .trim()
         .split(|c: char| c == '(' || c.is_whitespace())
         .next()
         .unwrap_or_default()
-        .to_ascii_lowercase();
-    matches!(
-        base.as_str(),
-        "binary" | "varbinary" | "tinyblob" | "blob" | "mediumblob" | "longblob"
-    )
 }
 
 /// Bind a string bound for a binary column, decoded per `binary_encoding`.
@@ -1959,6 +1978,19 @@ impl SqlDriver for MysqlDriver {
         }
     }
 
+    fn refuses_rows(
+        &self,
+        _target: &TableTarget,
+        records: &[Value],
+        columns: &[TableColumn],
+        require_match: bool,
+    ) -> bool {
+        let binary = self.config.binary_encoding;
+        faucet_common_sql::page_refuses(&Mysql, "", records, columns, require_match, |i, c, v| {
+            cell_refusal(i, c, v, binary)
+        })
+    }
+
     /// A binary value `binary_encoding` refuses fails only its own row.
     fn split_page(
         &self,
@@ -2747,5 +2779,69 @@ mod tests {
             mysql_data_type_to_json_schema("datetime", true),
             json!({"type":["string","null"]})
         );
+    }
+
+    #[test]
+    fn mysql_type_names_compare_without_lower_casing() {
+        for (ty, binary) in [
+            ("varbinary(32)", true),
+            ("BLOB", true),
+            (" LongBlob ", true),
+            ("binary(4) unsigned", true),
+            ("varchar(8)", false),
+            ("bit(1)", false),
+            ("", false),
+        ] {
+            assert_eq!(is_binary_type(ty), binary, "{ty}");
+        }
+        let at = "2026-01-02T03:04:05+02:00";
+        assert_eq!(
+            instant_text(at, "DATETIME(6)").as_deref(),
+            Some("2026-01-02 01:04:05")
+        );
+        assert_eq!(
+            instant_text(at, "Timestamp").as_deref(),
+            Some("2026-01-02 01:04:05+00:00")
+        );
+        assert_eq!(instant_text(at, "date"), None);
+    }
+
+    #[test]
+    fn a_page_refuses_exactly_when_its_split_fails_a_row() {
+        use serde_json::json;
+        let columns = engine_columns(&[
+            ("id".to_string(), "int".to_string()),
+            ("b".to_string(), "varbinary".to_string()),
+        ]);
+        let pages = [
+            vec![json!({"id": 1, "b": "SGVsbG8="}), json!({"id": 2})],
+            vec![json!({"id": 1, "b": "not base64!"})],
+            vec![json!({"none": 1})],
+            vec![json!(1)],
+        ];
+        for binary in [
+            BinaryEncoding::Auto,
+            BinaryEncoding::Text,
+            BinaryEncoding::Base64,
+        ] {
+            for page in &pages {
+                for require_match in [true, false] {
+                    let split = split_columns(page, &columns, binary, require_match);
+                    let refuses = faucet_common_sql::page_refuses(
+                        &Mysql,
+                        "",
+                        page,
+                        &columns,
+                        require_match,
+                        |i, c, v| cell_refusal(i, c, v, binary),
+                    );
+                    assert_eq!(
+                        refuses,
+                        split.outcomes.iter().any(Result::is_err),
+                        "{page:?} {binary:?} {require_match}"
+                    );
+                }
+            }
+        }
     }
 }

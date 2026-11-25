@@ -21,11 +21,10 @@ use std::time::Duration;
 /// the REST source's body-fingerprint guard (audit #146 H4/H5).
 fn page_fingerprint(records: &[Value]) -> u64 {
     use std::hash::{Hash, Hasher};
-    // `serde_json::Value` is not `Hash`; hash its canonical string form.
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     records.len().hash(&mut hasher);
     for r in records {
-        r.to_string().hash(&mut hasher);
+        faucet_core::util::hash_value(r, &mut hasher);
     }
     hasher.finish()
 }
@@ -550,7 +549,10 @@ impl XmlDriver {
                 let xml_text = self.execute_request(calls, &params, context, next).await?;
                 let records = self.page_records(&xml_text, &mut fault_logged).await?;
                 let record_count = records.len();
-                let fingerprint = page_fingerprint(&records);
+                let fingerprint = match self.config.pagination {
+                    Some(_) => page_fingerprint(&records),
+                    None => 0,
+                };
                 pages_fetched += 1;
 
                 // Loop guard: a server that ignores the page/offset parameter
@@ -1023,6 +1025,31 @@ fn short_page(stop_when_short: bool, record_count: usize, size: Option<usize>) -
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn page_fingerprint_matches_the_string_form() {
+        use std::hash::{Hash, Hasher};
+        let reference = |records: &[Value]| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            records.len().hash(&mut hasher);
+            for r in records {
+                r.to_string().hash(&mut hasher);
+            }
+            hasher.finish()
+        };
+        let pages = [
+            vec![],
+            vec![serde_json::json!({"id": "1", "name": "a<b>&\"c\""})],
+            vec![
+                serde_json::json!({"a": ["x", {"y": null}]}),
+                serde_json::json!("z"),
+            ],
+        ];
+        for page in &pages {
+            assert_eq!(page_fingerprint(page), reference(page), "{page:?}");
+        }
+        assert_ne!(page_fingerprint(&pages[1]), page_fingerprint(&pages[2]));
+    }
 
     #[test]
     fn path_placeholders_are_percent_encoded() {

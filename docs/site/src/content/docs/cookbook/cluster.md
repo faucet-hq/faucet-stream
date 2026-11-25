@@ -234,6 +234,39 @@ Useful alert expressions:
   the database answers again, the instance hands each one back as `pending`
   (unless a peer has already reclaimed it), and the cluster resumes it from its
   bookmark, as after a clustered shutdown.
+  A database that accepts connections but stops answering is treated the same
+  way: a renewal is given up after two thirds of `--lease-ttl-secs`, and the
+  cancel above happens on time even while a renewal is still waiting.
+- `increase(faucet_serve_lease_renewal_timeouts_total[10m]) > 0` — a lease
+  renewal (or the check for leases a peer took) got no answer in time. Look at
+  the database's load and locks before the instance fences itself.
+- `increase(faucet_serve_lease_upkeep_skipped_total[10m]) > 0` — the work a
+  lease tick does besides renewing and heartbeating (the member list,
+  reclaiming a dead member's runs, retrying terminal records) is taking longer
+  than a tick. Renewals and heartbeats are not delayed by it; failover and
+  cleanup are.
+
+### Timeouts on the history database
+
+Every limit follows `--lease-ttl-secs` (30 s by default), so a longer lease
+loosens them together:
+
+| Limit | Value | Default |
+|---|---|---|
+| One lease renewal, and the lost-lease check | two thirds of the TTL | 20 s |
+| Each history call of a lease tick's other work, except retried terminal records | two thirds of the TTL | 20 s |
+| The membership heartbeat (clustered) | two thirds of the TTL | 20 s |
+| Statement timeout of the lease statements (Postgres) | two thirds of the TTL | 20 s |
+
+The statement timeout is set only inside the transactions that renew and
+check leases; migrations, purges and list queries have none. A call cut by
+one of these limits fails and is retried on the next tick; it does not put the
+server into degraded mode by itself. A retried terminal record is never cut:
+a write cut on this side may still land, and its retry would then skip the
+run's completion callback. The heartbeat runs on its own, so slow upkeep never
+holds it back. Waiting for a pooled connection keeps the driver's own
+timeout. Each session also asks Postgres to probe an idle connection (`tcp_keepalives_idle` a third of the TTL), so the database
+notices a server that vanished and releases the row locks it held.
 
 ## Delivery guarantees and double-run boundary
 

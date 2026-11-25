@@ -137,107 +137,121 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
 
     // True page positions of the records currently flowing, kept in lockstep as
     // quality/contract remove rows.
+    #[cfg(feature = "quality")]
     let page_len = records.len();
 
     // ── Quality pass ────────────────────────────────────────────────────────
     #[cfg(feature = "quality")]
-    let (records, quality_envelopes, page_indices): (Vec<Value>, Vec<Value>, Vec<usize>) =
-        if let Some(q) = specs.quality {
-            let labels = crate::observability::Labels::new(pipeline_name, row, specs.run_id);
-            let outcome = crate::observability::instrumented_apply_quality(records, q, &labels)?;
-            let quarantined_idx: std::collections::HashSet<usize> =
-                outcome.quarantined.iter().map(|qr| qr.page_index).collect();
-            let envelopes: Vec<Value> = outcome
-                .quarantined
-                .iter()
-                .map(|qr| {
-                    let err = FaucetError::QualityFailure {
-                        check: qr.check.to_string(),
-                        message: qr.message.clone(),
-                    };
-                    // `record_index` is the position within the PAGE (the frozen
-                    // envelope contract), not the index in the quarantine list.
-                    build_envelope(
-                        &qr.record,
-                        &err,
-                        DlqReason::Quality,
-                        sink_name,
-                        envelope_pipeline,
-                        row,
-                        qr.page_index,
-                    )
-                })
-                .collect();
-            let survivor_idx: Vec<usize> = (0..page_len)
+    let (records, quality_envelopes, page_indices): (
+        Vec<Value>,
+        Vec<Value>,
+        Option<Vec<usize>>,
+    ) = if let Some(q) = specs.quality {
+        let labels = crate::observability::Labels::new(pipeline_name, row, specs.run_id);
+        let outcome = crate::observability::instrumented_apply_quality(records, q, &labels)?;
+        let quarantined_idx: std::collections::HashSet<usize> =
+            outcome.quarantined.iter().map(|qr| qr.page_index).collect();
+        let envelopes: Vec<Value> = outcome
+            .quarantined
+            .iter()
+            .map(|qr| {
+                let err = FaucetError::QualityFailure {
+                    check: qr.check.to_string(),
+                    message: qr.message.clone(),
+                };
+                // `record_index` is the position within the PAGE (the frozen
+                // envelope contract), not the index in the quarantine list.
+                build_envelope(
+                    &qr.record,
+                    &err,
+                    DlqReason::Quality,
+                    sink_name,
+                    envelope_pipeline,
+                    row,
+                    qr.page_index,
+                )
+            })
+            .collect();
+        let survivor_idx = (!quarantined_idx.is_empty()).then(|| {
+            (0..page_len)
                 .filter(|i| !quarantined_idx.contains(i))
-                .collect();
-            (outcome.survivors, envelopes, survivor_idx)
-        } else {
-            (records, Vec::new(), (0..page_len).collect())
-        };
+                .collect()
+        });
+        (outcome.survivors, envelopes, survivor_idx)
+    } else {
+        (records, Vec::new(), None)
+    };
     #[cfg(not(feature = "quality"))]
-    let (records, quality_envelopes, page_indices): (Vec<Value>, Vec<Value>, Vec<usize>) =
-        (records, Vec::new(), (0..page_len).collect());
+    let (records, quality_envelopes, page_indices): (
+        Vec<Value>,
+        Vec<Value>,
+        Option<Vec<usize>>,
+    ) = (records, Vec::new(), None);
 
     // ── Contract pass ───────────────────────────────────────────────────────
     // `fail` mirrors a quality `abort`: the breach error propagates immediately
     // and nothing from this page is written.
     #[cfg(feature = "contract")]
-    let (records, contract_envelopes, page_indices): (Vec<Value>, Vec<Value>, Vec<usize>) =
-        if let Some(c) = specs.contract {
-            let labels = crate::observability::Labels::new(pipeline_name, row, specs.run_id);
-            let outcome = crate::observability::instrumented_apply_contract(records, c, &labels)?;
-            if !outcome.warned.is_empty() && !state.warned_contract_breach {
-                tracing::warn!(
-                    version = %c.version,
-                    breaches = outcome.warned.len(),
-                    first = %outcome.warned[0].describe(),
-                    "contract: breaching records written unchanged (on_breach=warn); \
-                     this warning fires once per run"
-                );
-                state.warned_contract_breach = true;
-            }
-            let envelopes: Vec<Value> = outcome
-                .quarantined
-                .iter()
-                .map(|vr| {
-                    let err = FaucetError::ContractViolation {
-                        version: c.version.clone(),
-                        message: vr.violation.describe(),
-                    };
-                    // `vr.violation.page_index` is the position within *this
-                    // pass's input* — the quality survivors — which is aligned
-                    // with `page_indices`, so translate through it (#466 M1).
-                    let page_index = page_indices
-                        .get(vr.violation.page_index)
-                        .copied()
-                        .unwrap_or(vr.violation.page_index);
-                    build_envelope(
-                        &vr.record,
-                        &err,
-                        DlqReason::Contract,
-                        sink_name,
-                        envelope_pipeline,
-                        row,
-                        page_index,
-                    )
-                })
-                .collect();
-            let contract_quarantined: std::collections::HashSet<usize> = outcome
-                .quarantined
-                .iter()
-                .map(|vr| vr.violation.page_index)
-                .collect();
-            let survivor_idx: Vec<usize> = page_indices
-                .iter()
-                .enumerate()
-                .filter(|(pos, _)| !contract_quarantined.contains(pos))
-                .map(|(_, orig)| *orig)
-                .collect();
-            (outcome.survivors, envelopes, survivor_idx)
+    let (records, contract_envelopes, page_indices): (
+        Vec<Value>,
+        Vec<Value>,
+        Option<Vec<usize>>,
+    ) = if let Some(c) = specs.contract {
+        let offered = records.len();
+        let labels = crate::observability::Labels::new(pipeline_name, row, specs.run_id);
+        let outcome = crate::observability::instrumented_apply_contract(records, c, &labels)?;
+        if !outcome.warned.is_empty() && !state.warned_contract_breach {
+            tracing::warn!(
+                version = %c.version,
+                breaches = outcome.warned.len(),
+                first = %outcome.warned[0].describe(),
+                "contract: breaching records written unchanged (on_breach=warn); \
+                 this warning fires once per run"
+            );
+            state.warned_contract_breach = true;
+        }
+        let envelopes: Vec<Value> = outcome
+            .quarantined
+            .iter()
+            .map(|vr| {
+                let err = FaucetError::ContractViolation {
+                    version: c.version.clone(),
+                    message: vr.violation.describe(),
+                };
+                // `vr.violation.page_index` is the position within *this
+                // pass's input* — the quality survivors — which is aligned
+                // with `page_indices`, so translate through it (#466 M1).
+                let page_index = page_position(&page_indices, vr.violation.page_index);
+                build_envelope(
+                    &vr.record,
+                    &err,
+                    DlqReason::Contract,
+                    sink_name,
+                    envelope_pipeline,
+                    row,
+                    page_index,
+                )
+            })
+            .collect();
+        let contract_quarantined: std::collections::HashSet<usize> = outcome
+            .quarantined
+            .iter()
+            .map(|vr| vr.violation.page_index)
+            .collect();
+        let survivor_idx = if contract_quarantined.is_empty() {
+            page_indices
         } else {
-            (records, Vec::new(), page_indices)
+            Some(
+                (0..offered)
+                    .filter(|pos| !contract_quarantined.contains(pos))
+                    .map(|pos| page_position(&page_indices, pos))
+                    .collect(),
+            )
         };
+        (outcome.survivors, envelopes, survivor_idx)
+    } else {
+        (records, Vec::new(), page_indices)
+    };
 
     // ── Schema-drift pass ───────────────────────────────────────────────────
     let mut drift_envelopes: Vec<Value> = Vec::new();
@@ -285,7 +299,7 @@ pub(crate) async fn apply_governance<Si: Sink + ?Sized>(
                         &dest_owned,
                         matching,
                         records,
-                        &page_indices,
+                        page_indices.as_deref().unwrap_or(&[]),
                         sink,
                         sink_name,
                         pipeline_name,
@@ -367,6 +381,16 @@ pub(crate) fn dlq_write_error(context: &str, e: FaucetError) -> FaucetError {
 /// quality/drift quarantine envelopes durable, then raises it; with no DLQ —
 /// where no envelopes can exist — it is raised immediately.
 /// Appends drift quarantine envelopes to `drift_envelopes`.
+/// The true page position of the record at `pos` among the records still
+/// flowing; `None` = no pass has removed a row, so it is `pos` itself.
+#[cfg(feature = "contract")]
+fn page_position(page_indices: &Option<Vec<usize>>, pos: usize) -> usize {
+    page_indices
+        .as_ref()
+        .and_then(|idx| idx.get(pos).copied())
+        .unwrap_or(pos)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn apply_drift_policy<Si: Sink + ?Sized>(
     policy: &crate::drift::SchemaDriftPolicy,
@@ -657,6 +681,17 @@ mod tests {
         async fn write_batch(&self, r: &[Value]) -> Result<usize, FaucetError> {
             Ok(r.len())
         }
+    }
+
+    #[cfg(feature = "contract")]
+    #[test]
+    fn a_page_no_pass_thinned_keeps_every_record_at_its_own_position() {
+        assert_eq!(page_position(&None, 0), 0);
+        assert_eq!(page_position(&None, 7), 7);
+        let thinned = Some(vec![2, 5, 9]);
+        assert_eq!(page_position(&thinned, 0), 2);
+        assert_eq!(page_position(&thinned, 2), 9);
+        assert_eq!(page_position(&thinned, 3), 3);
     }
 
     #[tokio::test]

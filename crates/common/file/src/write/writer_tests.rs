@@ -61,7 +61,21 @@ fn rows(n: usize) -> Vec<Value> {
 
 #[test]
 fn estimate_is_the_json_length_plus_a_newline() {
+    let old = |v: &Value| serde_json::to_vec(v).map_or(0, |b| b.len()) + 1;
+    for v in [
+        json!(null),
+        json!("é\"\n\u{1}"),
+        json!(-1.5e300),
+        json!(18446744073709551615u64),
+        json!([1, [2, {"k": [true, false, null]}], "x"]),
+        json!({"a": {"b": {"c": "d".repeat(5000)}}, "n": 0.1, "s": ""}),
+    ] {
+        assert_eq!(estimate(&v), old(&v), "{v}");
+    }
     assert_eq!(estimate(&json!({"a": 1})), 8);
+    let mut count = ByteCount(3);
+    std::io::Write::flush(&mut count).unwrap();
+    assert_eq!(count.0, 3);
 }
 
 #[test]

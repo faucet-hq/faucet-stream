@@ -19,23 +19,36 @@ pub enum NaiveTemporal {
 /// Which zone-less temporal type `sql_type` is, if any. Zoned types
 /// (`timestamptz`, `timestamp with time zone`, `timetz`) are `None`.
 pub fn naive_temporal(sql_type: &str) -> Option<NaiveTemporal> {
-    let lower = sql_type.trim().to_ascii_lowercase();
-    let mut base = String::with_capacity(lower.len());
+    // Lower-cased, `(…)` dropped, whitespace collapsed; the longest name is 27 bytes.
+    let mut base = [0u8; 32];
+    let mut len = 0usize;
     let mut depth = 0usize;
-    for c in lower.chars() {
+    let mut gap = false;
+    for c in sql_type.chars() {
         match c {
             '(' => depth += 1,
             ')' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => base.push(c),
-            _ => {}
+            _ if depth > 0 => {}
+            _ if c.is_whitespace() => gap = len > 0,
+            _ => {
+                if !c.is_ascii() {
+                    return None;
+                }
+                if gap {
+                    *base.get_mut(len)? = b' ';
+                    len += 1;
+                    gap = false;
+                }
+                *base.get_mut(len)? = (c as u8).to_ascii_lowercase();
+                len += 1;
+            }
         }
     }
-    let base = base.split_whitespace().collect::<Vec<_>>().join(" ");
-    match base.as_str() {
-        "timestamp" | "timestamp without time zone" | "datetime" | "datetime2" => {
+    match &base[..len] {
+        b"timestamp" | b"timestamp without time zone" | b"datetime" | b"datetime2" => {
             Some(NaiveTemporal::Timestamp)
         }
-        "time" | "time without time zone" => Some(NaiveTemporal::Time),
+        b"time" | b"time without time zone" => Some(NaiveTemporal::Time),
         _ => None,
     }
 }
@@ -56,6 +69,83 @@ pub fn naive_temporal_text(sql_type: &str, text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The classification as it was computed with owned strings.
+    fn reference(sql_type: &str) -> Option<NaiveTemporal> {
+        let lower = sql_type.trim().to_ascii_lowercase();
+        let mut base = String::with_capacity(lower.len());
+        let mut depth = 0usize;
+        for c in lower.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                _ if depth == 0 => base.push(c),
+                _ => {}
+            }
+        }
+        let base = base.split_whitespace().collect::<Vec<_>>().join(" ");
+        match base.as_str() {
+            "timestamp" | "timestamp without time zone" | "datetime" | "datetime2" => {
+                Some(NaiveTemporal::Timestamp)
+            }
+            "time" | "time without time zone" => Some(NaiveTemporal::Time),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn classification_matches_the_string_built_one() {
+        let pieces = [
+            "timestamp",
+            "TIMESTAMP",
+            "Time",
+            "datetime",
+            "DateTime2",
+            "without",
+            "time",
+            "zone",
+            "with",
+            "tz",
+            "timestamptz",
+            "timetz",
+            "text",
+            "(3)",
+            "(",
+            ")",
+            "(6) ",
+            " ",
+            "  ",
+            "\t",
+            "\n",
+            "\u{a0}",
+            "\u{2003}",
+            "é",
+            "x",
+            "",
+            "((a)",
+            "timestamp without time zone",
+            "TIME WITHOUT TIME ZONE",
+            "time(3)stamp",
+            "a-very-long-type-name-that-overflows-it",
+        ];
+        let mut checked = 0;
+        for a in pieces {
+            for b in pieces {
+                for c in pieces {
+                    for sep in ["", " "] {
+                        let t = format!("{a}{sep}{b}{sep}{c}");
+                        assert_eq!(naive_temporal(&t), reference(&t), "{t:?}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 50_000);
+        assert_eq!(
+            naive_temporal(" Timestamp(3)\u{a0}WITHOUT  time\tzone "),
+            Some(NaiveTemporal::Timestamp)
+        );
+    }
 
     #[test]
     fn zone_less_types_are_recognised() {

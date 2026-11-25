@@ -89,24 +89,20 @@ pub(crate) fn build_auto_map_payload(
     if rows.is_empty() {
         return Ok(None);
     }
-    let matched_any: Vec<&serde_json::Map<String, Value>> =
-        records.iter().filter_map(Value::as_object).collect();
+    let union = union_columns(&rows, columns.len());
 
-    let insert_columns: Vec<&(String, String)> = union_columns(&rows, columns.len())
-        .into_iter()
-        .map(|i| &table_columns[i])
-        .collect();
-
-    // Pass 2: encode rows.
-    let mut data = String::with_capacity(matched_any.len() * 64);
-    for obj in &matched_any {
-        for (idx, (col, udt)) in insert_columns.iter().enumerate() {
+    // Pass 2: encode rows from the cells pass 1 matched (both in table order).
+    let mut data = String::with_capacity(rows.len() * 64);
+    for row in &rows {
+        let mut cells = row.cells.iter().peekable();
+        for (idx, column) in union.iter().enumerate() {
             if idx > 0 {
                 data.push('\t');
             }
-            match pg_bind_text_with(obj.get(col.as_str()), udt, binary)
-                .map_err(|e| format!("column {col}: {e}"))?
-            {
+            while cells.next_if(|(c, _)| c < column).is_some() {}
+            let value = cells.next_if(|(c, _)| c == column).map(|(_, v)| *v);
+            let (col, udt) = &table_columns[*column];
+            match pg_bind_text_with(value, udt, binary).map_err(|e| format!("column {col}: {e}"))? {
                 None => data.push_str("\\N"),
                 Some(text) => encode_copy_text_field(&mut data, &text),
             }
@@ -115,8 +111,8 @@ pub(crate) fn build_auto_map_payload(
     }
 
     Ok(Some(CopyPayload {
-        columns: insert_columns.iter().map(|(c, _)| c.clone()).collect(),
-        rows: matched_any.len(),
+        columns: union.iter().map(|i| table_columns[*i].0.clone()).collect(),
+        rows: rows.len(),
         data,
     }))
 }
@@ -201,6 +197,64 @@ mod tests {
             .iter()
             .map(|(c, u)| (c.to_string(), u.to_string()))
             .collect()
+    }
+
+    /// Pass 2 as it was: each unioned column looked up in the record again.
+    fn reference_data(
+        records: &[Value],
+        table_columns: &[(String, String)],
+        binary: BinaryEncoding,
+    ) -> (Vec<String>, String) {
+        let insert: Vec<&(String, String)> = table_columns
+            .iter()
+            .filter(|(c, _)| records.iter().any(|r| r.get(c.as_str()).is_some()))
+            .collect();
+        let mut data = String::new();
+        for obj in records.iter().filter_map(Value::as_object) {
+            for (idx, (col, udt)) in insert.iter().enumerate() {
+                if idx > 0 {
+                    data.push('\t');
+                }
+                match pg_bind_text_with(obj.get(col.as_str()), udt, binary).unwrap() {
+                    None => data.push_str("\\N"),
+                    Some(text) => encode_copy_text_field(&mut data, &text),
+                }
+            }
+            data.push('\n');
+        }
+        (insert.iter().map(|(c, _)| c.clone()).collect(), data)
+    }
+
+    #[test]
+    fn auto_map_data_matches_a_second_lookup_per_cell() {
+        let columns = cols(&[
+            ("id", "int8"),
+            ("name", "text"),
+            ("doc", "jsonb"),
+            ("raw", "bytea"),
+            ("at", "timestamp"),
+            ("unused", "text"),
+            ("Mixed", "text"),
+        ]);
+        let records = vec![
+            json!({"id": 1, "name": "a\tb", "doc": {"k": [1, null]}, "raw": "SGVsbG8="}),
+            json!({"name": null, "at": "2026-01-02T03:04:05+02:00", "extra": 1}),
+            json!({"id": 3, "Mixed": "x", "mixed": "ignored"}),
+            json!({"doc": "s", "raw": "AP8=", "at": "2026-01-02 03:04:05"}),
+        ];
+        for binary in [
+            BinaryEncoding::Auto,
+            BinaryEncoding::Text,
+            BinaryEncoding::Base64,
+        ] {
+            let payload = build_auto_map_payload(&records, &columns, binary)
+                .unwrap()
+                .unwrap();
+            let (expected_columns, expected_data) = reference_data(&records, &columns, binary);
+            assert_eq!(payload.columns, expected_columns, "{binary:?}");
+            assert_eq!(payload.data, expected_data, "{binary:?}");
+            assert_eq!(payload.rows, records.len());
+        }
     }
 
     #[test]
