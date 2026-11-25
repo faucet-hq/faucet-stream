@@ -288,6 +288,103 @@ fn matrix_upsert_delete_ordering() {
     every_keyed_dialect!(groups_run_in_page_order_with_journal_first);
 }
 
+/// Borrowed plans run the statements owned plans run, journal included.
+fn borrowed_plans_run_the_statements_owned_plans_run<D: SqlDialect + Clone>(d: D) {
+    let name = d.name();
+    let pages = [
+        vec![json!({"id": 1, "v": "a"}), json!({"id": 2, "v": "b"})],
+        vec![json!({"id": 1, "v": "a"}), json!({"id": 1, "v": "b"})],
+        vec![
+            json!({"id": 1, "v": "a"}),
+            json!({"id": 2}),
+            json!({"id": 3, "v": "c"}),
+        ],
+        vec![
+            json!({"id": 1, "op": "d"}),
+            json!({"id": 1, "v": "new"}),
+            json!({"id": 2, "op": "u", "v": "kept"}),
+            json!({"id": 3, "op": "d"}),
+        ],
+        vec![json!({"id": 1, "v": "a"}), json!({"v": "no key"})],
+        vec![],
+    ];
+    for journal in [false, true] {
+        let mut s = spec(WriteMode::Upsert, &["id"]);
+        s.delete_marker = Some(faucet_core::DeleteMarker {
+            field: "op".into(),
+            values: vec!["d".into()],
+        });
+        if journal {
+            s.rollback = Some(faucet_core::rollback::RollbackWriteSpec {
+                run_id: "r1".into(),
+                run_id_column: "_faucet_run_id".into(),
+                journal: true,
+                keep_previous: false,
+            });
+        }
+        let engine = SqlSinkEngine::new(d.clone(), s);
+        let t = target(engine.dialect(), "t");
+        for page in &pages {
+            let what = format!("{name}: journal = {journal}, page = {page:?}");
+            let owned = engine.plan_keyed(page).map_err(|e| e.to_string());
+            let borrowed = engine.plan_keyed_borrowed(page).map_err(|e| e.to_string());
+            assert_eq!(owned.as_ref().err(), borrowed.as_ref().err(), "{what}");
+            let (owned, failed) = engine.plan_keyed_partial(page);
+            let (borrowed, failed_borrowed) = engine.plan_keyed_partial_borrowed(page);
+            assert_eq!(
+                failed
+                    .iter()
+                    .map(|(i, e)| (*i, e.to_string()))
+                    .collect::<Vec<_>>(),
+                failed_borrowed
+                    .iter()
+                    .map(|(i, e)| (*i, e.to_string()))
+                    .collect::<Vec<_>>(),
+                "{what}"
+            );
+            assert_eq!(owned.len(), borrowed.len(), "{what}");
+
+            let mut rec = Recorder::new(&[("id", "int"), ("v", "text")]);
+            let affected = futures_lite_block_on(engine.apply_plans(&mut rec, &t, &owned)).unwrap();
+            let mut rec_borrowed = Recorder::new(&[("id", "int"), ("v", "text")]);
+            let affected_borrowed = futures_lite_block_on(engine.apply_plans_borrowed(
+                &mut rec_borrowed,
+                &t,
+                &borrowed,
+            ))
+            .unwrap();
+            assert_eq!(affected, affected_borrowed, "{what}");
+            assert_eq!(rec.statements, rec_borrowed.statements, "{what}");
+            assert_eq!(rec.journaled, rec_borrowed.journaled, "{what}");
+            assert_eq!(rec.journaled_keys, rec_borrowed.journaled_keys, "{what}");
+            assert_eq!(
+                rec.journaled.len(),
+                if journal { owned.len() } else { 0 },
+                "{what}"
+            );
+            assert_eq!(rec.catalog_reads, rec_borrowed.catalog_reads, "{what}");
+            let report = engine.report(page.len(), affected, &owned);
+            let report_borrowed = engine.report_borrowed(page.len(), affected, &borrowed);
+            assert_eq!(
+                (report.accepted, report.coalesced, report.skipped),
+                (
+                    report_borrowed.accepted,
+                    report_borrowed.coalesced,
+                    report_borrowed.skipped
+                ),
+                "{what}"
+            );
+        }
+    }
+    let append = SqlSinkEngine::new(d, spec(WriteMode::Append, &[]));
+    assert_eq!(append.report_borrowed(3, 3, &[]).accepted, 3, "{name}");
+}
+
+#[test]
+fn matrix_borrowed_plans() {
+    every_keyed_dialect!(borrowed_plans_run_the_statements_owned_plans_run);
+}
+
 /// A page alternating upserts and deletes is one group per row; the table's
 /// catalog is still read once per kind, not once per group.
 fn alternating_groups_read_the_catalog_once<D: SqlDialect>(d: D) {

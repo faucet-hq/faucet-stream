@@ -3,6 +3,7 @@
 use crate::error::FaucetError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Write semantics for a sink. Serialized snake_case. Default `Append`.
@@ -243,6 +244,32 @@ pub struct WritePlan {
     pub failed: Vec<(usize, String)>,
 }
 
+/// A [`WritePlan`] whose upserts borrow the page when the plan would only
+/// repeat it: no row failed, no key repeats, every row is an upsert and no
+/// row carries the delete-marker field. Any other page owns its upserts,
+/// built exactly as [`plan_writes`] builds them.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct WritePlanRef<'a> {
+    /// Rows to insert-or-update, deduped (last-write-wins), marker stripped.
+    pub upserts: Cow<'a, [Value]>,
+    /// Key tuples to delete, deduped.
+    pub deletes: Vec<KeyTuple>,
+    /// `(page_index, message)` for rows whose key could not be extracted.
+    pub failed: Vec<(usize, String)>,
+}
+
+impl WritePlanRef<'_> {
+    /// The owned plan, copying the upserts only when they borrow the page.
+    pub fn into_owned(self) -> WritePlan {
+        WritePlan {
+            upserts: self.upserts.into_owned(),
+            deletes: self.deletes,
+            failed: self.failed,
+        }
+    }
+}
+
 /// What a key's last row does: upsert the page row at an index, or delete.
 enum Action {
     Upsert(usize),
@@ -257,13 +284,25 @@ enum Action {
 /// and `"7"` are one key. A sink that keeps those apart (a document store
 /// matching on the JSON value) uses [`plan_writes_exact`].
 pub fn plan_writes(page: &[Value], spec: &WriteSpec) -> WritePlan {
-    plan_writes_by(page, spec, canonical)
+    plan_writes_borrowed(page, spec).into_owned()
 }
 
 /// [`plan_writes`] deduplicating only keys a document store treats as equal:
 /// `7` and `"7"` stay two rows, while numbers compare by value, so `7` and
 /// `7.0` are one — as a document store's `_id` match does (#862 M-018).
 pub fn plan_writes_exact(page: &[Value], spec: &WriteSpec) -> WritePlan {
+    plan_writes_exact_borrowed(page, spec).into_owned()
+}
+
+/// [`plan_writes`] without copying a page the plan would only repeat (see
+/// [`WritePlanRef`]).
+pub fn plan_writes_borrowed<'a>(page: &'a [Value], spec: &WriteSpec) -> WritePlanRef<'a> {
+    plan_writes_by(page, spec, canonical)
+}
+
+/// [`plan_writes_exact`] without copying a page the plan would only repeat
+/// (see [`WritePlanRef`]).
+pub fn plan_writes_exact_borrowed<'a>(page: &'a [Value], spec: &WriteSpec) -> WritePlanRef<'a> {
     plan_writes_by(page, spec, |k| {
         let values: Vec<Value> = k.0.iter().map(|(_, v)| numeric_value(v)).collect();
         crate::util::canonical_json(&Value::Array(values))
@@ -295,24 +334,26 @@ fn numeric_value(v: &Value) -> Value {
     }
 }
 
-fn plan_writes_by(
-    page: &[Value],
+fn plan_writes_by<'a>(
+    page: &'a [Value],
     spec: &WriteSpec,
     canonical: impl Fn(&KeyTuple) -> String,
-) -> WritePlan {
+) -> WritePlanRef<'a> {
     debug_assert!(
         matches!(spec.write_mode, WriteMode::Upsert | WriteMode::Delete),
         "plan_writes is only for Upsert/Delete — Append and Overwrite are routed separately"
     );
-    let mut plan = WritePlan::default();
+    let mut failed = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut order: Vec<Action> = Vec::new();
+    let mut repeats_page = true;
 
     for (i, rec) in page.iter().enumerate() {
         let key_tuple = match extract_key(rec, &spec.key) {
             Ok(k) => k,
             Err(msg) => {
-                plan.failed.push((i, msg));
+                failed.push((i, msg));
+                repeats_page = false;
                 continue;
             }
         };
@@ -329,9 +370,14 @@ fn plan_writes_by(
         } else {
             Action::Upsert(i)
         };
+        repeats_page =
+            repeats_page && !is_delete && !carries_marker(rec, spec.delete_marker.as_ref());
 
         match index.get(&canon) {
-            Some(&slot) => order[slot] = action,
+            Some(&slot) => {
+                order[slot] = action;
+                repeats_page = false;
+            }
             None => {
                 index.insert(canon, order.len());
                 order.push(action);
@@ -339,15 +385,28 @@ fn plan_writes_by(
         }
     }
 
+    if repeats_page {
+        return WritePlanRef {
+            upserts: Cow::Borrowed(page),
+            deletes: Vec::new(),
+            failed,
+        };
+    }
+    let mut upserts = Vec::new();
+    let mut deletes = Vec::new();
     for action in order {
         match action {
-            Action::Upsert(i) => plan
-                .upserts
-                .push(strip_marker(page[i].clone(), spec.delete_marker.as_ref())),
-            Action::Delete(k) => plan.deletes.push(k),
+            Action::Upsert(i) => {
+                upserts.push(strip_marker(page[i].clone(), spec.delete_marker.as_ref()))
+            }
+            Action::Delete(k) => deletes.push(k),
         }
     }
-    plan
+    WritePlanRef {
+        upserts: Cow::Owned(upserts),
+        deletes,
+        failed,
+    }
 }
 
 /// Split a keyed page into runs of consecutive upserts or deletes and plan
@@ -358,11 +417,23 @@ fn plan_writes_by(
 /// page re-inserted. Rows with no usable key are left out — the caller reports
 /// them from its own [`plan_writes`] over the page.
 pub fn plan_writes_ordered(page: &[Value], spec: &WriteSpec) -> Vec<WritePlan> {
+    plan_writes_ordered_borrowed(page, spec)
+        .into_iter()
+        .map(WritePlanRef::into_owned)
+        .collect()
+}
+
+/// [`plan_writes_ordered`] without copying a run the plan would only repeat
+/// (see [`WritePlanRef`]).
+pub fn plan_writes_ordered_borrowed<'a>(
+    page: &'a [Value],
+    spec: &WriteSpec,
+) -> Vec<WritePlanRef<'a>> {
     let mut plans = Vec::new();
     let mut run_start: Option<usize> = None;
     let mut run_is_delete = false;
-    let flush = |start: usize, end: usize, plans: &mut Vec<WritePlan>| {
-        let mut plan = plan_writes(&page[start..end], spec);
+    let flush = |start: usize, end: usize, plans: &mut Vec<WritePlanRef<'a>>| {
+        let mut plan = plan_writes_borrowed(&page[start..end], spec);
         plan.failed.clear();
         plans.push(plan);
     };
@@ -442,6 +513,10 @@ fn is_delete_marked(rec: &Value, marker: Option<&DeleteMarker>) -> bool {
     };
     let Some(s) = v.as_str() else { return false };
     dm.values.iter().any(|m| m == s)
+}
+
+fn carries_marker(rec: &Value, marker: Option<&DeleteMarker>) -> bool {
+    marker.is_some_and(|dm| rec.get(&dm.field).is_some())
 }
 
 fn strip_marker(mut rec: Value, marker: Option<&DeleteMarker>) -> Value {
@@ -603,6 +678,225 @@ mod tests {
         }
     }
     use serde_json::json;
+
+    fn repeats_page(page: &[Value], spec: &WriteSpec, plan: &WritePlan) -> bool {
+        plan.failed.is_empty()
+            && plan.deletes.is_empty()
+            && plan.upserts.len() == page.len()
+            && page
+                .iter()
+                .all(|r| !carries_marker(r, spec.delete_marker.as_ref()))
+    }
+
+    fn assert_same_plan(got: &WritePlan, want: &WritePlan, what: &str) {
+        assert_eq!(got.upserts, want.upserts, "{what}");
+        assert_eq!(got.deletes, want.deletes, "{what}");
+        assert_eq!(got.failed, want.failed, "{what}");
+    }
+
+    fn generated_pages() -> Vec<Vec<Value>> {
+        let ids = [
+            json!(1),
+            json!(1.0),
+            json!("1"),
+            json!(2),
+            json!("b"),
+            json!(true),
+            json!(null),
+            json!([1, 2]),
+            json!({"k": 1}),
+        ];
+        let ops = [None, Some(json!("d")), Some(json!("u")), Some(json!(7))];
+        let mut rows = vec![json!("not an object"), json!(3), json!({"v": "no key"})];
+        for (n, id) in ids.iter().enumerate() {
+            for (m, op) in ops.iter().enumerate() {
+                let mut row = json!({"id": id, "v": format!("{n}-{m}")});
+                if m % 2 == 0 {
+                    row["tenant"] = if n % 3 == 0 { json!(null) } else { json!("x") };
+                }
+                if let Some(op) = op {
+                    row["__op"] = op.clone();
+                }
+                rows.push(row);
+            }
+        }
+        let mut pages = vec![
+            Vec::new(),
+            vec![
+                json!({"id": 1, "tenant": "x"}),
+                json!({"id": 2, "tenant": "x"}),
+            ],
+            vec![
+                json!({"id": 1, "tenant": "x"}),
+                json!({"id": 1, "tenant": "y"}),
+            ],
+            vec![json!({"id": 1, "v": "a"}), json!({"id": "1", "v": "b"})],
+            vec![json!({"id": 1, "v": "a"}), json!({"id": 1.0, "v": "b"})],
+            vec![json!({"id": 1, "__op": "u", "tenant": "x"})],
+            vec![json!({"id": 1, "__op": "d", "tenant": "x"})],
+            vec![json!({"id": 1, "__op": null, "tenant": "x"})],
+            vec![
+                json!({"id": 1, "tenant": "x", "__op": "d"}),
+                json!({"id": 1, "tenant": "x", "v": "back"}),
+            ],
+            vec![
+                json!({"id": 1, "tenant": "x", "v": "first"}),
+                json!({"id": 1, "tenant": "x", "__op": "d"}),
+            ],
+            vec![json!({"id": 1, "tenant": "x"}), json!("not an object")],
+            vec![
+                json!({"id": null, "tenant": "x"}),
+                json!({"id": 2, "tenant": "x"}),
+            ],
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..400 {
+            let mut page = Vec::new();
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            for _ in 0..(state % 7) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                page.push(rows[(state % rows.len() as u64) as usize].clone());
+            }
+            pages.push(page);
+        }
+        pages
+    }
+
+    #[test]
+    fn borrowed_plans_match_the_row_cloning_planner() {
+        let marker = DeleteMarker {
+            field: "__op".into(),
+            values: vec!["d".into()],
+        };
+        let (mut borrowed_seen, mut owned_seen) = (0usize, 0usize);
+        for page in generated_pages() {
+            for write_mode in [WriteMode::Upsert, WriteMode::Delete] {
+                for key in [vec!["id".to_string()], vec!["id".into(), "tenant".into()]] {
+                    for delete_marker in [None, Some(marker.clone())] {
+                        let spec = WriteSpec {
+                            write_mode,
+                            key: key.clone(),
+                            delete_marker,
+                            ..WriteSpec::default()
+                        };
+                        let what = format!("{spec:?} {page:?}");
+                        let reference = reference_plan(&page, &spec);
+                        let owned = plan_writes(&page, &spec);
+                        let borrowed = plan_writes_borrowed(&page, &spec);
+                        assert_eq!(&borrowed.upserts[..], &owned.upserts[..], "{what}");
+                        let is_borrowed = matches!(borrowed.upserts, Cow::Borrowed(_));
+                        assert_eq!(
+                            is_borrowed,
+                            repeats_page(&page, &spec, &reference),
+                            "{what}"
+                        );
+                        if is_borrowed {
+                            borrowed_seen += 1;
+                        } else {
+                            owned_seen += 1;
+                        }
+                        assert_same_plan(&owned, &reference, &what);
+                        assert_same_plan(&borrowed.into_owned(), &reference, &what);
+
+                        let exact = plan_writes_exact(&page, &spec);
+                        let exact_borrowed = plan_writes_exact_borrowed(&page, &spec);
+                        assert_eq!(
+                            matches!(exact_borrowed.upserts, Cow::Borrowed(_)),
+                            repeats_page(&page, &spec, &exact),
+                            "{what}"
+                        );
+                        assert_same_plan(&exact_borrowed.into_owned(), &exact, &what);
+
+                        let ordered = plan_writes_ordered(&page, &spec);
+                        let ordered_borrowed = plan_writes_ordered_borrowed(&page, &spec);
+                        assert_eq!(ordered.len(), ordered_borrowed.len(), "{what}");
+                        let mut cursor = 0usize;
+                        for (run, run_borrowed) in ordered.iter().zip(ordered_borrowed) {
+                            assert!(run_borrowed.failed.is_empty(), "{what}");
+                            if let Cow::Borrowed(rows) = run_borrowed.upserts {
+                                let start = page[cursor..]
+                                    .iter()
+                                    .position(|r| std::ptr::eq(r, &rows[0]))
+                                    .map(|at| at + cursor);
+                                assert!(rows.is_empty() || start.is_some(), "{what}");
+                                cursor = start.unwrap_or(cursor) + rows.len();
+                                assert!(run.deletes.is_empty(), "{what}");
+                            }
+                            assert_same_plan(&run_borrowed.into_owned(), run, &what);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(borrowed_seen > 50 && owned_seen > 50);
+    }
+
+    #[test]
+    fn exact_borrowed_planning_copies_only_pages_it_changes() {
+        let spec = WriteSpec {
+            write_mode: WriteMode::Upsert,
+            key: vec!["id".into()],
+            ..Default::default()
+        };
+        let apart = vec![json!({"id": 7, "v": "a"}), json!({"id": "7", "v": "b"})];
+        assert!(matches!(
+            plan_writes_exact_borrowed(&apart, &spec).upserts,
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            plan_writes_borrowed(&apart, &spec).upserts,
+            Cow::Owned(_)
+        ));
+        let same = vec![json!({"id": 7, "v": "a"}), json!({"id": 7.0, "v": "b"})];
+        let plan = plan_writes_exact_borrowed(&same, &spec);
+        assert!(matches!(plan.upserts, Cow::Owned(_)));
+        assert_eq!(plan.upserts.to_vec(), vec![json!({"id": 7.0, "v": "b"})]);
+    }
+
+    #[test]
+    fn a_clean_upsert_page_is_not_copied() {
+        let marker = DeleteMarker {
+            field: "__op".into(),
+            values: vec!["d".into()],
+        };
+        let page: Vec<Value> = (0..50)
+            .map(|i| json!({"id": i, "name": format!("row-{i}")}))
+            .collect();
+        for delete_marker in [None, Some(marker)] {
+            let spec = WriteSpec {
+                write_mode: WriteMode::Upsert,
+                key: vec!["id".into()],
+                delete_marker,
+                ..Default::default()
+            };
+            let plan = plan_writes_borrowed(&page, &spec);
+            let Cow::Borrowed(rows) = plan.upserts else {
+                panic!("a clean page must be borrowed");
+            };
+            assert!(std::ptr::eq(rows.as_ptr(), page.as_ptr()));
+            assert_eq!(rows.len(), page.len());
+            assert!(plan.deletes.is_empty() && plan.failed.is_empty());
+
+            let runs = plan_writes_ordered_borrowed(&page, &spec);
+            assert_eq!(runs.len(), 1);
+            let Cow::Borrowed(rows) = &runs[0].upserts else {
+                panic!("a clean run must be borrowed");
+            };
+            assert!(std::ptr::eq(rows.as_ptr(), page.as_ptr()));
+        }
+        let spec = WriteSpec {
+            write_mode: WriteMode::Upsert,
+            key: vec!["id".into()],
+            ..Default::default()
+        };
+        let empty = plan_writes_borrowed(&[], &spec);
+        assert!(empty.upserts.is_empty());
+        assert!(WritePlanRef::default().into_owned().upserts.is_empty());
+    }
 
     #[test]
     fn exact_planning_keeps_keys_of_different_json_types_apart() {

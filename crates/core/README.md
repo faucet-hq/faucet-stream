@@ -639,7 +639,7 @@ Effectively-once requires a **deterministic-replay source** (`supports_exactly_o
 
 ## Write modes (upsert / delete)
 
-`faucet_core::write_mode` is the unified upsert layer. `WriteSpec` (`write_mode` + `key` + `delete_marker`) flattens into a capable sink's config; `plan_writes(page, &spec) -> WritePlan { upserts, deletes, failed }` is the single partitioning routine (last-write-wins dedup by `key`; missing/null-key rows → `failed` for DLQ/abort). Sinks advertise support via `supported_write_modes()`. Helpers: `key_to_doc_id`, `key_to_filter`, `KeyTuple`.
+`faucet_core::write_mode` is the unified upsert layer. `WriteSpec` (`write_mode` + `key` + `delete_marker`) flattens into a capable sink's config; `plan_writes(page, &spec) -> WritePlan { upserts, deletes, failed }` is the single partitioning routine (last-write-wins dedup by `key`; missing/null-key rows → `failed` for DLQ/abort). `plan_writes_borrowed` / `plan_writes_exact_borrowed` / `plan_writes_ordered_borrowed` return a `WritePlanRef` whose `upserts` borrow the page instead of copying it when the plan would only repeat the page (no failed row, no repeated key, every row an upsert, no row carrying the delete-marker field); any other page gets the same owned rows `plan_writes` builds, and `into_owned()` gives the `WritePlan`. Sinks advertise support via `supported_write_modes()`. Helpers: `key_to_doc_id`, `key_to_filter`, `KeyTuple`.
 
 ## Data-quality checks
 
@@ -921,7 +921,7 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `json_numbers` | `parse_json_exact` / `JsonBigNumbers` — exactness of numbers in JSON text a database stored |
 | `idempotency` | `DeliveryMode`, `format_token`, `parse_token`, `wrap_state`, `unwrap_state` |
 | `state_version` | Versioned state envelope (#736) — `StoredState`, `wrap_versioned`, `peel_versioned`, `check_compat`, `resolve_for_source`, `StateCodec`, `VersionedStateStore` |
-| `write_mode` | `WriteMode`, `WriteSpec`, `DeleteMarker`, `plan_writes`, `WritePlan` |
+| `write_mode` | `WriteMode`, `WriteSpec`, `DeleteMarker`, `plan_writes`, `plan_writes_borrowed`, `WritePlan`, `WritePlanRef` |
 | `quality` | Per-record / per-batch checks (`quality` / `quality-jsonschema` features) |
 | `contract` | Versioned data contracts — `ContractSpec`, `CompiledContract`, `apply_contract`, JSON-Schema / OpenLineage exports (the `contract` feature) |
 | `masking` | PII detection + column-level masking — `MaskingSpec`, `CompiledMasking`, `apply_masking`, `Detector`, `MaskAction`; `MaskingProof` / `proof::{rules_fingerprint, derive_key}` sign a DLQ envelope's `masking` object (`DlqGovernance::with_masking_proof`) (the `masking` feature) |
