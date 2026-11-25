@@ -526,3 +526,6 @@ mod tests;
 
 #[cfg(test)]
 mod differential;
+
+#[cfg(all(test, feature = "time-zones"))]
+mod news_oracle;

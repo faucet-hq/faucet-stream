@@ -174,6 +174,37 @@ mod tests {
     }
 
     #[test]
+    fn legacy_done_unit_whose_window_grew_is_read_again() {
+        let casablanca: chrono_tz::Tz = "Africa/Casablanca".parse().unwrap();
+        let from = parse_boundary("2026-09-20", casablanca).unwrap();
+        let to = parse_boundary("2026-09-22", casablanca).unwrap();
+        let plan = plan_windows(
+            from,
+            to,
+            Some(crate::backfill::plan::WindowStep::Days(1)),
+            casablanca,
+        )
+        .unwrap();
+        assert_eq!(plan[0].id, "20260919T230000Z");
+        assert_eq!(
+            plan[0].end.with_timezone(&chrono::Utc).to_rfc3339(),
+            "2026-09-21T00:00:00+00:00",
+            "Morocco keeps UTC from 2026-09-20 (tzdata 2026c)"
+        );
+        let legacy = BackfillState::from_value(serde_json::json!({
+            "descriptor": "d",
+            "units": { "20260919T230000Z": { "status": "done" } }
+        }))
+        .unwrap();
+        let (todo, _) = split_remaining(plan, &legacy);
+        let lost: chrono::DateTime<chrono::Utc> = "2026-09-20T23:30:00Z".parse().unwrap();
+        assert!(
+            todo.iter().any(|u| u.start <= lost && lost < u.end),
+            "the hour [2026-09-20T23:00Z, 2026-09-21T00:00Z) is never read: {todo:?}"
+        );
+    }
+
+    #[test]
     fn fresh_marker_runs_everything() {
         let plan = units(2);
         let (todo, skipped) = split_remaining(plan.clone(), &BackfillState::new("d"));
