@@ -292,12 +292,9 @@ impl IcebergDriver {
             catalog,
             state: Mutex::new(SinkState::new(None)),
         };
+        // The storage check runs, bounded, before the first writer opens.
         if let Some(table) = preloaded {
-            let verdict = driver.storage_verdict(&table).await;
-            driver.apply_verdict(verdict)?;
-            let mut state = driver.state.lock().await;
-            state.table = Some(table);
-            state.preflighted = true;
+            driver.state.lock().await.table = Some(table);
         }
         Ok(driver)
     }

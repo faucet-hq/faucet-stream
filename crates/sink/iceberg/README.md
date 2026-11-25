@@ -441,8 +441,9 @@ How the sink keeps them valid:
   If that reload fails, the write goes on with the previous credentials and
   logs a warning; if the table no longer exists, or was replaced by another
   table (another UUID), the write fails before anything is uploaded.
-- Before the first writer of a sink (and at construction with
-  `create_if_missing: false`) the table's storage is checked once: a `HEAD`
+- Before the first writer of a sink opens (also with `create_if_missing:
+  false`, which loads the table at construction) the table's storage is
+  checked once, inside the sink's call deadline and cancel: a `HEAD`
   of its current metadata file, with the credentials the writes will use
   (S3 and GCS table locations; other stores are not checked). It refuses the
   run only when the store or the signer reports a credential failure and the

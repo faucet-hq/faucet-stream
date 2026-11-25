@@ -305,7 +305,7 @@ async fn doctor_reports_the_storage() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_preloaded_table_is_checked_at_construction() {
+async fn a_preloaded_table_is_checked_before_the_first_upload() {
     let fakes = Fakes::start(Vend::Always).await;
     seeded(&fakes).await;
     let existing = config_with(
@@ -318,8 +318,11 @@ async fn a_preloaded_table_is_checked_at_construction() {
     assert_eq!(fakes.snapshots(TABLE), 2);
 
     fakes.set_vend(Vend::Never);
-    let err = refusal(IcebergSink::new(existing).await.unwrap_err());
+    let uploads = fakes.uploads().len();
+    let sink = IcebergSink::new(existing).await.unwrap();
+    let err = refusal(sink.write_batch(&page(3)).await.unwrap_err());
     assert!(err.contains("no usable storage credentials"), "{err}");
+    assert_eq!(fakes.uploads().len(), uploads, "nothing uploaded");
 }
 
 #[tokio::test(flavor = "multi_thread")]
