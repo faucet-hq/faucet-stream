@@ -10,11 +10,12 @@ use arrow::array::{
 };
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{
-    ArrowDictionaryKeyType, ArrowNativeType, DataType, Decimal32Type, Decimal64Type,
-    Decimal128Type, Decimal256Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
-    Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType, TimeUnit,
-    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-    TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+    ArrowDictionaryKeyType, ArrowNativeType, ArrowPrimitiveType, DataType, Decimal32Type,
+    Decimal64Type, Decimal128Type, Decimal256Type, Float16Type, Float32Type, Float64Type, Int8Type,
+    Int16Type, Int32Type, Int64Type, Time32MillisecondType, Time32SecondType,
+    Time64MicrosecondType, Time64NanosecondType, TimeUnit, TimestampMicrosecondType,
+    TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type,
+    UInt32Type, UInt64Type,
 };
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use serde_json::{Map, Value};
@@ -57,7 +58,7 @@ fn object(fields: &[(&str, Cell<'_>)], row: usize) -> Map<String, Value> {
     map
 }
 
-type KeyAt<'a> = Box<dyn Fn(usize) -> usize + 'a>;
+pub(super) type KeyAt<'a> = Box<dyn Fn(usize) -> usize + 'a>;
 
 struct Cell<'a> {
     nulls: Option<&'a NullBuffer>,
@@ -117,6 +118,8 @@ enum Kind<'a> {
     UInt32(&'a [u32]),
     UInt64(&'a [u64]),
     Float64(&'a [f64]),
+    Float32(&'a [f32]),
+    Float16(&'a [<Float16Type as ArrowPrimitiveType>::Native]),
     Text(Text<'a>),
     Binary(&'a GenericBinaryArray<i32>),
     LargeBinary(&'a GenericBinaryArray<i64>),
@@ -153,6 +156,7 @@ enum Kind<'a> {
     Dictionary {
         key: KeyAt<'a>,
         values: Text<'a>,
+        value_nulls: Option<&'a NullBuffer>,
     },
 }
 
@@ -173,6 +177,8 @@ impl Cell<'_> {
             Kind::UInt32(v) => Value::from(v[i]),
             Kind::UInt64(v) => Value::from(v[i]),
             Kind::Float64(v) => fidelity::float64(v[i]),
+            Kind::Float32(v) => fidelity::float32(v[i]),
+            Kind::Float16(v) => fidelity::float32(f32::from(v[i])),
             Kind::Text(text) => Value::String(text.at(i).to_owned()),
             Kind::Binary(a) => fidelity::binary(a.value(i)),
             Kind::LargeBinary(a) => fidelity::binary(a.value(i)),
@@ -210,7 +216,18 @@ impl Cell<'_> {
                 }
                 Value::Object(map)
             }
-            Kind::Dictionary { key, values } => Value::String(values.at(key(i)).to_owned()),
+            Kind::Dictionary {
+                key,
+                values,
+                value_nulls,
+            } => {
+                let k = key(i);
+                if value_nulls.is_some_and(|nulls| nulls.is_null(k)) {
+                    Value::Null
+                } else {
+                    Value::String(values.at(k).to_owned())
+                }
+            }
         }
     }
 }
@@ -226,21 +243,26 @@ fn dictionary_key<'a, K: ArrowDictionaryKeyType>(
     ))
 }
 
-fn dictionary(array: &dyn Array) -> Option<Kind<'_>> {
-    let (key, values) = dictionary_key::<Int8Type>(array)
+pub(super) fn dictionary_parts(array: &dyn Array) -> Option<(KeyAt<'_>, &dyn Array)> {
+    dictionary_key::<Int8Type>(array)
         .or_else(|| dictionary_key::<Int16Type>(array))
         .or_else(|| dictionary_key::<Int32Type>(array))
         .or_else(|| dictionary_key::<Int64Type>(array))
         .or_else(|| dictionary_key::<UInt8Type>(array))
         .or_else(|| dictionary_key::<UInt16Type>(array))
         .or_else(|| dictionary_key::<UInt32Type>(array))
-        .or_else(|| dictionary_key::<UInt64Type>(array))?;
-    if values.null_count() != 0 || matches!(values.data_type(), DataType::Utf8View) {
+        .or_else(|| dictionary_key::<UInt64Type>(array))
+}
+
+fn dictionary(array: &dyn Array) -> Option<Kind<'_>> {
+    let (key, values) = dictionary_parts(array)?;
+    if matches!(values.data_type(), DataType::Utf8View) {
         return None;
     }
     Some(Kind::Dictionary {
         key,
         values: Text::of(values)?,
+        value_nulls: values.nulls(),
     })
 }
 
@@ -260,6 +282,8 @@ fn plan(array: &dyn Array, depth: usize) -> Option<Cell<'_>> {
         DataType::UInt32 => Kind::UInt32(array.as_primitive_opt::<UInt32Type>()?.values()),
         DataType::UInt64 => Kind::UInt64(array.as_primitive_opt::<UInt64Type>()?.values()),
         DataType::Float64 => Kind::Float64(array.as_primitive_opt::<Float64Type>()?.values()),
+        DataType::Float32 => Kind::Float32(array.as_primitive_opt::<Float32Type>()?.values()),
+        DataType::Float16 => Kind::Float16(array.as_primitive_opt::<Float16Type>()?.values()),
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Kind::Text(Text::of(array)?),
         DataType::Binary => Kind::Binary(array.as_binary_opt()?),
         DataType::LargeBinary => Kind::LargeBinary(array.as_binary_opt()?),

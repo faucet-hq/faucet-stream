@@ -167,6 +167,55 @@ pub fn corpus() -> Vec<Value> {
     ]
 }
 
+/// Single-precision values with the JSON number a source must render for
+/// each: the shortest decimal that reads back as the value, ties away from
+/// zero, and the exact value for the two whose shortest decimal converts to a
+/// neighbouring single (#1106). Not part of [`corpus`]: a sink writes JSON
+/// numbers as doubles, so only a source that reads a single-precision column
+/// can check these. Pass the values it read, in this order, to
+/// [`assert_single_precision_read`].
+pub fn single_precision_corpus() -> Vec<f32> {
+    SINGLE_PRECISION
+        .iter()
+        .map(|(bits, _)| f32::from_bits(*bits))
+        .collect()
+}
+
+const SINGLE_PRECISION: &[(u32, &str)] = &[
+    (0x3f33_3333, "0.7"),
+    (0x3dcc_cccd, "0.1"),
+    (0x4c52_56d4, "55139150.0"),
+    (0x3980_0000, "0.00024414063"),
+    (0xb980_0000, "-0.00024414063"),
+    (0x401f_4000, "2.4882813"),
+    (0x15ae_43fd, "7.038530691851209e-26"),
+    (0x8000_0000, "-0.0"),
+    (0x7f7f_ffff, "3.4028235e38"),
+    (0x0000_0001, "1e-45"),
+    (0x4b80_0001, "16777218.0"),
+];
+
+/// Panics unless `read` holds, in order, the renderings of
+/// [`single_precision_corpus`], bit for bit.
+pub fn assert_single_precision_read(read: &[Value]) {
+    assert_eq!(
+        read.len(),
+        SINGLE_PRECISION.len(),
+        "one value per corpus entry"
+    );
+    for ((bits, text), got) in SINGLE_PRECISION.iter().zip(read) {
+        let want: f64 = text.parse().unwrap();
+        let got = got
+            .as_f64()
+            .unwrap_or_else(|| panic!("{bits:#010x}: expected the number {text}, read {got}"));
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "{bits:#010x}: expected {text}, read {got}"
+        );
+    }
+}
+
 /// The corpus as a flat single record, for destinations that take one wide row
 /// rather than one row per hazard class. Field names are prefixed with the
 /// class so they stay unique.
@@ -426,6 +475,37 @@ mod tests {
     #[test]
     fn an_unchanged_round_trip_has_no_mismatches() {
         assert_round_trip(&corpus(), &corpus(), Tolerance::exact());
+    }
+
+    #[test]
+    fn the_single_precision_corpus_reads_back_as_its_singles() {
+        let read: Vec<Value> = SINGLE_PRECISION
+            .iter()
+            .map(|(_, text)| serde_json::from_str(text).unwrap())
+            .collect();
+        for (v, json) in single_precision_corpus().into_iter().zip(&read) {
+            assert_eq!((json.as_f64().unwrap() as f32).to_bits(), v.to_bits());
+        }
+        assert_single_precision_read(&read);
+    }
+
+    #[test]
+    #[should_panic(expected = "0x4c5256d4: expected 55139150.0")]
+    fn a_longer_single_precision_spelling_fails() {
+        let mut read: Vec<Value> = SINGLE_PRECISION
+            .iter()
+            .map(|(_, text)| serde_json::from_str(text).unwrap())
+            .collect();
+        read[2] = serde_json::json!(55_139_152.0);
+        assert_single_precision_read(&read);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected the number")]
+    fn a_non_number_fails() {
+        let mut read: Vec<Value> = vec![Value::Null; SINGLE_PRECISION.len()];
+        read[0] = serde_json::json!("0.7");
+        assert_single_precision_read(&read);
     }
 
     #[test]

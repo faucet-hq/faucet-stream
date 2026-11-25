@@ -68,6 +68,14 @@ pub struct CatalogInner {
         "warehouse": "path"
     }))]
     pub properties: HashMap<String, String>,
+
+    /// REST catalog only: how the catalog should give faucet access to table
+    /// storage. `vended_credentials` asks for short-lived storage credentials
+    /// with each table (it sends `X-Iceberg-Access-Delegation:
+    /// vended-credentials`). A catalog that hands them out unasked needs no
+    /// setting. Refused on the `glue`, `sql` and `hms` catalogs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_delegation: Option<faucet_common_iceberg::AccessDelegation>,
 }
 
 /// Iceberg catalog type and its connection settings.
@@ -103,7 +111,7 @@ pub enum CatalogConfig {
 }
 
 impl CatalogConfig {
-    fn inner(&self) -> &CatalogInner {
+    pub(crate) fn inner(&self) -> &CatalogInner {
         match self {
             CatalogConfig::Rest(i)
             | CatalogConfig::Glue(i)
@@ -150,6 +158,7 @@ impl From<&CatalogConfig> for faucet_common_iceberg::CatalogConfig {
             warehouse: i.warehouse.clone(),
             credential: i.credential.clone(),
             properties: i.properties.clone(),
+            access_delegation: i.access_delegation,
         };
         match c {
             CatalogConfig::Rest(i) => Self::Rest(inner(i)),

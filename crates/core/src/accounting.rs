@@ -116,6 +116,7 @@ pub struct RowAccounts {
     dropped: AtomicU64,
     unaccounted: AtomicU64,
     non_finite: AtomicU64,
+    confirmed: AtomicU64,
 }
 
 /// A point-in-time copy of [`RowAccounts`].
@@ -146,6 +147,9 @@ pub struct RowAccountsSnapshot {
     /// Values with no JSON rendering (`NaN`, `±Infinity`) the source wrote as
     /// `null` (#885). A value count, not a row count.
     pub non_finite: u64,
+    /// Rows the sink wrote in pages whose checkpoint completed (sink flush,
+    /// then the state write). A failed run committed at least these rows.
+    pub confirmed: u64,
 }
 
 impl RowAccountsSnapshot {
@@ -208,7 +212,15 @@ impl RowAccounts {
             dropped: g(&self.dropped),
             unaccounted: g(&self.unaccounted),
             non_finite: g(&self.non_finite),
+            confirmed: g(&self.confirmed),
         }
+    }
+
+    /// Mark every row accepted so far as confirmed: called once a checkpoint
+    /// made them durable.
+    pub(crate) fn confirm(&self) {
+        self.confirmed
+            .fetch_max(self.accepted.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     pub(crate) fn add_non_finite(&self, n: u64) {

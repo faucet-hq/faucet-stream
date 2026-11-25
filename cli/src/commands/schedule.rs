@@ -9,7 +9,7 @@ use crate::config::PipelineConfig;
 use crate::error::{CliError, CliResult};
 use crate::executor::{ExecuteOptions, InvocationErrorKind, RunSummary};
 use crate::expand::{ExpandedNode, expand};
-use crate::schedule::compiled::CompiledSchedule;
+use crate::schedule::compiled::{CompiledSchedule, NextTickError};
 use crate::schedule::metrics as m;
 use crate::schedule::state::{AfterRun, RunOutcome, SchedulerState, TickAction};
 use chrono::{DateTime, Utc};
@@ -628,9 +628,11 @@ async fn run_loop(
     let mut next_due = if compiled.start_immediately {
         Utc::now()
     } else {
-        compiled
-            .next_after(Utc::now())
-            .ok_or_else(|| CliError::Config("schedule: no upcoming occurrence".into()))?
+        match compiled.try_next_after(Utc::now()) {
+            Ok(Some(t)) => t,
+            Ok(None) => return Err(CliError::Config("schedule: no upcoming occurrence".into())),
+            Err(e) => return Err(tick_error(&cron, &timezone, &e)),
+        }
     };
 
     // Startup banner: cron, timezone, and the next few firing times so an
@@ -639,12 +641,12 @@ async fn run_loop(
         let mut t = Utc::now();
         let mut v = Vec::with_capacity(3);
         while v.len() < 3 {
-            match compiled.next_after(t) {
-                Some(n) => {
+            match compiled.try_next_after(t) {
+                Ok(Some(n)) => {
                     v.push(n.to_rfc3339());
                     t = n;
                 }
-                None => break,
+                _ => break,
             }
         }
         v
@@ -738,14 +740,24 @@ async fn run_loop(
             // wall clock — so a sub-minute occurrence isn't skipped just because
             // dispatch latency pushed `now` past it. A long backlog (suspension)
             // is collapsed to a single catch-up inside `next_due_after_tick`.
-            next_due = match compiled.next_due_after_tick(next_due, Utc::now()) {
-                Some(t) => t,
-                None => {
+            next_due = match compiled.try_next_due_after_tick(next_due, Utc::now()) {
+                Ok(Some(t)) => t,
+                Ok(None) => {
                     return finish_last_run(
                         running.take(),
                         shutdown.recv(),
                         compiled.shutdown_grace,
                         &pipeline_name,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    return stop_on_tick_error(
+                        running.take(),
+                        shutdown.recv(),
+                        compiled.shutdown_grace,
+                        &pipeline_name,
+                        tick_error(&cron, &timezone, &e),
                     )
                     .await;
                 }
@@ -904,8 +916,19 @@ async fn run_loop(
                             .as_ref()
                             .and_then(|r| r.circuit_breaker)
                             .map(|cb| cb.cooldown);
-                        next_due =
-                            reload_next_due(&compiled, running.is_some(), Utc::now(), next_due);
+                        next_due = match reload_next_due(&compiled, running.is_some(), Utc::now(), next_due) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                return stop_on_tick_error(
+                                    running.take(),
+                                    shutdown.recv(),
+                                    compiled.shutdown_grace,
+                                    &pipeline_name,
+                                    tick_error(&cron, &timezone, &e),
+                                )
+                                .await;
+                            }
+                        };
                         m::reload(&pipeline_name, "ok");
                         tracing::info!(
                             pipeline = %pipeline_name, cron = %cron, timezone = %timezone,
@@ -935,12 +958,40 @@ fn reload_next_due(
     running: bool,
     now: chrono::DateTime<Utc>,
     previous: chrono::DateTime<Utc>,
-) -> chrono::DateTime<Utc> {
+) -> Result<chrono::DateTime<Utc>, NextTickError> {
     if compiled.start_immediately && !running {
-        now
+        Ok(now)
     } else {
-        compiled.next_after(now).unwrap_or(previous)
+        Ok(compiled.try_next_after(now)?.unwrap_or(previous))
     }
+}
+
+/// The error `faucet schedule` stops with when a next tick cannot be computed
+/// (#1111): never read as the end of the schedule.
+fn tick_error(cron: &str, timezone: &str, e: &NextTickError) -> CliError {
+    CliError::Internal(format!(
+        "schedule: cannot compute the next tick of cron '{cron}' in timezone '{timezone}': {e}"
+    ))
+}
+
+/// A next tick could not be computed: let the in-flight run finish (or drain
+/// it on a stop signal) and exit with `err`.
+async fn stop_on_tick_error(
+    running: Option<RunningRun>,
+    stop: impl std::future::Future<Output = ()>,
+    grace: Duration,
+    pipeline_name: &str,
+    err: CliError,
+) -> CliResult<()> {
+    tracing::error!(pipeline = %pipeline_name, error = %err, "cannot compute the next tick; exiting once the in-flight run finishes");
+    if let Some(rr) = running {
+        let finished = finish_or_drain(rr, stop, grace, pipeline_name).await;
+        m::in_flight(pipeline_name, 0);
+        if matches!(finished, Err(CliError::Cancelled)) {
+            return Err(CliError::Cancelled);
+        }
+    }
+    Err(err)
 }
 
 /// Await the in-flight run (or never resolve when idle). Returns the classified
@@ -1309,6 +1360,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_tick_search_stops_the_scheduler_with_an_error() {
+        let e = NextTickError::Search("TimeSearchLimitExceeded".into());
+        let err = tick_error("0 0 * * *", "UTC", &e);
+        assert!(
+            err.to_string()
+                .contains("cannot compute the next tick of cron '0 0 * * *' in timezone 'UTC'"),
+            "{err}"
+        );
+        let out = stop_on_tick_error(None, std::future::pending(), Duration::ZERO, "p", err).await;
+        assert!(matches!(out, Err(CliError::Internal(_))), "{out:?}");
+        let ok = running(tokio::spawn(async { Ok(summary(0, 1)) }));
+        let out = stop_on_tick_error(
+            Some(ok),
+            std::future::pending(),
+            Duration::ZERO,
+            "p",
+            tick_error("x", "UTC", &e),
+        )
+        .await;
+        assert!(
+            matches!(out, Err(CliError::Internal(_))),
+            "the run finishes, then the error: {out:?}"
+        );
+        let slow = running(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(summary(0, 1))
+        }));
+        let out = stop_on_tick_error(
+            Some(slow),
+            async {},
+            Duration::from_millis(10),
+            "p",
+            tick_error("x", "UTC", &e),
+        )
+        .await;
+        assert!(matches!(out, Err(CliError::Cancelled)), "{out:?}");
+    }
+
+    #[test]
+    fn a_reload_whose_search_fails_is_an_error() {
+        let c = compiled("cron: \"0 0 * * *\"");
+        let far = chrono::TimeZone::with_ymd_and_hms(&Utc, 9999, 12, 31, 0, 0, 0).unwrap();
+        assert!(reload_next_due(&c, true, far, far).is_err());
+    }
+
+    #[tokio::test]
     async fn wait_for_run_returns_classified_outcome() {
         let handle = tokio::spawn(async { Ok(summary(0, 1)) });
         let mut running = Some(RunningRun {
@@ -1576,8 +1673,8 @@ mod tests {
     fn a_reload_during_a_run_does_not_tick_immediately() {
         let c = compiled("cron: \"0 0 * * *\"\nstart_immediately: true\noverlap_policy: forbid");
         let now = Utc::now();
-        assert_eq!(reload_next_due(&c, false, now, now), now);
-        assert!(reload_next_due(&c, true, now, now) > now);
+        assert_eq!(reload_next_due(&c, false, now, now).unwrap(), now);
+        assert!(reload_next_due(&c, true, now, now).unwrap() > now);
     }
 
     #[tokio::test]

@@ -62,6 +62,8 @@ pub struct IcebergSource {
     catalog: OnceCell<Arc<dyn Catalog>>,
     bookmark: Mutex<Option<i64>>,
     shard: Mutex<Option<HashShard>>,
+    /// Set once the table's storage was checked (#1108).
+    preflighted: OnceCell<()>,
     /// Backend-call context (#880): catalog calls, scan planning and every
     /// batch read run through it.
     calls: faucet_core::CallSlot,
@@ -96,6 +98,7 @@ impl IcebergSource {
             catalog,
             bookmark: Mutex::new(None),
             shard: Mutex::new(None),
+            preflighted: OnceCell::new(),
             calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
     }
@@ -117,6 +120,83 @@ impl IcebergSource {
                     .map_err(|e| source_err(&format!("could not load table {}", self.ident), e))
             })
             .await
+    }
+
+    /// `faucet doctor`'s `storage` probe, bounded by `ctx.timeout`.
+    async fn storage_probe(
+        &self,
+        ctx: &faucet_core::check::CheckContext,
+        table: &Table,
+    ) -> faucet_core::check::Probe {
+        use faucet_common_iceberg::preflight::StorageVerdict;
+        use faucet_core::check::Probe;
+        let started = std::time::Instant::now();
+        let hint = "Give the storage credentials: have the catalog vend them \
+                    (catalog.access_delegation: vended_credentials) or set them in \
+                    catalog.properties.";
+        let checked = tokio::time::timeout(
+            ctx.timeout,
+            self.calls
+                .call_once("probe", async { Ok(self.storage_verdict(table).await) }),
+        )
+        .await;
+        match checked {
+            Ok(Ok(StorageVerdict::Refuse(e))) => {
+                Probe::fail_hint("storage", started.elapsed(), e.to_string(), hint)
+            }
+            Ok(Ok(StorageVerdict::Warn(w))) => {
+                Probe::fail_hint("storage", started.elapsed(), w, hint)
+            }
+            Ok(Ok(_)) => Probe::pass("storage", started.elapsed()),
+            Ok(Err(e)) => Probe::fail_hint("storage", started.elapsed(), e.to_string(), hint),
+            Err(_) => Probe::fail_hint(
+                "storage",
+                started.elapsed(),
+                format!("iceberg storage probe timed out after {:?}", ctx.timeout),
+                "Check network reachability to the object store.",
+            ),
+        }
+    }
+
+    /// The table's storage checked against the configured credentials.
+    async fn storage_verdict(
+        &self,
+        table: &Table,
+    ) -> faucet_common_iceberg::preflight::StorageVerdict {
+        let inner = self.config.catalog.inner();
+        let expect = faucet_common_iceberg::preflight::StorageExpectation::new(
+            &inner.properties,
+            inner.access_delegation,
+        );
+        faucet_common_iceberg::preflight::check_table_storage(table, &expect).await
+    }
+
+    /// Check the table's storage once per instance, before the first page: a
+    /// refusal fails the read, any other probe failure is a warning.
+    async fn preflight(&self, table: &Table) -> Result<(), FaucetError> {
+        use faucet_common_iceberg::preflight::StorageVerdict;
+        self.preflighted
+            .get_or_try_init(|| async {
+                let verdict = self
+                    .calls
+                    .call_once("probe", async { Ok(self.storage_verdict(table).await) })
+                    .await;
+                match verdict {
+                    Ok(StorageVerdict::Refuse(e)) => return Err(e),
+                    Ok(StorageVerdict::Warn(w)) => tracing::warn!(table = %self.ident, "{w}"),
+                    Ok(_) => {}
+                    Err(e @ FaucetError::Cancelled { .. }) => return Err(e),
+                    Err(e) => tracing::warn!(
+                        table = %self.ident,
+                        "iceberg: the storage check of table {} did not finish ({e}); the first \
+                         read will show whether the storage works",
+                        self.ident
+                    ),
+                }
+                Ok(())
+            })
+            .await
+            .map(|_| ())
     }
 
     fn plan_options(&self) -> Result<PlanOptions, FaucetError> {
@@ -242,6 +322,7 @@ impl IcebergSource {
         Box::pin(async_stream::try_stream! {
             let opts = self.plan_options()?;
             let table = self.load_table().await?;
+            self.preflight(&table).await?;
             let metadata = table.metadata();
             let snapshots: Vec<SnapshotInfo> =
                 metadata.snapshots().map(|s| SnapshotInfo::from(s.as_ref())).collect();
@@ -418,6 +499,7 @@ impl faucet_core::Source for IcebergSource {
     ) -> Result<faucet_core::check::CheckReport, FaucetError> {
         use faucet_core::check::{CheckReport, Probe};
         let started = std::time::Instant::now();
+        let mut loaded = None;
         let probe = match tokio::time::timeout(ctx.timeout, self.load_table()).await {
             Err(_) => Probe::fail_hint(
                 "table",
@@ -457,11 +539,18 @@ impl faucet_core::Source for IcebergSource {
                         e.to_string(),
                         "Fix the `filter` expression.",
                     ),
-                    (true, Ok(_)) => Probe::pass("table", started.elapsed()),
+                    (true, Ok(_)) => {
+                        loaded = Some(table.clone());
+                        Probe::pass("table", started.elapsed())
+                    }
                 }
             }
         };
-        Ok(CheckReport::single(probe))
+        let mut report = CheckReport::single(probe);
+        if let Some(table) = loaded {
+            report.probes.push(self.storage_probe(ctx, &table).await);
+        }
+        Ok(report)
     }
 
     async fn fetch_with_context(

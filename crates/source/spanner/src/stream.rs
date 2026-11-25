@@ -179,6 +179,37 @@ fn cursor_wrap(query: &str, column: &str, ty: &str) -> String {
     format!("SELECT * FROM ({inner}\n) AS q WHERE q.{c} >= {bookmark} ORDER BY q.{c}")
 }
 
+/// Named statement parameters.
+type Params = Vec<(String, Value)>;
+
+/// The cast type and parameters of the outer cursor filter. A FLOAT32
+/// column with a non-integer bookmark compares in FLOAT64 with the bookmark's
+/// single-precision bound (#1114), also bound to a user `@bookmark`; casting
+/// the decimal to FLOAT32 instead can round it above the row.
+fn float32_bound(
+    ty: &'static str,
+    mut params: Params,
+    start: &Value,
+) -> Result<(&'static str, Params), FaucetError> {
+    let bound = if ty == "FLOAT32" {
+        faucet_core::fidelity::f32_cursor_bound(start)?
+    } else {
+        None
+    };
+    let Some(bound) = bound else {
+        params.push((CURSOR_PARAM.to_string(), start.clone()));
+        return Ok((ty, params));
+    };
+    let bound = faucet_core::fidelity::float64(bound);
+    for (name, value) in &mut params {
+        if name == "bookmark" {
+            *value = bound.clone();
+        }
+    }
+    params.push((CURSOR_PARAM.to_string(), bound));
+    Ok(("FLOAT64", params))
+}
+
 /// The parameter the outer cursor filter binds the bookmark as.
 const CURSOR_PARAM: &str = "_faucet_bookmark";
 
@@ -384,8 +415,7 @@ impl Source for SpannerSource {
                 None => (query, params),
                 Some(ic) => {
                     let ty = self.cursor_type(&query, &params, &ic.column).await?;
-                    let mut params = params;
-                    params.push((CURSOR_PARAM.to_string(), ic.start.value.clone()));
+                    let (ty, params) = float32_bound(ty, params, &ic.start.value)?;
                     (cursor_wrap(&query, &ic.column, ty), params)
                 }
             };
@@ -670,6 +700,35 @@ impl SpannerSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_float32_cursor_compares_with_the_exact_bound() {
+        let params = vec![
+            ("bookmark".to_string(), json!(0.7)),
+            ("x".to_string(), json!(1)),
+        ];
+        let (ty, got) = float32_bound("FLOAT32", params.clone(), &json!(0.7)).unwrap();
+        let bound = json!(f64::from(0.7f32));
+        assert_eq!(ty, "FLOAT64");
+        assert_eq!(
+            got,
+            vec![
+                ("bookmark".to_string(), bound.clone()),
+                ("x".to_string(), json!(1)),
+                (CURSOR_PARAM.to_string(), bound)
+            ]
+        );
+        for (ty, start) in [
+            ("FLOAT32", json!(7)),
+            ("FLOAT64", json!(0.7)),
+            ("STRING", json!("a")),
+        ] {
+            let (got_ty, got) = float32_bound(ty, params.clone(), &start).unwrap();
+            assert_eq!(got_ty, ty);
+            assert_eq!(got[0].1, json!(0.7));
+            assert_eq!(got[2], (CURSOR_PARAM.to_string(), start));
+        }
+    }
     use faucet_core::shard::plan_pk_shards;
     use serde_json::json;
 

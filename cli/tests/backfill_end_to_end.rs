@@ -12,7 +12,7 @@ use faucet_cli::config::PipelineConfig;
 use serde_json::json;
 use std::path::Path;
 
-fn utc() -> chrono_tz::Tz {
+fn utc() -> faucet_core::time::ChronoZone {
     "UTC".parse().unwrap()
 }
 

@@ -587,6 +587,9 @@ pub(crate) async fn execute(
                 if let Some(r) = i.metrics.as_ref().and_then(|m| m.rows.as_ref()) {
                     eprintln!("  {:<30} {}", i.row_id, r.summary_line());
                 }
+                if let Some(line) = committed_before_failure(i) {
+                    eprintln!("  {:<30} {line}", i.row_id);
+                }
             }
             // Undoable runs (#706): print each invocation's run id so the
             // operator can `faucet rollback --run <id>` without digging it
@@ -766,6 +769,19 @@ pub(crate) struct RunSummaryDocument {
     /// shipping is off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_export: Option<crate::logship::LogExportView>,
+}
+
+/// For a failed invocation whose completed checkpoints made rows durable:
+/// how many, at least, the destination holds.
+pub(crate) fn committed_before_failure(i: &crate::executor::InvocationOutcome) -> Option<String> {
+    let confirmed = i.metrics.as_ref()?.rows.as_ref()?.confirmed;
+    (i.error.is_some() && confirmed > 0).then(|| {
+        format!(
+            "at least {confirmed} row{} {} committed before the failure",
+            if confirmed == 1 { "" } else { "s" },
+            if confirmed == 1 { "was" } else { "were" }
+        )
+    })
 }
 
 /// Whether an invocation never ran because a parent or `depends_on` row failed.
@@ -1052,6 +1068,28 @@ mod tests {
             usage: None,
             policy_denial: None,
         }
+    }
+
+    #[test]
+    fn a_failed_row_names_the_rows_its_checkpoints_committed() {
+        let with_rows = |err: Option<&str>, confirmed: u64| {
+            let mut o = outcome("a", 0, err);
+            let mut rows = faucet_core::RowAccountsSnapshot::default();
+            rows.confirmed = confirmed;
+            o.metrics.as_mut().unwrap().rows = Some(rows);
+            o
+        };
+        assert_eq!(
+            committed_before_failure(&with_rows(Some("boom"), 3)).as_deref(),
+            Some("at least 3 rows were committed before the failure")
+        );
+        assert_eq!(
+            committed_before_failure(&with_rows(Some("boom"), 1)).as_deref(),
+            Some("at least 1 row was committed before the failure")
+        );
+        assert!(committed_before_failure(&with_rows(Some("boom"), 0)).is_none());
+        assert!(committed_before_failure(&with_rows(None, 3)).is_none());
+        assert!(committed_before_failure(&outcome("b", 0, Some("boom"))).is_none());
     }
 
     #[test]

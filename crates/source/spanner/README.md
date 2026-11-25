@@ -89,6 +89,14 @@ at `value`), so a crash replays at most one page. Above 10,000 rows at one
 value the boundary is dropped and the next run re-reads that value
 (duplicates, never loss). Rows whose `column` is NULL are never read.
 
+**`FLOAT32` cursors.** A bookmark taken from a `FLOAT32` column holds its
+shortest decimal (`0.7`), which a double comparison, or a cast of that decimal
+to `FLOAT32`, can put above the stored value. For a `FLOAT32` cursor and a
+non-integer bookmark the source binds the exact single-precision value as a
+`FLOAT64` parameter, both for the outer filter (which then compares in
+`FLOAT64`) and for a user `@bookmark`
+([`faucet_core::fidelity::f32_cursor_bound`](https://docs.rs/faucet-core/latest/faucet_core/fidelity/fn.f32_cursor_bound.html)).
+
 Writing `@bookmark` in the query is optional; use it to apply the cursor
 inside the query (e.g. before a join), with `>=`. A strict comparison
 (`> @bookmark`, `> TIMESTAMP(@bookmark)`, `@bookmark < c`) is refused at load

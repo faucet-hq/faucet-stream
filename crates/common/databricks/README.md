@@ -16,7 +16,8 @@ use.
 - **`StatementClient`** — the
   [Statement Execution API](https://docs.databricks.com/api/workspace/statementexecution)
   lifecycle: submit (`POST /api/2.0/sql/statements`), poll until terminal,
-  follow result chunks, cancel on a client deadline.
+  follow result chunks, cancel on a client deadline. Requests are metered as
+  `submit` / `poll`; `with_op("describe")` meters a probe under its own op.
 - **`http_client`** — the client both connectors use, with a 30 s connect and
   300 s idle-read timeout so a half-open connection fails instead of hanging.
 - Response types (`StatementResponse`, `StatementStatus`, `ResultColumn`, …),

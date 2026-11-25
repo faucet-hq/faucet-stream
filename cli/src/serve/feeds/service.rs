@@ -175,7 +175,7 @@ fn undelivered_ratio(feed: &Feed, head: &Head, undelivered: u64) -> f64 {
         .deliveries
         .iter()
         .filter_map(|d| d.oldest_undelivered_at)
-        .map(|t| (head.now - t).num_milliseconds().max(0) as f64 / 1000.0)
+        .map(|t| head.now.since(t).as_millis().max(0) as f64 / 1000.0)
         .fold(0.0, f64::max);
     by_bytes.max(oldest / limits.max_age.secs().max(1) as f64)
 }
@@ -325,7 +325,9 @@ pub fn view(
                     (Some(x), Some(h)) => Some(x.cursor.distance_to(h.end())),
                     _ => None,
                 },
-                oldest_undelivered_at: dh.and_then(|x| x.oldest_undelivered_at),
+                oldest_undelivered_at: dh
+                    .and_then(|x| x.oldest_undelivered_at)
+                    .map(|t| t.to_chrono()),
                 batch_events: s.batch(max_events),
                 claim: s.claim.clone(),
                 last_run: s.last_run.clone(),
@@ -612,7 +614,7 @@ async fn views(state: &ServerState, feeds: &[Arc<Feed>]) -> Result<Vec<FeedView>
             heads.extend(found.into_iter().map(|h| (h.feed.clone(), h)));
         }
         match store.newest_received(&calls, uids).await {
-            Ok(Some(found)) => newest.extend(found),
+            Ok(Some(found)) => newest.extend(found.into_iter().map(|(u, t)| (u, t.to_chrono()))),
             _ => {
                 unbatched.insert(name);
             }
@@ -661,7 +663,8 @@ async fn views(state: &ServerState, feeds: &[Arc<Feed>]) -> Result<Vec<FeedView>
             };
             // What the last 24 hours brought, by the store's own clock.
             let calls = store_calls();
-            let since = head.now - chrono::Duration::hours(24);
+            let since: faucet_common_feed::Timestamp =
+                (head.now.to_chrono() - chrono::Duration::hours(24)).into();
             if let Ok(from) = store.seq_at(&calls, &feed.uid, since).await {
                 out.events_24h = Some(from.distance_to(head.end()));
                 out.bytes_24h = store
@@ -680,7 +683,7 @@ async fn views(state: &ServerState, feeds: &[Arc<Feed>]) -> Result<Vec<FeedView>
                     .read(&calls, &feed.uid, head.watermark, head.end())
                     .await
             {
-                out.last_event_at = batch.events.last().map(|e| e.received_at);
+                out.last_event_at = batch.events.last().map(|e| e.received_at.to_chrono());
             }
             Ok::<FeedView, ServeError>(out)
         }
@@ -714,7 +717,11 @@ async fn hourly_24h(state: &ServerState, feed: &Feed) -> Vec<u64> {
     let mut marks = Vec::with_capacity(25);
     for hours in (1..=24).rev() {
         match store
-            .seq_at(&calls, &feed.uid, head.now - chrono::Duration::hours(hours))
+            .seq_at(
+                &calls,
+                &feed.uid,
+                (head.now.to_chrono() - chrono::Duration::hours(hours)).into(),
+            )
             .await
         {
             Ok(seq) => marks.push(seq),
@@ -921,8 +928,8 @@ fn event_view(
     EventView {
         seq: e.seq.get(),
         id: e.id,
-        received_at: e.received_at,
-        stored_at: e.stored_at,
+        received_at: e.received_at.to_chrono(),
+        stored_at: e.stored_at.to_chrono(),
         content_type: e.content_type,
         size: e.size,
         sealed: e.sealed,
@@ -974,7 +981,7 @@ pub async fn events(
         (Some(from), _) => Some(from),
         (None, Some(at)) => Some(
             store
-                .seq_at(&store_calls(), &feed.uid, at)
+                .seq_at(&store_calls(), &feed.uid, at.into())
                 .await
                 .map_err(store_error)?
                 .get(),
@@ -1223,7 +1230,7 @@ pub async fn get(
             from: g.from.get(),
             to: g.to.get(),
             reason: g.reason,
-            at: g.at,
+            at: g.at.to_chrono(),
             by: g.by,
         })
         .collect();
@@ -2988,7 +2995,7 @@ pub async fn replay(
         Position::Seq(n) => Seq(n),
         Position::Time(at) => t
             .store
-            .seq_at(&calls, &t.feed.uid, at)
+            .seq_at(&calls, &t.feed.uid, at.into())
             .await
             .map_err(store_error)?,
     };

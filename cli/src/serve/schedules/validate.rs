@@ -9,8 +9,6 @@ use std::time::Duration;
 
 /// Longest schedule name.
 pub const MAX_NAME_LEN: usize = 64;
-/// Occurrences scanned when checking the shortest gap between ticks.
-const GAP_SCAN: usize = 64;
 /// The `${schedule.*}` tokens a template param may use.
 pub const TOKENS: &[&str] = &["tick", "name", "fired_at"];
 /// The shortest gap allowed between any schedule's ticks.
@@ -30,23 +28,24 @@ pub fn compile(cron: &str, timezone: &str) -> Result<CompiledSchedule, String> {
     })
 }
 
-/// The next `n` ticks strictly after `after`.
+/// The next `n` ticks strictly after `after` (fewer when the schedule ends or
+/// a search fails).
 pub fn next_ticks(
     schedule: &CompiledSchedule,
     after: DateTime<Utc>,
     n: usize,
 ) -> Vec<DateTime<Utc>> {
-    std::iter::successors(schedule.next_after(after), |t| schedule.next_after(*t))
+    let next = |t: DateTime<Utc>| schedule.try_next_after(t).ok().flatten();
+    std::iter::successors(next(after), |t| next(*t))
         .take(n)
         .collect()
 }
 
-/// The shortest gap between consecutive ticks over the next occurrences.
-pub fn shortest_gap(schedule: &CompiledSchedule, after: DateTime<Utc>) -> Option<Duration> {
-    next_ticks(schedule, after, GAP_SCAN)
-        .windows(2)
-        .filter_map(|w| (w[1] - w[0]).to_std().ok())
-        .min()
+/// The shortest gap between ticks of the cron on a UTC clock (#1111): the
+/// same for every date and time zone, so a schedule is never accepted or
+/// refused depending on the day it was made. `after` is not used.
+pub fn shortest_gap(schedule: &CompiledSchedule, _after: DateTime<Utc>) -> Option<Duration> {
+    schedule.nominal_shortest_gap()
 }
 
 /// Check a name: letters, digits, `_` and `-`, 1–64 characters (it appears in
@@ -348,5 +347,64 @@ mod tests {
         assert_eq!(human(Duration::from_secs(90)), "90 seconds");
         assert_eq!(human(Duration::from_secs(60)), "1 minute");
         assert_eq!(human(Duration::from_secs(7200)), "2 hours");
+    }
+    #[test]
+    fn dst_1111_serve_preview_ticks_once_on_london_spring_forward() {
+        let daily = compile("0 0 * * *", "Europe/London").unwrap();
+        let after: DateTime<Utc> = "2025-03-29T12:00:00Z".parse().unwrap();
+        let ticks: Vec<String> = next_ticks(&daily, after, 3)
+            .iter()
+            .map(|t| t.to_rfc3339())
+            .collect();
+        assert_eq!(
+            ticks,
+            [
+                "2025-03-30T00:00:00+00:00",
+                "2025-03-30T23:00:00+00:00",
+                "2025-03-31T23:00:00+00:00"
+            ]
+        );
+        assert_eq!(
+            shortest_gap(&daily, after),
+            Some(Duration::from_secs(24 * 3600))
+        );
+    }
+
+    #[test]
+    fn dst_1111_serve_preview_keeps_cadence_on_new_york_fall_back() {
+        let half = compile("*/30 * * * *", "America/New_York").unwrap();
+        let after: DateTime<Utc> = "2025-11-02T05:15:00Z".parse().unwrap();
+        let gaps: Vec<i64> = next_ticks(&half, after, 5)
+            .windows(2)
+            .map(|w| (w[1] - w[0]).num_minutes())
+            .collect();
+        assert_eq!(gaps, [30, 30, 30, 30]);
+    }
+
+    #[test]
+    fn the_minimum_interval_check_does_not_depend_on_the_date() {
+        let before_fall_back: DateTime<Utc> = "2025-11-01T12:00:00Z".parse().unwrap();
+        let summer: DateTime<Utc> = "2025-07-01T12:00:00Z".parse().unwrap();
+        for (cron, gap) in [("0 1,13 * * *", 12 * 3600), ("0,55 1 * * *", 55 * 60)] {
+            let spec: ScheduleSpec = serde_json::from_value(json!({
+                "name": "n", "cron": cron, "timezone": "America/New_York", "template": {"id": "t"}
+            }))
+            .unwrap();
+            let c = compile(cron, "America/New_York").unwrap();
+            for now in [before_fall_back, summer] {
+                assert_eq!(
+                    shortest_gap(&c, now),
+                    Some(Duration::from_secs(gap)),
+                    "{cron} at {now}"
+                );
+                assert!(check_min_interval(&spec, &c, MIN_INTERVAL, None, now).is_ok());
+                let refused =
+                    check_min_interval(&spec, &c, Duration::from_secs(gap + 60), Some("acme"), now);
+                assert!(
+                    refused.unwrap_err().contains("acme's schedules"),
+                    "{cron} at {now}"
+                );
+            }
+        }
     }
 }

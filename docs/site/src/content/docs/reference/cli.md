@@ -157,6 +157,20 @@ Pass `--param NAME=VALUE` (repeatable) to switch to strict binding and check one
 concrete invocation; `--param-env NAME[=VALUE]` overrides an environment variable
 for the validation only.
 
+### Schedules files
+
+`faucet validate --schedules FILE` checks a `faucet serve --schedules` file
+instead of a pipeline config, offline: every schedule's cron, time zone,
+minimum interval and template reference shape, with this binary's cron parser.
+It lists every problem (not just the first) and exits non-zero when there is
+one. Run it with a new release before upgrading a server: a file entry the new
+release refuses would stop that server from starting. With `--json` it prints
+`{"valid": …, "schedules": N, "problems": […]}`.
+
+```bash
+faucet validate --schedules schedules.yaml
+```
+
 ### JSON output
 
 Pass `--json` to emit a structured summary instead of the prose report, so CI can

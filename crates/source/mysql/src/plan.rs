@@ -49,6 +49,11 @@ fn fits<T: Type<MySql>>(ty: &MySqlTypeInfo) -> bool {
     ty.is_null() || T::compatible(ty)
 }
 
+/// Whether `ty` is a single-precision `FLOAT` (#1114).
+pub(crate) fn is_single_float(ty: &MySqlTypeInfo) -> bool {
+    !ty.is_null() && ty.name().eq_ignore_ascii_case("FLOAT") && <f32 as Type<MySql>>::compatible(ty)
+}
+
 impl DecodeKind {
     /// The first step of the cascade that accepts a column of type `ty`.
     pub(crate) fn of(ty: &MySqlTypeInfo, text: bool) -> Self {

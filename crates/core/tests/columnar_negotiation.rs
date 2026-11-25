@@ -1295,3 +1295,54 @@ async fn the_total_dlq_budget_aborts_on_the_columnar_path() {
         "the overshoot is written before aborting — losing those rows would be worse"
     );
 }
+
+/// A columnar sink whose second flush fails.
+#[derive(Default)]
+struct SecondFlushFails(FlushCountingSink);
+
+#[async_trait]
+impl Sink for SecondFlushFails {
+    async fn write_batch(&self, records: &[Value]) -> Result<usize, FaucetError> {
+        self.0.write_batch(records).await
+    }
+
+    fn supports_columnar(&self) -> bool {
+        true
+    }
+
+    async fn write_batch_columnar(
+        &self,
+        batch: &arrow::array::RecordBatch,
+    ) -> Result<usize, FaucetError> {
+        self.0.write_batch_columnar(batch).await
+    }
+
+    async fn flush(&self) -> Result<(), FaucetError> {
+        match self.0.flushes.fetch_add(1, Ordering::SeqCst) {
+            1 => Err(FaucetError::Sink("store refused".into())),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_failed_columnar_run_confirms_the_rows_of_completed_checkpoints() {
+    let source = PagedColumnarSource {
+        pages: vec![
+            (vec![json!({"id": 1}), json!({"id": 2})], Some(json!(1))),
+            (vec![json!({"id": 3})], Some(json!(2))),
+        ],
+        fail_after: None,
+    };
+    let sink = SecondFlushFails::default();
+    let accounts = Arc::new(faucet_core::RowAccounts::new());
+    let err = Pipeline::new(&source, &sink)
+        .with_row_accounts(Arc::clone(&accounts))
+        .run()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("store refused"), "{err}");
+    sink.0.assert_columnar();
+    let rows = accounts.snapshot();
+    assert_eq!((rows.accepted, rows.confirmed), (3, 2));
+}

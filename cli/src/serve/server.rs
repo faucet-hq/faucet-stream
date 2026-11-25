@@ -664,6 +664,13 @@ pub(crate) async fn refresh_membership(state: &ServerState, member_ttl: Duration
     refresh_member_view(state, member_ttl, None).await;
 }
 
+/// Whether this server writes a membership heartbeat: in a cluster, and on
+/// any SQL history, so servers sharing one history without `--cluster` see
+/// each other's tzdata release before a schedule fires (#1116).
+pub(crate) fn heartbeats(state: &ServerState) -> bool {
+    state.cluster().enabled() || state.persistent_history()
+}
+
 /// Write this member's heartbeat row.
 pub(crate) async fn heartbeat_member(state: &ServerState) {
     let cluster = state.cluster();
@@ -675,10 +682,7 @@ pub(crate) async fn heartbeat_member(state: &ServerState) {
         in_flight: state.registry().in_flight() as u32,
         state_format: faucet_core::state_version::STATE_FORMAT,
         pools: cluster.pools().to_vec(),
-        capabilities: crate::serve::history::INSTANCE_CAPABILITIES
-            .iter()
-            .map(|c| (*c).to_string())
-            .collect(),
+        capabilities: crate::serve::history::instance_capabilities(),
         clock_offset_ms,
     };
     if let Err(e) = state.history().heartbeat_instance(&beat).await {
@@ -1000,7 +1004,7 @@ pub(crate) async fn lease_loop(state: ServerState, period: Duration, shutdown: C
             _ = shutdown.cancelled() => break,
             _ = tick.tick() => {
                 renew_and_fence(&state, &mut health, member_ttl.saturating_sub(period)).await;
-                if state.cluster().enabled() {
+                if heartbeats(&state) {
                     if heartbeat.as_ref().is_some_and(|beat| !beat.0.is_finished()) {
                         tracing::warn!("cluster: the previous membership heartbeat is still running; skipping this one");
                     } else {
@@ -1339,6 +1343,7 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
             crate::serve::config::default_data_dir().display()
         )));
     }
+    let exclusive_history = history_lock.is_some();
     let _history_lock = history_lock;
     if config.cluster.enabled {
         // Cluster mode: a restarting instance re-queues its prior incarnation's
@@ -1546,6 +1551,7 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         #[cfg(feature = "triggers")]
         triggers_handle,
     );
+    state.set_exclusive_history(exclusive_history);
     // Template versions this server's own files pin are never pruned.
     {
         #[allow(unused_mut)]
@@ -1794,6 +1800,9 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
             shutdown.clone(),
         )))
     } else {
+        if heartbeats(&state) {
+            heartbeat_member(&state).await;
+        }
         None
     };
 

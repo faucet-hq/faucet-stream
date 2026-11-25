@@ -1,0 +1,15 @@
+"UTC" = true
+"Etc/UTC" = true
+"utc" = false
+"EST" = true
+"US/Eastern" = true
+"Europe/Kyiv" = true
+"Europe/Kiev" = true
+"Asia/Calcutta" = true
+"Asia/Kolkata" = true
+"europe/london" = false
+"Europe/London " = false
+"GMT+5" = false
+"Etc/GMT+5" = true
+"Mars/Olympus" = false
+"" = false

@@ -158,7 +158,11 @@ pub fn parse_window(s: &str) -> CliResult<WindowStep> {
 /// time is nudged forward an hour at a time until it does; a fall-back
 /// (ambiguous, repeated) hour resolves to the **earliest** instant, matching
 /// [`parse_boundary`].
-fn advance_calendar(cursor: DateTime<Utc>, tz: chrono_tz::Tz, days: i64) -> Option<DateTime<Utc>> {
+fn advance_calendar(
+    cursor: DateTime<Utc>,
+    tz: faucet_core::time::ChronoZone,
+    days: i64,
+) -> Option<DateTime<Utc>> {
     let naive = cursor
         .with_timezone(&tz)
         .naive_local()
@@ -176,7 +180,10 @@ fn advance_calendar(cursor: DateTime<Utc>, tz: chrono_tz::Tz, days: i64) -> Opti
 /// (`2026-06-01`, interpreted as midnight in `tz`). A midnight that falls in a
 /// DST gap resolves to the earliest valid instant after the gap; an ambiguous
 /// midnight resolves to the earlier of its two instants.
-pub fn parse_boundary(s: &str, tz: chrono_tz::Tz) -> CliResult<DateTime<FixedOffset>> {
+pub fn parse_boundary(
+    s: &str,
+    tz: faucet_core::time::ChronoZone,
+) -> CliResult<DateTime<FixedOffset>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Ok(dt.with_timezone(&tz).fixed_offset());
     }
@@ -206,7 +213,7 @@ pub fn plan_windows(
     from: DateTime<FixedOffset>,
     to: DateTime<FixedOffset>,
     window: Option<WindowStep>,
-    tz: chrono_tz::Tz,
+    tz: faucet_core::time::ChronoZone,
 ) -> CliResult<Vec<TimeChunk>> {
     if from >= to {
         return Err(CliError::Config(format!(
@@ -394,7 +401,7 @@ mod tests {
     // ── Time windows (moved verbatim from backfill::plan, proving the move
     // did not change planning behaviour) ────────────────────────────────────
 
-    fn tz(name: &str) -> chrono_tz::Tz {
+    fn tz(name: &str) -> faucet_core::time::ChronoZone {
         name.parse().unwrap()
     }
 
@@ -752,7 +759,7 @@ mod tests {
 
     #[test]
     fn windows_past_the_date_range_end_the_range_instead_of_panicking() {
-        let tz: chrono_tz::Tz = "UTC".parse().unwrap();
+        let tz: faucet_core::time::ChronoZone = "UTC".parse().unwrap();
         let from = parse_boundary("2026-01-01", tz).unwrap();
         let to = parse_boundary("2026-02-01", tz).unwrap();
         for step in [
@@ -771,7 +778,7 @@ mod tests {
     #[test]
     fn a_midnight_in_a_dst_gap_resolves_to_the_first_instant_after_it() {
         // Santiago springs forward at 00:00 → 01:00 on 2023-09-03.
-        let tz: chrono_tz::Tz = "America/Santiago".parse().unwrap();
+        let tz: faucet_core::time::ChronoZone = "America/Santiago".parse().unwrap();
         let b = parse_boundary("2023-09-03", tz).unwrap();
         assert_eq!(b.to_rfc3339(), "2023-09-03T01:00:00-03:00");
     }

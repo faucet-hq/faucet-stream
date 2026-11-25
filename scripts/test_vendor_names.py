@@ -60,6 +60,8 @@ class Matches(unittest.TestCase):
     def test_changelogs_are_skipped(self):
         self.assertTrue(vn.SKIPPED_FILES.search("crates/core/CHANGELOG.md"))
         self.assertFalse(vn.SKIPPED_FILES.search("docs/changelog-notes.md"))
+        self.assertTrue(vn.SKIPPED_FILES.search("vendor/chrono-tz/tz/northamerica"))
+        self.assertFalse(vn.SKIPPED_FILES.search("crates/vendor/x.rs"))
 
 
 if __name__ == "__main__":

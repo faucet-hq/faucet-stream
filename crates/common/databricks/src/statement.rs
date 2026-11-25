@@ -360,6 +360,14 @@ pub fn value_to_param_string(v: &Value) -> Value {
     }
 }
 
+fn parse_error(side: ErrorSide, e: FaucetError) -> FaucetError {
+    let detail = match e {
+        FaucetError::Json(e) => e.to_string(),
+        other => other.to_string(),
+    };
+    side.error(format!("databricks: could not parse response: {detail}"))
+}
+
 fn statement_error(side: ErrorSide, state: &str, status: Option<&StatementStatus>) -> FaucetError {
     let detail = status.and_then(|s| s.error.as_ref()).map(|e| {
         format!(
@@ -393,6 +401,7 @@ pub struct StatementClient {
     side: ErrorSide,
     calls: CallContext,
     max_response_bytes: Option<u64>,
+    op: Option<&'static str>,
 }
 
 impl std::fmt::Debug for StatementClient {
@@ -427,7 +436,15 @@ impl StatementClient {
             side,
             calls: CallContext::new().without_timeout(),
             max_response_bytes: Some(faucet_core::http::DEFAULT_MAX_RESPONSE_BYTES),
+            op: None,
         }
+    }
+
+    /// Meter every request of this client as `op` instead of `submit` /
+    /// `poll` (a probe that is not the read, such as a `describe`).
+    pub fn with_op(mut self, op: &'static str) -> Self {
+        self.op = Some(op);
+        self
     }
 
     /// Run every request through `calls` (#880): each attempt bounded by its
@@ -621,10 +638,10 @@ impl StatementClient {
         }
     }
 
-    async fn parse<T: for<'de> Deserialize<'de>>(
-        &self,
-        resp: reqwest::Response,
-    ) -> Result<T, FaucetError> {
+    async fn parse<T>(&self, resp: reqwest::Response) -> Result<T, FaucetError>
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
         let body = faucet_core::http::read_body_limited(resp, self.max_response_bytes)
             .await
             .map_err(|e| match e {
@@ -633,10 +650,9 @@ impl StatementClient {
                     .side
                     .error(format!("databricks: could not read response: {e}")),
             })?;
-        serde_json::from_slice::<T>(&body).map_err(|e| {
-            self.side
-                .error(format!("databricks: could not parse response: {e}"))
-        })
+        faucet_core::http::decode_json(body)
+            .await
+            .map_err(|e| parse_error(self.side, e))
     }
 
     async fn send(
@@ -648,7 +664,9 @@ impl StatementClient {
     ) -> Result<reqwest::Response, FaucetError> {
         let mut attempt: u32 = 0;
         let mut refreshed = false;
-        let op = if verb == Verb::Get { "poll" } else { "submit" };
+        let op = self
+            .op
+            .unwrap_or(if verb == Verb::Get { "poll" } else { "submit" });
         loop {
             let header = auth.clone();
             let sent = self
@@ -729,6 +747,27 @@ impl StatementClient {
 #[allow(clippy::disallowed_methods)] // tests drive time and raw clients directly
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_parse_failure_keeps_its_text_and_its_side() {
+        let serde = serde_json::from_str::<Value>("{").unwrap_err();
+        let text = format!("databricks: could not parse response: {serde}");
+        let e = parse_error(ErrorSide::Sink, FaucetError::Json(serde));
+        assert!(matches!(e, FaucetError::Sink(_)), "{e:?}");
+        assert!(e.to_string().ends_with(&text), "{e}");
+
+        let died = FaucetError::Source("decoding a response body failed: gone".into());
+        let e = parse_error(ErrorSide::Sink, died);
+        assert!(matches!(e, FaucetError::Sink(_)), "{e:?}");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("databricks: could not parse response: ")
+                && msg.contains("decoding a response body failed: gone"),
+            "{msg}"
+        );
+        let e = parse_error(ErrorSide::Source, FaucetError::Source("x".into()));
+        assert!(matches!(e, FaucetError::Source(_)), "{e:?}");
+    }
 
     #[test]
     fn state_parse_covers_every_variant() {

@@ -62,6 +62,13 @@ pub struct Entry {
     attempts: u32,
     /// The tick waits out a run-history outage (#1050).
     held: bool,
+    /// The tick whose tzdata hold was last recorded (#1116).
+    noted_tzdata_hold: Option<DateTime<Utc>>,
+    /// The schedule's shortest gap between ticks, once computed.
+    period: Option<chrono::Duration>,
+    /// The next tick could not be computed (#1111): the entry does not tick
+    /// until a reload computes one again.
+    compute_error: Option<String>,
 }
 
 /// What identifies a definition: a change rebuilds the entry.
@@ -79,19 +86,69 @@ impl Entry {
         schedule: CompiledSchedule,
         now: DateTime<Utc>,
     ) -> Self {
-        let next = schedule.next_after(now);
-        Self {
+        let mut entry = Self {
             fingerprint: fingerprint(&spec, owner.as_deref(), false),
             spec,
             owner,
             source,
             approved: false,
             schedule,
-            next,
+            next: None,
             resumed: false,
             retry_at: None,
             attempts: 0,
             held: false,
+            noted_tzdata_hold: None,
+            period: None,
+            compute_error: None,
+        };
+        entry.next = entry.next_of(now);
+        entry
+    }
+
+    /// The next occurrence strictly after `after`; a failed search stops the
+    /// entry (logged and counted once per failure, gauge 0) instead of reading
+    /// as the end of the schedule.
+    fn next_of(&mut self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        match self.schedule.try_next_after(after) {
+            Ok(t) => t,
+            Err(e) => {
+                if self.compute_error.is_none() {
+                    tracing::error!(schedule = %self.spec.name, cron = %self.spec.cron, timezone = %self.spec.timezone, error = %e, "cannot compute the schedule's next tick; it stops ticking until this clears");
+                    metrics::compute_error(&self.spec.name);
+                }
+                metrics::healthy(&self.spec.name, false);
+                self.compute_error = Some(e.to_string());
+                None
+            }
+        }
+    }
+
+    /// The schedule's shortest gap between ticks, an hour when unknown;
+    /// computed once per entry.
+    fn period(&mut self) -> chrono::Duration {
+        *self.period.get_or_insert_with(|| {
+            super::validate::shortest_gap(&self.schedule, Utc::now())
+                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .unwrap_or_else(|| chrono::Duration::hours(1))
+        })
+    }
+
+    /// Why the entry cannot compute its next tick, if it cannot.
+    pub fn compute_error(&self) -> Option<&str> {
+        self.compute_error.as_deref()
+    }
+
+    /// Try again to compute the next tick of an entry stopped by a failed search.
+    fn retry_compute(&mut self, now: DateTime<Utc>) {
+        if self.compute_error.is_none() || self.next.is_some() {
+            return;
+        }
+        if let Ok(next) = self.schedule.try_next_after(now) {
+            tracing::info!(schedule = %self.spec.name, "the schedule's next tick computes again; it ticks again");
+            metrics::healthy(&self.spec.name, true);
+            self.compute_error = None;
+            self.next = next;
         }
     }
 
@@ -108,11 +165,15 @@ impl Entry {
     }
 
     /// The latest occurrence in `(after, now]` and how many there are.
-    fn latest_due(&self, after: DateTime<Utc>, now: DateTime<Utc>) -> (Option<DateTime<Utc>>, u64) {
+    fn latest_due(
+        &mut self,
+        after: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> (Option<DateTime<Utc>>, u64) {
         let (mut latest, mut count) = (None, 0);
         let mut cursor = after;
         while count < MAX_SCAN {
-            match self.schedule.next_after(cursor) {
+            match self.next_of(cursor) {
                 Some(t) if t <= now => {
                     latest = Some(t);
                     count += 1;
@@ -125,17 +186,22 @@ impl Entry {
         (self.latest_before(now).or(latest), count)
     }
 
-    fn latest_before(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    fn latest_before(&mut self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         // Look back in doubling windows for any occurrence, then walk to the last.
-        std::iter::successors(Some(chrono::Duration::minutes(1)), |s| Some(*s * 2))
-            .take_while(|s| *s < chrono::Duration::days(3660))
-            .find_map(|step| self.schedule.next_after(now - step).filter(|t| *t <= now))
-            .map(|mut cursor| {
-                while let Some(n) = self.schedule.next_after(cursor).filter(|n| *n <= now) {
-                    cursor = n;
-                }
-                cursor
-            })
+        let mut step = chrono::Duration::minutes(1);
+        let mut cursor = loop {
+            if step >= chrono::Duration::days(3660) {
+                return None;
+            }
+            if let Some(t) = self.next_of(now - step).filter(|t| *t <= now) {
+                break t;
+            }
+            step = step * 2;
+        };
+        while let Some(n) = self.next_of(cursor).filter(|n| *n <= now) {
+            cursor = n;
+        }
+        Some(cursor)
     }
 
     /// Apply `missed` ticks in `(after, now]` ending at `latest`: run the latest
@@ -153,14 +219,14 @@ impl Entry {
             self.next = Some(latest);
             format!("running the latest ({latest}) once")
         } else {
-            self.next = self.schedule.next_after(now);
+            self.next = self.next_of(now);
             "catch_up is off, skipping them".to_string()
         };
         let never_ran = missed - u64::from(self.spec.catch_up);
         metrics::missed(&self.spec.name, never_ran);
         tracing::warn!(schedule = %self.spec.name, missed, "schedule missed {more}{missed} tick(s) {why}; {skipped}");
         MissedRange {
-            from: self.schedule.next_after(after).unwrap_or(latest),
+            from: self.next_of(after).unwrap_or(latest),
             to: latest,
             count: missed,
             reason: why.to_string(),
@@ -184,7 +250,7 @@ impl Entry {
                 None
             }
             (None, _) => {
-                self.next = self.schedule.next_after(fired);
+                self.next = self.next_of(fired);
                 None
             }
         }
@@ -260,11 +326,15 @@ pub struct Scheduler {
     pub entries: BTreeMap<String, Entry>,
     /// Wanted schedules that do not validate: left out, reported unhealthy,
     /// and forgotten once they are no longer wanted.
-    invalid: std::collections::BTreeSet<String>,
+    /// Name → the definition's fingerprint, so a refusal is logged once per
+    /// definition, not at every reload.
+    invalid: BTreeMap<String, String>,
     /// Schedules whose step runs now: their entry is out of `entries`.
     busy: std::collections::BTreeSet<String>,
     /// The schedule started last, so starts take turns.
     last_started: Option<String>,
+    /// Refusals reported (logged) so far: once per definition (#1111).
+    refusals_reported: u64,
 }
 
 impl Scheduler {
@@ -279,11 +349,13 @@ impl Scheduler {
                 continue;
             }
             let fp = fingerprint(&spec, owner.as_deref(), approved);
-            if self
-                .entries
-                .get(&spec.name)
-                .is_some_and(|e| e.fingerprint == fp)
+            if let Some(e) = self.entries.get_mut(&spec.name)
+                && e.fingerprint == fp
             {
+                e.retry_compute(now);
+                continue;
+            }
+            if self.invalid.get(&spec.name) == Some(&fp) {
                 continue;
             }
             match super::validate::validate(&spec) {
@@ -299,8 +371,9 @@ impl Scheduler {
                     // The API validates before storing; this is a record a newer
                     // or older binary wrote. Report it and leave it out.
                     tracing::error!(schedule = %spec.name, error = %e, "invalid schedule; not ticking it");
+                    self.refusals_reported += 1;
                     metrics::healthy(&spec.name, false);
-                    self.invalid.insert(spec.name.clone());
+                    self.invalid.insert(spec.name.clone(), fp);
                     self.entries.remove(&spec.name);
                 }
             }
@@ -313,7 +386,7 @@ impl Scheduler {
             }
             kept
         });
-        self.invalid.retain(|name| {
+        self.invalid.retain(|name, _| {
             let kept = keep.contains(name);
             if !kept {
                 metrics::forget(name);
@@ -356,6 +429,11 @@ impl Scheduler {
         if let Some(e) = entry {
             self.entries.insert(name.to_string(), e);
         }
+    }
+
+    /// Wanted schedules that do not validate, by name.
+    pub fn invalid_names(&self) -> Vec<String> {
+        self.invalid.keys().cloned().collect()
     }
 
     /// Schedules that tick (not paused).
@@ -434,6 +512,125 @@ fn hold(entry: &mut Entry, now: DateTime<Utc>) {
     entry.back_off(now);
 }
 
+/// What a due tick does while another tzdata release may be live (#1116).
+enum TzdataStep {
+    Fire,
+    FireLate,
+    Done,
+}
+
+/// Hold `tick` while a replica on other tzdata may run it at another instant:
+/// a tick that replica ran is recorded (so `catch_up` never replays it) and
+/// nothing starts; one nobody ran by `tick + delta + grace` runs late.
+async fn hold_for_tzdata(
+    state: &ServerState,
+    entry: &mut Entry,
+    tick: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> TzdataStep {
+    let zone = entry.schedule.zone();
+    let name = entry.spec.name.clone();
+    let history = state.history();
+    if !super::tzdata::may_hold(state, zone) {
+        return TzdataStep::Fire;
+    }
+    let period = entry.period();
+    let found = match super::tzdata::peer_for(state, &name, zone, period, tick, now).await {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::warn!(schedule = %name, %tick, error = %e, "could not check the tzdata of other replicas; holding the tick");
+            entry.back_off(now);
+            return TzdataStep::Done;
+        }
+    };
+    let Some((peer, runs)) = found else {
+        return TzdataStep::Fire;
+    };
+    let schedule = &entry.schedule;
+    let ours_at = |t: DateTime<Utc>| {
+        schedule
+            .try_next_after(t - chrono::Duration::seconds(1))
+            .ok()
+            .flatten()
+            == Some(t)
+    };
+    match super::tzdata::decide(
+        &peer,
+        tick,
+        now,
+        &runs,
+        faucet_core::time::TzdataVersion::current(),
+        ours_at,
+    ) {
+        super::tzdata::Decision::Delegated { run_id } => {
+            tracing::info!(schedule = %name, %tick, run = %run_id, peer = %peer.who(), "tick run by a replica on other tzdata; not starting it here");
+            metrics::tick(&name, "skipped");
+            status::record_tick(&*history, &name, &entry.last_tick(tick)).await;
+            status::record(
+                &*history,
+                &name,
+                tick,
+                Outcome::Skipped(format!(
+                    "run {run_id} started this slot on a replica with other tzdata"
+                )),
+            )
+            .await;
+            if let Some(range) = entry.advance(tick, now)
+                && let Err(e) =
+                    status::update(&*history, &name, |d| d.add_missed(range.clone())).await
+            {
+                tracing::warn!(schedule = %name, error = %e, "could not record missed ticks");
+            }
+            TzdataStep::Done
+        }
+        super::tzdata::Decision::Hold { until } => {
+            let why = format!(
+                "held until {until}: {} may run this slot at another instant (tzdata differs)",
+                peer.who()
+            );
+            if entry.noted_tzdata_hold != Some(tick) {
+                entry.noted_tzdata_hold = Some(tick);
+                tracing::warn!(schedule = %name, %tick, peer = %peer.who(), %until, "holding the tick while a replica on other tzdata may run it");
+                metrics::tick(&name, "held_tzdata");
+                status::record(&*history, &name, tick, Outcome::HeldTzdata(why)).await;
+            }
+            let poll = now + chrono::Duration::from_std(TZDATA_POLL).unwrap_or_default();
+            entry.retry_at = Some(poll.min(until));
+            TzdataStep::Done
+        }
+        super::tzdata::Decision::FireLate => {
+            tracing::warn!(schedule = %name, %tick, peer = %peer.who(), "no replica ran the held tick; running it late");
+            TzdataStep::FireLate
+        }
+    }
+}
+
+/// How often a tick held for another tzdata release looks for that run.
+pub const TZDATA_POLL: Duration = Duration::from_secs(30);
+
+/// A held tick that ran late, recorded as a missed range so the missed-tick
+/// metric and alert see it (#1116).
+async fn record_late(
+    history: &dyn RunHistory,
+    name: &str,
+    tick: DateTime<Utc>,
+    now: DateTime<Utc>,
+) {
+    metrics::missed(name, 1);
+    let range = MissedRange {
+        from: tick,
+        to: tick,
+        count: 1,
+        reason: "held while a replica on other tzdata was live; nobody ran it, so it ran late"
+            .to_string(),
+        caught_up: true,
+        recorded_at: now,
+    };
+    if let Err(e) = status::update(history, name, |d| d.add_missed(range.clone())).await {
+        tracing::warn!(schedule = %name, error = %e, "could not record missed ticks");
+    }
+}
+
 /// Fire `entry`'s due tick (if any) and fold the outcome in.
 pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
     let history = state.history();
@@ -501,8 +698,21 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
         }
         return;
     }
-    let result =
-        fire::fire_tick(state, &entry.spec, entry.owner.as_deref(), tick, now, &opts).await;
+    let late = match hold_for_tzdata(state, entry, tick, now).await {
+        TzdataStep::Fire => false,
+        TzdataStep::FireLate => true,
+        TzdataStep::Done => return,
+    };
+    let firing: std::pin::Pin<Box<dyn std::future::Future<Output = fire::TickResult> + Send + '_>> =
+        Box::pin(fire::fire_tick(
+            state,
+            &entry.spec,
+            entry.owner.as_deref(),
+            tick,
+            now,
+            &opts,
+        ));
+    let result = firing.await;
     let outcome = result.outcome();
     let targets = target_outcomes(&result);
     match &outcome {
@@ -542,7 +752,10 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
             metrics::healthy(&name, false);
             tracing::warn!(schedule = %name, %tick, errors = ?errors, "schedule tick refused; moving on to the next tick");
         }
-        Outcome::NeedsApproval(_) => {}
+        Outcome::NeedsApproval(_) | Outcome::HeldTzdata(_) => {}
+    }
+    if late && !matches!(outcome, Outcome::Retrying(_) | Outcome::Waiting(_)) {
+        record_late(&*history, &name, tick, now).await;
     }
     status::record_tick(&*history, &name, &entry.last_tick(tick)).await;
     status::record_with_targets(&*history, &name, tick, outcome, &targets).await;
@@ -599,6 +812,20 @@ async fn step_task(state: ServerState, mut entry: Entry, limit: Duration) -> (St
     (name, out)
 }
 
+/// One WARN at startup naming every schedule this release refuses (#1111):
+/// a stored cron an older parser accepted stops ticking after an upgrade.
+fn warn_invalid_at_start(names: &[String]) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    tracing::warn!(
+        schedules = ?names,
+        "{} schedule(s) do not validate with this release and will not tick; fix or delete them (the release notes list the cron forms it refuses)",
+        names.len()
+    );
+    true
+}
+
 /// Run the loop until `shutdown`.
 #[allow(clippy::disallowed_methods)] // a runtime timer, not a connector backend call
 pub async fn run(state: ServerState, shutdown: CancellationToken) {
@@ -613,11 +840,17 @@ pub async fn run_with(state: ServerState, shutdown: CancellationToken, step_limi
     let mut scheduler = Scheduler::default();
     let mut steps: tokio::task::JoinSet<(String, Stepped)> = tokio::task::JoinSet::new();
     let mut reload_at = Utc::now();
+    let mut first_load = true;
     loop {
         let now = Utc::now();
         if now >= reload_at {
             match wanted(&state).await {
-                Ok(w) => scheduler.reconcile(w, now),
+                Ok(w) => {
+                    scheduler.reconcile(w, now);
+                    if std::mem::take(&mut first_load) {
+                        warn_invalid_at_start(&scheduler.invalid_names());
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "could not reload schedules; keeping the current set")
                 }
@@ -761,12 +994,12 @@ mod tests {
 
     #[test]
     fn a_dense_schedule_over_a_long_outage_finds_the_latest_tick() {
-        let e = dense("* * * * * *", at("2026-09-26T00:00:00Z"));
+        let mut e = dense("* * * * * *", at("2026-09-26T00:00:00Z"));
         let now = at("2026-09-28T00:00:00Z");
         let (latest, missed) = e.latest_due(at("2026-09-26T00:00:00Z"), now);
         assert_eq!(latest, Some(at("2026-09-28T00:00:00Z")));
         assert_eq!(missed, MAX_SCAN);
-        let yearly = entry("0 0 29 2 *", at("2026-09-26T00:00:00Z"));
+        let mut yearly = entry("0 0 29 2 *", at("2026-09-26T00:00:00Z"));
         assert!(yearly.latest_before(at("2026-09-26T00:00:00Z")).is_some());
         let mut big = dense("* * * * * *", at("2026-09-26T00:00:00Z"));
         let r = big.settle_missed(at("2026-09-26T00:00:00Z"), now, MAX_SCAN, now, "while down");
@@ -905,6 +1138,197 @@ mod tests {
                 assert!(e.retry_at.is_some(), "a held tick is looked at again");
             }
         }
+    }
+
+    /// A server on a shared (SQL) history, backed in memory for the test.
+    async fn shared_state() -> ServerState {
+        let mut config = crate::serve::test_support::test_config();
+        config.history = crate::serve::config::HistoryBackendSpec::Sqlite("sqlite::memory:".into());
+        let state = crate::serve::test_support::state_from(&config);
+        assert!(state.persistent_history());
+        crate::templates::register(
+            &state.history(),
+            crate::templates::store::RegisterRequest {
+                id: Some("t".into()),
+                body: "version: 1\nkind: pipeline\nname: t\npipeline:\n  source: { type: csv, config: { path: in.csv } }\n  sink: { type: stdout }\ntests:\n  suite:\n    auto: { defaults_baseline: true }\n".into(),
+                format: crate::serve::load::ConfigFormat::Yaml,
+                description: None,
+                tags: Vec::new(),
+                launch: true,
+                created_by: None,
+            },
+        )
+        .await
+        .unwrap();
+        state
+    }
+
+    fn vancouver(now: DateTime<Utc>) -> Entry {
+        let s: ScheduleSpec = serde_json::from_value(json!({
+            "name": "morning", "cron": "0 9 * * *", "timezone": "America/Vancouver",
+            "catch_up": true, "template": {"id": "t"}
+        }))
+        .unwrap();
+        let compiled = super::super::validate::validate(&s).unwrap();
+        let mut e = Entry::new(s, None, Source::File, compiled, now);
+        e.resumed = true;
+        e
+    }
+
+    /// A run an older release (tzdata 2025b, no stamp) started for `tick`.
+    async fn old_release_run(state: &ServerState, id: &str, tick: &str) {
+        let labels = BTreeMap::from([
+            (fire::LABEL_SCHEDULE.to_string(), "morning".to_string()),
+            (fire::LABEL_TICK.to_string(), tick.to_string()),
+        ]);
+        let mut r =
+            crate::serve::history::RunRecord::queued(id.into(), None, labels, None, at(tick));
+        r.tzdata = None;
+        r.status = crate::serve::history::RunStatus::Completed;
+        state.history().upsert(&r).await.unwrap();
+    }
+
+    async fn runs_of(state: &ServerState) -> Vec<crate::serve::history::RunRecord> {
+        super::super::tzdata::recent_runs(state, "morning", at("2026-11-01T00:00:00Z"))
+            .await
+            .unwrap()
+    }
+
+    /// #1116: while a 2025b replica fires Vancouver's 09:00 at 17:00Z, a
+    /// newer one holds its 16:00Z tick, leaves the slot to that run, and a
+    /// restart with catch_up never replays it.
+    #[tokio::test]
+    async fn a_tick_an_older_replica_ran_is_delegated_and_never_replayed() {
+        let state = shared_state().await;
+        old_release_run(&state, "old-1", "2026-11-23T17:00:00Z").await;
+        let mut e = vancouver(at("2026-11-24T12:00:00Z"));
+        let tick = at("2026-11-24T16:00:00Z");
+        assert_eq!(e.due(tick), Some(tick));
+        step(&state, &mut e, tick).await;
+        assert_eq!(
+            outcome(&state, "morning").await.as_deref(),
+            Some("held_tzdata")
+        );
+        assert_eq!(runs_of(&state).await.len(), 1, "nothing started while held");
+        old_release_run(&state, "old-2", "2026-11-24T17:00:00Z").await;
+        let later = at("2026-11-24T17:00:30Z");
+        step(&state, &mut e, later).await;
+        assert_eq!(outcome(&state, "morning").await.as_deref(), Some("skipped"));
+        assert_eq!(
+            runs_of(&state).await.len(),
+            2,
+            "the older replica's run is the slot's run"
+        );
+        assert_eq!(e.next, Some(at("2026-11-25T16:00:00Z")));
+        let mut restarted = vancouver(at("2026-11-25T10:00:00Z"));
+        restarted.resumed = false;
+        step(&state, &mut restarted, at("2026-11-25T10:00:00Z")).await;
+        assert!(restarted.resumed);
+        assert_eq!(restarted.next, Some(at("2026-11-25T16:00:00Z")));
+        assert!(
+            status::read(&*state.history(), "morning")
+                .await
+                .missed
+                .is_empty()
+        );
+    }
+
+    /// #1116: when the older replica stops firing, the held tick runs at
+    /// `tick + 1 h + 5 min` and is recorded as a missed range.
+    #[tokio::test]
+    async fn a_held_tick_nobody_ran_runs_late() {
+        let state = shared_state().await;
+        old_release_run(&state, "old-1", "2026-11-23T17:00:00Z").await;
+        let mut e = vancouver(at("2026-11-24T12:00:00Z"));
+        let tick = at("2026-11-24T16:00:00Z");
+        step(&state, &mut e, tick).await;
+        assert_eq!(e.retry_at, Some(at("2026-11-24T16:00:30Z")));
+        step(&state, &mut e, at("2026-11-24T17:04:59Z")).await;
+        assert_eq!(runs_of(&state).await.len(), 1);
+        e.retry_at = None;
+        step(&state, &mut e, at("2026-11-24T17:05:00Z")).await;
+        let runs = runs_of(&state).await;
+        assert_eq!(runs.len(), 2, "it ran late");
+        let mine = runs.iter().find(|r| r.run_id != "old-1").unwrap();
+        assert_eq!(mine.labels[fire::LABEL_TICK], "2026-11-24T16:00:00Z");
+        assert_eq!(
+            mine.tzdata.as_deref(),
+            Some(faucet_core::time::TZDATA_VERSION)
+        );
+        let missed = status::read(&*state.history(), "morning").await.missed;
+        assert_eq!(missed.len(), 1);
+        assert!(missed[0].reason.contains("ran late"), "{:?}", missed[0]);
+    }
+
+    /// #1116: a tick outside every changed period, or with no older replica
+    /// about, fires at once.
+    #[tokio::test]
+    async fn ticks_fire_at_once_without_an_older_replica_or_outside_changed_periods() {
+        let state = shared_state().await;
+        let mut e = vancouver(at("2026-11-24T12:00:00Z"));
+        step(&state, &mut e, at("2026-11-24T16:00:00Z")).await;
+        assert_eq!(outcome(&state, "morning").await.as_deref(), Some("started"));
+        let state = shared_state().await;
+        old_release_run(&state, "old-1", "2026-06-30T16:00:00Z").await;
+        let mut summer = vancouver(at("2026-07-01T12:00:00Z"));
+        step(&state, &mut summer, at("2026-07-01T16:00:00Z")).await;
+        assert_eq!(outcome(&state, "morning").await.as_deref(), Some("started"));
+    }
+
+    /// #1116: a single server upgraded on the default (locked) history file
+    /// does not hold against the runs its own older release recorded.
+    #[tokio::test]
+    async fn a_single_upgraded_server_fires_on_time_past_its_own_unstamped_runs() {
+        let state = shared_state().await;
+        state.set_exclusive_history(true);
+        old_release_run(&state, "old-1", "2026-11-23T17:00:00Z").await;
+        let mut e = vancouver(at("2026-11-24T12:00:00Z"));
+        step(&state, &mut e, at("2026-11-24T16:00:00Z")).await;
+        assert_eq!(outcome(&state, "morning").await.as_deref(), Some("started"));
+    }
+
+    /// #1116: on that file, an unstamped run recorded after this server
+    /// started still comes from a live older release, and the tick is held.
+    #[tokio::test]
+    async fn an_unstamped_run_after_start_still_holds_on_an_exclusive_history() {
+        let state = shared_state().await;
+        state.set_exclusive_history(true);
+        let labels = BTreeMap::from([
+            (fire::LABEL_SCHEDULE.to_string(), "morning".to_string()),
+            (
+                fire::LABEL_TICK.to_string(),
+                "2026-11-23T17:00:00Z".to_string(),
+            ),
+        ]);
+        let mut r = crate::serve::history::RunRecord::queued(
+            "old-live".into(),
+            None,
+            labels,
+            None,
+            state.cluster().started_at() + chrono::Duration::seconds(1),
+        );
+        r.tzdata = None;
+        state.history().upsert(&r).await.unwrap();
+        let mut e = vancouver(at("2026-11-24T12:00:00Z"));
+        step(&state, &mut e, at("2026-11-24T16:00:00Z")).await;
+        assert_eq!(
+            outcome(&state, "morning").await.as_deref(),
+            Some("held_tzdata")
+        );
+    }
+
+    /// #1116: a tick held after a retry back-off is still recorded as held.
+    #[tokio::test]
+    async fn a_tick_held_after_a_back_off_is_recorded() {
+        let state = shared_state().await;
+        old_release_run(&state, "old-1", "2026-11-23T17:00:00Z").await;
+        let mut e = vancouver(at("2026-11-24T12:00:00Z"));
+        e.back_off(at("2026-11-24T15:59:00Z"));
+        step(&state, &mut e, at("2026-11-24T16:00:00Z")).await;
+        assert_eq!(
+            outcome(&state, "morning").await.as_deref(),
+            Some("held_tzdata")
+        );
     }
 
     #[tokio::test]
@@ -1103,12 +1527,12 @@ mod tests {
         let mut bad = spec("0 * * * *", true);
         bad.cron = "nope".into();
         s.reconcile(vec![(bad.clone(), None, Source::Console, false)], now);
-        assert!(s.invalid.contains("nightly"));
+        assert!(s.invalid.contains_key("nightly"));
         s.reconcile(
             vec![(spec("0 * * * *", true), None, Source::Console, false)],
             now,
         );
-        assert!(!s.invalid.contains("nightly"), "valid again");
+        assert!(!s.invalid.contains_key("nightly"), "valid again");
         s.reconcile(vec![(bad, None, Source::Console, false)], now);
         s.reconcile(Vec::new(), now);
         assert!(s.invalid.is_empty());
@@ -1372,5 +1796,65 @@ mod tests {
             .await
             .expect("the loop returns once shut down")
             .unwrap();
+    }
+
+    #[test]
+    fn a_refused_schedule_is_reported_once_per_definition() {
+        let now = at("2026-09-26T10:00:00Z");
+        let mut s = Scheduler::default();
+        let mut bad = spec("0 * * * *", true);
+        bad.cron = "0 0 * * SUN-SUN".into();
+        for _ in 0..3 {
+            s.reconcile(vec![(bad.clone(), None, Source::Console, false)], now);
+        }
+        assert_eq!(s.refusals_reported, 1);
+        assert_eq!(s.invalid_names(), ["nightly"]);
+        bad.cron = "mon * * * *".into();
+        s.reconcile(vec![(bad.clone(), None, Source::Console, false)], now);
+        assert_eq!(
+            s.refusals_reported, 2,
+            "a changed definition is reported again"
+        );
+        assert!(warn_invalid_at_start(&s.invalid_names()));
+        assert!(!warn_invalid_at_start(&[]));
+    }
+
+    #[test]
+    fn a_failed_search_stops_the_entry_until_a_reload_computes_again() {
+        use ::metrics::with_local_recorder;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let far = at("9999-12-31T00:00:00Z");
+        let now = at("2026-09-26T10:00:00Z");
+        let mut s = Scheduler::default();
+        with_local_recorder(&recorder, || {
+            let e = entry("0 0 * * *", far);
+            assert!(e.compute_error().is_some());
+            assert_eq!(e.next, None);
+            assert_eq!(e.due(far), None, "a failed entry is never due");
+            let mut e = e;
+            // Searching again from the same place fails again: counted once.
+            assert_eq!(e.next_of(far), None);
+            assert_eq!(e.latest_due(far, far), (None, 0));
+            let fp = e.fingerprint.clone();
+            s.entries.insert("nightly".into(), e);
+            // The same definition reloads: the entry searches again from now.
+            let wanted = vec![(spec("0 0 * * *", true), None, Source::File, false)];
+            assert_eq!(fingerprint(&wanted[0].0, None, false), fp);
+            s.reconcile(wanted.clone(), now);
+            let e = &s.entries["nightly"];
+            assert_eq!(e.compute_error(), None, "recovered");
+            assert_eq!(e.next, Some(at("2026-09-27T00:00:00Z")));
+            s.reconcile(wanted, now);
+        });
+        let counted: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, _, _, _)| k.key().name() == "faucet_serve_schedule_compute_errors_total")
+            .map(|(_, _, _, v)| v)
+            .collect();
+        assert_eq!(counted, [DebugValue::Counter(1)]);
     }
 }

@@ -15,10 +15,15 @@ pub mod config;
 #[cfg(feature = "catalog-hms")]
 pub mod hms;
 #[cfg(feature = "storage-opendal")]
+pub mod preflight;
+#[cfg(feature = "storage-opendal")]
 pub mod storage_factory;
 
 pub use catalog::build_catalog;
-pub use config::{CatalogConfig, CatalogInner, WarehouseScheme, warehouse_scheme};
+pub use config::{
+    AccessDelegation, CatalogConfig, CatalogInner, WarehouseScheme, holds_vended_credentials,
+    warehouse_scheme,
+};
 #[cfg(feature = "catalog-hms")]
 pub use hms::{HMS_LOCK_TIMEOUT_PROP, HmsCommitCatalog};
 #[cfg(feature = "storage-opendal")]

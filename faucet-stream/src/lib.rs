@@ -107,6 +107,7 @@
 //! | `contract` | Data contracts |
 //! | `masking` | PII detection and column masking |
 //! | `policy` | Data-flow policies |
+//! | `time-zones` | Named IANA time zones (`faucet_core::time::Zone`) from bundled tzdata |
 //! | `lineage`, `lineage-kafka` | OpenLineage emission (Kafka transport with the second) |
 //! | `transform-sql` | Embedded DuckDB SQL transform |
 //! | `transform-wasm` | WebAssembly transform |

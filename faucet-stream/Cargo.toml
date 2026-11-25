@@ -263,6 +263,8 @@ contract = ["faucet-core/contract"]
 masking = ["faucet-core/masking"]
 ## Data-flow policies (#702): classification-driven destination rules.
 policy = ["faucet-core/policy"]
+# Named IANA zones (`faucet_core::time::Zone`, jiff's bundled tzdata, #1116).
+time-zones = ["faucet-core/time-zones"]
 ## OpenLineage emission (`lineage:` config block). `lineage-kafka` adds the
 ## Kafka transport. Forwarded to `faucet-lineage`.
 lineage = ["dep:faucet-lineage"]
@@ -280,7 +282,7 @@ transform-wasm = ["dep:faucet-transform-wasm"]
 ## pulls a connector itself.
 encryption = ["faucet-core/encryption", "faucet-sink-jsonl?/encryption", "faucet-sink-file?/encryption", "faucet-source-file?/encryption", "faucet-sink-s3?/encryption", "faucet-sink-gcs?/encryption", "faucet-sink-azure-blob?/encryption", "faucet-sink-sftp?/encryption"]
 ## Every connector and state backend.
-full = ["source", "sink", "state", "auth", "registry", "kafka-schema-registry", "compression", "arrow", "quality", "quality-jsonschema", "contract", "masking", "policy", "lineage", "lineage-kafka", "transform-sql", "transform-wasm", "transform-cdc-unwrap", "encryption", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "google-sa", "source-rest-excel", "sink-clickhouse-staging", "sink-mssql-staging", "sink-databricks-staging", "source-xml-excel", "file-formats", "transforms", "source-iceberg-glue", "source-iceberg-hms", "source-iceberg-sql", "sink-iceberg-glue", "sink-iceberg-hms", "sink-iceberg-sql"]
+full = ["source", "sink", "state", "auth", "registry", "kafka-schema-registry", "compression", "arrow", "time-zones", "quality", "quality-jsonschema", "contract", "masking", "policy", "lineage", "lineage-kafka", "transform-sql", "transform-wasm", "transform-cdc-unwrap", "encryption", "delta-s3", "delta-azure", "delta-gcs", "mtls", "rabbitmq-tls", "oauth1", "google-sa", "source-rest-excel", "sink-clickhouse-staging", "sink-mssql-staging", "sink-databricks-staging", "source-xml-excel", "file-formats", "transforms", "source-iceberg-glue", "source-iceberg-hms", "source-iceberg-sql", "sink-iceberg-glue", "sink-iceberg-hms", "sink-iceberg-sql"]
 
 ## Individual source connectors.
 source-rest = ["dep:faucet-source-rest", "faucet-registry?/source-rest"]
@@ -691,7 +693,7 @@ required-features = ["source-file", "file-format-csv", "sink-bigquery"]
 # Every feature but bundled DuckDB, librdkafka and Oracle (docs.rs OOM, #794); see scripts/full-feature-coverage.py.
 features = [
     "arrow", "compression", "contract", "delta-azure", "delta-gcs", "delta-s3", "encryption",
-    "file-formats", "google-sa", "lineage", "masking", "mtls", "oauth1", "policy",
+    "file-formats", "google-sa", "lineage", "masking", "mtls", "oauth1", "policy", "time-zones",
     "quality-jsonschema", "rabbitmq-tls", "registry", "sink-azure-blob", "sink-bigquery",
     "sink-clickhouse-staging", "sink-csv", "sink-databricks-staging", "sink-delta",
     "sink-dynamodb", "sink-elasticsearch", "sink-file", "sink-gcs", "sink-http",

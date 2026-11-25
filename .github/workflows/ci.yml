@@ -196,6 +196,34 @@ jobs:
   # cli/examples files that must exist, carry no version facts, and their
   # plugin version is the faucet-cli version. Every connector, mode and
   # top-level block must have a validated example in cli/examples/.
+  tzdata:
+    name: Vendored tzdata
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: "1.99.1"
+      - name: Cargo.lock uses vendor/chrono-tz and its tzdata is the pinned release (#1118)
+        run: |
+          python3 scripts/test_tzdata_check.py
+          python3 scripts/tzdata-check.py
+      - name: Regenerate vendor/chrono-tz/src/prebuilt from tz/ and diff byte for byte
+        working-directory: vendor/chrono-tz
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/chrono-tz-target
+        run: |
+          cargo test --locked --test codegen
+          git diff --exit-code -- src/prebuilt
+
   skills:
     name: Skills and examples
     runs-on: ubuntu-latest

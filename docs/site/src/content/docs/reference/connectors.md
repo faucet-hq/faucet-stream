@@ -465,6 +465,21 @@ nuances (e.g. SQLite widening is a no-op; Elasticsearch can only add fields).
   a request that fails it gets `401` and is not stored. See the
   [webhook README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/source/webhook).
 
+- **Iceberg sink and source — vended storage credentials.** On a REST catalog
+  that vends storage credentials, `catalog.properties` names only how to
+  reach the store (`s3.endpoint`, `s3.region`, `s3.path-style-access`);
+  `catalog.access_delegation: vended_credentials` asks a catalog that vends
+  only on request. The sink keeps the credentials across commits and takes
+  fresh ones from the catalog before each new data-file writer (one more
+  catalog `GET` per flush cycle; the table's metadata is kept, so a lagging
+  catalog cannot bring an older schema back). Before the first write or read
+  the table's storage is checked once (S3 and GCS locations): no credentials
+  at all, or static S3 keys mixed with a vended session token, fail before any
+  data moves; any other probe failure is a warning. `faucet doctor` shows it
+  as a `storage` probe. S3 remote signing is refused at load. A
+  `catalog.properties` name no catalog reads logs one warning. See the
+  [sink README](https://github.com/faucet-hq/faucet-stream/tree/main/crates/sink/iceberg#vended-credentials).
+
 ## Authentication at a glance
 
 | Family | Auth options |

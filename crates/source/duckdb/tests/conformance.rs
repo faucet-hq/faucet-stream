@@ -129,3 +129,30 @@ async fn conformance_declared_columns_truthful() {
     .expect("source");
     faucet_conformance::assert_declared_columns_truthful(&source).await;
 }
+
+#[tokio::test]
+async fn single_precision_values_render_their_shortest_form() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("f.duckdb");
+    {
+        let conn = Connection::open(&path).expect("open");
+        conn.execute_batch("CREATE TABLE f (id INTEGER, v FLOAT)")
+            .expect("create");
+        for (i, v) in faucet_conformance::fidelity::single_precision_corpus()
+            .into_iter()
+            .enumerate()
+        {
+            conn.execute("INSERT INTO f VALUES (?, ?)", duckdb::params![i as i32, v])
+                .expect("insert");
+        }
+    }
+    let source = DuckdbSource::new(DuckdbSourceConfig::new(
+        path.to_string_lossy().into_owned(),
+        "SELECT v FROM f ORDER BY id",
+    ))
+    .await
+    .expect("source");
+    let rows = faucet_core::Source::fetch_all(&source).await.expect("read");
+    let read: Vec<serde_json::Value> = rows.iter().map(|r| r["v"].clone()).collect();
+    faucet_conformance::fidelity::assert_single_precision_read(&read);
+}

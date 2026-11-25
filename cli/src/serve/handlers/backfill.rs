@@ -25,7 +25,7 @@ use crate::backfill::plan::{parse_boundary, parse_window, range_hash, substitute
 use crate::backfill::spec::{has_scoping_tokens, parse_timezone};
 use crate::serve::error::ServeError;
 use crate::serve::rbac::AuthContext;
-use crate::serve::runner::{ConfigFormatWire, SubmitRequest};
+use crate::serve::runner::{ConfigFormatWire, IDEMPOTENCY_CONFLICT, SubmitRequest};
 use crate::serve::state::ServerState;
 use axum::Json;
 use axum::extract::{Extension, State};
@@ -35,7 +35,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 /// `POST /v1/backfill` request body.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct BackfillSubmitRequest {
     /// The pipeline config document (same body shape as `POST /v1/runs`).
     pub config: String,
@@ -99,6 +99,126 @@ fn submitted_range_key(base_name: &str, hash: &str) -> String {
     faucet_core::StateKey::pipeline(base_name)
         .with_suffix(faucet_core::KeySuffix::ServeBackfill(hash.to_owned()))
         .render()
+}
+
+fn range_descriptor(
+    from: chrono::DateTime<chrono::FixedOffset>,
+    to: chrono::DateTime<chrono::FixedOffset>,
+    window: Option<crate::backfill::plan::WindowStep>,
+    base_name: &str,
+) -> String {
+    format!(
+        "time|{}|{}|{}|{base_name}",
+        from.to_rfc3339(),
+        to.to_rfc3339(),
+        window
+            .map(|w| w.to_string())
+            .unwrap_or_else(|| "whole".into()),
+    )
+}
+
+fn unit_request(
+    req: &BackfillSubmitRequest,
+    config: String,
+    name: &str,
+    labels: BTreeMap<String, String>,
+    unit: &crate::backfill::plan::BackfillUnit,
+    key: String,
+) -> SubmitRequest {
+    SubmitRequest {
+        config,
+        config_format: ConfigFormatWire::Yaml,
+        name: Some(name.to_string()),
+        labels,
+        timeout_secs: req.timeout_secs,
+        doctor_first: false,
+        callback: None,
+        idempotency_key: Some(key),
+        clock: Some(unit.start.to_rfc3339()),
+        concurrency: None,
+        require_approval: false,
+        reason: None,
+        budget: None,
+        approved_change: None,
+        selection: None,
+        depends_on: None,
+        pool: req.pool.clone(),
+        trusted_config: false,
+        server_file: false,
+        sealed_params: None,
+        caller_fields: Default::default(),
+        server_key: true,
+        feed: None,
+        pipeline_name_suffix: None,
+    }
+}
+
+/// The label carrying a unit's planned end (UTC), so a resume can tell a unit
+/// run over a shorter window by a release on older tzdata (#1116).
+pub const LABEL_UNIT_END: &str = "backfill_unit_end";
+
+fn unit_end_label(unit: &crate::backfill::plan::BackfillUnit) -> String {
+    unit.end
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+}
+
+/// What the run already stored under a unit's key says about the unit.
+#[derive(Debug, PartialEq, Eq)]
+enum PriorUnit {
+    /// It ran the same window: report it.
+    Covers(String),
+    /// It ran another window: submit the unit under a key naming its end.
+    Differs,
+    /// No such run, or it differs in something other than the window.
+    Unknown,
+}
+
+async fn prior_unit_run(
+    state: &ServerState,
+    hash: &str,
+    key: &str,
+    unit: &crate::backfill::plan::BackfillUnit,
+    zone: faucet_core::time::Zone,
+) -> Result<PriorUnit, ServeError> {
+    use crate::serve::history::{ListFilter, labels::LabelFilter};
+    let filter = ListFilter {
+        labels: vec![
+            LabelFilter {
+                key: "backfill".into(),
+                value: Some(hash.into()),
+            },
+            LabelFilter {
+                key: "backfill_unit".into(),
+                value: Some(unit.id.clone()),
+            },
+        ],
+        limit: 100,
+        ..ListFilter::default()
+    };
+    let page = state.history().list(&filter).await?;
+    let scoped = format!(":{key}");
+    let Some(prior) = page.runs.into_iter().find(|r| {
+        r.idempotency_key
+            .as_deref()
+            .is_some_and(|k| k == key || k.ends_with(&scoped))
+    }) else {
+        return Ok(PriorUnit::Unknown);
+    };
+    Ok(match prior.labels.get(LABEL_UNIT_END) {
+        Some(end) if *end == unit_end_label(unit) => PriorUnit::Unknown,
+        Some(_) => PriorUnit::Differs,
+        None if zone.is_fixed()
+            || !faucet_core::time::changed_since_2025b::overlaps(
+                zone.name(),
+                unit.start.timestamp(),
+                unit.end.timestamp(),
+            ) =>
+        {
+            PriorUnit::Covers(prior.run_id)
+        }
+        None => PriorUnit::Differs,
+    })
 }
 
 fn unit_idempotency_key(hash: &str, generation: u32, unit: &str) -> String {
@@ -229,7 +349,7 @@ pub async fn submit_backfill(
     let spec = loaded.cfg.backfill.clone().unwrap_or_default();
     let tz = match req.timezone.as_deref().or(spec.timezone.as_deref()) {
         Some(name) => parse_timezone(name).map_err(|e| ServeError::BadConfig(e.to_string()))?,
-        None => chrono_tz::Tz::UTC,
+        None => faucet_core::time::ChronoZone::UTC,
     };
     let window = match req.window.as_deref().or(spec.window.as_deref()) {
         Some(w) => Some(parse_window(w).map_err(|e| ServeError::BadConfig(e.to_string()))?),
@@ -272,14 +392,7 @@ pub async fn submit_backfill(
         .clone()
         .or_else(|| loaded.cfg.name.clone())
         .unwrap_or_else(|| "pipeline".to_string());
-    let descriptor = format!(
-        "time|{}|{}|{}|{base_name}",
-        from.to_rfc3339(),
-        to.to_rfc3339(),
-        window
-            .map(|w| w.to_string())
-            .unwrap_or_else(|| "whole".into()),
-    );
+    let descriptor = range_descriptor(from, to, window, &base_name);
     let hash = range_hash(&descriptor);
 
     let RangeGuard {
@@ -322,43 +435,54 @@ pub async fn submit_backfill(
         let unit_name = unit_run_name(&base_name, &hash, &unit.id);
         let unit_doc = rewrite_unit_doc(&doc, &unit, &unit_name)
             .map_err(|e| ServeError::BadConfig(e.to_string()))?;
+        let end = unit_end_label(&unit);
         let mut labels = req.labels.clone();
         labels.insert("backfill".into(), hash.clone());
         labels.insert("backfill_unit".into(), unit.id.clone());
-        let submit = SubmitRequest {
-            config: unit_doc,
-            config_format: ConfigFormatWire::Yaml,
-            name: Some(unit_name),
-            labels,
-            timeout_secs: req.timeout_secs,
-            doctor_first: false,
-            callback: None,
-            idempotency_key: Some(unit_idempotency_key(&hash, generation, &unit.id)),
-            clock: Some(unit.start.to_rfc3339()),
-            concurrency: None,
-            require_approval: false,
-            reason: None,
-            budget: None,
-            approved_change: None,
-            selection: None,
-            depends_on: None,
-            pool: req.pool.clone(),
-            trusted_config: false,
-            server_file: false,
-            sealed_params: None,
-            caller_fields: Default::default(),
-            server_key: true,
-            feed: None,
-            pipeline_name_suffix: None,
+        labels.insert(LABEL_UNIT_END.into(), end.clone());
+        let key = unit_idempotency_key(&hash, generation, &unit.id);
+        let submit = |key: String| {
+            unit_request(
+                &req,
+                unit_doc.clone(),
+                &unit_name,
+                labels.clone(),
+                &unit,
+                key,
+            )
         };
-        let outcome = crate::runtime::server::submit(
-            &state,
-            &crate::runtime::Principal::caller(&state, actor.clone()),
-            submit,
-            crate::runtime::server::Approval::Standing,
-        )
-        .await
-        .and_then(|o| o.accepted());
+        let principal = crate::runtime::Principal::caller(&state, actor.clone());
+        let send = |request: SubmitRequest| {
+            crate::runtime::server::submit(
+                &state,
+                &principal,
+                request,
+                crate::runtime::server::Approval::Standing,
+            )
+        };
+        let mut outcome = send(submit(key.clone())).await.and_then(|o| o.accepted());
+        if matches!(&outcome, Err(ServeError::Conflict(m)) if m == IDEMPOTENCY_CONFLICT) {
+            match prior_unit_run(&state, &hash, &key, &unit, tz.zone()).await? {
+                PriorUnit::Covers(run_id) => {
+                    reports.push(BackfillUnitRun {
+                        unit: unit.id.clone(),
+                        start: unit.start.to_rfc3339(),
+                        end: unit.end.to_rfc3339(),
+                        status: "submitted".into(),
+                        run_id: Some(run_id),
+                        error: None,
+                    });
+                    submitted += 1;
+                    continue;
+                }
+                PriorUnit::Differs => {
+                    outcome = send(submit(format!("{key}:{end}")))
+                        .await
+                        .and_then(|o| o.accepted());
+                }
+                PriorUnit::Unknown => {}
+            }
+        }
         match outcome {
             Ok(resp) => {
                 if let Some((store, key, value)) = marker.take() {
@@ -574,7 +698,7 @@ mod tests {
 
     #[test]
     fn rewrite_substitutes_namespaces_and_forces_at_least_once() {
-        let utc: chrono_tz::Tz = "UTC".parse().unwrap();
+        let utc: faucet_core::time::ChronoZone = "UTC".parse().unwrap();
         let unit = crate::backfill::plan::BackfillUnit {
             id: "20260601T000000Z".into(),
             start: parse_boundary("2026-06-01T00:00:00Z", utc).unwrap(),
@@ -608,7 +732,7 @@ mod tests {
 
     #[test]
     fn rewrite_drops_sla_and_profiling_from_the_config_and_its_rows() {
-        let utc: chrono_tz::Tz = "UTC".parse().unwrap();
+        let utc: faucet_core::time::ChronoZone = "UTC".parse().unwrap();
         let unit = crate::backfill::plan::BackfillUnit {
             id: "20260601T000000Z".into(),
             start: parse_boundary("2026-06-01T00:00:00Z", utc).unwrap(),
@@ -646,7 +770,7 @@ mod tests {
 
     #[test]
     fn rewrite_rejects_unknown_token() {
-        let utc: chrono_tz::Tz = "UTC".parse().unwrap();
+        let utc: faucet_core::time::ChronoZone = "UTC".parse().unwrap();
         let unit = crate::backfill::plan::BackfillUnit {
             id: "u".into(),
             start: parse_boundary("2026-06-01", utc).unwrap(),
@@ -654,5 +778,129 @@ mod tests {
         };
         let doc = json!({"pipeline": {"source": {"config": {"q": "${backfill.oops}"}}}});
         assert!(rewrite_unit_doc(&doc, &unit, "n").is_err());
+    }
+
+    /// Submit a unit exactly as a release before #1116 did: no end label.
+    async fn old_release_unit(
+        state: &ServerState,
+        req: &BackfillSubmitRequest,
+        unit: &crate::backfill::plan::BackfillUnit,
+        hash: &str,
+    ) -> Result<String, ServeError> {
+        let doc: Value = crate::yaml::from_str(&req.config).unwrap();
+        let name = unit_run_name("orders", hash, &unit.id);
+        let config = rewrite_unit_doc(&doc, unit, &name).unwrap();
+        let labels = BTreeMap::from([
+            ("backfill".to_string(), hash.to_string()),
+            ("backfill_unit".to_string(), unit.id.clone()),
+        ]);
+        let request = unit_request(
+            req,
+            config,
+            &name,
+            labels,
+            unit,
+            unit_idempotency_key(hash, 0, &unit.id),
+        );
+        crate::runtime::server::submit(
+            state,
+            &crate::runtime::Principal::caller(state, AuthContext::system("old-release")),
+            request,
+            crate::runtime::server::Approval::Standing,
+        )
+        .await
+        .and_then(|o| o.accepted())
+        .map(|r| r.run_id)
+    }
+
+    fn day_request(tz: &str, from: &str, to: &str) -> BackfillSubmitRequest {
+        let out = std::env::temp_dir().join(format!("faucet-1116-{}", uuid::Uuid::new_v4()));
+        serde_json::from_value(json!({
+            "config": format!("version: 1\nname: orders\npipeline:\n  source:\n    type: rest\n    config:\n      url: \"http://127.0.0.1:9/o?s=${{backfill.start}}&e=${{backfill.end}}\"\n  sink:\n    type: jsonl\n    config:\n      path: \"{}/out-${{backfill.unit}}.jsonl\"\n", out.display()),
+            "from": from,
+            "to": to,
+            "window": "1d",
+            "timezone": tz,
+        }))
+        .unwrap()
+    }
+
+    fn planned(req: &BackfillSubmitRequest) -> (String, crate::backfill::plan::BackfillUnit) {
+        let tz: faucet_core::time::ChronoZone = req.timezone.as_deref().unwrap().parse().unwrap();
+        let from = parse_boundary(&req.from, tz).unwrap();
+        let to = parse_boundary(&req.to, tz).unwrap();
+        let window = parse_window(req.window.as_deref().unwrap()).unwrap();
+        let units = crate::backfill::plan::plan_windows(from, to, Some(window), tz).unwrap();
+        (
+            range_hash(&range_descriptor(from, to, Some(window), "orders")),
+            units[0].clone(),
+        )
+    }
+
+    async fn post(
+        state: &ServerState,
+        req: BackfillSubmitRequest,
+    ) -> Result<BackfillSubmitResponse, ServeError> {
+        submit_backfill(
+            State(state.clone()),
+            Extension(AuthContext::system("test")),
+            Json(req),
+        )
+        .await
+        .map(|(_, Json(r))| r)
+    }
+
+    #[tokio::test]
+    async fn a_legacy_unit_run_over_a_window_that_changed_is_run_again() {
+        let state = crate::serve::test_support::test_state();
+        let req = day_request("Africa/Casablanca", "2026-09-20", "2026-09-21");
+        let (hash, unit) = planned(&req);
+        assert_eq!(
+            unit.end.with_timezone(&chrono::Utc).to_rfc3339(),
+            "2026-09-21T00:00:00+00:00"
+        );
+        let legacy = old_release_unit(&state, &req, &unit, &hash).await.unwrap();
+        let out = post(&state, req).await.unwrap();
+        assert_eq!(out.backfill, hash);
+        let run = out.units[0].run_id.clone().unwrap();
+        assert_ne!(run, legacy, "the window that grew is read again");
+        let rec = state.history().get(&run).await.unwrap().unwrap();
+        assert_eq!(
+            rec.idempotency_key.as_deref(),
+            Some(format!("backfill:{hash}:20260919T230000Z:2026-09-21T00:00:00Z").as_str())
+        );
+        assert_eq!(rec.labels[LABEL_UNIT_END], "2026-09-21T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn a_legacy_unit_run_in_utc_is_reported_not_run_again() {
+        let state = crate::serve::test_support::test_state();
+        let req = day_request("UTC", "2026-06-01", "2026-06-02");
+        let (hash, unit) = planned(&req);
+        let legacy = old_release_unit(&state, &req, &unit, &hash).await.unwrap();
+        let out = post(&state, req).await.unwrap();
+        assert_eq!(out.units[0].run_id.as_deref(), Some(legacy.as_str()));
+        assert_eq!(out.submitted, 1);
+    }
+
+    #[tokio::test]
+    async fn an_older_replica_resuming_after_the_upgrade_gets_a_conflict() {
+        let state = crate::serve::test_support::test_state();
+        let req = day_request("UTC", "2026-06-01", "2026-06-03");
+        let (hash, unit) = planned(&req);
+        let out = post(&state, req.clone()).await.unwrap();
+        assert_eq!(out.submitted, 2);
+        let err = old_release_unit(&state, &req, &unit, &hash)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ServeError::Conflict(m) if m == IDEMPOTENCY_CONFLICT),
+            "{err:?}"
+        );
+        let again = post(&state, req).await.unwrap();
+        assert_eq!(
+            again.units[0].run_id, out.units[0].run_id,
+            "units already submitted stay"
+        );
     }
 }

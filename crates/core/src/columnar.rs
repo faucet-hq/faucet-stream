@@ -539,8 +539,10 @@ pub fn values_to_record_batch_inferred(records: &[Value]) -> Result<RecordBatch,
 /// one of: null, boolean, integers, `Float64`, strings, binary, decimals,
 /// timestamps (no zone or a zone that parses), times, dates, structs, lists
 /// (list, large list, fixed-size list), maps with string keys, and
-/// dictionaries of `Utf8` / `LargeUtf8` values without nulls. A batch holding
-/// anything else — `Float32` and `Float16` included — (or a duplicate field
+/// dictionaries of `Utf8` / `LargeUtf8` values. A null dictionary value (key
+/// or value) renders `null` on both paths, for every value type.
+/// `Float32` and `Float16` values render through [`crate::fidelity::float32`]
+/// on both paths. A batch holding anything else (or a duplicate field
 /// name, or nesting deeper than 32 levels) is converted whole by writing it
 /// as JSON text with `arrow-json` (explicit nulls on) and parsing that text. The choice is made before any
 /// value is rendered, so a batch is never converted by both, and the two
@@ -576,6 +578,23 @@ impl<F: FnMut(usize) -> String> arrow_json::writer::Encoder for StringEncoder<F>
     fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
         let text = (self.0)(idx);
         serde_json::to_writer(&mut *out, &text).expect("writing to a Vec cannot fail");
+    }
+}
+
+// arrow-json skips dictionary value nulls until apache/arrow-rs#12259; delete with its factory arm then (#1115).
+struct DictionaryValues<'a> {
+    key: direct::KeyAt<'a>,
+    nulls: Option<arrow::buffer::NullBuffer>,
+    values: arrow_json::writer::NullableEncoder<'a>,
+}
+
+impl arrow_json::writer::Encoder for DictionaryValues<'_> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        if self.nulls.as_ref().is_some_and(|nulls| nulls.is_null(idx)) {
+            out.extend_from_slice(b"null");
+        } else {
+            self.values.encode((self.key)(idx), out);
+        }
     }
 }
 
@@ -648,9 +667,9 @@ fn nullable<'a>(
 impl arrow_json::writer::EncoderFactory for ExactEncoderFactory {
     fn make_default_encoder<'a>(
         &self,
-        _field: &'a arrow::datatypes::FieldRef,
+        field: &'a arrow::datatypes::FieldRef,
         array: &'a dyn arrow::array::Array,
-        _options: &'a arrow_json::writer::EncoderOptions,
+        options: &'a arrow_json::writer::EncoderOptions,
     ) -> Result<Option<arrow_json::writer::NullableEncoder<'a>>, arrow::error::ArrowError> {
         use arrow::array::AsArray;
         use arrow::datatypes::{
@@ -688,9 +707,6 @@ impl arrow_json::writer::EncoderFactory for ExactEncoderFactory {
             }
             DataType::Float32 => {
                 let a = array.as_primitive::<Float32Type>();
-                if a.values().iter().all(|v| v.is_finite()) {
-                    return Ok(None);
-                }
                 nullable(
                     ValueEncoder(move |i| crate::fidelity::float32(a.value(i))),
                     array,
@@ -698,9 +714,6 @@ impl arrow_json::writer::EncoderFactory for ExactEncoderFactory {
             }
             DataType::Float16 => {
                 let a = array.as_primitive::<Float16Type>();
-                if a.values().iter().all(|v| v.is_finite()) {
-                    return Ok(None);
-                }
                 nullable(
                     ValueEncoder(move |i| crate::fidelity::float32(f32::from(a.value(i)))),
                     array,
@@ -797,6 +810,21 @@ impl arrow_json::writer::EncoderFactory for ExactEncoderFactory {
                         .to_vec(),
                 };
                 nullable(ValueEncoder(move |i| time_json(values[i], &unit)), array)
+            }
+            DataType::Dictionary(..) => {
+                let Some((key, values)) = direct::dictionary_parts(array) else {
+                    return Ok(None);
+                };
+                let nulls = array.logical_nulls();
+                let values = arrow_json::writer::make_encoder(field, values, options)?;
+                arrow_json::writer::NullableEncoder::new(
+                    Box::new(DictionaryValues {
+                        key,
+                        nulls: nulls.clone(),
+                        values,
+                    }),
+                    nulls,
+                )
             }
             _ => return Ok(None),
         };

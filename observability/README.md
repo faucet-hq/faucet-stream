@@ -54,6 +54,7 @@ exactly that (`examples/infra/grafana/`).
 | `FaucetServePoolStarved` | a pool's runs unclaimed for 15 m | warning |
 | `FaucetServePoolRunsFailed` | runs failed with `pool_unavailable` in 1 h | warning |
 | `FaucetServeScheduleTicksMissed` | a schedule trigger skipped ticks in 1 h | warning |
+| `FaucetServeTzdataMixed` | `faucet serve` replicas on one history disagree on tzdata (or one reports none) for 30 m; ticks in changed zones are held (#1116) | warning |
 | `FaucetServeConnectionsNeedReauth` | a tenant connection needs re-authorization ≥15 m | warning |
 | `FaucetFeedDeliveryStalled` | a feed delivery stalled on one event ≥1 m | critical |
 | `FaucetFeedDeliveryHeld` | a feed has a held delivery ≥1 m | critical |

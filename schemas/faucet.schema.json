@@ -13470,6 +13470,17 @@
                 "warehouse": "path"
               }
             },
+            "access_delegation": {
+              "description": "REST catalog only: how the catalog should give faucet access to table\nstorage. `vended_credentials` asks for short-lived storage credentials\nwith each table (it sends `X-Iceberg-Access-Delegation:\nvended-credentials`). A catalog that hands them out unasked needs no\nsetting. Refused on the `glue`, `sql` and `hms` catalogs.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/source_iceberg__AccessDelegation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "const": "rest"
@@ -13526,6 +13537,17 @@
                 "*.file": "path",
                 "warehouse": "path"
               }
+            },
+            "access_delegation": {
+              "description": "REST catalog only: how the catalog should give faucet access to table\nstorage. `vended_credentials` asks for short-lived storage credentials\nwith each table (it sends `X-Iceberg-Access-Delegation:\nvended-credentials`). A catalog that hands them out unasked needs no\nsetting. Refused on the `glue`, `sql` and `hms` catalogs.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/source_iceberg__AccessDelegation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "type": {
               "type": "string",
@@ -13584,6 +13606,17 @@
                 "warehouse": "path"
               }
             },
+            "access_delegation": {
+              "description": "REST catalog only: how the catalog should give faucet access to table\nstorage. `vended_credentials` asks for short-lived storage credentials\nwith each table (it sends `X-Iceberg-Access-Delegation:\nvended-credentials`). A catalog that hands them out unasked needs no\nsetting. Refused on the `glue`, `sql` and `hms` catalogs.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/source_iceberg__AccessDelegation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "const": "sql"
@@ -13641,12 +13674,33 @@
                 "warehouse": "path"
               }
             },
+            "access_delegation": {
+              "description": "REST catalog only: how the catalog should give faucet access to table\nstorage. `vended_credentials` asks for short-lived storage credentials\nwith each table (it sends `X-Iceberg-Access-Delegation:\nvended-credentials`). A catalog that hands them out unasked needs no\nsetting. Refused on the `glue`, `sql` and `hms` catalogs.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/source_iceberg__AccessDelegation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "const": "hms"
             }
           },
           "additionalProperties": true
+        }
+      ]
+    },
+    "source_iceberg__AccessDelegation": {
+      "description": "How a REST catalog gives the client access to table storage.",
+      "oneOf": [
+        {
+          "description": "Short-lived storage credentials returned with each table.",
+          "type": "string",
+          "const": "vended_credentials"
         }
       ]
     },
@@ -14807,6 +14861,17 @@
                 "warehouse": "path"
               }
             },
+            "access_delegation": {
+              "description": "REST catalog only: how the catalog should give faucet access to table\nstorage. `vended_credentials` asks for short-lived storage credentials\nwith each table (it sends `X-Iceberg-Access-Delegation:\nvended-credentials`). A catalog that hands them out unasked needs no\nsetting. Refused on the `glue`, `sql` and `hms` catalogs.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/sink_iceberg__AccessDelegation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "const": "rest"
@@ -14863,6 +14928,17 @@
                 "*.file": "path",
                 "warehouse": "path"
               }
+            },
+            "access_delegation": {
+              "description": "REST catalog only: how the catalog should give faucet access to table\nstorage. `vended_credentials` asks for short-lived storage credentials\nwith each table (it sends `X-Iceberg-Access-Delegation:\nvended-credentials`). A catalog that hands them out unasked needs no\nsetting. Refused on the `glue`, `sql` and `hms` catalogs.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/sink_iceberg__AccessDelegation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "type": {
               "type": "string",
@@ -14921,6 +14997,17 @@
                 "warehouse": "path"
               }
             },
+            "access_delegation": {
+              "description": "REST catalog only: how the catalog should give faucet access to table\nstorage. `vended_credentials` asks for short-lived storage credentials\nwith each table (it sends `X-Iceberg-Access-Delegation:\nvended-credentials`). A catalog that hands them out unasked needs no\nsetting. Refused on the `glue`, `sql` and `hms` catalogs.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/sink_iceberg__AccessDelegation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "const": "sql"
@@ -14978,12 +15065,33 @@
                 "warehouse": "path"
               }
             },
+            "access_delegation": {
+              "description": "REST catalog only: how the catalog should give faucet access to table\nstorage. `vended_credentials` asks for short-lived storage credentials\nwith each table (it sends `X-Iceberg-Access-Delegation:\nvended-credentials`). A catalog that hands them out unasked needs no\nsetting. Refused on the `glue`, `sql` and `hms` catalogs.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/sink_iceberg__AccessDelegation"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "const": "hms"
             }
           },
           "additionalProperties": true
+        }
+      ]
+    },
+    "sink_iceberg__AccessDelegation": {
+      "description": "How a REST catalog gives the client access to table storage.",
+      "oneOf": [
+        {
+          "description": "Short-lived storage credentials returned with each table.",
+          "type": "string",
+          "const": "vended_credentials"
         }
       ]
     },

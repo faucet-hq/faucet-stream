@@ -11,9 +11,14 @@ pub const OUTCOMES: &[&str] = &[
     "retried",
     "paused",
     "needs_approval",
+    "held_tzdata",
 ];
 
 pub fn describe() {
+    describe_gauge!(
+        "faucet_serve_tzdata_mixed",
+        "1 while live members report different tzdata releases or one reports none (#1116)"
+    );
     describe_gauge!(
         "faucet_serve_schedules_active",
         "Schedules this server ticks (not paused)"
@@ -44,6 +49,10 @@ pub fn describe() {
         "Fan-out ticks refused for one tenant while the others ran"
     );
     describe_counter!(
+        "faucet_serve_schedule_compute_errors_total",
+        "Times a schedule's next tick could not be computed; it stops ticking until that clears"
+    );
+    describe_counter!(
         "faucet_serve_schedule_runner_restarts_total",
         "Times the schedule loop panicked and was restarted"
     );
@@ -60,6 +69,11 @@ pub fn step_timed_out(schedule: &str) {
         .increment(1);
 }
 
+pub fn compute_error(schedule: &str) {
+    counter!("faucet_serve_schedule_compute_errors_total", "schedule" => schedule.to_string())
+        .increment(1);
+}
+
 pub fn runner_restarted() {
     counter!("faucet_serve_schedule_runner_restarts_total").increment(1);
 }
@@ -72,6 +86,8 @@ pub fn preinit(schedule: &str) {
     }
     counter!("faucet_serve_schedule_missed_ticks_total", "schedule" => schedule.to_string())
         .increment(0);
+    counter!("faucet_serve_schedule_compute_errors_total", "schedule" => schedule.to_string())
+        .increment(0);
     healthy(schedule, true);
 }
 
@@ -82,6 +98,12 @@ pub fn active(n: usize) {
 pub fn tick(schedule: &str, outcome: &'static str) {
     counter!("faucet_serve_schedule_ticks_total", "schedule" => schedule.to_string(), "outcome" => outcome)
         .increment(1);
+}
+
+/// 1 while live members report different tzdata releases, or one reports
+/// none (#1116).
+pub fn tzdata_mixed(mixed: bool) {
+    gauge!("faucet_serve_tzdata_mixed").set(if mixed { 1.0 } else { 0.0 });
 }
 
 pub fn missed(schedule: &str, n: u64) {
@@ -132,6 +154,7 @@ mod tests {
             last_tick("nightly", 1_700_000_000);
             runner_restarted();
             step_timed_out("nightly");
+            compute_error("nightly");
         });
         let names: Vec<String> = snapshotter
             .snapshot()
@@ -148,6 +171,7 @@ mod tests {
             "faucet_serve_schedule_tenant_failures_total",
             "faucet_serve_schedule_runner_restarts_total",
             "faucet_serve_schedule_step_timeouts_total",
+            "faucet_serve_schedule_compute_errors_total",
         ] {
             assert!(names.iter().any(|n| n == want), "missing {want}: {names:?}");
         }

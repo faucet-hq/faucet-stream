@@ -1227,6 +1227,59 @@ mod tests {
         );
     }
 
+    #[derive(Debug)]
+    struct DecodedOn(std::thread::ThreadId);
+
+    impl<'de> serde::Deserialize<'de> for DecodedOn {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            serde::de::IgnoredAny::deserialize(d)?;
+            Ok(Self(std::thread::current().id()))
+        }
+    }
+
+    fn json_string_of(bytes: usize) -> Vec<u8> {
+        let mut body = vec![b'a'; bytes];
+        body[0] = b'"';
+        body[bytes - 1] = b'"';
+        body
+    }
+
+    #[tokio::test]
+    async fn a_large_body_is_decoded_off_the_calling_thread() {
+        let here = std::thread::current().id();
+        let small: DecodedOn = decode_json(json_string_of(BLOCKING_DECODE_BYTES - 1))
+            .await
+            .unwrap();
+        assert_eq!(small.0, here);
+        let large: DecodedOn = decode_json(json_string_of(BLOCKING_DECODE_BYTES))
+            .await
+            .unwrap();
+        assert_ne!(large.0, here);
+    }
+
+    #[tokio::test]
+    async fn a_large_body_decodes_to_the_same_value_and_error() {
+        let n = BLOCKING_DECODE_BYTES / 8;
+        let rows: Vec<Vec<serde_json::Value>> = (0..n)
+            .map(|i| vec![serde_json::json!(i.to_string()), serde_json::Value::Null])
+            .collect();
+        let body = serde_json::to_vec(&rows).unwrap();
+        assert!(body.len() >= BLOCKING_DECODE_BYTES);
+        let decoded: Vec<Vec<serde_json::Value>> = decode_json(body.clone()).await.unwrap();
+        assert_eq!(decoded, rows);
+
+        let mut broken = body;
+        broken.truncate(BLOCKING_DECODE_BYTES + 1);
+        let inline = serde_json::from_slice::<Vec<Vec<serde_json::Value>>>(&broken).unwrap_err();
+        let err = decode_json::<Vec<Vec<serde_json::Value>>>(broken)
+            .await
+            .unwrap_err();
+        match err {
+            FaucetError::Json(e) => assert_eq!(e.to_string(), inline.to_string()),
+            other => panic!("{other:?}"),
+        }
+    }
+
     type Seen = Arc<Mutex<Vec<(String, Vec<(String, String)>)>>>;
 
     async fn serve(router: Router) -> String {

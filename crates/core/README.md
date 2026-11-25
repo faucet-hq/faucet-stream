@@ -614,6 +614,42 @@ assert_eq!(v["id"], serde_json::json!("18446744073709551616"));
 (`RowAccountsSnapshot::non_finite`, `faucet_fidelity_non_finite_total`). See
 the [value fidelity reference](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity/).
 
+`fidelity::f32_cursor_bound(&bookmark)` is what an incremental SQL source
+compares a single-precision cursor column with (#1114). A bookmark read from
+such a column holds the shortest decimal (`0.7`), which a double comparison
+puts above the stored `0.699999988…`. The bound is `min(D, F)`: `D` the
+bookmark as a double, `F` its decimal text parsed once as an `f32`. It is the
+row's exact value for an `f32` column and never above the bookmark for any
+other type. `None` for integers, non-numeric strings and other values. Send it
+to the server bit-exact, never as text to cast.
+
+## Dates, times and zones (`faucet_core::time`)
+
+One boundary for every instant, clock, civil value and zone (#1093):
+`Timestamp` (UTC, nanoseconds; serializes exactly as `chrono::DateTime<Utc>`
+does), `Span`, `OffsetClock`, `CivilDate` / `CivilTime` / `CivilDateTime`,
+and `Zone` / `LocalTime` behind the `time-zones` feature. Today they wrap
+`chrono`, so output is identical; the library underneath can change in this
+one module. Range constructors return `Option`, parsers return `TimeError`
+(converts into `FaucetError`). `OffsetClock::format_chrono_strftime` keeps the
+chrono strftime grammar `${now.strftime}` documents. New code should take and
+return these types rather than chrono ones.
+
+Named zones (`time-zones`) resolve through jiff's bundled IANA tzdata
+(`TZDATA_VERSION`, e.g. `2026f`; the host's zoneinfo is never read), not
+chrono-tz, whose last release bundles tzdata 2025b (#1116). `Zone::parse` is
+exact-case, `Zone::is_fixed` tells a fixed offset, and `Zone::resolve_local`
+reports an offset for a civil time only when it is the offset in force at the
+instant it names, so a fold or gap is never invented. The hidden `ChronoZone`
+adapter hands a `Zone` to code that takes a `chrono::TimeZone`.
+`TzdataVersion` parses and orders release names; `changed_since_2025b` lists,
+per zone, the UTC intervals where tzdata 2025b and the current release
+disagree (frozen, see `src/time/fixtures/README.md`), for state written by
+releases on 2025b. Arrow renderings keep using arrow's `Tz` (chrono-tz); this
+workspace builds it from `vendor/chrono-tz` with the same tzdata, and the
+tests fail unless both databases name the release in
+`supply-chain/tzdata-version` and agree on every offset 1970–2099.
+
 ## Declared column types
 
 A source that knows its column types implements `Source::declared_columns`,
@@ -915,9 +951,9 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `dlq` | `DlqConfig`, `OnBatchError`, `DlqReason`, `DlqStats`, `build_envelope` |
 | `governance` | `Governance`, `GovernedSinkBuilder`, `GovernedSink`, `DlqGovernance`, `PolicyGovernance`, `Pass`, `OptOut`, `SINK_LAYERS` — one builder for every guarantee (#875, #870); `GovernedPage`, `GovernedEnvelopes`, `GovernedOutput` — the governed-page typestate (RFC 0014) |
 | `driver` | `SinkDriver` (+ `StagingDriver`, `CommitTokenDriver`, `CleanupDriver`, `SchemaDriver`, `RollbackDriver`, `ColumnarDriver`), `DriverSink`, `SourceDriver`, `DriverSource`, `MessageDriver`, `MessageSinkDriver`, `MessageConsumer`, `MessageSourceDriver`, `RowOutcomes`, `HttpDriver`, `HttpSinkDriver` — family drivers (RFC 0014) |
-| `columnar` | `values_to_record_batch`, `record_batch_to_values`, `check_integral`, `binary_values_for_arrow_json` — JSON ⇄ Arrow (`arrow` feature). Binary columns read base64; a `FixedSizeBinary(16)` (UUID) column also reads a dashed UUID or 32 hex digits, which no base64 of 16 bytes can be |
+| `columnar` | `values_to_record_batch`, `record_batch_to_values`, `check_integral`, `binary_values_for_arrow_json` — JSON ⇄ Arrow (`arrow` feature). `Float32` / `Float16` render through `fidelity::float32` on both conversion paths; a null dictionary value renders `null` for every value type on both paths (the hop's dictionary guard is deleted once arrow-json carries apache/arrow-rs#12259, #1115). Binary columns read base64; a `FixedSizeBinary(16)` (UUID) column also reads a dashed UUID or 32 hex digits, which no base64 of 16 bytes can be |
 | `accounting` | `WriteReport`, `RowAccounts`, `RowAccountsSnapshot` — per-page row accounting (#879) |
-| `fidelity` | Canonical value renderings (#885) — `decimal_text`, `decimal_from_i128`, `decimal_from_pg_numeric`, `integer_*`, `number_text`, `float64` / `float32`, `binary`, `timestamp*`, `date`, `time`, `from_str` / `from_slice` / `parse_json`, `from_str_allow_non_finite` (bare `NaN` / `Infinity` as counted `null`), `non_integer_text`, `is_exact_decimal_type`, `NonFiniteCounter` |
+| `fidelity` | Canonical value renderings (#885) — `decimal_text`, `decimal_from_i128`, `decimal_from_pg_numeric`, `integer_*`, `number_text`, `float64` / `float32` (an `f32` is the shortest decimal that reads back as it, ties away from zero; it always converts back to the same `f32`), `binary`, `timestamp*`, `date`, `time`, `from_str` / `from_slice` / `parse_json`, `from_str_allow_non_finite` (bare `NaN` / `Infinity` as counted `null`), `non_integer_text`, `is_exact_decimal_type`, `NonFiniteCounter` |
 | `json_numbers` | `parse_json_exact` / `JsonBigNumbers` — exactness of numbers in JSON text a database stored |
 | `idempotency` | `DeliveryMode`, `format_token`, `parse_token`, `wrap_state`, `unwrap_state` |
 | `state_version` | Versioned state envelope (#736) — `StoredState`, `wrap_versioned`, `peel_versioned`, `check_compat`, `resolve_for_source`, `StateCodec`, `VersionedStateStore` |
@@ -934,6 +970,7 @@ wrapper with `faucet_conformance::forwarding::assert_sink_forwards_every_hook` /
 | `schema` | `infer_schema` from record samples |
 | `check` | `CheckContext`, `Probe`, `CheckReport` for `faucet doctor` |
 | `observability` | Pipeline-internal `tracing`/`metrics` decorators; `install_observability` |
+| `time-zones` | `faucet_core::time::Zone`: named IANA zones from the compiled-in database (pulls `jiff` with `jiff-tzdb`) |
 | `compression` | `CompressionConfig`, `compress_buf` (the `compression` feature) |
 | `file_format` | One format vocabulary for every file connector — `FileFormat` (incl. `from_path` extension detection), `decode` / `encode`, `ContainerDecoder` (Avro / ORC across many files, resolved against the first file's schema), `avro` (OCF read + write, explicit logical-type mapping, schema inference), `orc` (read-only, projection, stripe streaming), `budget` (`DecodeBudget`: `max_decoded_bytes`, what one object or batch may decode to; `decode_bounded` / `decode_owned_bounded` / `ContainerDecoder::with_max_decoded_bytes` apply it to Avro and Excel) |
 | `util` | `quote_ident`, `extract_records`, `check_http_response`, `redact_uri_credentials`, `encode_url_component` (percent-encode one URL path segment or query value) |

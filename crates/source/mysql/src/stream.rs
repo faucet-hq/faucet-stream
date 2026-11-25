@@ -109,25 +109,70 @@ impl MysqlSource {
 
     /// The incremental query before ordering: the configured query with its
     /// context and `@bookmark` bound, sharded, then filtered to
-    /// `column >= start`, with its bind values in marker order.
-    fn incremental_base(
+    /// `column >= start`, with its bind values in marker order. A FLOAT
+    /// cursor compares with [`faucet_core::fidelity::f32_cursor_bound`].
+    async fn incremental_base(
         &self,
         context: &std::collections::HashMap<String, Value>,
         column: &str,
         start: &Value,
         sharded: bool,
-    ) -> (String, Vec<Value>) {
-        let (query, mut binds) = bind_bookmark(&self.config.query, context, start);
-        binds.push(start.clone());
-        (
+    ) -> Result<(String, Vec<Value>), FaucetError> {
+        let (query, _) = bind_bookmark(&self.config.query, context, start);
+        let inner = self.shard_wrap_if(query, sharded);
+        let bound = self.cursor_bound(&inner, column, start).await?;
+        let (query, mut binds) = bind_bookmark(&self.config.query, context, &bound);
+        binds.push(bound);
+        Ok((
             cursor_filter(&self.shard_wrap_if(query, sharded), column),
             binds,
-        )
+        ))
+    }
+
+    /// The value `column` is compared with: `start`, or for a FLOAT column
+    /// and a non-integer bookmark its single-precision bound (#1114). Only
+    /// that case describes `inner`; a describe that fails fails the read.
+    async fn cursor_bound(
+        &self,
+        inner: &str,
+        column: &str,
+        start: &Value,
+    ) -> Result<Value, FaucetError> {
+        use sqlx::{Column as _, Executor as _};
+        let Some(bound) = faucet_core::fidelity::f32_cursor_bound(start)? else {
+            return Ok(start.clone());
+        };
+        let described = self
+            .calls
+            .call_once("describe", async {
+                (&self.pool).describe(inner).await.map_err(|e| {
+                    FaucetError::Source(format!(
+                        "mysql: could not describe the incremental query to read the type of \
+                         cursor column {column:?}: {e}"
+                    ))
+                })
+            })
+            .await?;
+        let mut matches = described
+            .columns()
+            .iter()
+            .filter(|c| c.name().eq_ignore_ascii_case(column));
+        let (Some(col), None) = (matches.next(), matches.next()) else {
+            return Err(FaucetError::Config(format!(
+                "mysql: incremental replication `column` {column:?} must name exactly one \
+                 column of the query's output"
+            )));
+        };
+        Ok(if crate::plan::is_single_float(col.type_info()) {
+            faucet_core::fidelity::float64(bound)
+        } else {
+            start.clone()
+        })
     }
 
     /// The final SQL and bind values for a fetch, and the cursor tracker of
     /// an incremental read.
-    fn plan_fetch(
+    async fn plan_fetch(
         &self,
         context: &std::collections::HashMap<String, Value>,
     ) -> Result<(String, Vec<Value>, Option<CursorTracker>), FaucetError> {
@@ -137,7 +182,9 @@ impl MysqlSource {
                 (self.shard_wrap(query), binds, None)
             }
             Some((column, start)) => {
-                let (base, binds) = self.incremental_base(context, &column, &start.value, true);
+                let (base, binds) = self
+                    .incremental_base(context, &column, &start.value, true)
+                    .await?;
                 (
                     cursor_order(&base, &column),
                     binds,
@@ -912,7 +959,7 @@ impl faucet_core::Source for MysqlSource {
         let batch_size = self.config.batch_size;
 
         Box::pin(async_stream::try_stream! {
-            let (query_str, bind_values, mut tracker) = self.plan_fetch(context)?;
+            let (query_str, bind_values, mut tracker) = self.plan_fetch(context).await?;
             let text_columns = self.text_columns(&query_str, &bind_values).await;
             let query = bind_params(sqlx::query(&query_str), &bind_values);
 
@@ -1045,7 +1092,7 @@ impl faucet_core::Source for MysqlSource {
         context: &std::collections::HashMap<String, Value>,
     ) -> Result<Option<faucet_core::DeclaredColumns>, FaucetError> {
         use sqlx::{Executor, TypeInfo};
-        let (query, binds, _) = self.plan_fetch(context)?;
+        let (query, binds, _) = self.plan_fetch(context).await?;
         let described = self
             .calls
             .call_once("describe", async {
@@ -1162,6 +1209,7 @@ impl faucet_core::Source for MysqlSource {
             None => (self.config.query.clone(), Vec::new()),
             Some((column, start)) => {
                 self.incremental_base(&Default::default(), &column, &start.value, false)
+                    .await?
             }
         };
         let bounds_sql = pk_bounds_query(&base, &quote_ident_mysql(&shard_cfg.key), "SIGNED");
@@ -1214,7 +1262,10 @@ impl faucet_core::Source for MysqlSource {
             MysqlReplication::Incremental {
                 column,
                 initial_value,
-            } => self.incremental_base(&Default::default(), column, initial_value, false),
+            } => {
+                self.incremental_base(&Default::default(), column, initial_value, false)
+                    .await?
+            }
         };
         let inner = bounds.wrap(&base, quote_ident_mysql);
         let sql = digest_query(&inner, key, columns);
@@ -1759,20 +1810,26 @@ mod tests {
             "SELECT 1",
         ));
         assert_eq!(full.state_key(), None);
-        assert!(full.plan_fetch(&Default::default()).unwrap().2.is_none());
+        assert!(
+            full.plan_fetch(&Default::default())
+                .await
+                .unwrap()
+                .2
+                .is_none()
+        );
 
         let cfg = MysqlSourceConfig::new("mysql://root@127.0.0.1:1/db", "SELECT 1")
             .incremental("ts", serde_json::json!(3));
         let src = lazy_source(cfg.clone());
         assert!(src.state_key().unwrap().starts_with("mysql:127.0.0.1:"));
-        let (q, binds, tracker) = src.plan_fetch(&Default::default()).unwrap();
+        let (q, binds, tracker) = src.plan_fetch(&Default::default()).await.unwrap();
         assert!(q.ends_with("ORDER BY q.`ts`"), "{q}");
         assert_eq!(binds, vec![serde_json::json!(3)]);
         assert!(tracker.is_some());
         src.apply_start_bookmark(serde_json::json!({"value": 9, "boundary": []}))
             .await
             .unwrap();
-        let (_, binds, _) = src.plan_fetch(&Default::default()).unwrap();
+        let (_, binds, _) = src.plan_fetch(&Default::default()).await.unwrap();
         assert_eq!(binds, vec![serde_json::json!(9)]);
         assert!(
             src.apply_start_bookmark(serde_json::json!({"value": null}))

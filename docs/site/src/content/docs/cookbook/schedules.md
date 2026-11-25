@@ -87,6 +87,22 @@ start, and a six-field cron (one with a seconds field) is refused outright.
 For anything more frequent, use a [trigger](/faucet-stream/cookbook/triggers/) or a streaming
 source.
 
+The interval is measured on a UTC clock, so the same cron is accepted or
+refused the same way whatever the day it is made and whatever its time zone:
+`0,55 1 * * *` counts as 55 minutes apart even in `America/New_York`, where
+it never comes closer. A step job can still run closer together once a year,
+across a fall-back (`*/58 1 * * *` runs at 01:58 EDT and 01:00 EST, two
+minutes apart). Schedules follow the daylight-saving rule of
+[`faucet schedule`](/faucet-stream/cookbook/scheduling/#timezone-and-dst).
+
+Check a `--schedules` file offline, for example with a new release before
+upgrading, with `faucet validate --schedules FILE`: it lists every schedule
+the release refuses and exits non-zero. A stored schedule (made through the
+API or the console) that a new release refuses stops ticking: the server logs
+one WARN at startup naming every such schedule and one ERROR per schedule,
+and sets `faucet_serve_schedule_healthy` to `0` until it is fixed or
+deleted.
+
 ## Ticks, runs and failures
 
 Each tick submits a run through the same path as any template run: approval
@@ -109,6 +125,37 @@ the health gauge is left alone — the outage shows through
 if later ticks fell due meanwhile, `catch_up: true` runs the latest once and
 counts the rest as missed, and `catch_up: false` drops the stale tick and
 waits for the next one.
+
+### Rolling upgrades across a tzdata change
+
+Every server on a SQL history (with or without `--cluster`) advertises the
+tzdata release it resolves zones with, and stamps the runs it records with it.
+A release before this one (tzdata 2025b) does neither, and fires a tick in a
+zone whose rules changed since at its own UTC instant, up to an hour away.
+While such a server may be live — a member without the `tzdata:` capability,
+or a run of the schedule without a stamp in its last two periods — a newer
+server **holds** a tick that falls in one of the zone's changed periods
+(status `held_tzdata`, the reason names the older member or run):
+
+- if the older server starts a run for that slot (at the same instant, or an
+  hour either side), the tick is left to it and recorded, so `catch_up` never
+  replays it;
+- if nobody runs it by the tick plus 1 h 5 min, it runs then, late, and is
+  recorded as a missed range.
+
+So during the overlap a tick in a changed zone runs at the older server's time,
+once. Ticks in other zones, or outside the changed periods, fire as usual.
+Between two releases that both advertise tzdata, the older one holds every
+tick in a named zone while a newer member is live, and the newer one fires.
+An older server that neither heartbeats nor has run the schedule in its last
+two periods is not seen; that tick can run twice, once.
+
+A server on the default history file holds that file alone, so it does not
+hold against the unstamped runs its own older release recorded before the
+upgrade; only an unstamped run recorded after it started counts. A server on
+PostgreSQL or a `--history sqlite:` path cannot tell its own earlier runs from
+another server's, so after the upgrade each schedule in a changed zone can hold
+once, until those runs leave its last two periods.
 
 One schedule's step (resolving the tick, firing every target) is cut off after
 five minutes and its tick retried
@@ -205,15 +252,18 @@ Every call is audited as `schedule.<action>`. See the
 | Metric | Meaning |
 |---|---|
 | `faucet_serve_schedules_active` | Schedules this server ticks. |
-| `faucet_serve_schedule_ticks_total{schedule,outcome}` | Ticks by outcome: `started`, `skipped`, `failed`, `retried`, `paused` (held while the run history is unreachable), `needs_approval`. |
+| `faucet_serve_schedule_ticks_total{schedule,outcome}` | Ticks by outcome: `started`, `skipped`, `failed`, `retried`, `paused` (held while the run history is unreachable), `needs_approval`, `held_tzdata` (held while a server on older tzdata may run it). |
+| `faucet_serve_tzdata_mixed` | `1` while live members report different tzdata releases, or one reports none. |
 | `faucet_serve_schedule_step_timeouts_total{schedule}` | Steps cut off after five minutes; the tick is retried. |
 | `faucet_serve_schedule_missed_ticks_total{schedule}` | Ticks that never ran (no server up, or collapsed into one catch-up). |
 | `faucet_serve_schedule_tenant_failures_total{schedule,tenant}` | Fan-out ticks refused for one tenant while the others ran. |
-| `faucet_serve_schedule_healthy{schedule}` | `0` while a tick is retrying or the schedule needs approval; left alone while the run history is unreachable. |
+| `faucet_serve_schedule_compute_errors_total{schedule}` | Times the schedule's next tick could not be computed. It stops ticking (healthy `0`) and is tried again at each reload. |
+| `faucet_serve_schedule_healthy{schedule}` | `0` while a tick is retrying, the schedule needs approval, it no longer validates, or its next tick cannot be computed; left alone while the run history is unreachable. |
 | `faucet_serve_schedule_last_tick_unix_seconds{schedule}` | The last tick that started. |
 
 The shipped alerts (`observability/prometheus/alerts.yml`) cover missed ticks,
-repeated failures, a tick stuck retrying and step timeouts. The unhealthy
+repeated failures, a tick stuck retrying, step timeouts and replicas left on
+different tzdata for 30 minutes (`FaucetServeTzdataMixed`). The unhealthy
 alert is held back on a replica whose run history is unreachable.
 
 ## Moving from `type: schedule` triggers

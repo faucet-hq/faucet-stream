@@ -1941,6 +1941,145 @@ async fn two_servers_on_one_history_fire_each_tick_once() {
     );
 }
 
+#[cfg(feature = "schedule")]
+/// #1116: two servers on one history, both on this release, in a zone whose
+/// rules changed since tzdata 2025b: they advertise the same tzdata (without
+/// `--cluster`), so nothing is held and each tick fires once.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_current_servers_fire_each_tick_once_in_a_changed_zone() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = rows_mock().await;
+    let out = dir.path().join("out.jsonl");
+    let db = format!("sqlite:{}", dir.path().join("history.db").display());
+    let a = spawn(dir.path(), Some(db.clone()), &rows.uri()).await;
+    let b_dir = dir.path().join("b");
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let _b = spawn(&b_dir, Some(db), &rows.uri()).await;
+    let (code, reg) = a
+        .post(
+            "admin-tok",
+            "/v1/templates",
+            json!({"config": plain_template(&rows.uri(), &out), "launch": true}),
+        )
+        .await;
+    assert_eq!(code, 201, "{reg}");
+    let (code, made) = a
+        .post(
+            "op-tok",
+            "/v1/schedules",
+            json!({"name": "vancouver", "cron": "* * * * * *", "timezone": "America/Vancouver", "template": {"id": "plain-sync"}, "overlap": "queue"}),
+        )
+        .await;
+    assert_eq!(code, 201, "{made}");
+    let mut per_tick = std::collections::BTreeMap::<String, usize>::new();
+    for _ in 0..600 {
+        per_tick.clear();
+        let (_, page) = a
+            .get("admin-tok", "/v1/runs?label=schedule:vancouver&limit=200")
+            .await;
+        for r in page["runs"].as_array().unwrap() {
+            *per_tick
+                .entry(r["labels"]["schedule_tick"].as_str().unwrap().to_string())
+                .or_default() += 1;
+        }
+        if per_tick.len() >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(per_tick.len() >= 4, "{per_tick:?}");
+    assert!(
+        per_tick.values().all(|n| *n == 1),
+        "a tick fired twice: {per_tick:?}"
+    );
+}
+
+#[cfg(feature = "schedule")]
+/// #1116: a member on one history that does not advertise tzdata (a release
+/// on 2025b) is live but fires nothing: ticks in a changed period are held,
+/// not started twice, and the schedule says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_member_holds_ticks_in_a_changed_zone() {
+    use faucet_cli::serve::history::{InstanceHeartbeat, RunHistory, sqlite::SqliteHistory};
+    let dir = tempfile::tempdir().unwrap();
+    let rows = rows_mock().await;
+    let out = dir.path().join("out.jsonl");
+    let path = dir.path().join("history.db");
+    let db = format!("sqlite:{}", path.display());
+    let a = spawn(dir.path(), Some(db.clone()), &rows.uri()).await;
+    let old = SqliteHistory::connect(
+        &db,
+        Duration::from_secs(3600),
+        Duration::from_secs(3600),
+        "older-release".into(),
+    )
+    .await
+    .unwrap();
+    old.heartbeat_instance(&InstanceHeartbeat {
+        started_at: chrono::Utc::now(),
+        listen: None,
+        max_concurrent: 1,
+        in_flight: 0,
+        state_format: 1,
+        pools: Vec::new(),
+        capabilities: vec!["policy_pin".into()],
+        clock_offset_ms: None,
+    })
+    .await
+    .unwrap();
+    let (code, reg) = a
+        .post(
+            "admin-tok",
+            "/v1/templates",
+            json!({"config": plain_template(&rows.uri(), &out), "launch": true}),
+        )
+        .await;
+    assert_eq!(code, 201, "{reg}");
+    for (name, tz) in [("held", "America/Vancouver"), ("utc", "UTC")] {
+        let (code, made) = a
+            .post(
+                "op-tok",
+                "/v1/schedules",
+                json!({"name": name, "cron": "* * * * * *", "timezone": tz, "template": {"id": "plain-sync"}, "overlap": "queue"}),
+            )
+            .await;
+        assert_eq!(code, 201, "{made}");
+    }
+    let mut held = Value::Null;
+    let mut utc_runs = 0;
+    for _ in 0..200 {
+        let (_, h) = a.get("admin-tok", "/v1/schedules/held").await;
+        held = h;
+        let (_, page) = a
+            .get("admin-tok", "/v1/runs?label=schedule:utc&limit=50")
+            .await;
+        utc_runs = page["runs"].as_array().unwrap().len();
+        if held["schedule"]["status"] == "held_tzdata" && utc_runs >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(held["schedule"]["status"], "held_tzdata", "{held}");
+    assert!(
+        held["schedule"]["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("older-release"),
+        "{held}"
+    );
+    assert!(utc_runs >= 2, "a fixed zone is never held");
+    let (_, page) = a
+        .get("admin-tok", "/v1/runs?label=schedule:held&limit=50")
+        .await;
+    assert!(page["runs"].as_array().unwrap().is_empty(), "{page}");
+    let (_, ready) = a.get("admin-tok", "/readyz").await;
+    assert_eq!(
+        ready["tzdata"],
+        faucet_core::time::TZDATA_VERSION,
+        "{ready}"
+    );
+}
+
 /// #1044: a `type: schedule` trigger is refused with a pointer to
 /// `--schedules`.
 #[cfg(feature = "triggers")]

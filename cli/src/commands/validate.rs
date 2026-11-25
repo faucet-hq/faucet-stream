@@ -15,6 +15,9 @@ use std::collections::HashSet;
 
 /// Execute the `validate` subcommand.
 pub async fn run(args: ValidateArgs) -> CliResult<()> {
+    if let Some(path) = &args.schedules {
+        return validate_schedules_file(path, args.json);
+    }
     let cwd = std::env::current_dir()?;
     let env_path =
         crate::env_loader::resolve_env_file(args.env_file.as_deref(), args.no_env_file, &cwd)?;
@@ -769,6 +772,54 @@ pub(crate) fn check_transforms(nodes: &[crate::expand::ExpandedNode]) -> CliResu
             .map_err(|e| CliError::Config(format!("row '{}': {e}", n.id)))?;
     }
     Ok(())
+}
+
+/// `faucet validate --schedules FILE` (#1111): check a `--schedules` file
+/// offline with this release's cron parser and list every problem.
+#[cfg(all(feature = "schedule", feature = "templates"))]
+fn validate_schedules_file(path: &std::path::Path, json: bool) -> CliResult<()> {
+    use crate::serve::schedules::{file_problems, is_json_path, parse_file};
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| CliError::Config(format!("reading schedules file {}: {e}", path.display())))?;
+    let file = parse_file(&text, is_json_path(path)).map_err(CliError::Config)?;
+    let problems = file_problems(&file);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "valid": problems.is_empty(),
+                "schedules": file.schedules.len(),
+                "problems": problems,
+            })
+        );
+    } else if problems.is_empty() {
+        println!(
+            "✓ {}: {} schedule(s) valid",
+            path.display(),
+            file.schedules.len()
+        );
+    } else {
+        for p in &problems {
+            println!("✗ {p}");
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::Config(format!(
+            "{} problem(s) in schedules file {}",
+            problems.len(),
+            path.display()
+        )))
+    }
+}
+
+/// Without the schedules features there is nothing to check a file against.
+#[cfg(not(all(feature = "schedule", feature = "templates")))]
+fn validate_schedules_file(_path: &std::path::Path, _json: bool) -> CliResult<()> {
+    Err(CliError::Config(
+        "`--schedules` needs a build with the `schedule` and `templates` features".into(),
+    ))
 }
 
 #[cfg(test)]

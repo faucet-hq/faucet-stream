@@ -1180,3 +1180,28 @@ async fn an_explicit_xml_format_reads_a_file_auto_would_skip() {
         rows
     );
 }
+
+#[tokio::test]
+async fn single_precision_parquet_values_render_their_shortest_form() {
+    use arrow::array::{Array, Float32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f.parquet");
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Float32, false)]));
+    let values = Float32Array::from(faucet_conformance::fidelity::single_precision_corpus());
+    assert_eq!(values.null_count(), 0);
+    let batch = arrow::array::RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+    let mut w =
+        parquet::arrow::ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, None)
+            .unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let src = FileSource::new(FileSourceConfig::new(path.to_string_lossy().into_owned())).unwrap();
+    let read: Vec<Value> = read_all(&src)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r["v"].clone())
+        .collect();
+    faucet_conformance::fidelity::assert_single_precision_read(&read);
+}

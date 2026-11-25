@@ -105,7 +105,8 @@ The `catalog` block is an internally-tagged enum selected by `type`. Every varia
 | `uri` | string | Catalog endpoint. **Required** for `rest` (`https://catalog.example.com`), `sql` (the SQLx/JDBC connection string, e.g. `postgres://…`), and `hms` (`thrift://hms:9083`). For `glue` the endpoint is resolved from AWS config, so `uri` is **not** required. |
 | `warehouse` | string | Object-storage warehouse root, e.g. `s3://lake/warehouse`. Required by the non-REST catalogs (its scheme selects the storage factory). |
 | `credential` | string | REST bearer token (or other catalog-specific credential). **Redacted in `Debug`.** |
-| `properties` | map | Arbitrary key-value pairs forwarded to the catalog/storage builder (S3/GCS options — see [Warehouse storage](#warehouse-storage)). |
+| `properties` | map | Arbitrary key-value pairs forwarded to the catalog/storage builder (S3/GCS options — see [Warehouse storage](#warehouse-storage)). A name no catalog client reads logs one warning per process (`iceberg: catalog.properties.<name> is not read by faucet`), with the faucet setting for known names from other clients (`rest.vended-credentials-enabled`, `io-impl`). |
+| `access_delegation` | `vended_credentials` | REST catalog only: asks the catalog for short-lived storage credentials with each table (sends `X-Iceberg-Access-Delegation: vended-credentials`). See [Vended credentials](#vended-credentials). Refused on `glue` / `sql` / `hms`. |
 
 #### `PartitionField`
 
@@ -404,12 +405,70 @@ already landed a second time). See
 
 Declares `append`, idempotent writes (exactly-once) and additive schema evolution (`schema_report: reported`). `faucet list --json` prints these declared capabilities.
 
+## Vended credentials
+
+A REST catalog that vends credentials hands out short-lived storage keys (an
+S3 key, secret and session token; a GCS token) with each table it returns.
+Some catalogs do so for every request; others only when asked, which
+`catalog.access_delegation: vended_credentials` does. `catalog.properties`
+then names only how to reach the store (`s3.endpoint`, `s3.region`,
+`s3.path-style-access`), never keys:
+
+```yaml
+catalog:
+  type: rest
+  uri: http://catalog:8181/catalog
+  warehouse: lake
+  access_delegation: vended_credentials
+  properties:
+    s3.endpoint: http://store:9000
+    s3.region: us-east-1
+    s3.path-style-access: "true"
+```
+
+How the sink keeps them valid:
+
+- A commit response carries no table config, so the handle kept after a
+  commit (or a schema evolution) takes the committed metadata with the storage
+  settings of the handle the data files were written through.
+- Before each new data-file writer, when the storage holds a credential the
+  catalog vended (a session token, a GCS OAuth token, an ADLS SAS token not
+  written in `catalog.properties`), the table is loaded again to take fresh
+  credentials. This is a credential refresh only: the handle keeps its own
+  metadata, so a catalog that lags behind this run's commit cannot bring an
+  older schema back. One more catalog `GET` per flush cycle on vending
+  catalogs; static keys and the SQL / Glue / HMS catalogs make no extra call.
+  If that reload fails, the write goes on with the previous credentials and
+  logs a warning; if the table no longer exists, or was replaced by another
+  table (another UUID), the write fails before anything is uploaded.
+- Before the first writer of a sink opens (also with `create_if_missing:
+  false`, which loads the table at construction) the table's storage is
+  checked once, inside the sink's call deadline and cancel: a `HEAD`
+  of its current metadata file, with the credentials the writes will use
+  (S3 and GCS table locations; other stores are not checked). It refuses the
+  run only when the store or the signer reports a credential failure and the
+  config explains it: no storage credentials at all (the error names both
+  fixes), or static `s3.access-key-id` / `s3.secret-access-key` in
+  `catalog.properties` together with a session token the catalog vended (the
+  store refuses that mix; remove the static keys). Any other probe failure,
+  a timeout included, is a warning. `faucet doctor` runs the same check as a
+  `storage` probe (skipped while the table does not exist yet).
+- S3 remote signing is not supported: a `header.X-Iceberg-Access-Delegation`
+  asking for `remote-signing`, or `s3.remote-signing-enabled: true`, is
+  refused at load.
+
+Not covered: the rows between two flushes taking longer to write than the
+credentials live. A catalog that vends credentials only through the
+`storage-credentials` field of the table response (not its `config`) is not
+read by `iceberg-rust` 0.11; the storage check then reports that the catalog
+returned no credentials.
+
 ## Timeouts, cancellation and retries
 
 Catalog calls, data-file writes and the snapshot commit run through the
 pipeline's `CallContext` (#880): each is made once (iceberg-rust's own commit
 retry is unchanged), any caller deadline ends it, and each is metered as a round
-trip (`catalog`, `write`, `commit`). A commit the deadline cut short is treated
+trip (`catalog`, `write`, `commit`, and `probe` for the storage check). A commit the deadline cut short is treated
 as ambiguous: its data files are never cleaned up, whatever
 `cleanup_orphans_on_failure` says. The orphan-file deletes of a definitive loss
 run under the context too; one the deadline or a cancel cuts short is counted

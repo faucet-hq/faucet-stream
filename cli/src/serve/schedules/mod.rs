@@ -19,6 +19,7 @@ pub mod runner;
 pub mod secrets;
 pub mod service;
 pub mod status;
+pub mod tzdata;
 pub mod validate;
 
 use crate::error::{CliError, CliResult};
@@ -49,22 +50,49 @@ pub struct SchedulesFile {
     pub schedules: Vec<ScheduleSpec>,
 }
 
-/// Validate a parsed file. `Err` is user-facing.
+/// Validate a parsed file. `Err` is user-facing: the first problem.
 pub fn check_file(file: &SchedulesFile) -> Result<(), String> {
+    match file_problems(file).into_iter().next() {
+        Some(p) => Err(p),
+        None => Ok(()),
+    }
+}
+
+/// Every problem in a parsed file, in file order (#1111: an upgrade check
+/// names them all, not just the first).
+pub fn file_problems(file: &SchedulesFile) -> Vec<String> {
     if file.version != 1 {
-        return Err(format!(
+        return vec![format!(
             "schedules: unsupported version {} (expected 1)",
             file.version
-        ));
+        )];
     }
+    let mut out = Vec::new();
     let mut names = std::collections::HashSet::new();
     for s in &file.schedules {
-        validate::validate(s).map_err(|e| format!("schedules: '{}': {e}", s.name))?;
+        if let Err(e) = validate::validate(s) {
+            out.push(format!("schedules: '{}': {e}", s.name));
+        }
         if !names.insert(s.name.as_str()) {
-            return Err(format!("schedules: duplicate schedule name '{}'", s.name));
+            out.push(format!("schedules: duplicate schedule name '{}'", s.name));
         }
     }
-    Ok(())
+    out
+}
+
+/// Parse a `--schedules` file's text, JSON or YAML.
+pub fn parse_file(text: &str, is_json: bool) -> Result<SchedulesFile, String> {
+    if is_json {
+        serde_json::from_str(text).map_err(|e| format!("parsing schedules JSON: {e}"))
+    } else {
+        crate::yaml::from_str(text).map_err(|e| format!("parsing schedules YAML: {e}"))
+    }
+}
+
+/// Whether a schedules file path is read as JSON.
+pub fn is_json_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("json"))
 }
 
 /// Load + validate a `--schedules` file (YAML or JSON).
@@ -73,16 +101,7 @@ pub async fn load_file(path: &std::path::Path) -> CliResult<SchedulesFile> {
         .await
         .map_err(|e| CliError::Serve(format!("reading schedules file {}: {e}", path.display())))?;
     crate::serve::load::protect_file(path);
-    let is_json = path
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("json"));
-    let file: SchedulesFile = if is_json {
-        serde_json::from_str(&text)
-            .map_err(|e| CliError::Serve(format!("parsing schedules JSON: {e}")))?
-    } else {
-        crate::yaml::from_str(&text)
-            .map_err(|e| CliError::Serve(format!("parsing schedules YAML: {e}")))?
-    };
+    let file = parse_file(&text, is_json_path(path)).map_err(CliError::Serve)?;
     check_file(&file).map_err(CliError::Serve)?;
     Ok(file)
 }
@@ -194,6 +213,32 @@ pub async fn supervise<F, Fut>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_problems_lists_every_problem_in_order() {
+        let file = parse_file(
+            "version: 1\nschedules:\n  - {name: a, cron: '0 0 * * SUN-SUN', template: {id: t}}\n  - {name: b, cron: 'mon * * * *', template: {id: t}}\n  - {name: a, cron: '0 * * * *', template: {id: t}}\n",
+            false,
+        )
+        .unwrap();
+        let p = file_problems(&file);
+        assert_eq!(p.len(), 3, "{p:?}");
+        assert!(
+            p[0].contains("'a'") && p[0].contains("every day"),
+            "{}",
+            p[0]
+        );
+        assert!(
+            p[1].contains("'b'") && p[1].contains("invalid cron"),
+            "{}",
+            p[1]
+        );
+        assert!(p[2].contains("duplicate schedule name 'a'"), "{}", p[2]);
+        assert_eq!(check_file(&file).unwrap_err(), p[0]);
+        assert!(parse_file("{", true).unwrap_err().contains("JSON"));
+        assert!(is_json_path(std::path::Path::new("x.JSON")));
+        assert!(!is_json_path(std::path::Path::new("x.yaml")));
+    }
 
     #[tokio::test]
     async fn a_file_loads_and_every_problem_is_named() {

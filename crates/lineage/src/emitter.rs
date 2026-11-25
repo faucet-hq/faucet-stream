@@ -363,6 +363,27 @@ mod tests {
     }
 
     #[test]
+    fn event_time_spelling_is_frozen() {
+        let dir = tempfile::tempdir().unwrap();
+        let em = LineageEmitter::new(cfg(dir.path().join("ol.jsonl"))).unwrap();
+        let mut ctx = lifecycle();
+        for (at, want) in [
+            ("2026-11-25T10:00:00Z", "2026-11-25T10:00:00+00:00"),
+            ("2026-11-25T10:00:00.5Z", "2026-11-25T10:00:00.500+00:00"),
+            (
+                "2026-11-25T10:00:00.123456789Z",
+                "2026-11-25T10:00:00.123456789+00:00",
+            ),
+        ] {
+            ctx.started_at = chrono::DateTime::parse_from_rfc3339(at).unwrap().to_utc();
+            ctx.finished_at = None;
+            assert_eq!(em.build(EventType::Start, &ctx).event_time, want, "{at}");
+            ctx.finished_at = Some(ctx.started_at);
+            assert_eq!(em.build(EventType::Complete, &ctx).event_time, want, "{at}");
+        }
+    }
+
+    #[test]
     fn running_events_carry_the_send_time_and_facets_their_own_schema() {
         let dir = tempfile::tempdir().unwrap();
         let mut c = cfg(dir.path().join("ol.jsonl"));

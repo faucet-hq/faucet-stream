@@ -117,7 +117,7 @@ fn metadata(event: &StoredEvent) -> Value {
     meta.insert("id".into(), Value::String(event.id.clone()));
     meta.insert(
         "received_at".into(),
-        fidelity::timestamp(&event.received_at, TimePrecision::Micros),
+        fidelity::timestamp(&event.received_at.to_chrono(), TimePrecision::Micros),
     );
     meta.insert("headers".into(), Value::Object(headers));
     Value::Object(meta)

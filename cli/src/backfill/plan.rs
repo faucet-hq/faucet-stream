@@ -87,7 +87,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn tz(name: &str) -> chrono_tz::Tz {
+    fn tz(name: &str) -> faucet_core::time::ChronoZone {
         name.parse().unwrap()
     }
 

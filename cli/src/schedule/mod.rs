@@ -10,3 +10,8 @@ pub mod compiled;
 pub mod metrics;
 pub mod spec;
 pub mod state;
+
+#[cfg(test)]
+mod dst_oracle;
+#[cfg(test)]
+mod golden_ticks;
