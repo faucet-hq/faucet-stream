@@ -614,6 +614,15 @@ assert_eq!(v["id"], serde_json::json!("18446744073709551616"));
 (`RowAccountsSnapshot::non_finite`, `faucet_fidelity_non_finite_total`). See
 the [value fidelity reference](https://faucet-hq.github.io/faucet-stream/reference/value-fidelity/).
 
+`fidelity::f32_cursor_bound(&bookmark)` is what an incremental SQL source
+compares a single-precision cursor column with (#1114). A bookmark read from
+such a column holds the shortest decimal (`0.7`), which a double comparison
+puts above the stored `0.699999988…`. The bound is `min(D, F)`: `D` the
+bookmark as a double, `F` its decimal text parsed once as an `f32`. It is the
+row's exact value for an `f32` column and never above the bookmark for any
+other type. `None` for integers, non-numeric strings and other values. Send it
+to the server bit-exact, never as text to cast.
+
 ## Declared column types
 
 A source that knows its column types implements `Source::declared_columns`,

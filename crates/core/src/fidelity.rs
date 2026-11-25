@@ -354,6 +354,74 @@ pub fn float32(v: f32) -> Value {
     }
 }
 
+/// The value an incremental read compares a single-precision (`f32`) cursor
+/// column with, for a bookmark `D` (#1114).
+///
+/// A bookmark taken from an `f32` column holds that value's shortest decimal
+/// (`0.7`). Compared as a double, `0.7` sits above the column's
+/// `0.699999988…`, so rows at the bookmark are skipped. The bound is
+/// `min(D, F)`, where `F` is the bookmark's decimal text parsed **once** as an
+/// `f32` (never `D as f32`, which rounds twice), widened exactly. For an `f32`
+/// column that is exactly the row's value; for any other type it is at most
+/// `D`, so the worst case is a re-read row, never a lost one. Send it to the
+/// server bit-exact (a native double bind), never as text to cast.
+///
+/// `Ok(None)` when the bookmark is not a non-integer number (an integer, a
+/// non-numeric string, any other value): such a cursor is compared as today.
+/// A numeric string beyond the `f64` range is an error.
+pub fn f32_cursor_bound(bookmark: &Value) -> Result<Option<f64>, crate::FaucetError> {
+    let (text, d) = match bookmark {
+        Value::Number(n) if n.is_f64() => match n.as_f64() {
+            Some(d) => (n.to_string(), d),
+            None => return Ok(None),
+        },
+        Value::String(s) if is_decimal_literal(s) => {
+            let d = s
+                .parse::<f64>()
+                .ok()
+                .filter(|d| d.is_finite())
+                .ok_or_else(|| {
+                    crate::FaucetError::Config(
+                        "incremental replication: the bookmark is a number beyond the range of a \
+                     double"
+                            .into(),
+                    )
+                })?;
+            (s.clone(), d)
+        }
+        _ => return Ok(None),
+    };
+    let f = match text.parse::<f32>() {
+        Ok(f) if f.is_finite() => f64::from(f),
+        _ => return Ok(Some(d)),
+    };
+    Ok(Some(d.min(f)))
+}
+
+/// Whether `s` is a decimal number with a fraction or an exponent
+/// (`-1.5`, `2e-3`); an integer, `NaN`, `inf` or any other text is not.
+fn is_decimal_literal(s: &str) -> bool {
+    let body = s.strip_prefix(['-', '+']).unwrap_or(s);
+    let (mantissa, exponent) = match body.split_once(['e', 'E']) {
+        Some((m, e)) => (m, Some(e)),
+        None => (body, None),
+    };
+    let (int, frac) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (mantissa, None),
+    };
+    let digits = |t: &str| t.bytes().all(|b| b.is_ascii_digit());
+    let exp_ok = exponent.is_none_or(|e| {
+        let e = e.strip_prefix(['-', '+']).unwrap_or(e);
+        !e.is_empty() && digits(e)
+    });
+    (frac.is_some() || exponent.is_some())
+        && digits(int)
+        && frac.is_none_or(digits)
+        && (!int.is_empty() || frac.is_some_and(|f| !f.is_empty()))
+        && exp_ok
+}
+
 /// The text a sink binds for a JSON number that is not an integer: its
 /// shortest round-trip decimal form, so the server parses the value the record
 /// holds. An `f64` bound into a `DECIMAL` column is converted from binary and
@@ -830,6 +898,111 @@ mod tests {
                 "the shortest decimal casts away"
             );
             assert_eq!(float32(v), json!(f64::from(v)));
+        }
+    }
+
+    fn assert_bound_selects_exactly_from(x: f32) {
+        let b = f32_cursor_bound(&float32(x)).unwrap().unwrap();
+        let below = f64::from(x.next_down());
+        assert!(
+            below < b && b <= f64::from(x),
+            "{x:e} ({:#x}): bound {b:e}",
+            x.to_bits()
+        );
+    }
+
+    #[test]
+    fn f32_cursor_bound_is_the_rows_value_for_every_kind_of_f32() {
+        let specials = [
+            0.1f32,
+            0.3,
+            0.7,
+            -0.1,
+            -0.7,
+            f32::from_bits(363_742_205),
+            -f32::from_bits(363_742_205),
+            f32::MAX,
+            -f32::MAX,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::from_bits(0x0040_0001),
+            16_777_217.0,
+            1.5,
+        ];
+        for x in specials {
+            assert_bound_selects_exactly_from(x);
+        }
+        let mut bits = 0u32;
+        while let Some(next) = bits.checked_add(9_973) {
+            let x = f32::from_bits(bits);
+            if x.is_finite() {
+                assert_bound_selects_exactly_from(x);
+            }
+            bits = next;
+        }
+    }
+
+    #[test]
+    fn f32_cursor_bound_never_exceeds_the_bookmark() {
+        for d in [
+            0.7f64,
+            0.1,
+            -0.7,
+            0.699_999_988_079_071,
+            1e-300,
+            1e300,
+            -1e300,
+        ] {
+            let b = f32_cursor_bound(&serde_json::json!(d)).unwrap().unwrap();
+            assert!(b <= d, "{d}: {b}");
+        }
+        assert_eq!(
+            f32_cursor_bound(&serde_json::json!(0.699_999_988_079_071)).unwrap(),
+            Some(f64::from(0.7f32))
+        );
+        assert_eq!(
+            f32_cursor_bound(&serde_json::json!(1e300)).unwrap(),
+            Some(1e300)
+        );
+        assert_eq!(
+            f32_cursor_bound(&serde_json::json!(-1e300)).unwrap(),
+            Some(-1e300)
+        );
+    }
+
+    #[test]
+    fn f32_cursor_bound_reads_numeric_strings_and_skips_everything_else() {
+        let v = |s: &str| f32_cursor_bound(&Value::String(s.into()));
+        assert_eq!(v("0.7").unwrap(), Some(f64::from(0.7f32)));
+        assert_eq!(v("0.699999988079071").unwrap(), Some(f64::from(0.7f32)));
+        assert_eq!(v("-7e-1").unwrap(), Some(-0.7));
+        assert_eq!(v(".5").unwrap(), Some(0.5));
+        assert_eq!(v("1E+2").unwrap(), Some(100.0));
+        for not in [
+            "",
+            "7",
+            "-7",
+            "abc",
+            "NaN",
+            "inf",
+            "1.2.3",
+            "1e",
+            ".",
+            "1.x",
+            "2024-01-01",
+            "1e+",
+        ] {
+            assert_eq!(v(not).unwrap(), None, "{not:?}");
+        }
+        assert!(v("1e400").is_err());
+        for not in [
+            serde_json::json!(7),
+            serde_json::json!(-7),
+            Value::Null,
+            serde_json::json!(true),
+            serde_json::json!([0.5]),
+        ] {
+            assert_eq!(f32_cursor_bound(&not).unwrap(), None, "{not}");
         }
     }
 
