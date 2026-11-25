@@ -100,11 +100,21 @@ pub fn mixed(members: &[InstanceRecord]) -> bool {
     seen.len() > 1
 }
 
-/// A run of this schedule started within `window` by a replica that does not
-/// advertise tzdata: an older peer that never heartbeats.
-pub fn peer_among_runs(runs: &[RunRecord], since: DateTime<Utc>) -> Option<Peer> {
+/// A run of this schedule started since `since` by a replica that does not
+/// advertise tzdata: an older peer that never heartbeats. With `own_before`
+/// (this process holds the history alone and started then), an unstamped run
+/// submitted earlier is this server's own, from before its upgrade.
+pub fn peer_among_runs(
+    runs: &[RunRecord],
+    since: DateTime<Utc>,
+    own_before: Option<DateTime<Utc>>,
+) -> Option<Peer> {
     runs.iter()
-        .find(|r| r.tzdata.is_none() && r.submitted_at >= since)
+        .find(|r| {
+            r.tzdata.is_none()
+                && r.submitted_at >= since
+                && own_before.is_none_or(|start| r.submitted_at >= start)
+        })
         .map(|r| Peer::Before {
             who: format!("the replica that started run {}", r.run_id),
         })
@@ -184,8 +194,15 @@ pub async fn recent_runs(
         .map_err(|e| e.to_string())
 }
 
-/// The peer that makes `tick` of schedule `name` (in `zone`, every `period`)
-/// one to hold, if any. Only a SQL history can be shared.
+/// Whether a tick in `zone` can ever be held here: only a SQL history can
+/// be shared, and a fixed zone never moves.
+pub fn may_hold(state: &ServerState, zone: Zone) -> bool {
+    state.persistent_history() && !zone.is_fixed()
+}
+
+/// The peer that makes `tick` of schedule `name` (in `zone`, every
+/// `period`) one to hold, if any. On the default file this process holds
+/// alone, only runs recorded after it started can be another replica's.
 pub async fn peer_for(
     state: &ServerState,
     name: &str,
@@ -194,7 +211,7 @@ pub async fn peer_for(
     tick: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Result<Option<(Peer, Vec<RunRecord>)>, String> {
-    if !state.persistent_history() || zone.is_fixed() {
+    if !may_hold(state, zone) {
         return Ok(None);
     }
     let ours = TzdataVersion::current();
@@ -208,7 +225,11 @@ pub async fn peer_for(
     let lookback = (period * 2).max(Duration::hours(1));
     let since = (now - lookback).min(tick - delta);
     let runs = recent_runs(state, name, since).await?;
-    let peer = peer_among(&members, ours).or_else(|| peer_among_runs(&runs, now - lookback));
+    let own_before = state
+        .exclusive_history()
+        .then(|| state.cluster().started_at());
+    let peer =
+        peer_among(&members, ours).or_else(|| peer_among_runs(&runs, now - lookback, own_before));
     Ok(peer.filter(|p| p.affects(zone, tick)).map(|p| (p, runs)))
 }
 
@@ -280,9 +301,29 @@ mod tests {
             run("new", "2026-11-24T16:00:00Z", Some("2026f")),
             run("old", "2026-11-24T17:00:00Z", None),
         ];
-        let p = peer_among_runs(&runs, at("2026-11-24T00:00:00Z")).unwrap();
+        let p = peer_among_runs(&runs, at("2026-11-24T00:00:00Z"), None).unwrap();
         assert!(p.who().contains("run old"));
-        assert!(peer_among_runs(&runs, at("2026-11-25T00:00:00Z")).is_none());
+        assert!(peer_among_runs(&runs, at("2026-11-25T00:00:00Z"), None).is_none());
+        let since = at("2026-11-24T00:00:00Z");
+        assert!(
+            peer_among_runs(&runs, since, Some(at("2026-11-24T17:30:00Z"))).is_none(),
+            "this server's own run from before its upgrade"
+        );
+        assert!(peer_among_runs(&runs, since, Some(at("2026-11-24T16:30:00Z"))).is_some());
+    }
+
+    #[tokio::test]
+    async fn nothing_is_held_on_a_memory_history_or_in_a_fixed_zone() {
+        let memory = crate::serve::test_support::test_state();
+        assert!(!may_hold(
+            &memory,
+            Zone::parse("America/Vancouver").unwrap()
+        ));
+        let mut config = crate::serve::test_support::test_config();
+        config.history = crate::serve::config::HistoryBackendSpec::Sqlite("sqlite::memory:".into());
+        let sql = crate::serve::test_support::state_from(&config);
+        assert!(may_hold(&sql, Zone::parse("America/Vancouver").unwrap()));
+        assert!(!may_hold(&sql, Zone::UTC));
     }
 
     #[test]

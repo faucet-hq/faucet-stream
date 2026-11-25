@@ -62,6 +62,10 @@ pub struct Entry {
     attempts: u32,
     /// The tick waits out a run-history outage (#1050).
     held: bool,
+    /// The tick whose tzdata hold was last recorded (#1116).
+    noted_tzdata_hold: Option<DateTime<Utc>>,
+    /// The schedule's shortest gap between ticks, once computed.
+    period: Option<chrono::Duration>,
     /// The next tick could not be computed (#1111): the entry does not tick
     /// until a reload computes one again.
     compute_error: Option<String>,
@@ -94,6 +98,8 @@ impl Entry {
             retry_at: None,
             attempts: 0,
             held: false,
+            noted_tzdata_hold: None,
+            period: None,
             compute_error: None,
         };
         entry.next = entry.next_of(now);
@@ -118,11 +124,14 @@ impl Entry {
         }
     }
 
-    /// The schedule's shortest gap between ticks, an hour when unknown.
-    fn period(&self) -> chrono::Duration {
-        super::validate::shortest_gap(&self.schedule, Utc::now())
-            .and_then(|d| chrono::Duration::from_std(d).ok())
-            .unwrap_or_else(|| chrono::Duration::hours(1))
+    /// The schedule's shortest gap between ticks, an hour when unknown;
+    /// computed once per entry.
+    fn period(&mut self) -> chrono::Duration {
+        *self.period.get_or_insert_with(|| {
+            super::validate::shortest_gap(&self.schedule, Utc::now())
+                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .unwrap_or_else(|| chrono::Duration::hours(1))
+        })
     }
 
     /// Why the entry cannot compute its next tick, if it cannot.
@@ -520,9 +529,12 @@ async fn hold_for_tzdata(
     now: DateTime<Utc>,
 ) -> TzdataStep {
     let zone = entry.schedule.zone();
-    let period = entry.period();
     let name = entry.spec.name.clone();
     let history = state.history();
+    if !super::tzdata::may_hold(state, zone) {
+        return TzdataStep::Fire;
+    }
+    let period = entry.period();
     let found = match super::tzdata::peer_for(state, &name, zone, period, tick, now).await {
         Ok(found) => found,
         Err(e) => {
@@ -576,7 +588,8 @@ async fn hold_for_tzdata(
                 "held until {until}: {} may run this slot at another instant (tzdata differs)",
                 peer.who()
             );
-            if entry.retry_at.is_none() {
+            if entry.noted_tzdata_hold != Some(tick) {
+                entry.noted_tzdata_hold = Some(tick);
                 tracing::warn!(schedule = %name, %tick, peer = %peer.who(), %until, "holding the tick while a replica on other tzdata may run it");
                 metrics::tick(&name, "held_tzdata");
                 status::record(&*history, &name, tick, Outcome::HeldTzdata(why)).await;
@@ -690,8 +703,16 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
         TzdataStep::FireLate => true,
         TzdataStep::Done => return,
     };
-    let result =
-        fire::fire_tick(state, &entry.spec, entry.owner.as_deref(), tick, now, &opts).await;
+    let firing: std::pin::Pin<Box<dyn std::future::Future<Output = fire::TickResult> + Send + '_>> =
+        Box::pin(fire::fire_tick(
+            state,
+            &entry.spec,
+            entry.owner.as_deref(),
+            tick,
+            now,
+            &opts,
+        ));
+    let result = firing.await;
     let outcome = result.outcome();
     let targets = target_outcomes(&result);
     match &outcome {
@@ -1252,6 +1273,62 @@ mod tests {
         let mut summer = vancouver(at("2026-07-01T12:00:00Z"));
         step(&state, &mut summer, at("2026-07-01T16:00:00Z")).await;
         assert_eq!(outcome(&state, "morning").await.as_deref(), Some("started"));
+    }
+
+    /// #1116: a single server upgraded on the default (locked) history file
+    /// does not hold against the runs its own older release recorded.
+    #[tokio::test]
+    async fn a_single_upgraded_server_fires_on_time_past_its_own_unstamped_runs() {
+        let state = shared_state().await;
+        state.set_exclusive_history(true);
+        old_release_run(&state, "old-1", "2026-11-23T17:00:00Z").await;
+        let mut e = vancouver(at("2026-11-24T12:00:00Z"));
+        step(&state, &mut e, at("2026-11-24T16:00:00Z")).await;
+        assert_eq!(outcome(&state, "morning").await.as_deref(), Some("started"));
+    }
+
+    /// #1116: on that file, an unstamped run recorded after this server
+    /// started still comes from a live older release, and the tick is held.
+    #[tokio::test]
+    async fn an_unstamped_run_after_start_still_holds_on_an_exclusive_history() {
+        let state = shared_state().await;
+        state.set_exclusive_history(true);
+        let labels = BTreeMap::from([
+            (fire::LABEL_SCHEDULE.to_string(), "morning".to_string()),
+            (
+                fire::LABEL_TICK.to_string(),
+                "2026-11-23T17:00:00Z".to_string(),
+            ),
+        ]);
+        let mut r = crate::serve::history::RunRecord::queued(
+            "old-live".into(),
+            None,
+            labels,
+            None,
+            state.cluster().started_at() + chrono::Duration::seconds(1),
+        );
+        r.tzdata = None;
+        state.history().upsert(&r).await.unwrap();
+        let mut e = vancouver(at("2026-11-24T12:00:00Z"));
+        step(&state, &mut e, at("2026-11-24T16:00:00Z")).await;
+        assert_eq!(
+            outcome(&state, "morning").await.as_deref(),
+            Some("held_tzdata")
+        );
+    }
+
+    /// #1116: a tick held after a retry back-off is still recorded as held.
+    #[tokio::test]
+    async fn a_tick_held_after_a_back_off_is_recorded() {
+        let state = shared_state().await;
+        old_release_run(&state, "old-1", "2026-11-23T17:00:00Z").await;
+        let mut e = vancouver(at("2026-11-24T12:00:00Z"));
+        e.back_off(at("2026-11-24T15:59:00Z"));
+        step(&state, &mut e, at("2026-11-24T16:00:00Z")).await;
+        assert_eq!(
+            outcome(&state, "morning").await.as_deref(),
+            Some("held_tzdata")
+        );
     }
 
     #[tokio::test]

@@ -108,6 +108,9 @@ struct Inner {
     grafana_url: Option<String>,
     /// Set when shutdown begins: new work is refused and `/readyz` is 503.
     draining: std::sync::atomic::AtomicBool,
+    /// This process holds the default history file's lock: no other server
+    /// writes to it (#1049).
+    exclusive_history: std::sync::atomic::AtomicBool,
     /// Failed bearer-token attempts per source address.
     failed_auth: crate::serve::auth::FailedAuth,
     /// Clustered terminal records whose owner-fenced write failed (the
@@ -191,6 +194,7 @@ impl ServerState {
                 references: Arc::new(config.references.clone()),
                 grafana_url: config.grafana_url.clone(),
                 draining: std::sync::atomic::AtomicBool::new(false),
+                exclusive_history: std::sync::atomic::AtomicBool::new(false),
                 failed_auth: Default::default(),
                 pending_finalize: std::sync::Mutex::new(Vec::new()),
                 forgotten_runs: Default::default(),
@@ -551,6 +555,21 @@ impl ServerState {
     /// Whether run records are stored in a SQL history backend.
     pub fn persistent_history(&self) -> bool {
         self.inner.persistent_history
+    }
+
+    /// Whether this process holds the default history file's lock, so no
+    /// other server can write to the history.
+    pub fn exclusive_history(&self) -> bool {
+        self.inner
+            .exclusive_history
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record that this process holds the default history file's lock.
+    pub fn set_exclusive_history(&self, exclusive: bool) {
+        self.inner
+            .exclusive_history
+            .store(exclusive, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Keep a terminal record whose owner-fenced write failed for a retry.
