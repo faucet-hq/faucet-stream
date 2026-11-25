@@ -132,6 +132,8 @@ exclude = [
     "examples/wasm-transforms/rust",
     "fuzz",
     "skills/faucet-connector/examples",
+    # chrono-tz 0.10.4 with current tzdata, through [patch.crates-io] (#1118).
+    "vendor/chrono-tz",
 ]
 
 [workspace.package]
@@ -478,3 +480,11 @@ lto = "thin"
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+
+# chrono-tz is unmaintained (RUSTSEC-2026-0555) and its last release bundles
+# tzdata 2025b. Arrow and ORC read zones through it, so every build of this
+# workspace uses an unmodified 0.10.4 whose tables are regenerated from the
+# tzdata pinned in supply-chain/tzdata-version (#1118). Delete when no
+# dependency uses chrono-tz.
+[patch.crates-io]
+chrono-tz = { path = "vendor/chrono-tz" }

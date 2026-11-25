@@ -90,7 +90,7 @@ ignore = [
     # comes only from object_store and deltalake-core. Not a vulnerability.
     # Drop each id when no copy remains in Cargo.lock.
     { id = "RUSTSEC-2026-0543", reason = "chrono: no maintained release; arrow, parquet, object_store, deltalake, iceberg, duckdb, orc-rust, russh-sftp and volo-thrift require it with no alternative; our own code moves behind faucet_core::time (#1093); drop when none of them pulls it (2026-11-25)" },
-    { id = "RUSTSEC-2026-0555", reason = "chrono-tz: no maintained release; under arrow-array and orc-rust, and the CLI's zone handling until #1093 stage B and #1111 land; drop when cargo tree -i chrono-tz is empty (2026-11-25)" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz: no maintained release; only under arrow-array and orc-rust (our zones resolve through jiff, #1116), and this workspace builds vendor/chrono-tz with current tzdata (#1118); drop when cargo tree -i chrono-tz is empty (2026-11-25)" },
     { id = "RUSTSEC-2026-0542", reason = "humantime: no maintained release; only via object_store and deltalake-core, never a dependency of ours; drop when both release without it (2026-11-25)" },
     # 2026-11-05 — astral-tokio-tar is unmaintained (Astral ended it on
     # 2026-11-03). Only testcontainers uses it, a test-only dependency, and its

@@ -25,6 +25,9 @@ url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
 [imports.zcash]
 url = "https://raw.githubusercontent.com/zcash/rust-ecosystem/main/supply-chain/audits.toml"
 
+[policy.chrono-tz]
+audit-as-crates-io = false
+
 [policy.faucet-auth]
 audit-as-crates-io = false
 
@@ -1070,10 +1073,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.chrono]]
 version = "0.4.45"
-criteria = "safe-to-deploy"
-
-[[exemptions.chrono-tz]]
-version = "0.10.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.cipher]]

@@ -19,7 +19,8 @@ import re
 import subprocess
 import sys
 
-SKIPPED_FILES = re.compile(r"(^|/)CHANGELOG\.md$")
+# vendor/ holds third-party sources kept unmodified (#1118), not the engine.
+SKIPPED_FILES = re.compile(r"(^|/)CHANGELOG\.md$|^vendor/")
 
 # Names matched in any case. A name with several parts also matches with a
 # space, `_` or `-` between them (or nothing).

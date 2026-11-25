@@ -70,6 +70,8 @@ docs/superpowers/
 !/scripts/connector-deps.py
 !/scripts/license-files.py
 !/scripts/test_license_files.py
+!/scripts/tzdata-check.py
+!/scripts/test_tzdata_check.py
 !/scripts/add-crate-team.sh
 !/scripts/advisory-scope.py
 !/scripts/test_advisory_scope.py
