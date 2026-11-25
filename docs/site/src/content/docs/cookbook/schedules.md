@@ -87,6 +87,22 @@ start, and a six-field cron (one with a seconds field) is refused outright.
 For anything more frequent, use a [trigger](/faucet-stream/cookbook/triggers/) or a streaming
 source.
 
+The interval is measured on a UTC clock, so the same cron is accepted or
+refused the same way whatever the day it is made and whatever its time zone:
+`0,55 1 * * *` counts as 55 minutes apart even in `America/New_York`, where
+it never comes closer. A step job can still run closer together once a year,
+across a fall-back (`*/58 1 * * *` runs at 01:58 EDT and 01:00 EST, two
+minutes apart). Schedules follow the daylight-saving rule of
+[`faucet schedule`](/faucet-stream/cookbook/scheduling/#timezone-and-dst).
+
+Check a `--schedules` file offline, for example with a new release before
+upgrading, with `faucet validate --schedules FILE`: it lists every schedule
+the release refuses and exits non-zero. A stored schedule (made through the
+API or the console) that a new release refuses stops ticking: the server logs
+one WARN at startup naming every such schedule and one ERROR per schedule,
+and sets `faucet_serve_schedule_healthy` to `0` until it is fixed or
+deleted.
+
 ## Ticks, runs and failures
 
 Each tick submits a run through the same path as any template run: approval
@@ -209,7 +225,8 @@ Every call is audited as `schedule.<action>`. See the
 | `faucet_serve_schedule_step_timeouts_total{schedule}` | Steps cut off after five minutes; the tick is retried. |
 | `faucet_serve_schedule_missed_ticks_total{schedule}` | Ticks that never ran (no server up, or collapsed into one catch-up). |
 | `faucet_serve_schedule_tenant_failures_total{schedule,tenant}` | Fan-out ticks refused for one tenant while the others ran. |
-| `faucet_serve_schedule_healthy{schedule}` | `0` while a tick is retrying or the schedule needs approval; left alone while the run history is unreachable. |
+| `faucet_serve_schedule_compute_errors_total{schedule}` | Times the schedule's next tick could not be computed. It stops ticking (healthy `0`) and is tried again at each reload. |
+| `faucet_serve_schedule_healthy{schedule}` | `0` while a tick is retrying, the schedule needs approval, it no longer validates, or its next tick cannot be computed; left alone while the run history is unreachable. |
 | `faucet_serve_schedule_last_tick_unix_seconds{schedule}` | The last tick that started. |
 
 The shipped alerts (`observability/prometheus/alerts.yml`) cover missed ticks,

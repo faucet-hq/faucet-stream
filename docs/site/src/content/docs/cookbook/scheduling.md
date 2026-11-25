@@ -74,27 +74,60 @@ for sub-minute intervals:
 | `0 */5 * * * *` | Every 5 minutes (explicit seconds=0) |
 
 Field ranges follow standard cron semantics: `*` (every), `*/N` (every N),
-`a-b` (range), `a,b,c` (list). Month and day-of-week names (`JAN`, `MON`,
-etc.) are accepted. Special strings like `@daily` and `@hourly` are **not**
-supported — use the numeric form.
+`a-b` (range), `a,b,c` (list), `a-b/N` (every N within the range). A step
+without a range starts at the value given, or at the field's first value:
+`5/5` in the minute field is 5, 10, …, 55; `/5` is 0, 5, …, 55; `0 3/4 * * *`
+runs at 03:00, 07:00, …, 23:00; day-of-month `/5` is the 1st, 6th, 11th, …;
+month `/2` is January, March, May, …; weekday `/2` is Sunday, Tuesday,
+Thursday, Saturday. Month names (`JAN`) are accepted in the month field and
+weekday names (`MON`) in the weekday field only. `0` and `7` both mean Sunday.
+The aliases `@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly` and
+`@annually` are accepted.
+
+Refused, with a `config error: schedule: invalid cron …` message:
+
+- a name in the wrong field (`mon * * * *`, `0 0 * * jan`);
+- a bare `L` in the weekday field, alone or in a list (`0 0 * * L`,
+  `0 0 * * 1,L`); write `5L` for the last Friday;
+- a weekday range from Sunday to `SUN` (`SUN-SUN`, `0-SUN`), which would run
+  every day; write `SUN`, `0` or `7`.
 
 ## Timezone and DST
 
 Set `timezone` to any [IANA timezone name](https://www.iana.org/time-zones)
 (e.g. `America/Los_Angeles`, `Europe/Berlin`, `Asia/Tokyo`). The default is
-`UTC`.
+`UTC`. Ticks are UTC instants; the cron is read on the zone's wall clock.
 
-All tick times are computed on UTC monotonic instants with timezone-correct
-wall-clock interpretation, so DST transitions behave correctly:
+What a cron does on a daylight-saving day depends on its kind:
 
-- **Fall-back (clocks go back):** a repeated wall-clock hour fires **once**.
-- **Spring-forward (clocks skip ahead):** a wall-clock time in the skipped
-  hour is treated as if it were in the hour immediately after the gap — the
-  next valid tick.
+- **Fixed-time job**: the seconds, minutes and hours fields each hold exactly
+  one value (`30 2 * * *`, `0 0 * * *`, `@daily`).
+- **Interval job**: anything else, including lists and ranges
+  (`*/30 * * * *`, `0 * * * *`, `0 1,13 * * *`, `58 1-2 * * *`).
+
+| | Clocks skip ahead (a gap) | Clocks go back (an hour repeats) |
+|---|---|---|
+| Fixed-time job | Runs **once, at the first valid time after the gap**: `30 2 * * *` in `America/New_York` on 2025-03-09 runs at 03:00 EDT. It runs only if that time is still on a day the cron allows. | Runs **once**, in the first pass. |
+| Interval job, `*` or a step in the minute or hour field | Times in the gap are **skipped**: `*/30 2 * * *` has no run on 2025-03-09. | Runs in **both** passes, keeping its cadence: `*/30 * * * *` runs at 01:00 and 01:30 EDT, then 01:00 and 01:30 EST. |
+| Interval job, only numbers, lists and ranges in the minute and hour fields | Times in the gap are **skipped**: `0 2,14 * * *` has no 02:00 run on 2025-03-09, only 14:00. | Runs **once**, in the first pass (`0 1,13 * * *` runs at 01:00 EDT, not again at 01:00 EST). |
+
+The last row is classic cron behaviour. The cron library would run such a
+job in both passes; faucet skips the second pass on purpose (#1111).
+
+**`${now.*}` on a repeated hour.** The two runs of a `*` or step job in the
+repeated hour have the same local `${now.date}` and `${now.hour}`. If a run
+writes to a path built from those tokens, the second run lands on the first
+run's path. Use `${now.iso}` (it carries the UTC offset, `-04:00` then
+`-05:00`) or `${now.unix}` for per-run paths.
 
 The scheduler loop re-checks the wall clock at least every 30 seconds, so
 NTP steps, VM freeze/thaw, and DST shifts can never drift a scheduled fire
 by more than ~30 seconds.
+
+If the next tick cannot be computed (the cron library fails), `faucet
+schedule` stops with a non-zero exit and a `cannot compute the next tick`
+message once the run in flight finishes. It ends quietly (exit 0) only when a
+seven-field cron's year field has run out.
 
 ## Missed-tick behavior
 
