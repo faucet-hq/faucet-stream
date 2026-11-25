@@ -460,7 +460,11 @@ pub async fn run_backfill(
     };
 
     let planned = units.len();
-    let (todo, skipped) = split_remaining(units.clone(), &marker);
+    let zone = match &opts.range {
+        BackfillRange::Time { tz, .. } => tz.zone(),
+        BackfillRange::Bookmark { .. } => faucet_core::time::Zone::UTC,
+    };
+    let (todo, skipped) = split_remaining(units.clone(), &marker, zone);
     for _ in 0..skipped {
         super::metrics::record_unit(&opts.pipeline_name, "skipped");
     }
@@ -473,7 +477,7 @@ pub async fn run_backfill(
                 unit: u.id.clone(),
                 start: u.start.to_rfc3339(),
                 end: u.end.to_rfc3339(),
-                outcome: if marker.is_done(&u.id) {
+                outcome: if marker.covers(u, zone) {
                     "skipped".into()
                 } else {
                     "pending".into()
@@ -632,7 +636,7 @@ impl Progress {
             }
         };
         match &error {
-            None => self.marker.mark_done(&unit.id),
+            None => self.marker.mark_done_range(&unit),
             Some(e) => self.marker.mark_failed(&unit.id, e.clone()),
         }
         store.put(&self.marker_k, &self.marker.to_value()?).await?;
