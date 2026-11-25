@@ -84,13 +84,14 @@ ignore = [
     { id = "RUSTSEC-2026-0405", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)" },
     { id = "RUSTSEC-2026-0406", reason = "only zstd-safe 7.3.0 via zstd 0.13 remains; affected APIs unused (2026-10-28)" },
     # 2026-11-18: chrono, chrono-tz and humantime were declared unmaintained
-    # (chronotope/chrono#1768); no release fixes it. chrono and chrono-tz are
-    # direct dependencies and sit under arrow, sqlx, croner and the cloud SDKs;
-    # humantime comes only from object_store and deltalake-core. Not a
-    # vulnerability. Drop each id when no copy remains in Cargo.lock (#1093).
-    { id = "RUSTSEC-2026-0543", reason = "chrono: no maintained release; direct dependency and under arrow, sqlx, croner and the cloud SDKs; move tracked in #1093 (2026-11-18)" },
-    { id = "RUSTSEC-2026-0555", reason = "chrono-tz: no maintained release; direct dependency and under arrow-array; move tracked in #1093 (2026-11-18)" },
-    { id = "RUSTSEC-2026-0542", reason = "humantime: no maintained release; only via object_store and deltalake-core; tracked in #1093 (2026-11-18)" },
+    # (chronotope/chrono#1768); no release fixes it. Upstream crates we cannot
+    # replace still require chrono and chrono-tz; our own code moves behind
+    # faucet_core::time so one file changes when they leave (#1093). humantime
+    # comes only from object_store and deltalake-core. Not a vulnerability.
+    # Drop each id when no copy remains in Cargo.lock.
+    { id = "RUSTSEC-2026-0543", reason = "chrono: no maintained release; arrow, parquet, object_store, deltalake, iceberg, duckdb, orc-rust, russh-sftp and volo-thrift require it with no alternative; our own code moves behind faucet_core::time (#1093); drop when none of them pulls it (2026-11-25)" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz: no maintained release; under arrow-array and orc-rust, and the CLI's zone handling until #1093 stage B and #1111 land; drop when cargo tree -i chrono-tz is empty (2026-11-25)" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime: no maintained release; only via object_store and deltalake-core, never a dependency of ours; drop when both release without it (2026-11-25)" },
     # 2026-11-05 — astral-tokio-tar is unmaintained (Astral ended it on
     # 2026-11-03). Only testcontainers uses it, a test-only dependency, and its
     # newest release (0.28) still does. Drop when testcontainers moves off it.

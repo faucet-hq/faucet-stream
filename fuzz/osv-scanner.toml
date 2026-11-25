@@ -60,15 +60,15 @@ reason = "sqlite bundled in libsqlite3-sys 0.30.1, pinned by sqlx 0.8 (sqlx 0.9 
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0543"
-reason = "chrono: no maintained release; direct dependency and under arrow, sqlx, croner and the cloud SDKs; move tracked in #1093 (2026-11-18)"
+reason = "chrono: no maintained release; arrow, parquet, object_store, deltalake, iceberg, duckdb, orc-rust, russh-sftp and volo-thrift require it with no alternative; our own code moves behind faucet_core::time (#1093); drop when none of them pulls it (2026-11-25)"
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0555"
-reason = "chrono-tz: no maintained release; direct dependency and under arrow-array; move tracked in #1093 (2026-11-18)"
+reason = "chrono-tz: no maintained release; under arrow-array and orc-rust, and the CLI's zone handling until #1093 stage B and #1111 land; drop when cargo tree -i chrono-tz is empty (2026-11-25)"
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0542"
-reason = "humantime: no maintained release; only via object_store and deltalake-core; tracked in #1093 (2026-11-18)"
+reason = "humantime: no maintained release; only via object_store and deltalake-core, never a dependency of ours; drop when both release without it (2026-11-25)"
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0194"
