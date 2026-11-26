@@ -51,8 +51,9 @@ ALLOWED = [
     ("scripts/test_vendor_names.py", r".*"),
     # npm integrity hashes are random base64 that can spell a name ("AdP").
     ("docs/site/package-lock.json", r'^\s*"integrity": "sha\d+-[A-Za-z0-9+/=]+",?$'),
-    # An ORC file is made of stripes: the format's own word, here an option
-    # of the fixture writer.
+    # An ORC file is made of stripes: the format's own word, in the ORC
+    # reader's type and method names and in the fixture writer's options.
+    ("crates/core/src/file_format/orc.rs", r"Stripe|stripe_"),
     ("crates/core/tests/fixtures/orc/generate.py", r"stripe_size="),
 ]
 

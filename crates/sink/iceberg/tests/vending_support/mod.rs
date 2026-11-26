@@ -83,6 +83,7 @@ struct Catalog {
     namespaces: Vec<String>,
     tables: HashMap<String, TableEntry>,
     fail_loads: u32,
+    hang_loads: u32,
     stale_loads: u32,
     conflict: bool,
     calls: Vec<CatalogCall>,
@@ -438,6 +439,11 @@ impl RestResponder {
                             catalog.fail_loads -= 1;
                             return catalog_error(500, "InternalServerError");
                         }
+                        if catalog.hang_loads > 0 {
+                            catalog.hang_loads -= 1;
+                            return catalog_error(500, "InternalServerError")
+                                .set_delay(std::time::Duration::from_secs(120));
+                        }
                         let stale = catalog.stale_loads > 0;
                         catalog.stale_loads = catalog.stale_loads.saturating_sub(1);
                         match catalog.tables.get(&id) {
@@ -489,6 +495,7 @@ impl Fakes {
                 namespaces: Vec::new(),
                 tables: HashMap::new(),
                 fail_loads: 0,
+                hang_loads: 0,
                 stale_loads: 0,
                 conflict: false,
                 calls: Vec::new(),
@@ -571,6 +578,11 @@ impl Fakes {
 
     pub fn fail_next_loads(&self, n: u32) {
         self.shared.catalog.lock().unwrap().fail_loads = n;
+    }
+
+    /// The next `n` table loads get no answer for two minutes.
+    pub fn hang_next_loads(&self, n: u32) {
+        self.shared.catalog.lock().unwrap().hang_loads = n;
     }
 
     pub fn stale_next_loads(&self, n: u32) {

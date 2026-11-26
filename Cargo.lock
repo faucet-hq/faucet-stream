@@ -5382,6 +5382,7 @@ dependencies = [
  "orc-rust",
  "parquet 58.4.2",
  "percent-encoding",
+ "prost 0.13.5",
  "quick-xml 0.42.0",
  "regex",
  "reqwest 0.13.5",

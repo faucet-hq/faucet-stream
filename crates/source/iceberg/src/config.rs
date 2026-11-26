@@ -108,6 +108,20 @@ pub struct IcebergSourceConfig {
     /// Incremental only: reaction to a bookmarked snapshot that has expired.
     #[serde(default)]
     pub on_expired: OnExpired,
+
+    /// When the catalog vends the storage credentials: take fresh ones during
+    /// a read once they are this many seconds old (default `300`), by loading
+    /// the table again. The data files already being read finish first, so
+    /// the credentials must live longer than this plus the time those files
+    /// take. `0` takes fresh credentials before every data file, one file at a
+    /// time (for tests and diagnosis). Ignored for credentials the catalog did
+    /// not vend.
+    #[serde(default = "default_credential_refresh_secs")]
+    pub credential_refresh_secs: u64,
+}
+
+fn default_credential_refresh_secs() -> u64 {
+    300
 }
 
 fn default_batch_size() -> usize {

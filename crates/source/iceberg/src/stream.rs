@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
+use faucet_common_iceberg::{StorageReload, credential_expiry_ms, storage_reload};
 use faucet_core::shard::{HashShard, ShardSpec, parse_hash_shard, plan_hash_shards};
 use faucet_core::{FaucetError, Stream, StreamPage};
 use futures::{StreamExt, TryStreamExt};
@@ -19,8 +20,11 @@ use serde_json::Value;
 use tokio::sync::OnceCell;
 
 use crate::config::{IcebergSourceConfig, ReadMode, parse_timestamp_ms};
-use crate::convert::{UuidColumns, batch_to_rows, descriptor, select_tasks};
+use crate::convert::{
+    UuidColumns, batch_to_rows, descriptor, ensure_no_variant_projected, select_tasks,
+};
 use crate::filter::{self, Expr};
+use crate::refresh::{self, Credentials, REFRESH_TIMEOUT, TaskQueue};
 use crate::snapshots::{PlanOptions, SnapshotInfo, Step, bookmark_value, parse_bookmark, plan};
 
 /// Unit the scan emits before it is shaped into row or columnar pages.
@@ -33,6 +37,14 @@ type EventStream<'a> = Pin<Box<dyn Stream<Item = Result<Event, FaucetError>> + S
 
 fn source_err(context: &str, e: impl std::fmt::Display) -> FaucetError {
     FaucetError::Source(format!("iceberg: {context}: {e}"))
+}
+
+/// The wall clock in milliseconds since the Unix epoch, to compare with the
+/// expiry a catalog sends with its credentials.
+fn wall_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 use faucet_core::CallExt as _;
@@ -64,6 +76,8 @@ pub struct IcebergSource {
     shard: Mutex<Option<HashShard>>,
     /// Set once the table's storage was checked (#1108).
     preflighted: OnceCell<()>,
+    /// Treat the storage credentials as vended whatever they are (tests).
+    refresh_forced: bool,
     /// Backend-call context (#880): catalog calls, scan planning and every
     /// batch read run through it.
     calls: faucet_core::CallSlot,
@@ -99,8 +113,17 @@ impl IcebergSource {
             bookmark: Mutex::new(None),
             shard: Mutex::new(None),
             preflighted: OnceCell::new(),
+            refresh_forced: false,
             calls: faucet_core::CallSlot::new(faucet_core::CallContext::new().without_timeout()),
         })
+    }
+
+    /// Refresh the table's storage during a read as if its credentials were
+    /// vended, whatever they are. For tests of the refresh on a local table.
+    #[doc(hidden)]
+    pub fn with_storage_refresh_forced(mut self) -> Self {
+        self.refresh_forced = true;
+        self
     }
 
     async fn catalog(&self) -> Result<Arc<dyn Catalog>, FaucetError> {
@@ -257,21 +280,58 @@ impl IcebergSource {
         Ok(added)
     }
 
-    /// Scan one snapshot (optionally only the files in `added`).
-    async fn scan(
-        &self,
+    /// The schema `snapshot_id` reads with.
+    fn snapshot_schema(
         table: &Table,
         snapshot_id: i64,
-        added: Option<&HashSet<String>>,
-    ) -> Result<(ArrowRecordBatchStream, UuidColumns), FaucetError> {
+    ) -> Result<iceberg::spec::SchemaRef, FaucetError> {
         let metadata = table.metadata();
         let snapshot = metadata
             .snapshot_by_id(snapshot_id)
             .ok_or_else(|| source_err("snapshot vanished while planning", snapshot_id))?;
-        let schema = snapshot
+        snapshot
             .schema(metadata)
-            .map_err(|e| source_err("could not resolve the snapshot schema", e))?;
+            .map_err(|e| source_err("could not resolve the snapshot schema", e))
+    }
 
+    /// Whether the schema a run would read holds only columns the reader can
+    /// decode: the snapshot the config selects in `mode: full`, the current
+    /// schema in `mode: incremental` (each step is checked when the run starts).
+    fn readable_schema(&self, table: &Table) -> Result<(), FaucetError> {
+        let metadata = table.metadata();
+        let snapshots: Vec<SnapshotInfo> = metadata
+            .snapshots()
+            .map(|s| SnapshotInfo::from(s.as_ref()))
+            .collect();
+        let selected = match self.config.mode {
+            ReadMode::Incremental => None,
+            ReadMode::Full => self
+                .plan_options()
+                .and_then(|opts| plan(&opts, &snapshots, metadata.current_snapshot_id(), None))
+                .ok()
+                .and_then(|steps| {
+                    steps.into_iter().find_map(|step| match step {
+                        Step::Full { snapshot_id, .. } => Some(snapshot_id),
+                        _ => None,
+                    })
+                }),
+        };
+        let schema = match selected {
+            Some(id) => Self::snapshot_schema(table, id)?,
+            None => metadata.current_schema().clone(),
+        };
+        ensure_no_variant_projected(&schema, &self.config.columns)
+    }
+
+    /// Plan one snapshot (optionally only the files in `added`): the data
+    /// files to read, with their delete files.
+    async fn plan_tasks(
+        &self,
+        table: &Table,
+        snapshot_id: i64,
+        added: Option<&HashSet<String>>,
+    ) -> Result<(Vec<FileScanTask>, UuidColumns), FaucetError> {
+        let schema = Self::snapshot_schema(table, snapshot_id)?;
         let mut builder = table.scan().snapshot_id(snapshot_id);
         builder = if self.config.columns.is_empty() {
             builder.select_all()
@@ -304,7 +364,17 @@ impl IcebergSource {
             table = %self.ident,
             "iceberg source scanning snapshot"
         );
+        Ok((tasks, UuidColumns::of(&schema)))
+    }
 
+    /// Read planned data files through `table`'s storage: the tasks `queue`
+    /// hands out until `until`.
+    fn read_tasks(
+        &self,
+        table: &Table,
+        queue: TaskQueue,
+        until: Option<tokio::time::Instant>,
+    ) -> Result<ArrowRecordBatchStream, FaucetError> {
         let mut reader = table
             .reader_builder()
             .with_data_file_concurrency_limit(self.config.concurrency);
@@ -313,41 +383,147 @@ impl IcebergSource {
         }
         let result = reader
             .build()
-            .read(futures::stream::iter(tasks.into_iter().map(Ok)).boxed())
+            .read(refresh::feed(queue, until))
             .map_err(|e| source_err("could not start reading data files", e))?;
-        Ok((result.stream(), UuidColumns::of(&schema)))
+        Ok(result.stream())
+    }
+
+    /// Whether `storage` (a table's storage properties) holds credentials the
+    /// catalog vended.
+    fn vended(&self, storage: &HashMap<String, String>) -> bool {
+        self.refresh_forced
+            || faucet_common_iceberg::holds_vended_credentials(
+                storage,
+                &self.config.catalog.inner().properties,
+            )
+    }
+
+    /// How old `table`'s storage credentials are, counted from now.
+    fn credentials_of(&self, table: &Table) -> Credentials {
+        let storage = table.file_io().config().props();
+        Credentials::new(
+            self.vended(storage),
+            std::time::Duration::from_secs(self.config.credential_refresh_secs),
+            credential_expiry_ms(storage),
+            tokio::time::Instant::now(),
+        )
+    }
+
+    /// Take fresh storage credentials when they are due (#1117): load the
+    /// table again and keep only its storage, so the plan and the schema of
+    /// this read stay what they were. A table that is gone or was replaced
+    /// fails the read; any other failure keeps the current credentials and is
+    /// tried again later.
+    async fn refresh_storage_if_due(
+        &self,
+        table: &mut Table,
+        credentials: &mut Credentials,
+    ) -> Result<(), FaucetError> {
+        if !credentials.due(tokio::time::Instant::now(), wall_ms()) {
+            return Ok(());
+        }
+        let loaded = self
+            .calls
+            .get()
+            .with_timeout(REFRESH_TIMEOUT)
+            .call_once("load", async {
+                Ok(self.catalog().await?.load_table(&self.ident).await)
+            })
+            .await;
+        let now = tokio::time::Instant::now();
+        let why = match loaded {
+            Err(e @ FaucetError::Cancelled { .. }) => return Err(e),
+            Err(e) => e.to_string(),
+            Ok(loaded) => match storage_reload(table, loaded) {
+                StorageReload::Fresh(fresh) => {
+                    let storage = fresh.file_io().config().props();
+                    credentials.refreshed(self.vended(storage), credential_expiry_ms(storage), now);
+                    *table = fresh;
+                    tracing::debug!(table = %self.ident, "iceberg: took fresh storage credentials");
+                    return Ok(());
+                }
+                StorageReload::Replaced => {
+                    return Err(FaucetError::Source(format!(
+                        "iceberg: table {} was replaced by another table (uuid changed) while it \
+                         was being read; the read stops here",
+                        self.ident
+                    )));
+                }
+                StorageReload::Gone => {
+                    return Err(FaucetError::Source(format!(
+                        "iceberg: table {} no longer exists in the catalog; it was dropped while \
+                         it was being read",
+                        self.ident
+                    )));
+                }
+                StorageReload::Failed(why) => why,
+            },
+        };
+        credentials.failed(now);
+        tracing::warn!(
+            table = %self.ident,
+            "iceberg: could not take fresh storage credentials for table {} ({why}); reading on \
+             with the current ones and trying again later",
+            self.ident
+        );
+        Ok(())
     }
 
     fn events(&self) -> EventStream<'_> {
         Box::pin(async_stream::try_stream! {
             let opts = self.plan_options()?;
-            let table = self.load_table().await?;
+            let mut table = self.load_table().await?;
             self.preflight(&table).await?;
-            let metadata = table.metadata();
-            let snapshots: Vec<SnapshotInfo> =
-                metadata.snapshots().map(|s| SnapshotInfo::from(s.as_ref())).collect();
-            let bookmark = *self.bookmark.lock().expect("bookmark lock");
-            let steps = plan(&opts, &snapshots, metadata.current_snapshot_id(), bookmark)?;
+            let mut credentials = self.credentials_of(&table);
+            let steps = {
+                let metadata = table.metadata();
+                let snapshots: Vec<SnapshotInfo> =
+                    metadata.snapshots().map(|s| SnapshotInfo::from(s.as_ref())).collect();
+                let bookmark = *self.bookmark.lock().expect("bookmark lock");
+                plan(&opts, &snapshots, metadata.current_snapshot_id(), bookmark)?
+            };
+            // Every step's schema is checked before the first page, so a run
+            // never emits pages and then meets a column it cannot read.
+            for step in &steps {
+                if let Step::Full { snapshot_id, .. } | Step::Append(snapshot_id) = step {
+                    let schema = Self::snapshot_schema(&table, *snapshot_id)?;
+                    ensure_no_variant_projected(&schema, &self.config.columns)?;
+                }
+            }
 
             for step in steps {
-                let (snapshot_id, added, checkpoint) = match step {
+                let (snapshot_id, incremental, checkpoint) = match step {
                     Step::Checkpoint(id) => {
                         yield Event::Checkpoint(id);
                         continue;
                     }
-                    Step::Full { snapshot_id, checkpoint } => (snapshot_id, None, checkpoint),
-                    Step::Append(id) => (
-                        id,
-                        Some(self.calls.call_once("plan", self.files_added_by(&table, id)).await?),
-                        true,
-                    ),
+                    Step::Full { snapshot_id, checkpoint } => (snapshot_id, false, checkpoint),
+                    Step::Append(id) => (id, true, true),
                 };
-                let (mut batches, uuids) = self.scan(&table, snapshot_id, added.as_ref()).await?;
+                self.refresh_storage_if_due(&mut table, &mut credentials).await?;
+                let added = match incremental {
+                    true => Some(
+                        self.calls
+                            .call_once("plan", self.files_added_by(&table, snapshot_id))
+                            .await?,
+                    ),
+                    false => None,
+                };
+                let (tasks, uuids) = self.plan_tasks(&table, snapshot_id, added.as_ref()).await?;
+                let queue = refresh::queue(tasks);
                 let reads = self.calls.get().with_roundtrip_metering(false);
-                while let Some(batch) = batches.next().within_ctx(&reads, "read").await? {
-                    let batch = batch.map_err(|e| source_err("read error", e))?;
-                    if batch.num_rows() > 0 {
-                        yield Event::Batch(uuids.apply(batch)?);
+                // One reader per generation of credentials: a reader stops
+                // taking files when a refresh is due and finishes the ones it
+                // started; the next reader works on the rest of the queue.
+                while !refresh::is_empty(&queue) {
+                    self.refresh_storage_if_due(&mut table, &mut credentials).await?;
+                    let until = credentials.due_at(tokio::time::Instant::now(), wall_ms());
+                    let mut batches = self.read_tasks(&table, queue.clone(), until)?;
+                    while let Some(batch) = batches.next().within_ctx(&reads, "read").await? {
+                        let batch = batch.map_err(|e| source_err("read error", e))?;
+                        if batch.num_rows() > 0 {
+                            yield Event::Batch(uuids.apply(batch)?);
+                        }
                     }
                 }
                 if checkpoint {
@@ -539,10 +715,18 @@ impl faucet_core::Source for IcebergSource {
                         e.to_string(),
                         "Fix the `filter` expression.",
                     ),
-                    (true, Ok(_)) => {
-                        loaded = Some(table.clone());
-                        Probe::pass("table", started.elapsed())
-                    }
+                    (true, Ok(_)) => match self.readable_schema(&table) {
+                        Err(e) => Probe::fail_hint(
+                            "table",
+                            started.elapsed(),
+                            e.to_string(),
+                            "List the columns to read in `columns`.",
+                        ),
+                        Ok(()) => {
+                            loaded = Some(table.clone());
+                            Probe::pass("table", started.elapsed())
+                        }
+                    },
                 }
             }
         };

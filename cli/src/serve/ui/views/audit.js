@@ -149,8 +149,10 @@ export async function renderAudit(host, params) {
       r = await api(`/v1/audit?${query(nextBefore || last.id)}`);
     } catch (e) {
       // A server without the cursor pages by time instead.
+      // An entry at the epoch has a damaged stored time: page from the last real one.
       const p = query();
-      p.set("until", last.timestamp);
+      const dated = [...entries].reverse().find((e) => !String(e.timestamp).startsWith("1970-01-01T00:00:00"));
+      p.set("until", (dated || last).timestamp);
       try { r = await api(`/v1/audit?${p}`); } catch { r = null; }
     }
     loadingMore = false;

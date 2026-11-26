@@ -58,6 +58,13 @@ pub fn record_run_finished(status: RunStatus, reason: &'static str) {
     .increment(1);
 }
 
+/// A stored run-history timestamp that did not parse was read (#1112). Counts
+/// reads, not rows: a damaged row counts each time it is read.
+pub fn record_unparseable_timestamp(table: &'static str) {
+    metrics::counter!("faucet_serve_history_unparseable_timestamps_total", "table" => table)
+        .increment(1);
+}
+
 /// Count an idempotency-key replay hit.
 pub fn record_idempotency_hit() {
     metrics::counter!("faucet_serve_idempotency_hits_total").increment(1);

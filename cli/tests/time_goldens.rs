@@ -281,13 +281,12 @@ fn f3_history_timestamps() {
     ] {
         out.push(format!("parse_ts {raw} = {}", fmt_ts(parse_ts(raw))));
     }
+    // #1112: text that is no timestamp reads as the epoch, the same on every
+    // read (it read as "now" before, a different value each time).
+    for raw in ["not a timestamp", ""] {
+        out.push(format!("parse_ts {raw:?} = {}", fmt_ts(parse_ts(raw))));
+    }
     snapshot(&out, include_str!("fixtures/time_goldens/f3_history.txt"));
-    let before = chrono::Utc::now();
-    let fallback = parse_ts("not a timestamp");
-    assert!(
-        fallback >= before && fallback <= chrono::Utc::now(),
-        "parse_ts falls back to now today (#1112)"
-    );
 }
 
 #[cfg(feature = "serve")]

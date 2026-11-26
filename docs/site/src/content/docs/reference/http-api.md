@@ -666,6 +666,16 @@ is full, `next_before` is the cursor for the next, older one: pass it as
 for the SQL backends; an in-memory ring otherwise) and expire with the
 `--retain-terminal-runs-secs` window.
 
+An entry whose stored time is damaged (text that is no timestamp) is still
+listed, with `timestamp` `1970-01-01T00:00:00Z`: the same value on every read,
+and plainly not when the action happened. Its place in the list, the `since` /
+`until` filters and the retention window go by the stored text, so they are not
+affected. The same marker is used for a damaged launch or deprecation time of a
+template, a damaged statistics point of a catalogued dataset and a damaged
+start or heartbeat time of a cluster member. Each read of a damaged value is
+counted in `faucet_serve_history_unparseable_timestamps_total{table}` and the
+row is named once in the server log (WARN).
+
 ### One order of checks for every operation
 
 Every endpoint, MCP tool, trigger fire and approved change request that loads
@@ -2068,6 +2078,10 @@ checks the history did not answer in time),
 `faucet_serve_lease_upkeep_skipped_total` (lease ticks that found the previous
 tick's upkeep still running), `faucet_serve_history_call_timeouts_total`
 (history calls of the lease upkeep cut off at their time limit),
+`faucet_serve_history_unparseable_timestamps_total{table}` (reads of a stored
+timestamp that is no timestamp; `table` is one of `audit`,
+`template_launches`, `template_deprecations`,
+`template_version_deprecations`, `log_ship`, `catalog_stats`, `instances`),
 `faucet_serve_policy_merge_failures_total{tenant}` (a tenant's policy no
 longer merges with the server's; its runs are refused) and
 `faucet_serve_history_unreachable` (the last

@@ -10,7 +10,7 @@ Reach for it to move lakehouse data *out* of Iceberg — into a warehouse, a ser
 - **Predicate pushdown** — `filter` is typed against the table schema and pushed into the scan as an Iceberg expression, so non-matching data files and row groups are skipped and rows are filtered exactly.
 - **Time travel** — read a pinned `snapshot_id`, or the snapshot that was current at `as_of_timestamp`. Each snapshot is read with its own schema.
 - **Incremental snapshot reads** — `mode: incremental` reads only the data files added by `append` snapshots since the bookmarked snapshot, one bookmark per snapshot. `overwrite` / `delete` snapshots and rolled-back history are detected (`on_rewrite`), expired bookmarks too (`on_expired`).
-- **Row-level deletes are never ignored** — Parquet position and equality delete files are applied during the scan. A delete file the source does not apply yet (a v3 deletion vector) makes it refuse the table rather than return deleted rows.
+- **Row-level deletes are never ignored** — Parquet position and equality delete files and format-v3 deletion vectors are applied during the scan. A delete file the reader cannot apply makes the source refuse the table rather than return deleted rows.
 - **Columnar fast path** — with the `arrow` feature, an `iceberg → parquet` (or any Arrow-capable sink) chain moves `RecordBatch`es end to end with no per-row `Value`.
 - **Discovery** — `faucet discover` lists every namespace and table with its schema and row count.
 - **Sharding** — clustered runs split a table by data file (hash of the file path).
@@ -30,6 +30,7 @@ Reach for it to move lakehouse data *out* of Iceberg — into a warehouse, a ser
 | `mode` | `full` \| `incremental` | `full` | `full` re-reads the table each run; `incremental` reads only appended data since the bookmark. |
 | `on_rewrite` | `fail` \| `full_refresh` | `fail` | Incremental: an `overwrite` / `delete` snapshot since the bookmark, or a bookmark that is no longer an ancestor of the current snapshot. |
 | `on_expired` | `fail` \| `full_refresh` | `fail` | Incremental: the bookmarked snapshot (or one after it) was expired from the metadata. |
+| `credential_refresh_secs` | int | `300` | With vended storage credentials: take fresh ones during a read once they are this old (see [Vended credentials](#vended-credentials)). `0` takes them before every data file, one file at a time. |
 
 `full_refresh` re-reads the current snapshot in full and moves the bookmark to it; rows already delivered are delivered again, so pair it with an upsert or overwrite sink.
 
@@ -54,7 +55,7 @@ filter: "status = 'active' and (amount >= 10.5 or vip is not null) and region in
 
 ## Record shape
 
-Rows come out with every column present (a null is `null`); a `decimal` column keeps every digit as a string, a non-finite float is a `null` counted in the run summary (`non_finite`), a `uuid` column (also inside a struct, list or map) is hyphenated UUID text on both the row and the columnar path, and a binary or `fixed` column is base64. A `variant` column (format v3) is not decoded: it arrives as an object holding the encoded `metadata` and `value` as base64, and `discover()` reports it as `{"type": "object"}`. `discover()` reports the same shapes: a decimal column as `{"type": "string", "format": "decimal"}` and a float column as `["number", "string"]`, so a contract or drift baseline built from it accepts real rows.
+Rows come out with every column present (a null is `null`); a `decimal` column keeps every digit as a string, a non-finite float is a `null` counted in the run summary (`non_finite`), a `uuid` column (also inside a struct, list or map) is hyphenated UUID text on both the row and the columnar path, and a binary or `fixed` column is base64. A `variant` column (format v3) cannot be read yet (see [Variant columns](#variant-columns)); `discover()` reports it as `{"type": "object"}`. `discover()` reports the same shapes: a decimal column as `{"type": "string", "format": "decimal"}` and a float column as `["number", "string"]`, so a contract or drift baseline built from it accepts real rows.
 
 ## Incremental reads
 
@@ -102,7 +103,26 @@ source:
 
 ## Row-level deletes
 
-iceberg-rust applies Parquet **position** and **equality** delete files during the scan, so deleted rows never reach the sink. Before reading, the source checks every delete file attached to each data file and refuses the read — naming both files — when one is not a Parquet delete file (for example a v3 deletion vector stored in Puffin) or is an equality delete without equality field ids.
+iceberg-rust applies Parquet **position** and **equality** delete files and format-v3 **deletion vectors** (a position-delete blob in a Puffin file) during the scan, so deleted rows never reach the sink. Tables written by engines that use deletion vectors for row-level deletes (format v3) are read, including a table upgraded from v2 that holds both kinds.
+
+Before reading, the source checks every delete file attached to each data file by its declared format, and refuses the read, naming both files, when it is:
+
+- in another format than Parquet or Puffin (an Avro or ORC delete file);
+- a Puffin file that is not a position delete, or that lacks its blob offset, blob size or data file;
+- an equality delete without equality field ids;
+- a data file listed as a delete file.
+
+A deletion vector is matched to its data file by the exact path text, as in the Java reader: a writer that spells the same file two ways (`s3://` and `s3a://`) would not have its vector applied.
+
+## Variant columns
+
+The reader cannot decode a format-v3 `variant` column yet (iceberg-rust 0.11 refuses it). A read that would include one, at the top level or inside a struct, list or map, is refused before the first page, and by `faucet doctor`, with the columns named:
+
+```text
+iceberg: column(s) ["payload"] hold a `variant`, which the reader cannot decode yet; nothing was read. Set `columns` to the columns to read without them (readable: ["id", "name"])
+```
+
+List the other columns in `columns` and the table reads, with its deletes and filter applied. An incremental run checks the schema of every snapshot it will read before it emits anything.
 
 ## Sharding and discovery
 
@@ -114,7 +134,20 @@ iceberg-rust applies Parquet **position** and **equality** delete files during t
 
 ## Vended credentials
 
-On a REST catalog that vends storage credentials (the sink's [Vended credentials](https://crates.io/crates/faucet-sink-iceberg#vended-credentials) section has the config, including `catalog.access_delegation: vended_credentials`), the source reads with the credentials the catalog returns with the table. Before the first page of each source instance it checks the table's storage once (a `HEAD` of the current metadata file, S3 and GCS table locations): no storage credentials at all, or static `s3.access-key-id` / `s3.secret-access-key` in `catalog.properties` together with a vended session token the store refuses, fail the read before any page with a message naming the fix; any other probe failure is a warning. The table is loaded once per read, so a scan that takes longer than the credentials live fails part-way.
+On a REST catalog that vends storage credentials (the sink's [Vended credentials](https://crates.io/crates/faucet-sink-iceberg#vended-credentials) section has the config, including `catalog.access_delegation: vended_credentials`), the source reads with the credentials the catalog returns with the table. Before the first page of each source instance it checks the table's storage once (a `HEAD` of the current metadata file, S3 and GCS table locations): no storage credentials at all, or static `s3.access-key-id` / `s3.secret-access-key` in `catalog.properties` together with a vended session token the store refuses, fail the read before any page with a message naming the fix; any other probe failure is a warning.
+
+### Long reads take fresh credentials
+
+Vended credentials expire, usually after about an hour. During a read the source takes fresh ones by loading the table again and keeping only its storage settings: the snapshot, the planned data files and the schema of the read stay what they were, so a catalog that lags behind cannot change them.
+
+- **When.** Once the credentials are `credential_refresh_secs` old (default 300), or sooner when the catalog sent an expiry with them (`s3.session-token-expires-at-ms` and the matching keys of the other stores) that is less than 5 minutes away. Two attempts are at least 30 seconds apart. Credentials you wrote in `catalog.properties` yourself are never refreshed.
+- **How.** The data files already being read finish on the credentials they started with; the following files use the new ones. So the credentials must live longer than `credential_refresh_secs` plus the time the files in flight take (up to about twice `concurrency` files are open at once). A single data file that takes longer to read than the credentials live still fails.
+- **A refresh that fails** (catalog down, slow, or no answer within 30 seconds) is logged as a warning; the read goes on with the current credentials and tries again 30 seconds later. It fails only if the store then refuses them.
+- **A table dropped or replaced during the read** fails the read with a message naming the table.
+- **Cost.** One catalog `GET` per refresh (round-trip op `load`). After a refresh the next files load their delete files and manifests again.
+- `credential_refresh_secs: 0` takes fresh credentials before every data file and reads one file at a time: for tests and diagnosis.
+
+Not covered: a catalog that sends credentials only in the `storage-credentials` list of its load response (iceberg-rust 0.11 reads the `config` map only), and S3 remote signing.
 
 ## Library usage
 
