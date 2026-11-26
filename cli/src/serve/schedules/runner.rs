@@ -691,6 +691,7 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
         tracing::warn!(schedule = %name, %tick, reason = %why, "schedule not ticked: it needs approval");
         status::record_tick(&*history, &name, &entry.last_tick(tick)).await;
         status::record(&*history, &name, tick, Outcome::NeedsApproval(why)).await;
+        entry.noted_tzdata_hold = None;
         if let Some(range) = entry.advance(tick, now)
             && let Err(e) = status::update(&*history, &name, |d| d.add_missed(range.clone())).await
         {
@@ -703,6 +704,8 @@ pub async fn step(state: &ServerState, entry: &mut Entry, now: DateTime<Utc>) {
         TzdataStep::FireLate => true,
         TzdataStep::Done => return,
     };
+    // Whatever this step records replaces a held_tzdata outcome.
+    entry.noted_tzdata_hold = None;
     let firing: std::pin::Pin<Box<dyn std::future::Future<Output = fire::TickResult> + Send + '_>> =
         Box::pin(fire::fire_tick(
             state,
@@ -793,6 +796,7 @@ async fn step_task(state: ServerState, mut entry: Entry, limit: Duration) -> (St
         Err(_) => {
             // Its targets dedupe on the tick's idempotency key when it fires again.
             entry.back_off(Utc::now());
+            entry.noted_tzdata_hold = None;
             metrics::step_timed_out(&name);
             tracing::error!(schedule = %name, "a schedule step timed out; retrying its tick");
             if let Some(tick) = entry.next {
@@ -1275,42 +1279,73 @@ mod tests {
         assert_eq!(outcome(&state, "morning").await.as_deref(), Some("started"));
     }
 
-    /// #1116: a single server upgraded on the default (locked) history file
-    /// does not hold against the runs its own older release recorded.
+    /// #1116: a single upgraded server cannot tell its own pre-upgrade runs
+    /// from an older replica's, so it holds the tick and runs it once, late,
+    /// at `tick + 1 h + 5 min`.
     #[tokio::test]
-    async fn a_single_upgraded_server_fires_on_time_past_its_own_unstamped_runs() {
+    async fn a_single_upgraded_server_holds_on_its_own_unstamped_runs_then_fires_once() {
         let state = shared_state().await;
-        state.set_exclusive_history(true);
         old_release_run(&state, "old-1", "2026-11-23T17:00:00Z").await;
         let mut e = vancouver(at("2026-11-24T12:00:00Z"));
         step(&state, &mut e, at("2026-11-24T16:00:00Z")).await;
+        assert_eq!(
+            outcome(&state, "morning").await.as_deref(),
+            Some("held_tzdata")
+        );
+        e.retry_at = None;
+        step(&state, &mut e, at("2026-11-24T17:04:59Z")).await;
+        assert_eq!(runs_of(&state).await.len(), 1, "nothing started while held");
+        e.retry_at = None;
+        step(&state, &mut e, at("2026-11-24T17:05:00Z")).await;
         assert_eq!(outcome(&state, "morning").await.as_deref(), Some("started"));
+        assert_eq!(e.next, Some(at("2026-11-25T16:00:00Z")));
+        e.retry_at = None;
+        step(&state, &mut e, at("2026-11-24T17:30:00Z")).await;
+        assert_eq!(runs_of(&state).await.len(), 2, "it ran once");
     }
 
-    /// #1116: on that file, an unstamped run recorded after this server
-    /// started still comes from a live older release, and the tick is held.
+    /// #1116: a tick still held after its step timed out is recorded as held
+    /// again, not left `retrying`.
     #[tokio::test]
-    async fn an_unstamped_run_after_start_still_holds_on_an_exclusive_history() {
+    async fn a_held_tick_after_a_step_timeout_is_recorded_as_held_again() {
         let state = shared_state().await;
-        state.set_exclusive_history(true);
-        let labels = BTreeMap::from([
-            (fire::LABEL_SCHEDULE.to_string(), "morning".to_string()),
-            (
-                fire::LABEL_TICK.to_string(),
-                "2026-11-23T17:00:00Z".to_string(),
-            ),
-        ]);
-        let mut r = crate::serve::history::RunRecord::queued(
-            "old-live".into(),
-            None,
-            labels,
-            None,
-            state.cluster().started_at() + chrono::Duration::seconds(1),
-        );
-        r.tzdata = None;
-        state.history().upsert(&r).await.unwrap();
+        old_release_run(&state, "old-1", "2026-11-23T17:00:00Z").await;
         let mut e = vancouver(at("2026-11-24T12:00:00Z"));
-        step(&state, &mut e, at("2026-11-24T16:00:00Z")).await;
+        let tick = at("2026-11-24T16:00:00Z");
+        step(&state, &mut e, tick).await;
+        assert_eq!(e.noted_tzdata_hold, Some(tick));
+        // A shared history whose run listing hangs: the step stops inside
+        // the tzdata check, before anything else could clear the hold.
+        let mut config = crate::serve::test_support::test_config();
+        config.history = crate::serve::config::HistoryBackendSpec::Sqlite("sqlite::memory:".into());
+        let hung = ServerState::new(
+            &config,
+            None,
+            CancellationToken::new(),
+            std::sync::Arc::new(HangOnList(state.history())),
+            crate::serve::logs::LogHub::new(),
+            None,
+            #[cfg(feature = "triggers")]
+            crate::serve::triggers::health::TriggersHandle::empty(),
+        );
+        let (_, stepped) = step_task(hung, e, Duration::from_millis(20)).await;
+        let Stepped::TimedOut(mut e) = stepped else {
+            panic!("the step should time out");
+        };
+        // The write the timeout arm makes, here on the shared history.
+        status::record(
+            &*state.history(),
+            "morning",
+            tick,
+            Outcome::Retrying("step timed out".into()),
+        )
+        .await;
+        assert_eq!(
+            outcome(&state, "morning").await.as_deref(),
+            Some("retrying")
+        );
+        e.retry_at = None;
+        step(&state, &mut e, at("2026-11-24T16:01:00Z")).await;
         assert_eq!(
             outcome(&state, "morning").await.as_deref(),
             Some("held_tzdata")
@@ -1634,6 +1669,61 @@ mod tests {
         fn degraded(&self) -> bool {
             assert!(!self.panic, "a broken history");
             false
+        }
+    }
+
+    /// A history whose run listing never answers; everything else is
+    /// `inner`'s.
+    struct HangOnList(std::sync::Arc<dyn RunHistory>);
+
+    #[async_trait::async_trait]
+    impl RunHistory for HangOnList {
+        async fn claim_idempotency(
+            &self,
+            a: &str,
+            b: &str,
+            c: &str,
+            d: Duration,
+        ) -> Result<crate::serve::history::Claim, crate::serve::history::HistoryError> {
+            self.0.claim_idempotency(a, b, c, d).await
+        }
+        async fn upsert(
+            &self,
+            r: &crate::serve::history::RunRecord,
+        ) -> Result<(), crate::serve::history::HistoryError> {
+            self.0.upsert(r).await
+        }
+        async fn get(
+            &self,
+            id: &str,
+        ) -> Result<Option<crate::serve::history::RunRecord>, crate::serve::history::HistoryError>
+        {
+            self.0.get(id).await
+        }
+        async fn list(
+            &self,
+            _: &crate::serve::history::ListFilter,
+        ) -> Result<crate::serve::history::ListPage, crate::serve::history::HistoryError> {
+            std::future::pending().await
+        }
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> Result<crate::serve::history::DeleteOutcome, crate::serve::history::HistoryError>
+        {
+            self.0.delete(id).await
+        }
+        async fn purge_expired(
+            &self,
+            d: Duration,
+        ) -> Result<usize, crate::serve::history::HistoryError> {
+            self.0.purge_expired(d).await
+        }
+        async fn recover_orphans(&self) -> Result<usize, crate::serve::history::HistoryError> {
+            self.0.recover_orphans().await
+        }
+        fn degraded(&self) -> bool {
+            self.0.degraded()
         }
     }
 
