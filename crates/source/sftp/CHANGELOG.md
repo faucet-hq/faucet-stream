@@ -7,6 +7,16 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
 
+## [1.3.5](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-sftp-v1.3.4...faucet-source-sftp-v1.3.5) - 2026-11-26
+
+### Documentation
+
+- Switch the docs site to Astro Starlight and remove mdBook ([#1080](https://github.com/faucet-hq/faucet-stream/pull/1080))
+
+### Performance
+
+- Clear measured bottlenecks across the engine, SQL, file, HTTP, messaging and serve paths ([#1101](https://github.com/faucet-hq/faucet-stream/pull/1101))
+
 ## [1.3.4](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-sftp-v1.3.3...faucet-source-sftp-v1.3.4) - 2026-11-12
 
 ### Bug Fixes

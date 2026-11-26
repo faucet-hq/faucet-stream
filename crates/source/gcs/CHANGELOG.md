@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.9.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-gcs-v1.9.2...faucet-source-gcs-v1.9.3) - 2026-11-26
+
+### Bug Fixes
+
+- Read JSON floats with correct rounding, plus the design-first follow-ups of the performance pass ([#1107](https://github.com/faucet-hq/faucet-stream/pull/1107))
+
+### Documentation
+
+- Switch the docs site to Astro Starlight and remove mdBook ([#1080](https://github.com/faucet-hq/faucet-stream/pull/1080))
+
+### Performance
+
+- Clear measured bottlenecks across the engine, SQL, file, HTTP, messaging and serve paths ([#1101](https://github.com/faucet-hq/faucet-stream/pull/1101))
+
 ## [1.9.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-gcs-v1.9.1...faucet-source-gcs-v1.9.2) - 2026-11-12
 
 ### Bug Fixes

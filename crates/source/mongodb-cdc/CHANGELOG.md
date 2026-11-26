@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.5.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-mongodb-cdc-v1.5.2...faucet-source-mongodb-cdc-v1.5.3) - 2026-11-26
+
+### Documentation
+
+- Switch the docs site to Astro Starlight and remove mdBook ([#1080](https://github.com/faucet-hq/faucet-stream/pull/1080))
+
+### Performance
+
+- Clear measured bottlenecks across the engine, SQL, file, HTTP, messaging and serve paths ([#1101](https://github.com/faucet-hq/faucet-stream/pull/1101))
+
 ## [1.5.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-mongodb-cdc-v1.5.1...faucet-source-mongodb-cdc-v1.5.2) - 2026-11-12
 
 ### Bug Fixes

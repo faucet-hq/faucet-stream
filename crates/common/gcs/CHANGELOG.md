@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.3.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-gcs-v1.3.2...faucet-common-gcs-v1.3.3) - 2026-11-26
+
+### Bug Fixes
+
+- Read JSON floats with correct rounding, plus the design-first follow-ups of the performance pass ([#1107](https://github.com/faucet-hq/faucet-stream/pull/1107))
+- Reliability and correctness fixes across the engine, serve, feeds and connectors ([#1096](https://github.com/faucet-hq/faucet-stream/pull/1096))
+
 ## [1.3.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-gcs-v1.3.1...faucet-common-gcs-v1.3.2) - 2026-11-12
 
 ### Bug Fixes

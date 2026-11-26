@@ -7,6 +7,17 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
 
+## [1.2.4](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-nats-v1.2.3...faucet-sink-nats-v1.2.4) - 2026-11-26
+
+### Bug Fixes
+
+- Follow-up fixes and tests after the reliability pass ([#1097](https://github.com/faucet-hq/faucet-stream/pull/1097))
+- Reliability and correctness fixes across the engine, serve, feeds and connectors ([#1096](https://github.com/faucet-hq/faucet-stream/pull/1096))
+
+### Documentation
+
+- Switch the docs site to Astro Starlight and remove mdBook ([#1080](https://github.com/faucet-hq/faucet-stream/pull/1080))
+
 ## [1.2.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-nats-v1.2.2...faucet-sink-nats-v1.2.3) - 2026-11-12
 
 ### Bug Fixes

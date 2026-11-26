@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.7.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-iceberg-v1.7.2...faucet-sink-iceberg-v1.7.3) - 2026-11-26
+
+### Bug Fixes
+
+- Iceberg reads that outlive vended credentials, v3 deletion vectors, ORC writer zones and damaged history timestamps ([#1128](https://github.com/faucet-hq/faucet-stream/pull/1128))
+- Iceberg vended credentials, single-precision cursors, DST schedules and tzdata 2026f, plus the #1100/#1093 follow-ups ([#1121](https://github.com/faucet-hq/faucet-stream/pull/1121))
+- Follow-up fixes and tests after the reliability pass ([#1097](https://github.com/faucet-hq/faucet-stream/pull/1097))
+- Reliability and correctness fixes across the engine, serve, feeds and connectors ([#1096](https://github.com/faucet-hq/faucet-stream/pull/1096))
+- *(deps)* Upgrade Iceberg to 0.11, bound CI installs and job times, add a feed demo to try-local ([#1090](https://github.com/faucet-hq/faucet-stream/pull/1090))
+
+### Documentation
+
+- Switch the docs site to Astro Starlight and remove mdBook ([#1080](https://github.com/faucet-hq/faucet-stream/pull/1080))
+
+### Performance
+
+- Clear measured bottlenecks across the engine, SQL, file, HTTP, messaging and serve paths ([#1101](https://github.com/faucet-hq/faucet-stream/pull/1101))
+
 ## [1.7.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-iceberg-v1.7.1...faucet-sink-iceberg-v1.7.2) - 2026-11-12
 
 ### Bug Fixes

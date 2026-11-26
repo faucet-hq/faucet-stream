@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.19.0](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.18.2...faucet-cli-v1.19.0) - 2026-11-26
+
+### Bug Fixes
+
+- Iceberg reads that outlive vended credentials, v3 deletion vectors, ORC writer zones and damaged history timestamps ([#1128](https://github.com/faucet-hq/faucet-stream/pull/1128))
+- Feed delete recovery, schedule hold after upgrade, and Scorecard config for the vendored chrono-tz ([#1123](https://github.com/faucet-hq/faucet-stream/pull/1123))
+- Iceberg vended credentials, single-precision cursors, DST schedules and tzdata 2026f, plus the #1100/#1093 follow-ups ([#1121](https://github.com/faucet-hq/faucet-stream/pull/1121))
+- Follow-up fixes and tests after the reliability pass ([#1097](https://github.com/faucet-hq/faucet-stream/pull/1097))
+- Reliability and correctness fixes across the engine, serve, feeds and connectors ([#1096](https://github.com/faucet-hq/faucet-stream/pull/1096))
+- *(webhook)* Review follow-ups — declared consumes_destructively capability, per-run paths, page cap ([#1081](https://github.com/faucet-hq/faucet-stream/pull/1081))
+- Webhook answers after commit, numeric schedule versions, self-closing advisory issue, coverage cache budget ([#1074](https://github.com/faucet-hq/faucet-stream/pull/1074))
+
+### Documentation
+
+- Switch the docs site to Astro Starlight and remove mdBook ([#1080](https://github.com/faucet-hq/faucet-stream/pull/1080))
+
+### Features
+
+- Feeds, durable push ingestion for faucet serve ([#1085](https://github.com/faucet-hq/faucet-stream/pull/1085))
+
+### Performance
+
+- Clear measured bottlenecks across the engine, SQL, file, HTTP, messaging and serve paths ([#1101](https://github.com/faucet-hq/faucet-stream/pull/1101))
+
+### Testing
+
+- *(cli)* Fix a race between the log-capture and env-interpolation tests ([#1084](https://github.com/faucet-hq/faucet-stream/pull/1084))
+
 ## [1.18.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-cli-v1.18.0...faucet-cli-v1.18.2) - 2026-11-13
 
 ### Bug Fixes

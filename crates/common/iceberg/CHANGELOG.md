@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.2.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-iceberg-v1.2.2...faucet-common-iceberg-v1.2.3) - 2026-11-26
+
+### Bug Fixes
+
+- Iceberg reads that outlive vended credentials, v3 deletion vectors, ORC writer zones and damaged history timestamps ([#1128](https://github.com/faucet-hq/faucet-stream/pull/1128))
+- Iceberg vended credentials, single-precision cursors, DST schedules and tzdata 2026f, plus the #1100/#1093 follow-ups ([#1121](https://github.com/faucet-hq/faucet-stream/pull/1121))
+- *(deps)* Upgrade Iceberg to 0.11, bound CI installs and job times, add a feed demo to try-local ([#1090](https://github.com/faucet-hq/faucet-stream/pull/1090))
+
 ## [1.2.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-iceberg-v1.2.1...faucet-common-iceberg-v1.2.2) - 2026-11-12
 
 ### Bug Fixes
