@@ -2203,6 +2203,43 @@ pub async fn finish_removed(state: &ServerState, record: &FeedRecord) -> Result<
     Ok(())
 }
 
+/// The run-history meta key naming the approved change request that
+/// deleted feed `feed_uid`: the proof of its delete once the record is gone.
+pub fn deleted_by_key(feed_uid: &str) -> String {
+    format!("feed_deleted_by:{feed_uid}")
+}
+
+/// Whether change `id` has not reached a final status yet.
+async fn change_open(state: &ServerState, id: &str) -> Result<bool, String> {
+    let change = state
+        .history()
+        .change_get(id)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(change.is_some_and(|c| !c.status.is_terminal()))
+}
+
+/// Keep the proof that change `id` deleted feed `uid` only while the change
+/// is open, so neither it nor [`forget_delete_proof`] leaves one behind.
+pub(super) async fn keep_delete_proof(
+    state: &ServerState,
+    uid: &str,
+    id: &str,
+) -> Result<(), String> {
+    let history = state.history();
+    let key = deleted_by_key(uid);
+    if change_open(state, id).await? {
+        history
+            .meta_put(&key, id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if change_open(state, id).await? {
+            return Ok(());
+        }
+    }
+    history.meta_delete(&key).await.map_err(|e| e.to_string())
+}
+
 /// Finish deleting a feed marked `deleting`: its runs' state keys, its
 /// events and positions, its statuses and warning count, then the record
 /// with its tokens. Safe to repeat and to run on any server.
@@ -2248,6 +2285,13 @@ pub async fn finish_delete(state: &ServerState, record: &FeedRecord) -> Result<(
         .map_err(|e| e.to_string())?
     {
         rt.ingest().forget_token(&token.id);
+    }
+    if let Some(id) = record
+        .deleting
+        .as_ref()
+        .and_then(|d| d.change_id.as_deref())
+    {
+        keep_delete_proof(state, &record.uid, id).await?;
     }
     history
         .feed_remove(record)
@@ -2646,7 +2690,8 @@ pub async fn audit_approved(
 
 /// Whether the approved feed change `change` is already in the run history:
 /// its execution was interrupted after its write. Proven only by the change
-/// id the write carries; a deleted feed already purged proves nothing.
+/// id the write carries, or, for a delete whose record is already gone, by
+/// the [`deleted_by_key`] proof its removal kept.
 pub async fn already_applied(
     state: &ServerState,
     change: &crate::serve::changes::ChangeRequest,
@@ -2657,14 +2702,48 @@ pub async fn already_applied(
     let Some(uid) = p.feed_uid.as_deref() else {
         return Ok(None);
     };
-    let record = state
-        .history()
+    let history = state.history();
+    let record = history
         .feed_get(&feed_key(p.tenant.as_deref(), &p.name))
         .await
         .map_err(ServeError::from)?;
-    Ok(record
-        .filter(|r| r.uid == uid && r.applied(&change.id))
-        .map(|_| p))
+    if let Some(r) = record.filter(|r| r.uid == uid) {
+        return Ok(r.applied(&change.id).then_some(p));
+    }
+    if !matches!(p.action, ChangeAction::Delete) {
+        return Ok(None);
+    }
+    let by = history
+        .meta_get(&deleted_by_key(uid))
+        .await
+        .map_err(ServeError::from)?;
+    Ok((by.as_deref() == Some(change.id.as_str())).then_some(p))
+}
+
+/// Drop the proof a deleted feed's removal kept for `change`, once the
+/// change is saved executed.
+pub async fn forget_delete_proof(
+    state: &ServerState,
+    change: &crate::serve::changes::ChangeRequest,
+) {
+    let Ok(ChangePayload {
+        action: ChangeAction::Delete,
+        feed_uid: Some(uid),
+        ..
+    }) = serde_json::from_value::<ChangePayload>(change.payload.clone())
+    else {
+        return;
+    };
+    let key = deleted_by_key(&uid);
+    let history = state.history();
+    let result = match history.meta_get(&key).await {
+        Ok(Some(id)) if id == change.id => history.meta_delete(&key).await,
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = result {
+        tracing::warn!(change = %change.id, error = %e, "could not drop the proof of a feed delete");
+    }
 }
 
 /// `<tenant>/<name>` for a tenant feed, else the name.

@@ -1672,6 +1672,7 @@ async fn execute(
         change.deferred = false;
         change.touch();
         save(state, &change).await?;
+        crate::serve::feeds::service::forget_delete_proof(state, &change).await;
         record_metric(change.kind, "executed");
         crate::serve::audit::write(
             state,
@@ -1944,6 +1945,10 @@ async fn execute(
             change.plan = Some(fresh);
             change.touch();
             save(state, &change).await?;
+            #[cfg(feature = "feeds")]
+            if change.kind == ChangeKind::Feed {
+                crate::serve::feeds::service::forget_delete_proof(state, &change).await;
+            }
             record_metric(change.kind, "executed");
             crate::serve::audit::write(
                 state,

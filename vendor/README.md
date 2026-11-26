@@ -8,7 +8,9 @@ workspace patches it (`[patch.crates-io]` in the root `Cargo.toml`) with this
 copy:
 
 - every file is crates.io chrono-tz 0.10.4 unchanged, except `publish = false`
-  in `Cargo.toml`, `tz/` and `src/prebuilt/`;
+  in `Cargo.toml`, `tz/`, `src/prebuilt/` and `osv-scanner.toml` (Scorecard scans
+  this crate's own `Cargo.lock` with the config in its directory, not the root
+  one; the lockfile only serves the codegen);
 - `tz/` holds the IANA tzdata release named in `supply-chain/tzdata-version`,
   taken from `tzdata<version>.tar.gz` after checking its signature
   (`tzdata<version>.tar.gz.asc`, key `7E3792A9D8ACF7D633BC1588ED97E90E62AA7E34`);

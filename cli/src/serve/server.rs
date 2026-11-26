@@ -1343,7 +1343,6 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
             crate::serve::config::default_data_dir().display()
         )));
     }
-    let exclusive_history = history_lock.is_some();
     let _history_lock = history_lock;
     if config.cluster.enabled {
         // Cluster mode: a restarting instance re-queues its prior incarnation's
@@ -1551,7 +1550,6 @@ pub async fn serve(config: ServeConfig, mcp: crate::serve::McpServeSettings) -> 
         #[cfg(feature = "triggers")]
         triggers_handle,
     );
-    state.set_exclusive_history(exclusive_history);
     // Template versions this server's own files pin are never pruned.
     {
         #[allow(unused_mut)]

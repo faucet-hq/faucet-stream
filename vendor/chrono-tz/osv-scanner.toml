@@ -1,0 +1,17 @@
+# OpenSSF Scorecard's Vulnerabilities check scans this crate's own Cargo.lock
+# with this directory's config, not the root one. This lockfile only resolves
+# the copy's codegen and tests for the byte-for-byte regeneration check; the
+# workspace build uses the crate's sources through [patch.crates-io] (#1118).
+# Keep in sync with the root osv-scanner.toml; drop this copy with vendor/chrono-tz.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+reason = "chrono: no maintained release; the same entry as the root osv-scanner.toml (#1093) (2026-11-26)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0555"
+reason = "chrono-tz: this directory is our own copy with tzdata 2026f, kept until arrow-array and orc-rust leave chrono-tz (#1118) (2026-11-26)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0559"
+reason = "chrono-tz-build: used only by this copy's codegen to regenerate src/prebuilt in CI, never built into faucet; goes with vendor/chrono-tz (#1118) (2026-11-26)"

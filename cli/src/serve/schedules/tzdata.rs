@@ -101,20 +101,12 @@ pub fn mixed(members: &[InstanceRecord]) -> bool {
 }
 
 /// A run of this schedule started since `since` by a replica that does not
-/// advertise tzdata: an older peer that never heartbeats. With `own_before`
-/// (this process holds the history alone and started then), an unstamped run
-/// submitted earlier is this server's own, from before its upgrade.
-pub fn peer_among_runs(
-    runs: &[RunRecord],
-    since: DateTime<Utc>,
-    own_before: Option<DateTime<Utc>>,
-) -> Option<Peer> {
+/// advertise tzdata: an older peer that never heartbeats. An unstamped run
+/// carries no owner, so this server's own runs from before its upgrade count
+/// too: an older server that takes no lock may still write the history.
+pub fn peer_among_runs(runs: &[RunRecord], since: DateTime<Utc>) -> Option<Peer> {
     runs.iter()
-        .find(|r| {
-            r.tzdata.is_none()
-                && r.submitted_at >= since
-                && own_before.is_none_or(|start| r.submitted_at >= start)
-        })
+        .find(|r| r.tzdata.is_none() && r.submitted_at >= since)
         .map(|r| Peer::Before {
             who: format!("the replica that started run {}", r.run_id),
         })
@@ -201,8 +193,7 @@ pub fn may_hold(state: &ServerState, zone: Zone) -> bool {
 }
 
 /// The peer that makes `tick` of schedule `name` (in `zone`, every
-/// `period`) one to hold, if any. On the default file this process holds
-/// alone, only runs recorded after it started can be another replica's.
+/// `period`) one to hold, if any.
 pub async fn peer_for(
     state: &ServerState,
     name: &str,
@@ -225,11 +216,7 @@ pub async fn peer_for(
     let lookback = (period * 2).max(Duration::hours(1));
     let since = (now - lookback).min(tick - delta);
     let runs = recent_runs(state, name, since).await?;
-    let own_before = state
-        .exclusive_history()
-        .then(|| state.cluster().started_at());
-    let peer =
-        peer_among(&members, ours).or_else(|| peer_among_runs(&runs, now - lookback, own_before));
+    let peer = peer_among(&members, ours).or_else(|| peer_among_runs(&runs, now - lookback));
     Ok(peer.filter(|p| p.affects(zone, tick)).map(|p| (p, runs)))
 }
 
@@ -301,15 +288,9 @@ mod tests {
             run("new", "2026-11-24T16:00:00Z", Some("2026f")),
             run("old", "2026-11-24T17:00:00Z", None),
         ];
-        let p = peer_among_runs(&runs, at("2026-11-24T00:00:00Z"), None).unwrap();
+        let p = peer_among_runs(&runs, at("2026-11-24T00:00:00Z")).unwrap();
         assert!(p.who().contains("run old"));
-        assert!(peer_among_runs(&runs, at("2026-11-25T00:00:00Z"), None).is_none());
-        let since = at("2026-11-24T00:00:00Z");
-        assert!(
-            peer_among_runs(&runs, since, Some(at("2026-11-24T17:30:00Z"))).is_none(),
-            "this server's own run from before its upgrade"
-        );
-        assert!(peer_among_runs(&runs, since, Some(at("2026-11-24T16:30:00Z"))).is_some());
+        assert!(peer_among_runs(&runs, at("2026-11-25T00:00:00Z")).is_none());
     }
 
     #[tokio::test]

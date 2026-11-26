@@ -150,12 +150,13 @@ tick in a named zone while a newer member is live, and the newer one fires.
 An older server that neither heartbeats nor has run the schedule in its last
 two periods is not seen; that tick can run twice, once.
 
-A server on the default history file holds that file alone, so it does not
-hold against the unstamped runs its own older release recorded before the
-upgrade; only an unstamped run recorded after it started counts. A server on
-PostgreSQL or a `--history sqlite:` path cannot tell its own earlier runs from
-another server's, so after the upgrade each schedule in a changed zone can hold
-once, until those runs leave its last two periods.
+A run recorded by an older release names no owner, so a server cannot tell
+its own pre-upgrade runs from another server's, and an older server that
+takes no lock on the history file may still be writing it. After an upgrade,
+in a zone whose rules changed, every tick within two periods (at least one
+hour) of the last run the older release recorded is held and fires up to
+1 h 5 min late, shown as `held_tzdata`; it never runs twice. A daily schedule
+runs late up to twice; a 5-minute schedule runs late for about an hour.
 
 One schedule's step (resolving the tick, firing every target) is cut off after
 five minutes and its tick retried
