@@ -2209,6 +2209,33 @@ pub fn deleted_by_key(feed_uid: &str) -> String {
     format!("feed_deleted_by:{feed_uid}")
 }
 
+/// Whether change `id` has not reached a final status yet.
+async fn change_open(state: &ServerState, id: &str) -> Result<bool, String> {
+    let change = state
+        .history()
+        .change_get(id)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(change.is_some_and(|c| !c.status.is_terminal()))
+}
+
+/// Keep the proof that change `id` deleted feed `uid` only while the change
+/// is open, so neither it nor [`forget_delete_proof`] leaves one behind.
+async fn keep_delete_proof(state: &ServerState, uid: &str, id: &str) -> Result<(), String> {
+    let history = state.history();
+    let key = deleted_by_key(uid);
+    if change_open(state, id).await? {
+        history
+            .meta_put(&key, id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if change_open(state, id).await? {
+            return Ok(());
+        }
+    }
+    history.meta_delete(&key).await.map_err(|e| e.to_string())
+}
+
 /// Finish deleting a feed marked `deleting`: its runs' state keys, its
 /// events and positions, its statuses and warning count, then the record
 /// with its tokens. Safe to repeat and to run on any server.
@@ -2260,10 +2287,7 @@ pub async fn finish_delete(state: &ServerState, record: &FeedRecord) -> Result<(
         .as_ref()
         .and_then(|d| d.change_id.as_deref())
     {
-        history
-            .meta_put(&deleted_by_key(&record.uid), id)
-            .await
-            .map_err(|e| e.to_string())?;
+        keep_delete_proof(state, &record.uid, id).await?;
     }
     history
         .feed_remove(record)
@@ -2693,7 +2717,7 @@ pub async fn already_applied(
 }
 
 /// Drop the proof a deleted feed's removal kept for `change`, once the
-/// change is saved executed. A failure leaves one small meta row.
+/// change is saved executed.
 pub async fn forget_delete_proof(
     state: &ServerState,
     change: &crate::serve::changes::ChangeRequest,

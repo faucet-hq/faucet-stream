@@ -2605,8 +2605,7 @@ async fn an_approved_feed_change_interrupted_after_its_write_is_executed() {
     use service::{ChangeAction, ChangePayload};
     let dir = tempfile::tempdir().unwrap();
     let srv = Srv::start(dir.path(), &["--require-approval", "feed"]).await;
-    // No background scheduler: it would finish the marked removal at a time
-    // of its own (the next test covers that path).
+    // No background scheduler: it would finish the marked removal itself.
     srv.state
         .set_feeds(FeedsRuntime::from_config(&srv.config).offline());
     service::create(&srv.state, &admin(), None, feed_spec("orders", json!([])))
@@ -2663,9 +2662,7 @@ async fn an_approved_feed_change_interrupted_after_its_write_is_executed() {
     }
 }
 
-/// An approved delete interrupted after the feed was marked deleted ends
-/// executed when a scheduler finished the removal before the change ran
-/// again, and the proof the removal kept is dropped once it is saved.
+/// An interrupted delete whose removal a scheduler finished first ends executed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_approved_delete_interrupted_and_finished_elsewhere_is_executed() {
     use faucet_cli::serve::changes::{self, ChangeStatus};
@@ -2762,8 +2759,85 @@ async fn an_approved_delete_leaves_no_proof_behind() {
     assert_eq!(history.meta_get(&proof).await.unwrap(), None);
 }
 
-/// A delete change whose feed was deleted without it and made again under
-/// the same name is not executed, and the new feed stays.
+/// A recovered delete leaves no proof once a scheduler finishes the removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovered_delete_finished_later_leaves_no_proof() {
+    use faucet_cli::serve::changes::{self, ChangeStatus};
+    use service::{ChangeAction, ChangePayload};
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &["--require-approval", "feed"]).await;
+    srv.state
+        .set_feeds(FeedsRuntime::from_config(&srv.config).offline());
+    service::create(&srv.state, &admin(), None, feed_spec("orders", json!([])))
+        .await
+        .unwrap();
+    let proposed = pending(
+        service::change(
+            &srv.state,
+            &admin(),
+            ChangePayload::new(ChangeAction::Delete, None, "orders", None),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let p: ChangePayload = serde_json::from_value(proposed.payload.clone()).unwrap();
+    let proof = service::deleted_by_key(p.feed_uid.as_deref().unwrap());
+    let stop = faucet_cli::serve::feeds::StopAfter::Marked;
+    srv.state.feeds().stop_removals_after(Some(stop));
+    let _ = service::apply(&srv.state, &admin(), p, true, Some(&proposed.id)).await;
+    let done = changes::approve(&srv.state, &bob(), &proposed.id, None)
+        .await
+        .unwrap();
+    assert_eq!(done.status, ChangeStatus::Executed, "{:?}", done.error);
+    srv.state.feeds().stop_removals_after(None);
+    let history = srv.state.history();
+    let marked = history.feed_list().await.unwrap().remove(0);
+    service::finish_delete(&srv.state, &marked).await.unwrap();
+    assert!(history.feed_list().await.unwrap().is_empty());
+    assert_eq!(history.meta_get(&proof).await.unwrap(), None);
+}
+
+/// A delete finished by a scheduler after its change was saved leaves no proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_approved_delete_finished_by_a_scheduler_leaves_no_proof() {
+    use faucet_cli::serve::changes::{self, ChangeStatus};
+    use service::{ChangeAction, ChangePayload};
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &["--require-approval", "feed"]).await;
+    srv.state
+        .set_feeds(FeedsRuntime::from_config(&srv.config).offline());
+    service::create(&srv.state, &admin(), None, feed_spec("orders", json!([])))
+        .await
+        .unwrap();
+    let proposed = pending(
+        service::change(
+            &srv.state,
+            &admin(),
+            ChangePayload::new(ChangeAction::Delete, None, "orders", None),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let p: ChangePayload = serde_json::from_value(proposed.payload.clone()).unwrap();
+    let proof = service::deleted_by_key(p.feed_uid.as_deref().unwrap());
+    let stop = faucet_cli::serve::feeds::StopAfter::Marked;
+    srv.state.feeds().stop_removals_after(Some(stop));
+    let done = changes::approve(&srv.state, &bob(), &proposed.id, None)
+        .await
+        .unwrap();
+    assert_eq!(done.status, ChangeStatus::Executed, "{:?}", done.error);
+    srv.state.feeds().stop_removals_after(None);
+    let history = srv.state.history();
+    let marked = history.feed_list().await.unwrap().remove(0);
+    assert!(!marked.live());
+    service::finish_delete(&srv.state, &marked).await.unwrap();
+    assert!(history.feed_list().await.unwrap().is_empty());
+    assert_eq!(history.meta_get(&proof).await.unwrap(), None);
+}
+
+/// A delete change whose feed was deleted and remade elsewhere is not executed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_approved_delete_of_a_feed_deleted_elsewhere_and_remade_is_not_executed() {
     use faucet_cli::serve::changes::{self, ChangeStatus};

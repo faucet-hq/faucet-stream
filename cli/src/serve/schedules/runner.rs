@@ -1279,33 +1279,45 @@ mod tests {
         assert_eq!(outcome(&state, "morning").await.as_deref(), Some("started"));
     }
 
-    /// #1116: a single upgraded server cannot tell its own pre-upgrade runs
-    /// from an older replica's, so it holds the tick and runs it once, late,
-    /// at `tick + 1 h + 5 min`.
+    /// #1116: ticks near this server's own unstamped runs are held, then fire late once each.
     #[tokio::test]
-    async fn a_single_upgraded_server_holds_on_its_own_unstamped_runs_then_fires_once() {
+    async fn a_single_upgraded_server_holds_ticks_near_its_own_unstamped_runs_then_fires_each_once()
+    {
         let state = shared_state().await;
         old_release_run(&state, "old-1", "2026-11-23T17:00:00Z").await;
         let mut e = vancouver(at("2026-11-24T12:00:00Z"));
-        step(&state, &mut e, at("2026-11-24T16:00:00Z")).await;
-        assert_eq!(
-            outcome(&state, "morning").await.as_deref(),
-            Some("held_tzdata")
-        );
-        e.retry_at = None;
-        step(&state, &mut e, at("2026-11-24T17:04:59Z")).await;
-        assert_eq!(runs_of(&state).await.len(), 1, "nothing started while held");
-        e.retry_at = None;
-        step(&state, &mut e, at("2026-11-24T17:05:00Z")).await;
+        for (tick, late, runs) in [
+            ("2026-11-24T16:00:00Z", "2026-11-24T17:05:00Z", 2),
+            ("2026-11-25T16:00:00Z", "2026-11-25T17:05:00Z", 3),
+        ] {
+            let (tick, late) = (at(tick), at(late));
+            step(&state, &mut e, tick).await;
+            assert_eq!(
+                outcome(&state, "morning").await.as_deref(),
+                Some("held_tzdata"),
+                "{tick}"
+            );
+            e.retry_at = None;
+            step(&state, &mut e, tick + chrono::Duration::minutes(30)).await;
+            assert_eq!(runs_of(&state).await.len(), runs - 1, "held at {tick}");
+            e.retry_at = None;
+            step(&state, &mut e, late).await;
+            assert_eq!(outcome(&state, "morning").await.as_deref(), Some("started"));
+            e.retry_at = None;
+            step(&state, &mut e, late + chrono::Duration::minutes(25)).await;
+            assert_eq!(runs_of(&state).await.len(), runs, "{tick} ran once");
+            for mut r in runs_of(&state).await {
+                r.status = crate::serve::history::RunStatus::Completed;
+                state.history().upsert(&r).await.unwrap();
+            }
+        }
+        // Past the lookback the old run no longer counts: the tick fires on time.
+        step(&state, &mut e, at("2026-11-26T16:00:00Z")).await;
         assert_eq!(outcome(&state, "morning").await.as_deref(), Some("started"));
-        assert_eq!(e.next, Some(at("2026-11-25T16:00:00Z")));
-        e.retry_at = None;
-        step(&state, &mut e, at("2026-11-24T17:30:00Z")).await;
-        assert_eq!(runs_of(&state).await.len(), 2, "it ran once");
+        assert_eq!(runs_of(&state).await.len(), 4);
     }
 
-    /// #1116: a tick still held after its step timed out is recorded as held
-    /// again, not left `retrying`.
+    /// #1116: a tick still held after a step timeout is recorded as held again.
     #[tokio::test]
     async fn a_held_tick_after_a_step_timeout_is_recorded_as_held_again() {
         let state = shared_state().await;
@@ -1314,8 +1326,7 @@ mod tests {
         let tick = at("2026-11-24T16:00:00Z");
         step(&state, &mut e, tick).await;
         assert_eq!(e.noted_tzdata_hold, Some(tick));
-        // A shared history whose run listing hangs: the step stops inside
-        // the tzdata check, before anything else could clear the hold.
+        // The step hangs inside the tzdata check, before anything else clears the hold.
         let mut config = crate::serve::test_support::test_config();
         config.history = crate::serve::config::HistoryBackendSpec::Sqlite("sqlite::memory:".into());
         let hung = ServerState::new(
@@ -1672,8 +1683,7 @@ mod tests {
         }
     }
 
-    /// A history whose run listing never answers; everything else is
-    /// `inner`'s.
+    /// A history whose run listing never answers.
     struct HangOnList(std::sync::Arc<dyn RunHistory>);
 
     #[async_trait::async_trait]
