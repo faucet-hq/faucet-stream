@@ -2221,7 +2221,11 @@ async fn change_open(state: &ServerState, id: &str) -> Result<bool, String> {
 
 /// Keep the proof that change `id` deleted feed `uid` only while the change
 /// is open, so neither it nor [`forget_delete_proof`] leaves one behind.
-async fn keep_delete_proof(state: &ServerState, uid: &str, id: &str) -> Result<(), String> {
+pub(super) async fn keep_delete_proof(
+    state: &ServerState,
+    uid: &str,
+    id: &str,
+) -> Result<(), String> {
     let history = state.history();
     let key = deleted_by_key(uid);
     if change_open(state, id).await? {
@@ -2722,13 +2726,15 @@ pub async fn forget_delete_proof(
     state: &ServerState,
     change: &crate::serve::changes::ChangeRequest,
 ) {
-    let Ok(p) = serde_json::from_value::<ChangePayload>(change.payload.clone()) else {
+    let Ok(ChangePayload {
+        action: ChangeAction::Delete,
+        feed_uid: Some(uid),
+        ..
+    }) = serde_json::from_value::<ChangePayload>(change.payload.clone())
+    else {
         return;
     };
-    let (ChangeAction::Delete, Some(uid)) = (&p.action, p.feed_uid.as_deref()) else {
-        return;
-    };
-    let key = deleted_by_key(uid);
+    let key = deleted_by_key(&uid);
     let history = state.history();
     let result = match history.meta_get(&key).await {
         Ok(Some(id)) if id == change.id => history.meta_delete(&key).await,

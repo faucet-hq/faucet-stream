@@ -1737,6 +1737,28 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn hang_on_list_passes_every_other_call_through() {
+        let h = HangOnList(std::sync::Arc::new(MemoryHistory::new(
+            Duration::from_secs(60),
+        )));
+        let rec = crate::serve::history::RunRecord::queued(
+            "r1".into(),
+            None,
+            BTreeMap::new(),
+            None,
+            Utc::now(),
+        );
+        h.upsert(&rec).await.unwrap();
+        assert!(h.get("r1").await.unwrap().is_some());
+        h.claim_idempotency("k", "f", "r2", Duration::from_secs(60))
+            .await
+            .unwrap();
+        h.delete("r1").await.unwrap();
+        h.purge_expired(Duration::from_secs(60)).await.unwrap();
+        h.recover_orphans().await.unwrap();
+    }
+
     fn hang_state(panic: bool) -> ServerState {
         ServerState::new(
             &crate::serve::test_support::test_config(),

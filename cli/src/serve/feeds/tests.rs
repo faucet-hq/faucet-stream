@@ -714,3 +714,57 @@ fn a_moved_store_is_not_transient_and_says_where_the_events_are() {
     assert!(busy.is_transient());
     assert_eq!(busy.to_string(), "busy");
 }
+
+fn delete_change(id: &str, status: &str) -> crate::serve::changes::ChangeRequest {
+    serde_json::from_value(json!({
+        "id": id,
+        "kind": "feed",
+        "status": status,
+        "requester": "alice",
+        "requester_role": "admin",
+        "payload": {"action": "delete", "name": "orders", "feed_uid": "u1"},
+        "required_approvals": 1,
+        "created_at": "2026-11-26T00:00:00Z",
+        "updated_at": "2026-11-26T00:00:00Z",
+        "expires_at": "2026-11-27T00:00:00Z"
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_delete_proof_is_kept_while_its_change_is_open() {
+    let state = crate::serve::test_support::test_state();
+    let change = delete_change("c1", "approved");
+    state.history().change_upsert(&change).await.unwrap();
+    service::keep_delete_proof(&state, "u1", "c1")
+        .await
+        .unwrap();
+    let key = service::deleted_by_key("u1");
+    assert_eq!(
+        state.history().meta_get(&key).await.unwrap().as_deref(),
+        Some("c1")
+    );
+    service::forget_delete_proof(&state, &change).await;
+    assert_eq!(state.history().meta_get(&key).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn forgetting_a_delete_proof_survives_an_unreachable_history() {
+    let flaky = std::sync::Arc::new(crate::serve::test_support::Flaky {
+        inner: std::sync::Arc::new(crate::serve::history::memory::MemoryHistory::new(
+            std::time::Duration::from_secs(60),
+        )),
+        down: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    });
+    let state = ServerState::new(
+        &crate::serve::test_support::test_config(),
+        None,
+        tokio_util::sync::CancellationToken::new(),
+        flaky,
+        crate::serve::logs::LogHub::new(),
+        None,
+        #[cfg(feature = "triggers")]
+        crate::serve::triggers::health::TriggersHandle::empty(),
+    );
+    service::forget_delete_proof(&state, &delete_change("c1", "executed")).await;
+}
