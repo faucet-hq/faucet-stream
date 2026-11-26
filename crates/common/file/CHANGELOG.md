@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.1.5](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-file-v1.1.4...faucet-common-file-v1.1.5) - 2026-11-26
+
+### Bug Fixes
+
+- Follow-up fixes and tests after the reliability pass ([#1097](https://github.com/faucet-hq/faucet-stream/pull/1097))
+- Reliability and correctness fixes across the engine, serve, feeds and connectors ([#1096](https://github.com/faucet-hq/faucet-stream/pull/1096))
+
+### Performance
+
+- Clear measured bottlenecks across the engine, SQL, file, HTTP, messaging and serve paths ([#1101](https://github.com/faucet-hq/faucet-stream/pull/1101))
+
 ## [1.1.4](https://github.com/faucet-hq/faucet-stream/compare/faucet-common-file-v1.1.3...faucet-common-file-v1.1.4) - 2026-11-12
 
 ### Bug Fixes

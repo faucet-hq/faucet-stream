@@ -7,6 +7,21 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
 
+## [1.4.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-duckdb-v1.4.1...faucet-sink-duckdb-v1.4.2) - 2026-11-26
+
+### Bug Fixes
+
+- Iceberg vended credentials, single-precision cursors, DST schedules and tzdata 2026f, plus the #1100/#1093 follow-ups ([#1121](https://github.com/faucet-hq/faucet-stream/pull/1121))
+- Reliability and correctness fixes across the engine, serve, feeds and connectors ([#1096](https://github.com/faucet-hq/faucet-stream/pull/1096))
+
+### Documentation
+
+- Switch the docs site to Astro Starlight and remove mdBook ([#1080](https://github.com/faucet-hq/faucet-stream/pull/1080))
+
+### Performance
+
+- Clear measured bottlenecks across the engine, SQL, file, HTTP, messaging and serve paths ([#1101](https://github.com/faucet-hq/faucet-stream/pull/1101))
+
 ## [1.4.1](https://github.com/faucet-hq/faucet-stream/compare/faucet-sink-duckdb-v1.4.0...faucet-sink-duckdb-v1.4.1) - 2026-11-12
 
 ### Bug Fixes

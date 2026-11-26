@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (see the versioning policy in CONTRIBUTING.md — connector crates version
 independently).
+## [1.5.3](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-mysql-cdc-v1.5.2...faucet-source-mysql-cdc-v1.5.3) - 2026-11-26
+
+### Bug Fixes
+
+- Iceberg vended credentials, single-precision cursors, DST schedules and tzdata 2026f, plus the #1100/#1093 follow-ups ([#1121](https://github.com/faucet-hq/faucet-stream/pull/1121))
+
+### Documentation
+
+- Switch the docs site to Astro Starlight and remove mdBook ([#1080](https://github.com/faucet-hq/faucet-stream/pull/1080))
+
 ## [1.5.2](https://github.com/faucet-hq/faucet-stream/compare/faucet-source-mysql-cdc-v1.5.1...faucet-source-mysql-cdc-v1.5.2) - 2026-11-12
 
 ### Bug Fixes
