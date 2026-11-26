@@ -12,3 +12,12 @@ table = pa.table({
     "tags": pa.array([["a", "b"], [], None], pa.list_(pa.string())),
 })
 orc.write_table(table, "people.orc", compression="zstd")
+
+# zones.orc: two stripes, uncompressed, so a test can patch the writer time zone
+# ("GMT", once per stripe footer) in place.
+n = 2048
+zones = pa.table({
+    "id": pa.array(range(n), pa.int64()),
+    "at": pa.array([datetime.datetime(2024, 2, 29, 12, 0, 0)] * n, pa.timestamp("ns")),
+})
+orc.write_table(zones, "zones.orc", compression="uncompressed", stripe_size=1, batch_size=1024)
