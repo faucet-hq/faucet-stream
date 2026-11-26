@@ -2605,6 +2605,10 @@ async fn an_approved_feed_change_interrupted_after_its_write_is_executed() {
     use service::{ChangeAction, ChangePayload};
     let dir = tempfile::tempdir().unwrap();
     let srv = Srv::start(dir.path(), &["--require-approval", "feed"]).await;
+    // No background scheduler: it would finish the marked removal at a time
+    // of its own (the next test covers that path).
+    srv.state
+        .set_feeds(FeedsRuntime::from_config(&srv.config).offline());
     service::create(&srv.state, &admin(), None, feed_spec("orders", json!([])))
         .await
         .unwrap();
@@ -2657,6 +2661,143 @@ async fn an_approved_feed_change_interrupted_after_its_write_is_executed() {
             "{action}: {audit:?}"
         );
     }
+}
+
+/// An approved delete interrupted after the feed was marked deleted ends
+/// executed when a scheduler finished the removal before the change ran
+/// again, and the proof the removal kept is dropped once it is saved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_approved_delete_interrupted_and_finished_elsewhere_is_executed() {
+    use faucet_cli::serve::changes::{self, ChangeStatus};
+    use service::{ChangeAction, ChangePayload};
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &["--require-approval", "feed"]).await;
+    srv.state
+        .set_feeds(FeedsRuntime::from_config(&srv.config).offline());
+    service::create(&srv.state, &admin(), None, feed_spec("orders", json!([])))
+        .await
+        .unwrap();
+    let proposed = pending(
+        service::change(
+            &srv.state,
+            &admin(),
+            ChangePayload::new(ChangeAction::Delete, None, "orders", None),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let p: ChangePayload = serde_json::from_value(proposed.payload.clone()).unwrap();
+    let uid = p.feed_uid.clone().unwrap();
+    srv.state
+        .feeds()
+        .stop_removals_after(Some(faucet_cli::serve::feeds::StopAfter::Marked));
+    let _ = service::apply(&srv.state, &admin(), p, true, Some(&proposed.id)).await;
+    srv.state.feeds().stop_removals_after(None);
+    let history = srv.state.history();
+    let marked = history
+        .feed_list()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name() == "orders")
+        .unwrap();
+    assert!(!marked.live());
+    service::finish_delete(&srv.state, &marked).await.unwrap();
+    assert!(history.feed_list().await.unwrap().is_empty());
+    let proof = service::deleted_by_key(&uid);
+    assert_eq!(
+        history.meta_get(&proof).await.unwrap().as_deref(),
+        Some(proposed.id.as_str())
+    );
+    let done = changes::approve(&srv.state, &bob(), &proposed.id, None)
+        .await
+        .unwrap();
+    assert_eq!(done.status, ChangeStatus::Executed, "{:?}", done.error);
+    let audit = history
+        .list_audit(&faucet_cli::serve::history::AuditFilter {
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        audit.iter().any(|e| e.action == "feed.delete"
+            && e.detail.as_deref().is_some_and(|d| d.contains("recovered"))),
+        "{audit:?}"
+    );
+    assert_eq!(history.meta_get(&proof).await.unwrap(), None);
+}
+
+/// An approved delete that runs through leaves no proof of itself behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_approved_delete_leaves_no_proof_behind() {
+    use faucet_cli::serve::changes::{self, ChangeStatus};
+    use service::{ChangeAction, ChangePayload};
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &["--require-approval", "feed"]).await;
+    srv.state
+        .set_feeds(FeedsRuntime::from_config(&srv.config).offline());
+    service::create(&srv.state, &admin(), None, feed_spec("orders", json!([])))
+        .await
+        .unwrap();
+    let proposed = pending(
+        service::change(
+            &srv.state,
+            &admin(),
+            ChangePayload::new(ChangeAction::Delete, None, "orders", None),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let p: ChangePayload = serde_json::from_value(proposed.payload.clone()).unwrap();
+    let done = changes::approve(&srv.state, &bob(), &proposed.id, None)
+        .await
+        .unwrap();
+    assert_eq!(done.status, ChangeStatus::Executed, "{:?}", done.error);
+    let history = srv.state.history();
+    assert!(history.feed_list().await.unwrap().is_empty());
+    let proof = service::deleted_by_key(p.feed_uid.as_deref().unwrap());
+    assert_eq!(history.meta_get(&proof).await.unwrap(), None);
+}
+
+/// A delete change whose feed was deleted without it and made again under
+/// the same name is not executed, and the new feed stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_approved_delete_of_a_feed_deleted_elsewhere_and_remade_is_not_executed() {
+    use faucet_cli::serve::changes::{self, ChangeStatus};
+    use service::{ChangeAction, ChangePayload};
+    let dir = tempfile::tempdir().unwrap();
+    let srv = Srv::start(dir.path(), &["--require-approval", "feed"]).await;
+    srv.state
+        .set_feeds(FeedsRuntime::from_config(&srv.config).offline());
+    service::create(&srv.state, &admin(), None, feed_spec("orders", json!([])))
+        .await
+        .unwrap();
+    let proposed = pending(
+        service::change(
+            &srv.state,
+            &admin(),
+            ChangePayload::new(ChangeAction::Delete, None, "orders", None),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    service::delete(&srv.state, &admin(), None, "orders")
+        .await
+        .unwrap();
+    service::create(&srv.state, &admin(), None, feed_spec("orders", json!([])))
+        .await
+        .unwrap();
+    let remade = service::find(&srv.state, None, "orders").await.unwrap();
+    let done = changes::approve(&srv.state, &bob(), &proposed.id, None)
+        .await
+        .unwrap();
+    assert_eq!(done.status, ChangeStatus::Invalidated, "{:?}", done.error);
+    let still = service::find(&srv.state, None, "orders").await.unwrap();
+    assert_eq!(still.feed.uid, remade.feed.uid);
 }
 
 /// A stall and a crossing of a `warn_at` threshold each send one

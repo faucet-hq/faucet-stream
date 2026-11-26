@@ -132,7 +132,9 @@ nothing runs twice. If an execution is interrupted after approval (a crash, a
 store error before `executed` was written), the same sweep finds the request
 still `approved` five minutes later and finishes it: a run is submitted again
 under its `change:<id>` key (so the original run is replayed, never doubled),
-a launch is re-applied (re-launching the live version is a no-op), and a
+a launch is re-applied (re-launching the live version is a no-op), a feed
+change whose write already landed is marked `executed` (a feed delete too,
+when a scheduler finished removing the feed first), and a
 registration is marked `failed` — its outcome is unknown, so check the
 template's versions before proposing it again.
 
