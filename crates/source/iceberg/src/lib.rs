@@ -11,6 +11,7 @@
 pub mod config;
 pub mod convert;
 pub mod filter;
+mod refresh;
 pub mod snapshots;
 pub mod stream;
 

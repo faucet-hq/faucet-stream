@@ -32,9 +32,10 @@ where
 {
     let backend = classify_backend_error;
     let ts: String = r.try_get("ts").map_err(backend)?;
+    let id: String = r.try_get("id").map_err(backend)?;
     Ok(crate::serve::history::AuditEntry {
-        id: r.try_get("id").map_err(backend)?,
-        timestamp: parse_ts(&ts),
+        timestamp: parse_stored_ts(&ts, StoredTs::Audit, &id),
+        id,
         principal: r.try_get("principal").map_err(backend)?,
         role: r.try_get("role").map_err(backend)?,
         action: r.try_get("action").map_err(backend)?,
@@ -109,7 +110,16 @@ pub struct LogShipColumns {
 
 /// Decode a `faucet_serve_log_ship` row.
 pub fn decode_log_ship(c: LogShipColumns) -> crate::serve::history::LogShipRow {
-    let ts = |v: Option<String>| v.as_deref().map(parse_ts);
+    // Damaged: absent, except `failing_since` (epoch keeps the notification).
+    let run = c.run_id.clone();
+    let ts = |v: Option<String>| {
+        v.as_deref()
+            .and_then(|raw| parse_stored_ts_opt(raw, StoredTs::LogShip, &run))
+    };
+    let failing_since = c
+        .failing_since
+        .as_deref()
+        .map(|raw| parse_stored_ts(raw, StoredTs::LogShip, &run));
     let notified = c.notified.unwrap_or_default();
     crate::serve::history::LogShipRow {
         run_id: c.run_id,
@@ -119,7 +129,7 @@ pub fn decode_log_ship(c: LogShipColumns) -> crate::serve::history::LogShipRow {
         dropped: c.dropped.and_then(|d| d.parse().ok()).unwrap_or(0),
         last_error: c.last_error,
         last_attempt_at: ts(c.last_attempt_at),
-        failing_since: ts(c.failing_since),
+        failing_since,
         owner: c.owner,
         lease_expires_at: ts(c.lease_expires_at),
         notified_failure: notified.contains('f'),
@@ -3349,13 +3359,92 @@ pub fn unpad_seq(raw: &str) -> u64 {
     raw.trim_start_matches('0').parse().unwrap_or(0)
 }
 
-/// Inverse of [`fmt_ts`]. An unparseable value falls back to *now* rather than
-/// failing the read: a single corrupt timestamp must not make a whole template or
-/// audit row unusable, and every caller uses the value for display/ordering only.
+/// Inverse of [`fmt_ts`]. An unparseable value reads as the Unix epoch rather
+/// than failing the read: a single corrupt timestamp must not make a whole
+/// template or audit row unusable. The epoch is the same on every read and is
+/// plainly no real event time (#1112). Readers of stored rows use
+/// [`parse_stored_ts`], which also reports the damage.
 pub fn parse_ts(raw: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(raw)
-        .map(|d| d.to_utc())
-        .unwrap_or_else(|_| Utc::now())
+    try_parse_ts(raw).unwrap_or(DateTime::UNIX_EPOCH)
+}
+
+fn try_parse_ts(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw).ok().map(|d| d.to_utc())
+}
+
+/// The tables whose stored timestamps are read leniently; the `table` label
+/// of `faucet_serve_history_unparseable_timestamps_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StoredTs {
+    Audit,
+    TemplateLaunch,
+    TemplateDeprecation,
+    TemplateVersionDeprecation,
+    LogShip,
+    CatalogStats,
+    Instance,
+}
+
+impl StoredTs {
+    pub fn label(self) -> &'static str {
+        match self {
+            StoredTs::Audit => "audit",
+            StoredTs::TemplateLaunch => "template_launches",
+            StoredTs::TemplateDeprecation => "template_deprecations",
+            StoredTs::TemplateVersionDeprecation => "template_version_deprecations",
+            StoredTs::LogShip => "log_ship",
+            StoredTs::CatalogStats => "catalog_stats",
+            StoredTs::Instance => "instances",
+        }
+    }
+}
+
+/// How many damaged rows are named in the log per process; past it they are
+/// only counted.
+const UNPARSEABLE_WARN_CAP: usize = 1024;
+
+/// Count a stored timestamp that did not parse, and name its row in the log
+/// once per process.
+fn note_unparseable(table: StoredTs, row: &str, raw: &str) {
+    crate::serve::metrics::record_unparseable_timestamp(table.label());
+    static WARNED: std::sync::Mutex<Option<std::collections::HashSet<(StoredTs, String)>>> =
+        std::sync::Mutex::new(None);
+    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    let warned = warned.get_or_insert_with(Default::default);
+    if warned.len() >= UNPARSEABLE_WARN_CAP || !warned.insert((table, row.to_string())) {
+        return;
+    }
+    let shown: String = crate::secrets::registry::redact(raw)
+        .chars()
+        .take(64)
+        .collect();
+    tracing::warn!(
+        table = table.label(),
+        row,
+        stored = %shown,
+        "run history: a stored timestamp of {} row {row} is not a timestamp; it reads as a \
+         marker value until the row is repaired",
+        table.label()
+    );
+}
+
+/// A stored timestamp of `table`'s row `row`. One that does not parse reads
+/// as the Unix epoch, and is logged and counted.
+pub fn parse_stored_ts(raw: &str, table: StoredTs, row: &str) -> DateTime<Utc> {
+    try_parse_ts(raw).unwrap_or_else(|| {
+        note_unparseable(table, row, raw);
+        DateTime::UNIX_EPOCH
+    })
+}
+
+/// [`parse_stored_ts`] for a timestamp whose absence is the safe reading: one
+/// that does not parse reads as absent.
+pub fn parse_stored_ts_opt(raw: &str, table: StoredTs, row: &str) -> Option<DateTime<Utc>> {
+    let parsed = try_parse_ts(raw);
+    if parsed.is_none() {
+        note_unparseable(table, row, raw);
+    }
+    parsed
 }
 
 /// True when a claim timestamped `claimed_at` (RFC3339) is older than `window`.
@@ -5208,11 +5297,6 @@ macro_rules! impl_sql_history {
                     .fetch_all(&self.pool)
                     .await
                     .map_err(backend)?;
-                let parse_dt = |s: &str| {
-                    chrono::DateTime::parse_from_rfc3339(s)
-                        .map(|d| d.to_utc())
-                        .unwrap_or(now)
-                };
                 let mut out = Vec::with_capacity(rows.len());
                 for r in &rows {
                     let started: String = r.try_get("started_at").map_err(backend)?;
@@ -5223,10 +5307,13 @@ macro_rules! impl_sql_history {
                     let pools: Option<String> = r.try_get("pools").map_err(backend)?;
                     let caps: Option<String> = r.try_get("capabilities").map_err(backend)?;
                     let offset: Option<String> = r.try_get("clock_offset_ms").map_err(backend)?;
+                    let instance_id: String = r.try_get("instance_id").map_err(backend)?;
+                    let parse_dt =
+                        |s: &str| sql::parse_stored_ts(s, sql::StoredTs::Instance, &instance_id);
                     out.push(InstanceRecord {
-                        instance_id: r.try_get("instance_id").map_err(backend)?,
                         started_at: parse_dt(&started),
                         last_heartbeat: parse_dt(&hb),
+                        instance_id: instance_id.clone(),
                         listen: r.try_get("listen").map_err(backend)?,
                         max_concurrent: mc.and_then(|s| s.parse().ok()).unwrap_or(0),
                         in_flight: inf.and_then(|s| s.parse().ok()).unwrap_or(0),
@@ -6443,9 +6530,11 @@ macro_rules! impl_sql_history {
                     let run_id: String = r.try_get("run_id").map_err(backend)?;
                     let records: String = r.try_get("records").map_err(backend)?;
                     stats.push(catalog::CatalogStatsPoint {
-                        recorded_at: chrono::DateTime::parse_from_rfc3339(&recorded)
-                            .map(|d| d.to_utc())
-                            .unwrap_or_else(|_| chrono::Utc::now()),
+                        recorded_at: $crate::serve::history::sql::parse_stored_ts(
+                            &recorded,
+                            $crate::serve::history::sql::StoredTs::CatalogStats,
+                            &format!("{id}/{run_id}"),
+                        ),
                         run_id,
                         records: records.parse().unwrap_or(0),
                     });
@@ -8435,7 +8524,11 @@ macro_rules! impl_sql_history {
                     out.push(templates::LaunchRecord {
                         seq,
                         version,
-                        launched_at: sql::parse_ts(&launched_at),
+                        launched_at: sql::parse_stored_ts(
+                            &launched_at,
+                            sql::StoredTs::TemplateLaunch,
+                            &format!("{id}#{seq}"),
+                        ),
                         launched_by,
                         evidence,
                     });
@@ -8666,7 +8759,11 @@ macro_rules! impl_sql_history {
                     out.push(templates::VersionDeprecation {
                         version,
                         record: templates::DeprecationRecord {
-                            deprecated_at: sql::parse_ts(&at),
+                            deprecated_at: sql::parse_stored_ts(
+                                &at,
+                                sql::StoredTs::TemplateVersionDeprecation,
+                                &format!("{id}@{version}"),
+                            ),
                             deprecated_by: row.try_get("deprecated_by").map_err(backend)?,
                             reason: row.try_get("reason").map_err(backend)?,
                         },
@@ -8695,7 +8792,7 @@ macro_rules! impl_sql_history {
                 };
                 let at: String = row.try_get("deprecated_at").map_err(backend)?;
                 Ok(Some(templates::DeprecationRecord {
-                    deprecated_at: sql::parse_ts(&at),
+                    deprecated_at: sql::parse_stored_ts(&at, sql::StoredTs::TemplateDeprecation, id),
                     deprecated_by: row.try_get("deprecated_by").map_err(backend)?,
                     reason: row.try_get("reason").map_err(backend)?,
                 }))
@@ -8746,6 +8843,94 @@ pub(crate) use impl_sql_history;
 
 #[cfg(test)]
 mod tests {
+    /// #1112: a damaged log-shipping timestamp reads as absent, except
+    /// `failing_since`, which reads as the epoch so the failure notification
+    /// is still raised; each damaged field is counted.
+    #[test]
+    fn damaged_log_ship_timestamps_read_as_absent_or_the_epoch() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let columns = |bad: &str| super::LogShipColumns {
+            run_id: format!("run-{bad}"),
+            total_seq: super::pad_seq(9),
+            delivered_seq: Some(super::pad_seq(4)),
+            delivered_at: Some(bad.to_string()),
+            dropped: None,
+            last_error: Some("collector down".into()),
+            last_attempt_at: Some(bad.to_string()),
+            failing_since: Some(bad.to_string()),
+            owner: Some("inst".into()),
+            lease_expires_at: Some(bad.to_string()),
+            notified: None,
+        };
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let row = metrics::with_local_recorder(&recorder, || {
+            super::decode_log_ship(columns("not-a-time"))
+        });
+        assert_eq!(
+            row.delivered_at, None,
+            "no retention purge on a damaged time"
+        );
+        assert_eq!(row.last_attempt_at, None);
+        assert_eq!(row.lease_expires_at, None);
+        assert_eq!(row.failing_since, Some(chrono::DateTime::UNIX_EPOCH));
+        assert_eq!(row.delivered_seq, Some(4));
+        let counted: u64 = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, ..)| {
+                key.key().name() == "faucet_serve_history_unparseable_timestamps_total"
+                    && key.key().labels().any(|l| l.value() == "log_ship")
+            })
+            .map(|(.., v)| match v {
+                DebugValue::Counter(n) => n,
+                other => panic!("{other:?}"),
+            })
+            .sum();
+        assert_eq!(counted, 4);
+
+        let good = super::fmt_ts(chrono::Utc::now());
+        let row = super::decode_log_ship(columns(&good));
+        assert!(row.delivered_at.is_some() && row.lease_expires_at.is_some());
+        assert_eq!(row.failing_since.map(super::fmt_ts), Some(good));
+    }
+
+    #[test]
+    fn a_stored_timestamp_keeps_parsing_in_every_accepted_spelling() {
+        use super::{StoredTs, parse_stored_ts, parse_stored_ts_opt};
+        for raw in [
+            "2026-11-25T10:00:00Z",
+            "2026-11-25T12:00:00+02:00",
+            "2026-11-25t10:00:00z",
+            "2026-11-25 10:00:00Z",
+        ] {
+            let want = chrono::DateTime::parse_from_rfc3339("2026-11-25T10:00:00Z").unwrap();
+            assert_eq!(
+                parse_stored_ts(raw, StoredTs::Audit, "spelling"),
+                want,
+                "{raw}"
+            );
+            assert_eq!(
+                parse_stored_ts_opt(raw, StoredTs::Audit, "spelling"),
+                Some(want.to_utc())
+            );
+        }
+        assert_eq!(super::parse_ts("nope"), chrono::DateTime::UNIX_EPOCH);
+        let labels: std::collections::HashSet<_> = [
+            StoredTs::Audit,
+            StoredTs::TemplateLaunch,
+            StoredTs::TemplateDeprecation,
+            StoredTs::TemplateVersionDeprecation,
+            StoredTs::LogShip,
+            StoredTs::CatalogStats,
+            StoredTs::Instance,
+        ]
+        .map(StoredTs::label)
+        .into();
+        assert_eq!(labels.len(), 7, "one label per table");
+    }
+
     #[test]
     fn database_clock_readings_and_owner_keyed_lease_thresholds() {
         use chrono::TimeZone as _;

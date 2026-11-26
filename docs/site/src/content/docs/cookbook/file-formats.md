@@ -340,6 +340,24 @@ timestamps become `Timestamp(ns)`, and nested types become `Struct` / `List` /
 `Map`. On the record path they convert the same way a Parquet file's do, so
 the two formats produce the same records for the same content.
 
+### Writer time zones
+
+Every ORC stripe records the time zone of the process that wrote it. The reader
+needs to know that zone, whether or not the file has timestamp columns. A file
+with a stripe whose zone is not in the IANA time-zone database this build
+carries is refused before any of its rows are read, naming the file, the stripe
+and the zone:
+
+```text
+'events/part-7.orc': orc: stripe 1 was written in time zone "PST", which is not a zone of this build's IANA time-zone database …
+```
+
+Java writers store the JVM's default zone, which can be a legacy id (`PST`,
+`CST`, `IST`) or an offset (`GMT+08:00`); neither is an IANA name. Rewrite such
+a file with a writer whose zone is an IANA name (`America/Los_Angeles`, `UTC`).
+A file that damages the reader in another way fails with an error too, never a
+crash, and emits no partial stripe.
+
 ## The columnar path for Avro and ORC
 
 Both formats decode to Arrow `RecordBatch`es. On S3, GCS, Azure Blob, SFTP and

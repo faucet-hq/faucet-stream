@@ -8,7 +8,7 @@ use faucet_core::FaucetError;
 use faucet_core::discover::{DatasetDescriptor, columns_to_schema, nullable_type};
 use faucet_core::shard::HashShard;
 use iceberg::scan::FileScanTask;
-use iceberg::spec::{DataContentType, PrimitiveType, Schema, Type};
+use iceberg::spec::{DataContentType, DataFileFormat, PrimitiveType, Schema, Type};
 use serde_json::{Value, json};
 
 /// Decode a batch into one JSON object per row, keeping explicit nulls and
@@ -311,18 +311,33 @@ pub fn descriptor(
 
 /// Refuse a scan task whose delete files iceberg-rust cannot apply, so a read
 /// never returns rows that were deleted.
+///
+/// Decided by the delete file's declared format: Parquet position and
+/// equality deletes, and a Puffin deletion vector that carries where its blob
+/// lies and which data file it belongs to.
 pub fn ensure_deletes_supported(task: &FileScanTask) -> Result<(), FaucetError> {
     for d in task.deletes() {
-        let parquet = d.file_path.to_ascii_lowercase().ends_with(".parquet");
-        let problem = match d.file_type {
-            _ if !parquet => Some("is not a Parquet delete file (e.g. a deletion vector)"),
-            DataContentType::EqualityDeletes
+        let problem = match (d.file_format, d.file_type) {
+            (_, DataContentType::Data) => Some("is a data file listed as a delete file".into()),
+            (DataFileFormat::Parquet, DataContentType::EqualityDeletes)
                 if d.equality_ids.as_ref().is_none_or(Vec::is_empty) =>
             {
-                Some("is an equality delete without equality field ids")
+                Some("is an equality delete without equality field ids".into())
             }
-            DataContentType::Data => Some("is a data file listed as a delete file"),
-            _ => None,
+            (DataFileFormat::Parquet, _) => None,
+            (DataFileFormat::Puffin, DataContentType::PositionDeletes)
+                if d.content_offset.is_some()
+                    && d.content_size_in_bytes.is_some()
+                    && d.referenced_data_file.is_some() =>
+            {
+                None
+            }
+            (DataFileFormat::Puffin, DataContentType::PositionDeletes) => {
+                Some("is a deletion vector without its blob offset, blob size or data file".into())
+            }
+            (format, _) => Some(format!(
+                "is in {format} format, not a Parquet delete file or a deletion vector"
+            )),
         };
         if let Some(problem) = problem {
             return Err(FaucetError::Source(format!(
@@ -334,6 +349,48 @@ pub fn ensure_deletes_supported(task: &FileScanTask) -> Result<(), FaucetError> 
         }
     }
     Ok(())
+}
+
+/// Whether a column of this type holds a `variant` anywhere inside it.
+fn contains_variant(ty: &Type) -> bool {
+    match ty {
+        Type::Variant(_) => true,
+        Type::Primitive(_) => false,
+        Type::Struct(s) => s.fields().iter().any(|f| contains_variant(&f.field_type)),
+        Type::List(l) => contains_variant(&l.element_field.field_type),
+        Type::Map(m) => {
+            contains_variant(&m.key_field.field_type) || contains_variant(&m.value_field.field_type)
+        }
+    }
+}
+
+/// Refuse a read that projects a column holding a `variant`: iceberg-rust
+/// cannot decode one yet and fails at the first data file. `columns` is the
+/// configured projection (empty = every column).
+pub fn ensure_no_variant_projected(schema: &Schema, columns: &[String]) -> Result<(), FaucetError> {
+    let variants: Vec<&str> = schema
+        .as_struct()
+        .fields()
+        .iter()
+        .filter(|f| columns.is_empty() || columns.contains(&f.name))
+        .filter(|f| contains_variant(&f.field_type))
+        .map(|f| f.name.as_str())
+        .collect();
+    if variants.is_empty() {
+        return Ok(());
+    }
+    let readable: Vec<&str> = schema
+        .as_struct()
+        .fields()
+        .iter()
+        .filter(|f| !contains_variant(&f.field_type))
+        .map(|f| f.name.as_str())
+        .collect();
+    Err(FaucetError::Source(format!(
+        "iceberg: column(s) {variants:?} hold a `variant`, which the reader cannot decode yet; \
+         nothing was read. Set `columns` to the columns to read without them (readable: \
+         {readable:?})"
+    )))
 }
 
 /// Keep the tasks this read should process: only files added by the snapshot
@@ -363,7 +420,7 @@ mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use iceberg::scan::FileScanTaskDeleteFile;
-    use iceberg::spec::{DataFileFormat, ListType, MapType, NestedField, StructType};
+    use iceberg::spec::{ListType, MapType, NestedField, StructType};
     use std::sync::Arc;
 
     #[test]
@@ -841,54 +898,128 @@ mod tests {
             .unwrap()
     }
 
-    fn del(path: &str, ty: DataContentType, ids: Option<Vec<i32>>) -> FileScanTaskDeleteFile {
+    fn del(
+        path: &str,
+        format: DataFileFormat,
+        ty: DataContentType,
+        ids: Option<Vec<i32>>,
+    ) -> FileScanTaskDeleteFile {
         FileScanTaskDeleteFile::builder()
             .with_file_path(path.to_string())
             .with_file_size_in_bytes(1)
-            .with_file_format(if path.ends_with(".parquet") {
-                DataFileFormat::Parquet
-            } else {
-                DataFileFormat::Puffin
-            })
+            .with_file_format(format)
             .with_file_type(ty)
             .with_partition_spec_id(0)
             .with_equality_ids(ids)
             .build()
     }
 
+    fn vector(
+        offset: Option<i64>,
+        size: Option<i64>,
+        data_file: Option<&str>,
+    ) -> FileScanTaskDeleteFile {
+        let mut d = del(
+            "dv.puffin",
+            DataFileFormat::Puffin,
+            DataContentType::PositionDeletes,
+            None,
+        );
+        d.content_offset = offset;
+        d.content_size_in_bytes = size;
+        d.referenced_data_file = data_file.map(str::to_string);
+        d
+    }
+
     #[test]
     fn delete_support_check() {
+        use DataContentType::{Data, EqualityDeletes, PositionDeletes};
+        use DataFileFormat::{Avro, Orc, Parquet, Puffin};
         ensure_deletes_supported(&task("a.parquet", vec![])).unwrap();
         ensure_deletes_supported(&task(
             "a.parquet",
             vec![
-                del("p.PARQUET", DataContentType::PositionDeletes, None),
-                del("e.parquet", DataContentType::EqualityDeletes, Some(vec![1])),
+                // The declared format decides, whatever the file is called.
+                del("p.PARQUET", Parquet, PositionDeletes, None),
+                del("no-extension", Parquet, PositionDeletes, None),
+                del("e.parquet", Parquet, EqualityDeletes, Some(vec![1])),
+                vector(Some(4), Some(40), Some("a.parquet")),
             ],
         ))
         .unwrap();
         for (d, needle) in [
             (
-                del("dv.puffin", DataContentType::PositionDeletes, None),
-                "not a Parquet",
+                vector(None, Some(40), Some("a.parquet")),
+                "without its blob",
+            ),
+            (vector(Some(4), None, Some("a.parquet")), "without its blob"),
+            (vector(Some(4), Some(40), None), "without its blob"),
+            (
+                del("e.puffin", Puffin, EqualityDeletes, Some(vec![1])),
+                "not a Parquet delete file or a deletion vector",
             ),
             (
-                del("e.parquet", DataContentType::EqualityDeletes, None),
+                del("p.avro", Avro, PositionDeletes, None),
+                "is in avro format",
+            ),
+            (del("p.orc", Orc, PositionDeletes, None), "is in orc format"),
+            (
+                del("e.parquet", Parquet, EqualityDeletes, None),
                 "without equality",
             ),
             (
-                del("e.parquet", DataContentType::EqualityDeletes, Some(vec![])),
+                del("e.parquet", Parquet, EqualityDeletes, Some(vec![])),
                 "without equality",
             ),
-            (
-                del("x.parquet", DataContentType::Data, None),
-                "data file listed",
-            ),
+            (del("x.parquet", Parquet, Data, None), "data file listed"),
+            (del("x.puffin", Puffin, Data, None), "data file listed"),
         ] {
             let e = ensure_deletes_supported(&task("a.parquet", vec![d])).unwrap_err();
             assert!(e.to_string().contains(needle), "{e}");
             assert!(e.to_string().contains("refuses"), "{e}");
         }
+    }
+
+    #[test]
+    fn a_projected_variant_is_refused_and_an_unprojected_one_is_not() {
+        let variant = || Type::Variant(iceberg::spec::VariantType);
+        let nested = Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+            5,
+            "inner",
+            variant(),
+        ))]));
+        let schema = Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::optional(2, "payload", variant())),
+                Arc::new(NestedField::optional(3, "wrapped", nested)),
+                Arc::new(NestedField::optional(
+                    6,
+                    "name",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let cols = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        ensure_no_variant_projected(&schema, &cols(&["id", "name"])).unwrap();
+        ensure_no_variant_projected(&table_schema(), &[]).unwrap();
+        let all = ensure_no_variant_projected(&schema, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(all.contains(r#"["payload", "wrapped"]"#), "{all}");
+        assert!(all.contains(r#"readable: ["id", "name"]"#), "{all}");
+        let one = ensure_no_variant_projected(&schema, &cols(&["id", "wrapped"]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            one.contains(r#"["wrapped"]"#) && !one.contains("payload\","),
+            "{one}"
+        );
     }
 
     #[test]
@@ -909,10 +1040,7 @@ mod tests {
         }
         assert_eq!(total, 20, "hash shards partition the files");
 
-        let bad = vec![task(
-            "x.parquet",
-            vec![del("dv.puffin", DataContentType::PositionDeletes, None)],
-        )];
+        let bad = vec![task("x.parquet", vec![vector(None, None, None)])];
         assert!(select_tasks(bad, None, None).is_err());
     }
 

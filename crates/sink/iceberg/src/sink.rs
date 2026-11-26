@@ -53,6 +53,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use faucet_common_iceberg::{StorageReload, storage_reload, with_storage_of};
 use faucet_core::driver::{
     CommitTokenDriver, DriverSink, PageWrite, RowPolicy, SchemaDriver, SinkDriver,
 };
@@ -192,24 +193,6 @@ const MAX_PROPERTY_SCOPE: usize = 200;
 /// The key an earlier release wrote a long scope's token under.
 fn legacy_token_property(scope: &str) -> String {
     format!("{}.{scope}", faucet_core::idempotency::ICEBERG_TOKEN_PROP)
-}
-
-/// `committed`'s metadata and metadata location with `storage`'s `FileIO`.
-///
-/// A commit returns a handle whose `FileIO` holds only the catalog's own
-/// properties (a commit response carries no table config), so a catalog's
-/// vended credentials would be lost. The rebuilt handle has no KMS client and
-/// runs on the current tokio runtime, as the catalog's handles do.
-fn with_storage_of(committed: &Table, storage: &Table) -> Result<Table, iceberg::Error> {
-    let builder = Table::builder()
-        .identifier(committed.identifier().clone())
-        .metadata(committed.metadata_ref())
-        .file_io(storage.file_io().clone())
-        .runtime(iceberg::Runtime::try_current()?);
-    match committed.metadata_location() {
-        Some(location) => builder.metadata_location(location.to_string()).build(),
-        None => builder.build(),
-    }
 }
 
 // ── IcebergSink ───────────────────────────────────────────────────────────────
@@ -416,34 +399,28 @@ impl IcebergDriver {
             })
             .await;
         let failure = match reloaded {
-            Ok(Ok(fresh)) if fresh.metadata().uuid() != table.metadata().uuid() => {
-                return Err(FaucetError::Sink(format!(
-                    "iceberg: table '{name}' was replaced by another table (uuid changed) during \
-                     the run; nothing of this page was written"
-                )));
-            }
-            Ok(Ok(fresh)) => match with_storage_of(&table, &fresh) {
-                Ok(refreshed) => {
+            Err(e @ FaucetError::Cancelled { .. }) => return Err(e),
+            Err(e) => e.to_string(),
+            Ok(loaded) => match storage_reload(&table, loaded) {
+                StorageReload::Fresh(refreshed) => {
                     state.storage_stale = false;
                     state.table = Some(refreshed.clone());
                     return Ok(refreshed);
                 }
-                Err(e) => e.to_string(),
+                StorageReload::Replaced => {
+                    return Err(FaucetError::Sink(format!(
+                        "iceberg: table '{name}' was replaced by another table (uuid changed) \
+                         during the run; nothing of this page was written"
+                    )));
+                }
+                StorageReload::Gone => {
+                    return Err(FaucetError::Sink(format!(
+                        "iceberg: table '{name}' no longer exists in the catalog; nothing of this \
+                         page was written"
+                    )));
+                }
+                StorageReload::Failed(why) => why,
             },
-            Ok(Err(e))
-                if matches!(
-                    e.kind(),
-                    ErrorKind::TableNotFound | ErrorKind::NamespaceNotFound
-                ) =>
-            {
-                return Err(FaucetError::Sink(format!(
-                    "iceberg: table '{name}' no longer exists in the catalog; nothing of this \
-                     page was written"
-                )));
-            }
-            Ok(Err(e)) => e.to_string(),
-            Err(e @ FaucetError::Cancelled { .. }) => return Err(e),
-            Err(e) => e.to_string(),
         };
         if state.storage_stale {
             return Err(FaucetError::Sink(format!(

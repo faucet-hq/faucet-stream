@@ -16,6 +16,7 @@ pub mod config;
 pub mod hms;
 #[cfg(feature = "storage-opendal")]
 pub mod preflight;
+pub mod storage;
 #[cfg(feature = "storage-opendal")]
 pub mod storage_factory;
 
@@ -26,6 +27,7 @@ pub use config::{
 };
 #[cfg(feature = "catalog-hms")]
 pub use hms::{HMS_LOCK_TIMEOUT_PROP, HmsCommitCatalog};
+pub use storage::{StorageReload, credential_expiry_ms, storage_reload, with_storage_of};
 #[cfg(feature = "storage-opendal")]
 pub use storage_factory::select_storage_factory;
 

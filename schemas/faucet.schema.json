@@ -29521,6 +29521,16 @@
                       "description": "Incremental only: reaction to a bookmarked snapshot that has expired.",
                       "$ref": "#/$defs/source_iceberg__OnExpired",
                       "default": "fail"
+                    },
+                    "credential_refresh_secs": {
+                      "description": "When the catalog vends the storage credentials: take fresh ones during\na read once they are this many seconds old (default `300`), by loading\nthe table again. The data files already being read finish first, so\nthe credentials must live longer than this plus the time those files\ntake. `0` takes fresh credentials before every data file, one file at a\ntime (for tests and diagnosis). Ignored for credentials the catalog did\nnot vend.",
+                      "type": [
+                        "integer",
+                        "string"
+                      ],
+                      "format": "uint64",
+                      "minimum": 0,
+                      "default": 300
                     }
                   }
                 },

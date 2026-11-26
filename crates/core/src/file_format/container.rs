@@ -768,6 +768,32 @@ mod tests {
         assert_eq!(rows, 3);
     }
 
+    /// #1119: a stripe written in a time zone the reader does not know fails
+    /// the file by name, with no rows of it emitted.
+    #[cfg(feature = "file-format-orc")]
+    #[test]
+    fn an_orc_file_with_an_unknown_writer_zone_is_refused_by_name() {
+        const ZONES: &[u8] = include_bytes!("../../tests/fixtures/orc/zones.orc");
+        let mut bad = ZONES.to_vec();
+        let at = bad
+            .windows(5)
+            .rposition(|w| w == [0x1a, 0x03, b'G', b'M', b'T'])
+            .expect("a writer zone");
+        bad[at + 2..at + 5].copy_from_slice(b"Q0Q");
+        let mut d = ContainerDecoder::new(FileFormat::Orc, &FormatOptions::default()).unwrap();
+        let mut rows = 0;
+        let err = d
+            .records("events/part-7.orc", FileInput::Bytes(bad), 100, &mut |c| {
+                rows += c.len();
+                Ok(())
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'events/part-7.orc': orc: stripe 1"), "{err}");
+        assert!(err.contains(r#""Q0Q""#), "{err}");
+        assert_eq!(rows, 0);
+    }
+
     #[cfg(feature = "file-format-orc")]
     #[test]
     fn orc_files_must_share_a_schema() {

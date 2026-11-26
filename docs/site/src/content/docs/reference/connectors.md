@@ -472,7 +472,12 @@ nuances (e.g. SQLite widening is a no-op; Elasticsearch can only add fields).
   only on request. The sink keeps the credentials across commits and takes
   fresh ones from the catalog before each new data-file writer (one more
   catalog `GET` per flush cycle; the table's metadata is kept, so a lagging
-  catalog cannot bring an older schema back). Before the first write or read
+  catalog cannot bring an older schema back). The source does the same during
+  a long read: once its credentials are `credential_refresh_secs` old
+  (default 300), or close to an expiry the catalog sent, it loads the table
+  again, keeps only the storage settings, and reads the remaining data files
+  with them; a refresh that fails is a warning and is tried again, and a
+  table dropped or replaced during the read fails it. Before the first write or read
   the table's storage is checked once (S3 and GCS locations): no credentials
   at all, or static S3 keys mixed with a vended session token, fail before any
   data moves; any other probe failure is a warning. `faucet doctor` shows it
