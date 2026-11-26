@@ -35,30 +35,40 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
-/// Put the fixture warehouse at [`WAREHOUSE`], once per content version: the
-/// copy lands under a temporary name and is renamed into place, so tests and
-/// test processes running side by side never see half of it.
+/// Put the fixture warehouse at [`WAREHOUSE`], once per content version, and
+/// hold a shared lock on it for the life of this process: a process with
+/// another version of the fixtures waits for the readers of this one.
 fn install_fixture() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
+    static HELD: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+    HELD.get_or_init(|| {
         let sums = std::fs::read_to_string(fixture_dir().join("SHA256SUMS")).unwrap();
         let marker = Path::new(WAREHOUSE).join("SHA256SUMS");
         let current = || std::fs::read_to_string(&marker).is_ok_and(|have| have == sums);
-        if current() {
-            return;
-        }
         let parent = Path::new(WAREHOUSE).parent().unwrap();
         std::fs::create_dir_all(parent).unwrap();
-        let staged = tempfile::tempdir_in(parent).unwrap();
-        copy_tree(&fixture_dir().join("warehouse"), staged.path());
-        std::fs::write(staged.path().join("SHA256SUMS"), &sums).unwrap();
-        // Another process may have installed it meanwhile: only an older
-        // version is ever removed.
-        if std::fs::rename(staged.path(), WAREHOUSE).is_err() && !current() {
-            let _ = std::fs::remove_dir_all(WAREHOUSE);
-            let _ = std::fs::rename(staged.path(), WAREHOUSE);
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(parent.join("iceberg-v3.lock"))
+            .unwrap();
+        loop {
+            lock.lock_shared().unwrap();
+            if current() {
+                return lock;
+            }
+            lock.unlock().unwrap();
+            lock.lock().unwrap();
+            if !current() {
+                let staged = tempfile::tempdir_in(parent).unwrap();
+                copy_tree(&fixture_dir().join("warehouse"), staged.path());
+                std::fs::write(staged.path().join("SHA256SUMS"), &sums).unwrap();
+                let _ = std::fs::remove_dir_all(WAREHOUSE);
+                std::fs::rename(staged.path(), WAREHOUSE).unwrap();
+                std::mem::forget(staged);
+            }
+            lock.unlock().unwrap();
         }
-        assert!(current(), "the fixture warehouse is not at {WAREHOUSE}");
     });
 }
 

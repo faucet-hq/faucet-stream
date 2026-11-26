@@ -210,6 +210,23 @@ async fn a_failed_refresh_keeps_reading_while_the_credentials_still_work() {
     );
 }
 
+/// A reload that comes back without vended credentials must not replace the
+/// credentials the read is working with.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_that_brings_no_credentials_keeps_the_ones_in_use() {
+    let fakes = Fakes::start(Vend::Always).await;
+    seed(&fakes, fakes.catalog(json!({})), 1..=3).await;
+    let source = file_by_file(fakes.catalog(json!({})), json!({})).await;
+    let rows = read_around(&source, || fakes.set_vend(Vend::Never))
+        .await
+        .unwrap();
+    assert_eq!(sorted_ids(&rows), [1, 2, 3]);
+    assert!(
+        fakes.s3_calls().iter().all(|c| c.status < 400),
+        "every read went out on the vended credentials"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_catalog_that_never_answers_a_refresh_does_not_stall_the_read() {
     let fakes = Fakes::start(Vend::Always).await;

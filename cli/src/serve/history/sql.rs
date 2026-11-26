@@ -110,9 +110,7 @@ pub struct LogShipColumns {
 
 /// Decode a `faucet_serve_log_ship` row.
 pub fn decode_log_ship(c: LogShipColumns) -> crate::serve::history::LogShipRow {
-    // A damaged timestamp reads as absent, except where absent would hide a
-    // side effect: `failing_since` reads as the epoch, so the failure
-    // notification still goes out (once) for a row that keeps failing.
+    // Damaged: absent, except `failing_since` (epoch keeps the notification).
     let run = c.run_id.clone();
     let ts = |v: Option<String>| {
         v.as_deref()

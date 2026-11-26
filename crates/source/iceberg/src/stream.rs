@@ -435,6 +435,9 @@ impl IcebergSource {
             Err(e @ FaucetError::Cancelled { .. }) => return Err(e),
             Err(e) => e.to_string(),
             Ok(loaded) => match storage_reload(table, loaded) {
+                StorageReload::Fresh(fresh) if !self.vended(fresh.file_io().config().props()) => {
+                    "the catalog returned the table without vended credentials".to_string()
+                }
                 StorageReload::Fresh(fresh) => {
                     let storage = fresh.file_io().config().props();
                     credentials.refreshed(self.vended(storage), credential_expiry_ms(storage), now);
@@ -482,8 +485,7 @@ impl IcebergSource {
                 let bookmark = *self.bookmark.lock().expect("bookmark lock");
                 plan(&opts, &snapshots, metadata.current_snapshot_id(), bookmark)?
             };
-            // Every step's schema is checked before the first page, so a run
-            // never emits pages and then meets a column it cannot read.
+            // Checked for every step before the first page.
             for step in &steps {
                 if let Step::Full { snapshot_id, .. } | Step::Append(snapshot_id) = step {
                     let schema = Self::snapshot_schema(&table, *snapshot_id)?;
@@ -512,9 +514,7 @@ impl IcebergSource {
                 let (tasks, uuids) = self.plan_tasks(&table, snapshot_id, added.as_ref()).await?;
                 let queue = refresh::queue(tasks);
                 let reads = self.calls.get().with_roundtrip_metering(false);
-                // One reader per generation of credentials: a reader stops
-                // taking files when a refresh is due and finishes the ones it
-                // started; the next reader works on the rest of the queue.
+                // One reader per generation of credentials.
                 while !refresh::is_empty(&queue) {
                     self.refresh_storage_if_due(&mut table, &mut credentials).await?;
                     let until = credentials.due_at(tokio::time::Instant::now(), wall_ms());

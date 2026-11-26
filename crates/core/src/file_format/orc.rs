@@ -94,9 +94,7 @@ pub fn read_batches_checked(
     check: &mut dyn FnMut(&SchemaRef) -> Result<(), FaucetError>,
     f: &mut dyn FnMut(RecordBatch) -> Result<(), FaucetError>,
 ) -> Result<SchemaRef, FaucetError> {
-    // The zone check reads through a second handle on the same input. It
-    // finishes before the decode starts; the two never read at the same time
-    // (clones of a file share one cursor).
+    // The zone check's handle; it is done before the decode starts.
     match input {
         OrcInput::File(file) => {
             let second = file.try_clone().map_err(|e| {
@@ -188,8 +186,10 @@ fn read_from<R: ChunkReader>(
     check: &mut dyn FnMut(&SchemaRef) -> Result<(), FaucetError>,
     f: &mut dyn FnMut(RecordBatch) -> Result<(), FaucetError>,
 ) -> Result<SchemaRef, FaucetError> {
-    let mut builder = orc_rust::ArrowReaderBuilder::try_new(reader)
-        .map_err(|e| FaucetError::Source(format!("orc: not a readable ORC file: {e}")))?;
+    let mut builder = guarded("reading the file footer", || {
+        orc_rust::ArrowReaderBuilder::try_new(reader)
+    })?
+    .map_err(|e| FaucetError::Source(format!("orc: not a readable ORC file: {e}")))?;
     if let Some(cols) = &opts.columns {
         let root = builder.file_metadata().root_data_type();
         let known: Vec<&str> = root.children().iter().map(|c| c.name()).collect();
@@ -375,6 +375,19 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().ends_with("shape refused"), "{err}");
+    }
+
+    /// A file cut off at the front still ends in a postscript, whose lengths
+    /// then point before its start: the footer read must fail, not panic.
+    #[test]
+    fn a_file_whose_footer_lengths_exceed_it_is_an_error() {
+        for keep in [40, 60, 120, 200] {
+            let tail = ZONES[ZONES.len() - keep..].to_vec();
+            let err = decode(&tail, &OrcOptions::default())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("orc:"), "{keep}: {err}");
+        }
     }
 
     #[test]

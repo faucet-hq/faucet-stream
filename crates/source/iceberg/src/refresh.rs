@@ -57,12 +57,15 @@ impl Credentials {
         if self.every.is_zero() {
             return Some(now);
         }
-        let by_age = self.taken_at + self.every;
-        let by_expiry = self.expires_at_ms.map(|at| {
+        let by_age = self.taken_at.checked_add(self.every);
+        let by_expiry = self.expires_at_ms.and_then(|at| {
             let left = u64::try_from(at.saturating_sub(wall_ms)).unwrap_or(0);
-            now + Duration::from_millis(left).saturating_sub(EXPIRY_MARGIN)
+            now.checked_add(Duration::from_millis(left).saturating_sub(EXPIRY_MARGIN))
         });
-        let due = by_expiry.map_or(by_age, |e| e.min(by_age));
+        let due = match (by_age, by_expiry) {
+            (Some(a), Some(e)) => a.min(e),
+            (a, e) => a.or(e)?,
+        };
         Some(due.max(self.last_attempt + MIN_BETWEEN_ATTEMPTS))
     }
 
@@ -203,6 +206,23 @@ mod tests {
         // A reload that brought no vended credentials ends the refreshing.
         c.refreshed(false, None, Instant::now());
         assert_eq!(c.due_at(Instant::now(), WALL), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_age_or_expiry_too_far_away_is_not_due_and_does_not_overflow() {
+        let now = Instant::now();
+        let c = Credentials::new(true, Duration::from_secs(u64::MAX), None, now);
+        assert_eq!(c.due_at(now, WALL), None);
+        let c = Credentials::new(true, Duration::from_secs(u64::MAX), Some(i64::MAX), now);
+        assert!(!c.due(now, WALL));
+        // A countable expiry still applies when the age does not.
+        let c = Credentials::new(
+            true,
+            Duration::from_secs(u64::MAX),
+            Some(WALL + 360_000),
+            now,
+        );
+        assert_eq!(c.due_at(now, WALL), Some(now + Duration::from_secs(60)));
     }
 
     #[tokio::test(start_paused = true)]
